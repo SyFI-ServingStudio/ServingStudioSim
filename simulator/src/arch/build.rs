@@ -1187,9 +1187,13 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
     let model = deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")?;
-    Ok(match host_gather {
+    let model = match host_gather {
         Some(gather) => model.with_engram_host_gather(gather),
         None => model,
+    };
+    Ok(match deepinfer.map_or(0, |engine| engine.host_step_us) {
+        0 => model,
+        host_step_us => model.with_host_step_us(host_step_us),
     })
 }
 
@@ -2820,6 +2824,7 @@ pub fn build_iter_model(
             dp_size,
             force_load_balance,
             prefill_chunk_tokens,
+            deepinfer_host_step_us,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2837,6 +2842,7 @@ pub fn build_iter_model(
                 *engram_fetch,
                 *force_load_balance,
                 *prefill_chunk_tokens,
+                *deepinfer_host_step_us,
             )?,
             *engram_fetch,
             *engram_cpu_threads,

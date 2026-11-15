@@ -53,6 +53,7 @@ use anyhow::Result;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
 use crate::arch::deepseek_v41_vllm::{
     self as tp_arch, fold_layers, index_plan, layer_config, layer_input, prefill_pairs,
     replay_rows, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg,
@@ -60,19 +61,19 @@ use crate::arch::deepseek_v41_vllm::{
     LayerKind, PlanNode,
 };
 use crate::arch::kv_layout::KvCacheLayout;
-use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
+use crate::op::attention::DeepseekV41CandidateRole;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
+use crate::timing::Metrics4;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
-use crate::worklet::deepseek_v41_common::eval_or_zero;
-use crate::op::attention::DeepseekV41CandidateRole;
 use crate::worklet::deepseek_v41_attention_tp::DeepseekV41AttentionDeepInfer;
+use crate::worklet::deepseek_v41_common::eval_or_zero;
 use crate::worklet::{
     DeepseekV41AttentionEntry, DeepseekV41AttentionTpWorklet, DeepseekV41AttentionTpWorkletConfig,
     DeepseekV41AttentionTpWorkletInput, DeepseekV41AttentionTpWorkletResolved,
@@ -155,6 +156,12 @@ pub struct DeepInferEngine {
     /// contiguous corpus segments the mega MoE's routes are drawn in.
     /// `None`: independent tokens.
     pub prefill_chunk_tokens: Option<u32>,
+    /// Host time per engine step with the GPU idle (µs): the step's
+    /// `schedule`, input preparation and post-process run serially with the
+    /// forward on a prefill step (`worker.py`: prompt steps post-process in
+    /// place; `model_runner.py`: prompt steps never replay a CUDA graph).
+    /// Priced as one `host_step` leaf per step; 0 = not modeled.
+    pub host_step_us: u32,
 }
 
 /// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
@@ -867,6 +874,9 @@ pub struct DeepseekV41VllmDpModel {
     /// `Some` under the `cpu_gather` Engram fetch: the last slot is the GPU
     /// time each step waits for host-gathered rows.
     host_gather: Option<EngramHostGather>,
+    /// DeepInfer's host time per step with the GPU idle (ms), one `host_step`
+    /// leaf per step; 0 = no leaf.
+    host_step_ms: f32,
 }
 
 pub fn build(
@@ -929,6 +939,7 @@ pub fn build(
         cost_flat: Vec::new(),
         n_slots: 0,
         host_gather: None,
+        host_step_ms: 0.0,
         name,
     };
     let tree = model.cost_tree();
@@ -948,9 +959,28 @@ impl DeepseekV41VllmDpModel {
         self
     }
 
+    /// Price DeepInfer's host time per step (`DeepInferEngine::host_step_us`).
+    pub fn with_host_step_us(mut self, host_step_us: u32) -> Self {
+        self.host_step_ms = host_step_us as f32 / 1000.0;
+        let tree = self.cost_tree();
+        self.cost_flat = tree.flatten();
+        self.n_slots = tree.n_slots();
+        self
+    }
+
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let mut sections = self.compile_sections(&mut b);
+        if self.host_step_ms > 0.0 {
+            sections.push(CostNode::Labeled {
+                label: format!("{}.host_step [engine host time per step, GPU idle: schedule, input prep, post-process]", self.name),
+                child: Box::new(b.leaf(
+                    format!("{}.host_step", self.name),
+                    "host_step",
+                    serde_json::json!({}),
+                )),
+            });
+        }
         if self.host_gather.is_some() {
             sections.push(CostNode::Labeled {
                 label: format!(
@@ -1156,7 +1186,28 @@ impl DeepseekV41VllmDpModel {
             None => Evaluator::new(slots),
         };
         self.eval_step(&step, &mut evaluator);
-        let max_rows = step.full.ranks.iter().map(|rank| rank.rows).max().unwrap_or(0);
+        let max_rows = step
+            .full
+            .ranks
+            .iter()
+            .map(|rank| rank.rows)
+            .max()
+            .unwrap_or(0);
+        if self.host_step_ms > 0.0 {
+            // The ranks step in lockstep; each spends the same host time.
+            let host = LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.host_step_ms,
+                    ..Metrics4::ZERO
+                },
+                ..LeafMetrics::ZERO
+            };
+            evaluator.push(host, || {
+                SlotInput::from(ElementwiseKernelInput {
+                    num_tokens: max_rows,
+                })
+            });
+        }
         if self.host_gather.is_some() {
             evaluator.push(LeafMetrics::ZERO, || {
                 SlotInput::from(ElementwiseKernelInput {
@@ -1175,13 +1226,14 @@ impl DeepseekV41VllmDpModel {
             // The ranks run in lockstep: the step waits for its slowest rank's
             // rows. GPU time ahead of layer L: the step's mean per-layer time
             // times the L layers before it.
-            let per_layer = f64::from(total.m.time_ms) / f64::from(tp_arch::BODY_LAYERS);
+            // GPU time only: the host step runs before the forward.
+            let gpu_ms = f64::from(total.m.time_ms - self.host_step_ms);
+            let per_layer = gpu_ms / f64::from(tp_arch::BODY_LAYERS);
             let available: Vec<f64> = tp_arch::ENGRAM_LAYERS
                 .iter()
                 .map(|&layer| per_layer * f64::from(layer))
                 .collect();
-            let wait = gather.exposed_ms(max_rows, &available, f64::from(total.m.time_ms))
-                as f32;
+            let wait = gather.exposed_ms(max_rows, &available, gpu_ms) as f32;
             slots[self.n_slots - 1].m.time_ms = wait;
             total.m.time_ms += wait;
         }
@@ -1620,6 +1672,7 @@ mod tests {
             engram_fetch: false,
             force_load_balance: false,
             prefill_chunk_tokens: None,
+            host_step_us: 0,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         assert!(configs.engram_prefetch.is_none());
@@ -1642,6 +1695,7 @@ mod tests {
             engram_fetch: true,
             force_load_balance: false,
             prefill_chunk_tokens: None,
+            host_step_us: 0,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
     }
@@ -1656,7 +1710,10 @@ mod tests {
         let vllm = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         for body in vllm.bodies.iter().chain([&vllm.layer0]) {
             assert!(body.attention.deepinfer.is_none());
-            assert!(body.engram.as_ref().map_or(true, |e| e.mhc_unfused_backends.is_none()));
+            assert!(body
+                .engram
+                .as_ref()
+                .map_or(true, |e| e.mhc_unfused_backends.is_none()));
         }
         assert!(vllm.head.mhc_post_backends.is_none());
         p.deepinfer = Some(DeepInferEngine {
@@ -1665,12 +1722,19 @@ mod tests {
             engram_fetch: false,
             force_load_balance: true,
             prefill_chunk_tokens: None,
+            host_step_us: 0,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         let metadata: Vec<Vec<u32>> = configs
             .bodies
             .iter()
-            .filter(|body| body.attention.deepinfer.as_ref().unwrap().candidate_metadata)
+            .filter(|body| {
+                body.attention
+                    .deepinfer
+                    .as_ref()
+                    .unwrap()
+                    .candidate_metadata
+            })
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(metadata, [vec![24]]);
@@ -1683,7 +1747,16 @@ mod tests {
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(swa_index, [vec![20], vec![0]]);
-        assert_eq!(configs.layer0.attention.deepinfer.as_ref().unwrap().swa_ring_tokens, 134);
+        assert_eq!(
+            configs
+                .layer0
+                .attention
+                .deepinfer
+                .as_ref()
+                .unwrap()
+                .swa_ring_tokens,
+            134
+        );
         let consumers: Vec<u32> = configs
             .bodies
             .iter()
@@ -1691,9 +1764,15 @@ mod tests {
             .flat_map(|body| body.layers.clone())
             .collect();
         assert_eq!(consumers, [24, 28, 32, 36]);
-        let layer2 = configs.bodies.iter().find(|body| body.layers[0] == 2).unwrap();
+        let layer2 = configs
+            .bodies
+            .iter()
+            .find(|body| body.layers[0] == 2)
+            .unwrap();
         let resolved = resolve_layer(layer2);
-        assert!(resolved.attention.mhc_overlap.is_none() && resolved.attention.entry_fused.is_none());
+        assert!(
+            resolved.attention.mhc_overlap.is_none() && resolved.attention.entry_fused.is_none()
+        );
         assert!(resolved.attention.entry_mega_mhc.is_some());
     }
 
@@ -1979,5 +2058,19 @@ mod tests {
         .unwrap();
         assert_eq!(eager.mode, GraphMode::Eager);
         assert_eq!(eager.full.exchange.collective_tokens, vec![2080, 5, 1, 1]);
+    }
+
+    #[test]
+    fn host_step_adds_one_leaf_per_step() {
+        let plain = built();
+        let names = |model: &DeepseekV41VllmDpModel| -> Vec<String> {
+            model.cost_tree().manifest().slots.iter().map(|s| s.name.clone()).collect()
+        };
+        assert!(!names(&plain).iter().any(|n| n.ends_with(".host_step")));
+        let with = built().with_host_step_us(6490);
+        assert_eq!(with.host_step_ms, 6.49);
+        let with_names = names(&with);
+        assert_eq!(with_names.len(), names(&plain).len() + 1);
+        assert_eq!(with_names.iter().filter(|n| n.ends_with(".host_step")).count(), 1);
     }
 }

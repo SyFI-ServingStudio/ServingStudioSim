@@ -631,6 +631,7 @@ impl Deployment for UnifiedDeployment {
                 dp_size,
                 force_load_balance,
                 prefill_chunk_tokens,
+                deepinfer_host_step_us,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
@@ -652,6 +653,7 @@ impl Deployment for UnifiedDeployment {
                         *engram_fetch,
                         *force_load_balance,
                         *prefill_chunk_tokens,
+                        *deepinfer_host_step_us,
                     )?,
                     *engram_fetch,
                     *engram_cpu_threads,

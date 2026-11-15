@@ -127,6 +127,7 @@ pub fn deepseek_v41_dp_engine(
     engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
     force_load_balance: bool,
     prefill_chunk_tokens: u32,
+    host_step_us: u32,
 ) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
     let engram_fetch = engram_fetch != crate::arch::deepseek_v41_engram_fetch::EngramFetch::Off;
     match engine {
@@ -135,21 +136,24 @@ pub fn deepseek_v41_dp_engine(
                 num_redundant_experts == 0
                     && yoco_keep_tokens == 0
                     && !force_load_balance
-                    && prefill_chunk_tokens == 0,
-                "num_redundant_experts, yoco_keep_tokens, force_load_balance and \
-                 prefill_chunk_tokens are DeepInfer options; set engine: deepinfer"
+                    && prefill_chunk_tokens == 0
+                    && host_step_us == 0,
+                "num_redundant_experts, yoco_keep_tokens, force_load_balance, \
+                 prefill_chunk_tokens and deepinfer_host_step_us are DeepInfer options; \
+                 set engine: deepinfer"
             );
             Ok(None)
         }
-        DeepseekV41Engine::Deepinfer => {
-            Ok(Some(super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine {
+        DeepseekV41Engine::Deepinfer => Ok(Some(
+            super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine {
                 num_redundant_experts,
                 yoco_keep_tokens: (yoco_keep_tokens > 0).then_some(yoco_keep_tokens),
                 engram_fetch,
                 force_load_balance,
                 prefill_chunk_tokens: (prefill_chunk_tokens > 0).then_some(prefill_chunk_tokens),
-            }))
-        }
+                host_step_us,
+            },
+        )),
     }
 }
 
@@ -648,6 +652,13 @@ pub enum IterArchSel {
         #[serde(default = "default_engram_cpu_threads")]
         #[param(default = 8, cache_key)]
         engram_cpu_threads: u32,
+        /// DeepInfer only: host time per engine step with the GPU idle, in
+        /// microseconds (scheduling, input metadata, post-process between two
+        /// prefill forwards). Measured, not tuned: set it from a capture and
+        /// cite the capture in the preset. 0 = not modeled.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        deepinfer_host_step_us: u32,
         /// DP ranks per replica, which are also its EP group (2, 4 or 8; the
         /// captured deployment is 4). A pool of `replicas` such groups places
         /// sessions by prefix affinity like the PP replicas.
