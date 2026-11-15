@@ -185,6 +185,11 @@ const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
 const DEEPINFER_MEMCPY_BACKENDS: &[&str] = &["torch_memcpy_deepinfer"];
 /// DeepInfer's KV page (`ModelMetadata.resolved_tokens_per_block`).
 const DEEPINFER_BLOCK_SIZE: u32 = 128;
+/// DeepInfer's HF loader (`hugging_face/config.py` defaults, a679bb8) sets
+/// `use_qnorm: False` and no field of the checkpoint's config overrides it, so
+/// `attn.py` builds the prefill attention with `enable_q_norm=False`
+/// (job 22878's capture: every `fwd_kernel` instance is `Config{...,64,false}`).
+const DEEPINFER_Q_B_NORM: bool = false;
 /// `DEEPINFER_MAX_BACKTRACKING_TOKENS`' default, `max(v, nextn + 1)` with
 /// `nextn` 5 (`environ.py`): each request's SWA ring holds this many tokens
 /// past the window.
@@ -448,6 +453,7 @@ fn deepinfer_backends(
         mega_mhc_backends: DEEPINFER_MEGA_MHC_BACKENDS.to_vec(),
         mhc_unfused_backends: DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec(),
         prefill_attn_backends: DEEPINFER_PREFILL_ATTN_BACKENDS.to_vec(),
+        q_b_norm: DEEPINFER_Q_B_NORM,
         index_logits_backends: DEEPINFER_INDEX_LOGITS_BACKENDS.to_vec(),
         candidate_block_max_backends: DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS.to_vec(),
         topk_backends: DEEPINFER_TOPK_BACKENDS.to_vec(),

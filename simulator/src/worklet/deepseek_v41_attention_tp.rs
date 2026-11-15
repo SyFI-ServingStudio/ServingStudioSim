@@ -250,6 +250,8 @@ pub struct DeepseekV41AttentionDeepInfer {
     pub mhc_unfused_backends: Vec<&'static str>,
     /// FlashMLA `fused_norm_rope_attn_rope_cast.prefill`.
     pub prefill_attn_backends: Vec<&'static str>,
+    /// The engine's `use_qnorm`: the prefill attention normalizes each Q head.
+    pub q_b_norm: bool,
     /// DeepGEMM FP4 MQA logits (dense, sparse and the sparse schedule).
     pub index_logits_backends: Vec<&'static str>,
     pub candidate_block_max_backends: Vec<&'static str>,
@@ -635,7 +637,7 @@ impl DeepseekV41AttentionTpWorklet {
                 head_dim: cfg.head_dim.clone(),
                 rope_dim: cfg.rope_dim.clone(),
                 n_wv_group: o_groups_per_rank,
-                enable_q_norm: true,
+                enable_q_norm: di.q_b_norm,
                 q_dtype: DType::Bf16,
                 kv_dtype: DType::Bf16,
                 output_dtype: DType::Fp8E4m3,
