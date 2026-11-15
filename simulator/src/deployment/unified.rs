@@ -38,6 +38,7 @@ use crate::orchestrator::{
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
+use crate::worker::config::PrefixTierSpec;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_speculative_worker,
     resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
@@ -200,6 +201,14 @@ impl Deployment for UnifiedDeployment {
             .apply("unified", &mut worker_config)?;
         g.worker
             .apply_chunked_scheduling("unified", &mut worker_config)?;
+        if let IterWorkerSel::ChunkedPrefill {
+            external_decode,
+            prefix_tiers,
+            ..
+        } = &g.worker
+        {
+            apply_rank_tiers(*external_decode, prefix_tiers, &mut worker_config)?;
+        }
 
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -1161,6 +1170,29 @@ where
     }
 }
 
+/// `chunked_prefill`'s per-rank host tiers and external decode. The tiers
+/// reserve every request's whole footprint, a loading area needs a resumable
+/// recurrent state (checked against the layout at build), and the stages'
+/// balanced load is a pipeline what-if.
+fn apply_rank_tiers(
+    external_decode: bool,
+    prefix_tiers: &PrefixTierSpec,
+    config: &mut WorkerConfig,
+) -> anyhow::Result<()> {
+    prefix_tiers.apply("unified", config)?;
+    config.external_decode = external_decode;
+    ensure!(
+        !config.prefix_tier_balanced_load,
+        "unified: prefix_tier_balanced_load is a pipeline what-if (pipeline_chunked_prefill)"
+    );
+    ensure!(
+        config.prefix_tiers.is_empty()
+            || matches!(config.kv_admission, KvAdmissionConfig::FullFootprint),
+        "unified: host tiers need full-footprint KV admission"
+    );
+    Ok(())
+}
+
 /// Prefill-iteration multiplier of any co-located selector. The PD selectors do
 /// not carry it: every PD prefill iteration schedules prefill and no PD decode
 /// iteration does, so `gpu_time_multiplier` already expresses either stage.
@@ -1395,7 +1427,9 @@ mod tests {
             srpt: false,
             microbatch_budget: Default::default(),
             force_schedule: Default::default(),
+            external_decode: false,
             state_retention: Default::default(),
+            prefix_tiers: Default::default(),
         }
     }
 
@@ -1664,5 +1698,40 @@ pools:
             assert_eq!(speculative_draft_tokens(&worker), 0);
             assert_eq!(speculative_acceptance_seed(&worker), None);
         }
+    }
+
+    #[test]
+    fn rank_tiers_reject_pipeline_and_bounded_future_options() {
+        let tiers = |yaml: &str| -> PrefixTierSpec { serde_yaml::from_str(yaml).unwrap() };
+        let mut config = WorkerConfig::default();
+        apply_rank_tiers(true, &tiers("dram_tier_gb: 50.0"), &mut config).unwrap();
+        assert_eq!(config.prefix_tiers.len(), 1);
+        assert!(config.external_decode);
+        let error = apply_rank_tiers(
+            false,
+            &tiers("{dram_tier_gb: 50.0, prefix_tier_balanced_load: true}"),
+            &mut WorkerConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pipeline what-if"), "{error}");
+        let mut bounded = WorkerConfig {
+            kv_admission: KvAdmissionConfig::BoundedFuture(
+                crate::worker::config::BoundedFutureKvAdmissionConfig {
+                    page_size: 1,
+                    max_future_tokens: 4_096,
+                    initial_new_token_ratio: 0.7,
+                    minimum_new_token_ratio: 0.1,
+                    new_token_ratio_decay_steps: 600,
+                    retract_decode_steps: 20,
+                    retraction_policy: crate::worker::DecodeRetractionPolicy::Length,
+                },
+            ),
+            ..WorkerConfig::default()
+        };
+        let error =
+            apply_rank_tiers(false, &tiers("dram_tier_gb: 50.0"), &mut bounded).unwrap_err();
+        assert!(error.to_string().contains("full-footprint"), "{error}");
+        // Without tiers bounded-future admission stays legal.
+        apply_rank_tiers(false, &tiers("{}"), &mut bounded).unwrap();
     }
 }

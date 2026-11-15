@@ -406,8 +406,9 @@ impl StateRetentionSpec {
     }
 }
 
-/// Host tiers behind a pipeline head's prefix cache: DRAM, then SSD, each per
-/// GPU. Flattened into `pipeline_chunked_prefill`; every key absent is no
+/// Host tiers behind a prefix cache: DRAM, then SSD, each per GPU. Flattened
+/// into `pipeline_chunked_prefill` (one set per pipeline) and
+/// `chunked_prefill` (one set per attention DP rank); every key absent is no
 /// tier. A session request whose context is in a tier but not in HBM reads
 /// it back when admission reaches it, as vLLM's KV connector does; the rest
 /// is not vLLM.
@@ -445,7 +446,7 @@ pub struct PrefixTierSpec {
     ssd_tier_writes: SsdTierWrites,
     /// Tiers store and read the stages' mean KV bytes, as if the stages held
     /// equal shares, instead of the most loaded stage's. HBM is unchanged. A
-    /// what-if: vLLM's layer split leaves the stages unequal.
+    /// what-if: vLLM's layer split leaves the stages unequal. Pipeline only.
     #[serde(default)]
     #[param(default = false)]
     prefix_tier_balanced_load: bool,
@@ -1016,10 +1017,22 @@ pub enum IterWorkerSel {
         /// Per-rank force-schedule bound; see [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Decode runs elsewhere: a request completes at its first token, and
+        /// its decode hands the context back, every output but the last
+        /// extending the prompt's context in its rank's HBM and tiers (a round
+        /// then adds two round-end states). Sessions stay on their rank. Not
+        /// vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
         /// Round-end states a retained context keeps; see
         /// [`StateRetentionSpec`].
         #[serde(flatten)]
         state_retention: StateRetentionSpec,
+        /// Host tiers behind each attention DP rank's prefix cache, sessions
+        /// sticky to their rank; see [`PrefixTierSpec`].
+        #[serde(flatten)]
+        prefix_tiers: PrefixTierSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a

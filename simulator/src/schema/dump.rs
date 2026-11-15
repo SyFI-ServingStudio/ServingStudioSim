@@ -92,6 +92,7 @@ pub fn list_params() -> Value {
                         ("chunked_prefill", MicrobatchBudgetSpec::PARAMS),
                         ("chunked_prefill", ForceScheduleSpec::PARAMS),
                         ("chunked_prefill", StateRetentionSpec::PARAMS),
+                        ("chunked_prefill", PrefixTierSpec::PARAMS),
                         ("speculative", KvAccountingSpec::PARAMS),
                         ("speculative", KvAdmissionSpec::PARAMS),
                         ("pipeline_chunked_prefill", KvAccountingSpec::PARAMS),

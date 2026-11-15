@@ -5,6 +5,13 @@
 //! state at block boundaries and therefore ends every non-final prefill chunk
 //! on one. The lifecycle gets that block as its chunk-end quantum to match,
 //! unless the selector asks for `plain` chunking.
+//!
+//! Host tiers, if the config has any, sit behind each attention DP rank's
+//! prefix cache, one set per rank, each GPU storing and reading its share of
+//! the layout's bytes; reads stage through loading areas when the config has
+//! one. With tiers or `external_decode` sessions stick to their rank, and
+//! with `external_decode` a request completes at its first token and its
+//! decode elsewhere hands the context back. Not vLLM.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +24,7 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::kv::{TierBytes, TierStateOptions};
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
@@ -41,8 +49,8 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         .expect("chunked-prefill worker requires max_batch_tokens");
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
-    let kv_accounting =
-        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let kv_cache_layout = model.kv_cache_layout();
+    let kv_accounting = resolve_kv_accounting(&kv_cache_layout, model.num_attn_shards(), &config);
     let chunk_end_quantum = prefill_chunk_end_quantum(&kv_accounting, &config);
     tracing::info!(
         worker = id.0,
@@ -67,6 +75,11 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &kv_accounting,
         num_partitions,
     );
+    let tier_bytes = TierBytes::of_layout(&kv_cache_layout).per_gpu(model.num_attn_shards());
+    assert!(
+        config.prefix_tier_loading_area == 0.0 || tier_bytes.state > 0,
+        "chunked prefill: prefix_tier_loading_area needs an arch with recurrent state"
+    );
     let kv_store = kv_cache_store(
         kv_accounting,
         num_partitions,
@@ -74,7 +87,27 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &config,
         essentials.sampler,
         prefix_cache_logger,
+    )
+    .with_prefix_tiers(
+        &config.prefix_tiers,
+        tier_bytes,
+        TierStateOptions {
+            added_per_round: 1 + u32::from(config.external_decode),
+            compression_ratio: config.tier_state_compression_ratio,
+            anchors_in_place: config.recurrent_state_anchors_in_place,
+        },
     );
+    let kv_store = if config.prefix_tier_loading_area > 0.0 {
+        kv_store.with_loading_area(config.prefix_tier_loading_area)
+    } else {
+        kv_store
+    };
+    let kv_store = if config.prefix_tier_warm_start {
+        kv_store.with_tier_warm_start()
+    } else {
+        kv_store
+    }
+    .with_tiers_reports(essentials.tiers_reports);
     let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)
@@ -91,10 +124,19 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     }
     .with_microbatch_budget(config.microbatch_budget)
     .with_started_order(config.started_order);
-    let admission = match config.force_schedule {
+    let mut admission = match config.force_schedule {
         Some(schedule) => admission.with_force_schedule(schedule),
         None => admission,
     };
+    if !config.prefix_tiers.is_empty() || config.external_decode {
+        admission = admission.with_sticky_sessions();
+    }
+    if let Some(read_wait) = config.prefix_tier_read_wait {
+        admission = admission.with_read_wait(read_wait);
+    }
+    if config.external_decode {
+        admission = admission.with_external_decode();
+    }
 
     IterBatchWorker::from_components(
         essentials.context,

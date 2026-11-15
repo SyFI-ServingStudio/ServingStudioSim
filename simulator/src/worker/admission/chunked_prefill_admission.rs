@@ -25,6 +25,15 @@
 //! `Deadline`, the started-prompt order (`started_order.rs`, shared with the
 //! pipeline head), and the prefill budget (`microbatch_budget.rs`), whose
 //! backlog is the partition's queued and started prompts' tokens.
+//!
+//! Host tiers sit behind each rank's HBM, one set per rank (`TieredPrefixKv`):
+//! a fresh request whose context its rank's tiers hold beyond HBM is read back
+//! before admission, through the lifecycle the pipeline head uses
+//! (`fresh_reads.rs`), and every queue ranks by what HBM or the rank's tiers
+//! hold. With tiers or `external_decode` a session stays on the rank it last
+//! ran on, as a router that knows where its host copy lives would. With
+//! `external_decode` a request completes at its first token and its decode
+//! elsewhere hands the context back (`external_decode.rs`). Not vLLM.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -33,12 +42,15 @@ use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
 use crate::worker::config::{
     BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
 };
-use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
+use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext, TieredPrefixKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
+use super::external_decode::ExternalDecode;
+use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::{MicrobatchBudget, PrefillSplit};
 use super::policy::{ForceSchedule, Queued};
+use super::read_wait::ReadWait;
 use super::started_order::{FreshGate, PrefillFill, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
@@ -102,6 +114,12 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
     /// ordinary decode and sequential drafters.
     drafting_slots: u32,
+    /// Fresh requests out of their rank's queue for a host-tier read.
+    reads: FreshReads,
+    /// The partition each session last ran on, when sessions are sticky.
+    session_partitions: Option<HashMap<u32, usize>>,
+    /// The decode runs elsewhere: a request completes at its first token.
+    external_decode: Option<ExternalDecode>,
 }
 
 /// What gates one partition's fresh-prompt admission in the iteration being
@@ -164,6 +182,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             KvAdmissionConfig::FullFootprint => 1.0,
             KvAdmissionConfig::BoundedFuture(config) => config.initial_new_token_ratio,
         };
+        let reads = FreshReads::new(partition_policies.len());
         Self {
             partition_policies: partition_policies
                 .into_iter()
@@ -184,7 +203,31 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             next_admission: 0,
             decode_completion,
             drafting_slots,
+            reads,
+            session_partitions: None,
+            external_decode: None,
         }
+    }
+
+    /// Keep each session on the partition of its last request, as a router
+    /// that knows where the session's host-tier copy lives would.
+    pub(crate) fn with_sticky_sessions(mut self) -> Self {
+        self.session_partitions = Some(HashMap::new());
+        self
+    }
+
+    /// Start a host-tier read only within `read_wait` of its tier's channel.
+    /// Not vLLM.
+    pub(crate) fn with_read_wait(mut self, read_wait: ReadWait) -> Self {
+        self.reads.set_read_wait(read_wait);
+        self
+    }
+
+    /// Run each request to its first token and take its context back from a
+    /// decode elsewhere. Not vLLM.
+    pub(crate) fn with_external_decode(mut self) -> Self {
+        self.external_decode = Some(ExternalDecode::default());
+        self
     }
 
     /// End every non-final chunk on a checkpoint boundary of `alignment`.
@@ -239,13 +282,31 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         started + self.partition_policies[partition].0.queued_prompt_tokens()
     }
 
+    /// Retained KV has hard affinity, then a sticky session's last partition;
+    /// cold requests use the generic balance policy.
     fn choose_partition<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
         session_input: SessionInput,
     ) -> usize {
+        let partition = self.place(kv_store, session_input);
+        if let (Some(sessions), Some(session_id)) =
+            (&mut self.session_partitions, session_input.session_id())
+        {
+            sessions.insert(session_id, partition);
+        }
+        partition
+    }
+
+    fn place<K: ChunkedPrefillKv>(&mut self, kv_store: &K, session_input: SessionInput) -> usize {
         if let Some(partition) = kv_store.retained_prefix_partition(session_input) {
             return usize::from(partition);
+        }
+        if let Some(&partition) = session_input
+            .session_id()
+            .and_then(|session_id| self.session_partitions.as_ref()?.get(&session_id))
+        {
+            return partition;
         }
         if !self.balance.needs_load() {
             return self.balance.choose(self.partition_policies.len());
@@ -463,7 +524,7 @@ impl<P, D, K> PrefillFill<K> for ChunkedPrefillAdmission<P, D>
 where
     P: PendingOrderPolicy,
     D: DecodeCompletion<K>,
-    K: ChunkedPrefillKv,
+    K: TieredPrefixKv,
 {
     type Step = FreshAdmissionStep;
 
@@ -500,18 +561,34 @@ where
         let drafting_slots = self.drafting_slots;
         let partition_index = usize::from(partition);
         let mut remaining_budget = budget;
+        let mut passed_over = Vec::new();
+        if kv_store.stages_tier_reads() && gate.queues.takes_pending() {
+            let (policy, policy_context) = &mut self.partition_policies[partition_index];
+            self.reads
+                .start_staged_reads(partition, policy, policy_context, kv_store, now);
+        }
         while step.admits && remaining_budget > drafting_slots {
             let (policy, policy_context) = &mut self.partition_policies[partition_index];
-            let Some((candidate, queued)) =
-                policy.peek_head(gate.queues, policy_context, &mut |candidate| {
-                    kv_store.resident_prefix_tokens(
-                        candidate.fresh_prompt_tokens,
-                        candidate.session_input,
-                    )
-                })
+            let Some((source, candidate)) =
+                self.reads
+                    .peek(partition, policy, policy_context, kv_store, gate.queues)
             else {
                 break;
             };
+            match self.reads.at_head(
+                partition,
+                policy,
+                policy_context,
+                kv_store,
+                source,
+                candidate,
+                &mut passed_over,
+                now,
+            ) {
+                AtHead::Admit => {}
+                AtHead::Moved => continue,
+                AtHead::Stop => break,
+            }
             if candidate.remaining_output_tokens > 1 && step.future_decode_slots == Some(0) {
                 break;
             }
@@ -521,7 +598,7 @@ where
                 candidate.session_input,
             );
             if !gate.admits(
-                queued == Queued::Pending,
+                source == FreshSource::Queued(Queued::Pending),
                 resolved_prefill.remaining_prefill_tokens(),
             ) {
                 break;
@@ -569,8 +646,8 @@ where
             if !fits {
                 break;
             }
-            let taken = policy.take_head(queued, policy_context);
-            debug_assert_eq!(taken, candidate);
+            self.reads
+                .take(partition, policy, policy_context, source, candidate);
             self.admission_order
                 .insert(candidate.request_id, self.next_admission);
             self.next_admission += 1;
@@ -611,7 +688,7 @@ where
             }
         }
         let (policy, policy_context) = &mut self.partition_policies[partition_index];
-        policy.restore_set_aside(policy_context);
+        FreshReads::return_passed_over(policy, policy_context, passed_over);
         budget - remaining_budget
     }
 
@@ -640,7 +717,7 @@ impl<P, D, K> IterAdmission<K> for ChunkedPrefillAdmission<P, D>
 where
     P: PendingOrderPolicy,
     D: DecodeCompletion<K>,
-    K: ChunkedPrefillKv,
+    K: TieredPrefixKv,
 {
     type Msg = WorkerMsgCommon;
     type Event = WorkerEventCommon;
@@ -659,6 +736,9 @@ where
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
+            if let Some(external_decode) = &mut self.external_decode {
+                external_decode.accept(request, &mut record.request.definition);
+            }
             (
                 arrival_time,
                 record.request.definition.prompt_tokens,
@@ -671,18 +751,16 @@ where
                     .session_start_or(arrival_time),
             )
         };
+        // Placement is frozen when the request enters the worker.
+        let partition = self.choose_partition(kv_store, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
             remaining_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            kv_store.reusable_prefix_tokens(partition as u16, fresh_prompt_tokens, session_input),
         );
-        // Placement is frozen when the request enters the worker. Retained KV
-        // has hard affinity; cold requests use the same generic balance policy
-        // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
         let (policy, policy_context) = &mut self.partition_policies[partition];
         debug_assert!(!policy.contains(request));
         policy.push_arrived(candidate, arrival_time, policy_context);
@@ -695,15 +773,25 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        self.reads.land(kv_store, now);
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
-        // A hit computes only its new tokens: its context is in HBM. Without
-        // tiers no held context is at risk, so `WhenAtRisk` never splits here.
-        for (policy, _) in &mut self.partition_policies {
+        // A hit computes only its new tokens: its context is in HBM or the
+        // rank's tiers.
+        for (partition, (policy, _)) in self.partition_policies.iter_mut().enumerate() {
+            let partition = partition as u16;
             policy.promote(now, |candidate| {
-                kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+                kv_store.reusable_prefix_tokens(
+                    partition,
+                    candidate.fresh_prompt_tokens,
+                    candidate.session_input,
+                )
             });
+            if let Some(horizon) = policy.at_risk_horizon() {
+                let at_risk = horizon > 0
+                    && FreshReads::held_context_at_risk(partition, policy, kv_store, horizon);
+                policy.set_hits_first(at_risk);
+            }
         }
         self.started_prefills.resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);
@@ -943,13 +1031,21 @@ where
 
             for request in completed {
                 self.admission_order.remove(&request);
-                kv_store.release_retaining_prefix(request, partition, now);
+                match &mut self.external_decode {
+                    Some(external_decode) => {
+                        external_decode.release(kv_store, request, partition, now);
+                    }
+                    None => kv_store.release_retaining_prefix(request, partition, now),
+                }
                 events.push(WorkerEventCommon::RequestComplete {
                     worker: context.id,
                     req: request,
                 });
             }
             kv_store.sample_submit(partition, now);
+            if let Some(external_decode) = &mut self.external_decode {
+                external_decode.hand_back(kv_store, partition, now);
+            }
         }
     }
 
@@ -957,7 +1053,16 @@ where
         self.partition_policies
             .iter()
             .map(|(policy, _)| policy.len() as u32)
-            .sum()
+            .sum::<u32>()
+            + self.reads.len() as u32
+    }
+
+    fn reading_requests(&self) -> u32 {
+        self.reads.reading() as u32
+    }
+
+    fn next_read_landing(&self, kv_store: &K) -> Option<Time> {
+        kv_store.next_tier_landing()
     }
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {

@@ -182,6 +182,16 @@ impl TierBytes {
         }
     }
 
+    /// What one of the `ranks` GPUs a partition's bytes are spread over
+    /// stores, each rounded up: an attention DP rank's TP group.
+    pub fn per_gpu(self, ranks: u16) -> Self {
+        let ranks = u64::from(ranks.max(1));
+        Self {
+            per_token: self.per_token.div_ceil(ranks),
+            state: self.state.div_ceil(ranks),
+        }
+    }
+
     /// What one GPU of a pipeline reads, given each stage's bytes: the first
     /// stage with the most bytes per token, or with `balanced` the stages'
     /// means, each rounded up.

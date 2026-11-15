@@ -61,8 +61,18 @@ pub trait IterAdmission<K: KvStore> {
         events: &mut Vec<Self::Event>,
         now: Time,
     );
+    /// Queued requests, those out of their queue for a host-tier read included.
     fn queued_requests(&self) -> u32;
     fn cancel_pending(&mut self, request: RequestId) -> bool;
+    /// Queued requests whose host-tier read has not landed: nothing can run
+    /// for them before [`Self::next_read_landing`].
+    fn reading_requests(&self) -> u32 {
+        0
+    }
+    /// When the next host-tier read lands.
+    fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
+        None
+    }
 }
 
 /// Admission surface of the pipeline-head family.
