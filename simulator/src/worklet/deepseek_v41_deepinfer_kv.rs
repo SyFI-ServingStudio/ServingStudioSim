@@ -317,7 +317,11 @@ impl DeepseekV41DeepInferKv {
             main_store: maybe!(FusedNormRopeCastKernel, r.main_store, "compressor.kv_store"),
             main_load: maybe!(PagedKvCacheLoadKernel, r.main_load, "attention.main_load"),
             index_q: maybe!(FusedNormRopeCastKernel, r.index_q, "indexer.q_rope_cast"),
-            index_k_store: maybe!(FusedNormRopeCastKernel, r.index_k_store, "indexer.k_store"),
+            index_k_store: maybe!(
+                FusedNormRopeCastKernel,
+                r.index_k_store,
+                "indexer.k_norm_rope_cast_store"
+            ),
             index_k_load: maybe!(PagedKvCacheLoadKernel, r.index_k_load, "indexer.k_load"),
             compact_lens: maybe!(
                 CandidateCompactLensKernel,
