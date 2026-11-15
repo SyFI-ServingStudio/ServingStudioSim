@@ -11,7 +11,11 @@
 //!
 //! The prefill leaf is the whole chunk loop of the fork (compressed-cache
 //! dequant/gather, SWA gather, `combine_topk_swa_indices`, one fused launch per
-//! chunk); the decode leaf is one launch over every decode row. The global
+//! chunk); the decode leaf is one launch over every decode row. The kernel's
+//! prefill rows each time one chunk, keyed by its requests alone, so this op
+//! replays the fork's chunk plan (`prefill_chunk_plan`) with the deployment's
+//! `max_model_len`, `max_num_batched_tokens` and `prefill_chunk_size` and sums
+//! the chunks into the one prefill leaf. The global
 //! top-k remap (`compute_global_topk_indices_and_lens`) that precedes the
 //! decode launch on compressed layers is its own elementwise placeholder in
 //! the attention worklet (`attention.global_topk_remap`), not part of this op.
@@ -32,8 +36,9 @@ use std::sync::Arc;
 
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    swapab_layer, CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastKernelConfig,
-    CompressedSparseMlaRopeCastKernelInput, SWAPAB_MAX_TOKENS,
+    prefill_chunk_plan, swapab_layer, CompressedSparseMlaRopeCastKernel,
+    CompressedSparseMlaRopeCastKernelConfig, CompressedSparseMlaRopeCastKernelInput,
+    SWAPAB_MAX_TOKENS,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -56,6 +61,8 @@ pub struct DeepseekV41MegaAttnOpConfig {
     pub swapab_backends: Vec<&'static str>,
     pub head_dim: Dim,
     pub rope_dim: Dim,
+    /// The prefill chunk planner's budget inputs (vLLM `max_model_len`, the
+    /// step's `max_num_batched_tokens`, the layer's `PREFILL_CHUNK_SIZE`).
     pub max_model_len: u32,
     pub max_num_batched_tokens: u32,
     pub prefill_chunk_size: u32,
@@ -81,6 +88,9 @@ pub struct DeepseekV41MegaAttnOpInput {
 
 pub struct DeepseekV41MegaAttnOp {
     pub name: String,
+    /// The prefill chunk planner's inputs: `(max_model_len,
+    /// max_num_batched_tokens, prefill_chunk_size)`.
+    planner: (u32, u32, u32),
     pub prefill: Arc<CompressedSparseMlaRopeCastKernel>,
     pub decode: Arc<CompressedSparseMlaRopeCastKernel>,
     /// `Some` on layers vLLM marks `_use_swapab`.
@@ -106,6 +116,11 @@ impl DeepseekV41MegaAttnOp {
             })
             .transpose()?;
         Ok(Self {
+            planner: (
+                cfg.max_model_len,
+                cfg.max_num_batched_tokens,
+                cfg.prefill_chunk_size,
+            ),
             decode_swapab,
             prefill: Arc::new(CompressedSparseMlaRopeCastKernel::build(
                 prefill_name,
@@ -146,7 +161,7 @@ impl DeepseekV41MegaAttnOp {
 
     pub fn eval(&self, input: &DeepseekV41MegaAttnOpInput, ev: &mut Evaluator) {
         let (prefill, decode) = split_input(input);
-        push_segment(&self.prefill, prefill, ev);
+        self.push_prefill(prefill, ev);
         let Some(swapab) = &self.decode_swapab else {
             push_segment(&self.decode, decode, ev);
             return;
@@ -161,6 +176,30 @@ impl DeepseekV41MegaAttnOp {
             push_segment(&self.decode, decode, ev);
             push_segment(swapab, empty, ev);
         }
+    }
+}
+
+impl DeepseekV41MegaAttnOp {
+    /// The prefill segment: one kernel eval per planned chunk, summed into the
+    /// one prefill leaf, which logs the whole segment.
+    fn push_prefill(&self, segment: CompressedSparseMlaRopeCastKernelInput, ev: &mut Evaluator) {
+        let config = &self.prefill.config;
+        let (max_model_len, max_num_batched_tokens, prefill_chunk_size) = self.planner;
+        let pairs = &segment.query_context_pairs;
+        let mut metrics = LeafMetrics::ZERO;
+        for chunk in prefill_chunk_plan(
+            pairs,
+            config.compress_ratio,
+            config.window_size,
+            max_model_len,
+            max_num_batched_tokens,
+            prefill_chunk_size,
+        ) {
+            metrics.add_fanin(self.prefill.eval(&CompressedSparseMlaRopeCastKernelInput {
+                query_context_pairs: pairs[chunk].to_vec(),
+            }));
+        }
+        ev.push(metrics, || segment.into());
     }
 }
 
@@ -216,9 +255,6 @@ pub(crate) fn kernel_config(
         num_heads: cfg.padded_heads.clone(),
         head_dim: cfg.head_dim.clone(),
         rope_dim: cfg.rope_dim.clone(),
-        max_model_len: cfg.max_model_len,
-        max_num_batched_tokens: cfg.max_num_batched_tokens,
-        prefill_chunk_size: cfg.prefill_chunk_size,
         q_dtype: cfg.q_dtype,
         swa_cache_format: cfg.swa_cache_format.clone(),
         compressed_cache_format: if cfg.compress_ratio == 0 {

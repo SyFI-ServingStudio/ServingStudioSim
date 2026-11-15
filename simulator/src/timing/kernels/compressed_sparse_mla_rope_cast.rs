@@ -6,7 +6,12 @@
 //! compressed cache). Decode is one fused launch over the paged caches. Prefill
 //! is a loop over the chunk plan (a compressed gather when the ratio is
 //! nonzero, the SWA gather, the index combine and one fused attention launch
-//! per chunk); the whole loop is one slot.
+//! per chunk). One prefill input is one chunk of that loop: the plan is the
+//! only place the deployment's `max_model_len`, `max_num_batched_tokens` and
+//! `PREFILL_CHUNK_SIZE` reach the segment, and a chunk's launches depend only
+//! on its own requests, so the rows are keyed by geometry alone. The caller
+//! runs [`prefill_chunk_plan`] with the deployment's values and sums the
+//! chunks into its one slot (`op/attention/deepseek_v41_mega_attn.rs`).
 //!
 //! The runtime input is the exact `query_context_pairs` batch. Each token
 //! attends to `min(pos + 1, window) + min((pos + 1) / ratio, index_topk)` keys,
@@ -21,15 +26,13 @@
 //!   In prefill, this is the mean key count per token; the fused attention scales
 //!   with it.
 //! - `excess_gather_rows`: prefill with ratio > 0 only. The compressed gather
-//!   splits a fixed pool of 2048 workers across the requests of a chunk, so the
-//!   cost follows the padded area `sum(chunk requests * max rows / ratio)`, not
+//!   splits a fixed pool of 2048 workers across the requests of the chunk, so
+//!   the cost follows the padded area `chunk requests * max rows / ratio`, not
 //!   the row total: two requests with 25000 rows cost the same as one with
 //!   50000. The coordinate is that area minus `tokens / ratio + index_topk`.
 //!   That is the most area any (tokens, keys) point needs without extra
 //!   context, so the lowest grid plane is reachable across the whole
-//!   (tokens, keys) plane. The chunk plan replays the fork's
-//!   `get_prefill_chunk_plan` workspace budget. Chunks can hold more than
-//!   `prefill_chunk_size` short requests.
+//!   (tokens, keys) plane.
 //!
 //! Decode at 16 or 32 heads is vLLM's swap-AB kernel (backend
 //! `swapab_cutedsl`, fork `nvidia/ops/swapab_decode_attn.py`), which
@@ -44,7 +47,6 @@
 //! Measured B200 behaviour behind the axes: at 2048 prefill tokens (ratio 2),
 //! mean keys 240 -> 640 moves time 116 -> 183 us. The gather alone costs about
 //! 80 us for 100000 rows (ratio 1). Decode steps at every 148 rows (148 SMs).
-//! Each extra prefill chunk adds about 1 us, so the chunk count is folded.
 //! Known residual: the gather's per-chunk cost varies up to about 2x with the
 //! chunk size (power-of-two worker counts are slower); the area coordinate
 //! scales it linearly.
@@ -65,6 +67,9 @@ pub const MXFP8_RECORD_BYTES: u32 = 528;
 pub const NVFP4_RECORD_BYTES: u32 = 288;
 /// The profiler's request ceiling per call.
 const MAX_REQUESTS: u32 = 256;
+/// The longest context the profiler builds: DeepSeek-V4.1's
+/// `max_position_embeddings`, which bounds every deployment's `max_model_len`.
+const MAX_CONTEXT: u32 = 1_048_576;
 /// Decode rows the profiler accepts.
 const MAX_DECODE_ROWS: u32 = 2048;
 /// SMs on the only supported GPU (NVIDIA B200); the decode wave width at 64 heads.
@@ -113,9 +118,6 @@ pub struct CompressedSparseMlaRopeCastKernelConfig {
     pub num_heads: Dim,
     pub head_dim: Dim,
     pub rope_dim: Dim,
-    pub max_model_len: u32,
-    pub max_num_batched_tokens: u32,
-    pub prefill_chunk_size: u32,
     #[compute_dtype]
     pub q_dtype: DType,
     pub swa_cache_format: String,
@@ -125,7 +127,8 @@ pub struct CompressedSparseMlaRopeCastKernelConfig {
 }
 
 /// One segment's requests as `(query_len, context_len)`, context including the
-/// query. Decode flattens every query token into its own row.
+/// query. Decode flattens every query token into its own row; prefill holds the
+/// requests of one planner chunk ([`prefill_chunk_plan`]).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompressedSparseMlaRopeCastKernelInput {
     pub query_context_pairs: Vec<(u32, u32)>,
@@ -238,10 +241,9 @@ fn validate_config(config: &CompressedSparseMlaRopeCastKernelConfig) {
             config.index_topk,
             config.head_dim.get(),
             config.rope_dim.get(),
-            config.prefill_chunk_size,
         ),
-        (WINDOW, INDEX_TOPK, 512, 64, 4),
-        "unsupported (window, index_topk, head_dim, rope_dim, prefill_chunk_size)"
+        (WINDOW, INDEX_TOPK, 512, 64),
+        "unsupported (window, index_topk, head_dim, rope_dim)"
     );
     match config.num_heads.get() {
         64 | 128 => {}
@@ -256,7 +258,6 @@ fn validate_config(config: &CompressedSparseMlaRopeCastKernelConfig) {
         config.compress_ratio == 0,
         "compressed_cache_format is 'none' iff compress_ratio == 0"
     );
-    assert!(config.max_num_batched_tokens >= 1 && config.max_model_len >= 1);
 }
 
 fn is_decode(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
@@ -277,22 +278,39 @@ fn rows_per_wave(config: &CompressedSparseMlaRopeCastKernelConfig) -> u32 {
     B200_SMS * 64 / config.num_heads.get()
 }
 
-/// The padded compressed-gather area of the fork's prefill chunk plan:
-/// `sum(chunk requests * max compressed rows)`.
-fn gather_area(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfig) -> u64 {
-    let ratio = config.compress_ratio;
-    if ratio == 0 {
-        return 0;
-    }
-    let chunk = u64::from(config.prefill_chunk_size);
-    let budget = chunk
-        * (u64::from(config.max_model_len.div_ceil(ratio))
-            + u64::from(WINDOW)
-            + u64::from(config.max_num_batched_tokens));
-    let compressed = |(_, context): (u32, u32)| u64::from(context / ratio);
+/// The fork's prefill chunk plan (`DeepseekSparseSWAMetadata.
+/// get_prefill_chunk_plan`, `v1/attention/backends/mla/sparse_swa.py`): the
+/// requests, in order, grouped greedily into chunks whose padded area
+/// `requests * (max compressed rows + max gathered SWA rows)` stays within
+/// `prefill_chunk_size * (ceil(max_model_len / ratio) + window +
+/// max_num_batched_tokens)`. Each range is one chunk; a chunk always takes its
+/// first request, and can hold more than `prefill_chunk_size` short ones.
+pub fn prefill_chunk_plan(
+    pairs: &[(u32, u32)],
+    compress_ratio: u32,
+    window_size: u32,
+    max_model_len: u32,
+    max_num_batched_tokens: u32,
+    prefill_chunk_size: u32,
+) -> Vec<std::ops::Range<usize>> {
+    let ratio = compress_ratio;
+    let budget = u64::from(prefill_chunk_size)
+        * (if ratio == 0 {
+            0
+        } else {
+            u64::from(max_model_len.div_ceil(ratio))
+        } + u64::from(window_size)
+            + u64::from(max_num_batched_tokens));
+    let compressed = |(_, context): (u32, u32)| {
+        if ratio == 0 {
+            0
+        } else {
+            u64::from(context / ratio)
+        }
+    };
     let gathered =
-        |(query, context): (u32, u32)| u64::from(query + (context - query).min(WINDOW - 1));
-    let mut area = 0;
+        |(query, context): (u32, u32)| u64::from(query + (context - query).min(window_size - 1));
+    let mut chunks = Vec::new();
     let mut start = 0;
     while start < pairs.len() {
         let mut max_compressed = compressed(pairs[start]);
@@ -307,10 +325,20 @@ fn gather_area(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelC
             (max_compressed, max_gathered) = (next_compressed, next_gathered);
             end += 1;
         }
-        area += (end - start) as u64 * max_compressed;
+        chunks.push(start..end);
         start = end;
     }
-    area
+    chunks
+}
+
+/// The padded compressed-gather area of one chunk: `requests * max
+/// compressed rows`.
+fn gather_area(pairs: &[(u32, u32)], ratio: u32) -> u64 {
+    if ratio == 0 {
+        return 0;
+    }
+    let longest = pairs.iter().map(|&(_, c)| c / ratio).max().unwrap_or(0);
+    pairs.len() as u64 * u64::from(longest)
 }
 
 /// Bytes of one cache record: the SWA cache is always MXFP8; the compressed
@@ -383,7 +411,7 @@ fn project(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfi
     let excess = if ratio == 0 {
         0.0
     } else {
-        (gather_area(pairs, config) as f64 - area_floor(tokens, ratio)).max(0.0)
+        (gather_area(pairs, ratio) as f64 - area_floor(tokens, ratio)).max(0.0)
     };
     [f64::from(tokens), keys, excess]
 }
@@ -515,7 +543,7 @@ fn on_point(
         area_floor(point[0] as u32, config.compress_ratio)
     };
     pairs.len() <= MAX_REQUESTS as usize
-        && pairs.iter().all(|&(_, c)| c <= config.max_model_len)
+        && pairs.iter().all(|&(_, c)| c <= MAX_CONTEXT)
         && projected[0] == point[0]
         && (projected[1] - point[1]).abs() <= key_tolerance(point[1])
         && (projected[2] - point[2]).abs() <= area_tolerance(floor + point[2])
@@ -538,7 +566,7 @@ fn canonical_decode(
         rows,
         rows.min(MAX_REQUESTS),
         point[1],
-        config.max_model_len,
+        MAX_CONTEXT,
         &uniform_keys,
     )?;
     on_point(&pairs, point, config).then_some(pairs)
@@ -555,23 +583,22 @@ fn canonical_prefill(
     let ratio = config.compress_ratio;
     let uniform_keys = |tokens, count, context| uniform_mean_keys(tokens, count, context, ratio);
     for count in 1..=tokens.min(MAX_REQUESTS - 1) {
-        let Some(base) = uniform_for_keys(tokens, count, keys, config.max_model_len, &uniform_keys)
-        else {
+        let Some(base) = uniform_for_keys(tokens, count, keys, MAX_CONTEXT, &uniform_keys) else {
             continue;
         };
         if ratio == 0 {
             return on_point(&base, point, config).then_some(base);
         }
         let target = area_floor(tokens, ratio) + point[2];
-        let area = gather_area(&base, config) as f64;
+        let area = gather_area(&base, ratio) as f64;
         if area > target + area_tolerance(target) {
             return None;
         }
         if on_point(&base, point, config) {
             return Some(base);
         }
-        let stretched = lower_bound(base[0].1, config.max_model_len, target, |context| {
-            gather_area(&uniform_pairs(tokens, count, context), config) as f64
+        let stretched = lower_bound(base[0].1, MAX_CONTEXT, target, |context| {
+            gather_area(&uniform_pairs(tokens, count, context), ratio) as f64
         });
         let stretched = uniform_pairs(tokens, count, stretched);
         if on_point(&stretched, point, config) {
@@ -602,20 +629,14 @@ fn with_filler(
     for _ in 0..4 {
         let filler_keys = f64::from(token_keys(filler, ratio));
         let base_keys = (f64::from(tokens) * keys - filler_keys) / f64::from(tokens - 1);
-        let base = uniform_for_keys(
-            tokens - 1,
-            count,
-            base_keys,
-            config.max_model_len,
-            &uniform_keys,
-        )?;
+        let base = uniform_for_keys(tokens - 1, count, base_keys, MAX_CONTEXT, &uniform_keys)?;
         let with = |context| {
             let mut candidate = base.clone();
             candidate.push((1, context));
             candidate
         };
-        filler = lower_bound(1, config.max_model_len, target, |context| {
-            gather_area(&with(context), config) as f64
+        filler = lower_bound(1, MAX_CONTEXT, target, |context| {
+            gather_area(&with(context), ratio) as f64
         });
         pairs = with(filler);
     }
@@ -645,11 +666,13 @@ fn token_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
         axis.sort_unstable();
         return Axis::values(axis);
     }
-    Axis::values([1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192])
-        .into_iter()
-        .filter(|&tokens| tokens <= f64::from(config.max_num_batched_tokens))
-        .collect()
+    // One chunk holds at most one step's tokens; 16384 is the largest step
+    // budget the V4.1 deployments run. Larger chunks hold the edge bandwidth.
+    Axis::values(PREFILL_TOKENS)
 }
+
+/// The prefill query-token axis.
+const PREFILL_TOKENS: [u32; 11] = [1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 fn key_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     match (is_decode(config), config.compress_ratio) {
@@ -665,14 +688,13 @@ fn excess_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     if is_decode(config) || config.compress_ratio == 0 {
         return vec![0.0];
     }
-    // The top planes are one and two max-length requests at the largest
-    // token count; the second covers chunks that pad to two long requests.
-    // Below them the planes step by 4x; those at or past the top plane drop,
-    // so a short `max_model_len` (the 131072 capture) keeps its own grid and
-    // a long one (1048576) measures the 256K-row middle instead of
-    // interpolating 64K rows straight to 1M.
-    let longest = f64::from(config.max_model_len / config.compress_ratio);
-    let floor = area_floor(config.max_num_batched_tokens, config.compress_ratio);
+    // The planes step by 4x up to the 256K-row middle, then one and two
+    // longest-context requests at the largest token count; the second covers
+    // chunks that pad to two long requests. Larger areas hold the edge
+    // bandwidth (the gather is a streaming copy).
+    let ratio = config.compress_ratio;
+    let longest = f64::from(MAX_CONTEXT / ratio);
+    let floor = area_floor(*PREFILL_TOKENS.last().unwrap(), ratio);
     let (one, two) = (longest - floor, 2.0 * longest - floor);
     let mut axis = Axis::values([0, 1024, 4096, 16384, 65536, 262144])
         .into_iter()
@@ -753,9 +775,6 @@ impl KernelSpec for CompressedSparseMlaRopeCastSpec {
                 .with("num_heads", config.num_heads.get())
                 .with("head_dim", config.head_dim.get())
                 .with("rope_dim", config.rope_dim.get())
-                .with("max_model_len", config.max_model_len)
-                .with("max_num_batched_tokens", config.max_num_batched_tokens)
-                .with("prefill_chunk_size", config.prefill_chunk_size)
                 .with("q_dtype", config.q_dtype.as_str())
                 .with("swa_cache_format", config.swa_cache_format.clone())
                 .with(
@@ -785,15 +804,6 @@ mod tests {
         ratio: u32,
         heads: u32,
     ) -> CompressedSparseMlaRopeCastKernelConfig {
-        config_at(mode, ratio, heads, 131072)
-    }
-
-    fn config_at(
-        mode: &str,
-        ratio: u32,
-        heads: u32,
-        max_model_len: u32,
-    ) -> CompressedSparseMlaRopeCastKernelConfig {
         serde_json::from_value(serde_json::json!({
             "backends": ["flashmla_mega"],
             "gpu_name": "NVIDIA B200",
@@ -804,9 +814,6 @@ mod tests {
             "num_heads": heads,
             "head_dim": 512,
             "rope_dim": 64,
-            "max_model_len": max_model_len,
-            "max_num_batched_tokens": 2048,
-            "prefill_chunk_size": 4,
             "q_dtype": "bf16",
             "swa_cache_format": "mxfp8",
             "compressed_cache_format": if ratio == 0 { "none" } else { "nvfp4" },
@@ -891,19 +898,41 @@ mod tests {
         assert_eq!(coords("decode", 1, &two_waves)[2], 0.0);
     }
 
-    /// Catches a gather coordinate that sums rows instead of padding each
-    /// chunk to its longest request, or ignores the fork's area-based chunk
-    /// plan (five short requests and one long one share a single chunk).
+    /// Catches a planner that drifts from the fork's `get_prefill_chunk_plan`:
+    /// the area budget `chunk_size * (ceil(max_model_len / ratio) + window +
+    /// max_num_batched_tokens)`, greedy in request order, more than
+    /// `prefill_chunk_size` short requests per chunk, and a budget that moves
+    /// with `max_num_batched_tokens` and `max_model_len`.
     #[test]
-    fn prefill_gather_area_pads_each_planned_chunk() {
-        let config = config("prefill", 1);
-        assert_eq!(gather_area(&[(1, 50000)], &config), 50000);
-        assert_eq!(gather_area(&[(1, 25000), (1, 25000)], &config), 50000);
-        assert_eq!(gather_area(&[(16, 16), (1, 100000)], &config), 200000);
+    fn prefill_chunk_plan_replays_the_fork_budget() {
+        let plan = |pairs: &[(u32, u32)], ratio, max_model_len, mbt| {
+            prefill_chunk_plan(pairs, ratio, WINDOW, max_model_len, mbt, 4)
+        };
+        // Budget 4 * (131072 + 128 + 2048) = 532992 at ratio 1; the long
+        // request pads every request of its chunk to 100000 + 128.
         let five = [vec![(16, 16); 4], vec![(1, 100000)]].concat();
-        assert_eq!(gather_area(&five, &config), 500000);
-        let split = [vec![(16, 16); 5], vec![(1, 100000)]].concat();
-        assert_eq!(gather_area(&split, &config), 5 * 16 + 100000);
+        assert_eq!(plan(&five, 1, 131072, 2048), vec![0..5]);
+        let six = [vec![(16, 16); 5], vec![(1, 100000)]].concat();
+        assert_eq!(plan(&six, 1, 131072, 2048), vec![0..5, 5..6]);
+        // A larger step budget, or a longer max_model_len, fits it.
+        assert_eq!(plan(&six, 1, 131072, 32768), vec![0..6]);
+        assert_eq!(plan(&six, 1, 1_048_576, 2048), vec![0..6]);
+        // Ratio 0 pads only the gathered SWA width, 2048 + 127 per request:
+        // four fit 4 * (128 + 2048), thirty fit 4 * (128 + 16384).
+        let short = vec![(2048, 4096); 40];
+        let fours = (0..10).map(|c| 4 * c..4 * c + 4).collect::<Vec<_>>();
+        assert_eq!(plan(&short, 0, 131072, 2048), fours);
+        assert_eq!(plan(&short, 0, 131072, 16384), vec![0..30, 30..40]);
+        assert!(plan(&[], 2, 131072, 2048).is_empty());
+    }
+
+    /// Catches a gather coordinate that sums rows instead of padding the chunk
+    /// to its longest request.
+    #[test]
+    fn prefill_gather_area_pads_the_chunk() {
+        assert_eq!(gather_area(&[(1, 50000)], 1), 50000);
+        assert_eq!(gather_area(&[(1, 25000), (1, 25000)], 1), 50000);
+        assert_eq!(gather_area(&[(16, 16), (1, 100000)], 1), 200000);
         let pairs = [(1912, 1912), (91, 4096)];
         let projected = coords("prefill", 2, &pairs);
         let keys = (keys_prefix(1912, 2) + keys_prefix(4096, 2) - keys_prefix(4005, 2)) as f64;
@@ -918,23 +947,22 @@ mod tests {
         let shapes = [("decode", 64), ("decode", 128), ("prefill", 64)];
         let cases = shapes
             .into_iter()
-            .flat_map(|shape| [(shape, 131072), (shape, 1_048_576)])
-            .flat_map(|case| (0..=2).map(move |ratio| (case, ratio)))
+            .flat_map(|shape| (0..=2).map(move |ratio| (shape, ratio)))
             .collect::<Vec<_>>();
         // Each grid's canonical batches are independent; search them in parallel.
         std::thread::scope(|scope| {
-            for &(((mode, heads), max_model_len), ratio) in &cases {
+            for &((mode, heads), ratio) in &cases {
                 scope.spawn(move || {
-                    let config = config_at(mode, ratio, heads, max_model_len);
+                    let config = config_with_heads(mode, ratio, heads);
                     let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
                     let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
                     let feasible = mask.iter().filter(|&&drop| !drop).count();
                     assert!(
                         feasible > 0 && feasible <= 500,
-                        "{mode} r{ratio} @{max_model_len}: {feasible}"
+                        "{mode} r{ratio}: {feasible}"
                     );
                     eprintln!(
-                        "{mode} h{heads} r{ratio} @{max_model_len}: {} cells, {feasible} feasible",
+                        "{mode} h{heads} r{ratio}: {} cells, {feasible} feasible",
                         mask.len()
                     );
                 });
@@ -942,29 +970,20 @@ mod tests {
         });
     }
 
-    /// The gather-area planes: the 131072 capture keeps its 4x ladder below
-    /// one and two longest requests; at 1048576 the ladder reaches 256K rows.
+    /// The gather-area planes: a 4x ladder to 256K rows, then one and two
+    /// longest-context requests, the same for every deployment.
     #[test]
     fn excess_planes_ladder_up_to_the_longest_requests() {
-        let planes =
-            |ratio, max_model_len| excess_axis(&config_at("prefill", ratio, 64, max_model_len));
+        let planes = |ratio| excess_axis(&config("prefill", ratio));
         assert_eq!(
-            planes(1, 131072),
-            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 128512.0, 259584.0]
+            planes(1),
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1031680.0, 2080256.0]
         );
         assert_eq!(
-            planes(2, 131072),
-            [0.0, 1024.0, 4096.0, 16384.0, 64000.0, 129536.0]
+            planes(2),
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 515584.0, 1039872.0]
         );
-        assert_eq!(
-            planes(1, 1_048_576),
-            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1046016.0, 2094592.0]
-        );
-        assert_eq!(
-            planes(2, 1_048_576),
-            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 522752.0, 1047040.0]
-        );
-        assert_eq!(excess_axis(&config_at("decode", 2, 64, 1_048_576)), [0.0]);
+        assert_eq!(excess_axis(&config("decode", 2)), [0.0]);
     }
 
     /// Catches a swap-AB grid that leaves the steps vLLM routes there (more
@@ -980,22 +999,20 @@ mod tests {
         );
         for ratio in 1..=2 {
             for heads in [16, 32] {
-                for max_model_len in [131072, 1_048_576] {
-                    let config = config_at("decode", ratio, heads, max_model_len);
-                    assert_eq!(rows_per_wave(&config), 24);
-                    let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
-                    assert_eq!(grid.axes()[0].last(), Some(&16.0));
-                    let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
-                    let feasible = mask.iter().filter(|&&drop| !drop).count();
-                    assert!(
-                        feasible > 40 && feasible <= 500,
-                        "r{ratio} h{heads}: {feasible}"
-                    );
-                }
+                let config = config_with_heads("decode", ratio, heads);
+                assert_eq!(rows_per_wave(&config), 24);
+                let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
+                assert_eq!(grid.axes()[0].last(), Some(&16.0));
+                let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
+                let feasible = mask.iter().filter(|&&drop| !drop).count();
+                assert!(
+                    feasible > 40 && feasible <= 500,
+                    "r{ratio} h{heads}: {feasible}"
+                );
             }
         }
         // One wave: a single long row sets the keys of the whole step.
-        let config = config_at("decode", 1, 16, 131072);
+        let config = config_with_heads("decode", 1, 16);
         let input = CompressedSparseMlaRopeCastKernelInput {
             query_context_pairs: [vec![(1, 5000)], vec![(1, 64); 15]].concat(),
         };
@@ -1009,7 +1026,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "swap-AB")]
     fn live_heads_are_decode_on_compressed_layers_only() {
-        CompressedSparseMlaRopeCastSpec::sweep_grid(&config_at("prefill", 2, 16, 131072));
+        CompressedSparseMlaRopeCastSpec::sweep_grid(&config_with_heads("prefill", 2, 16));
     }
 
     /// Catches a ratio-0 layer configured with a compressed cache.

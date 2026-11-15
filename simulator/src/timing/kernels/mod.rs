@@ -156,7 +156,8 @@ pub use compressed_sparse_mla_prefill::{
 };
 pub use compressed_sparse_mla_rope_cast::{
     CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastKernelConfig,
-    CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastSpec, swapab_layer,
+    CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastSpec, prefill_chunk_plan,
+    swapab_layer,
     SWAPAB_MAX_TOKENS,
 };
 pub use dsa_compressed_mqa_logits_prefill::{

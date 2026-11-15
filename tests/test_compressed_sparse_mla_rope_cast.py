@@ -19,9 +19,6 @@ _BASE = dict(
     num_heads=64,
     head_dim=512,
     rope_dim=64,
-    max_model_len=65536,
-    max_num_batched_tokens=8192,
-    prefill_chunk_size=4,
     q_dtype="bf16",
     swa_cache_format="mxfp8",
     output_dtype="fp8_e4m3",
@@ -180,6 +177,8 @@ def test_invalid_shapes_fail_closed():
         _shape(num_heads=16)
     with pytest.raises(ValueError, match="query <= context"):
         _shape(query_context_pairs=((9, 8),))
+    with pytest.raises(runner.ProfilerNotImplemented, match="contexts up to"):
+        _shape(mode="prefill", query_context_pairs=((1, 1_048_577),))
 
 
 def test_swapab_accepts_only_the_steps_vllm_routes_to_it():

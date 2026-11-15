@@ -10,9 +10,12 @@ compressed cache holding ``context // ratio`` rows per request, with up to
   ``DeepseekV4MegaAttnAttention``. Decode times ``_forward_decode_mega``, one
   ``fused_norm_rope_attn_rope_cast_decode`` launch; the global top-k remap it
   normally calls first is replaced by precomputed slot ids. Prefill times
-  ``_forward_prefill_mega``: for each chunk of up to four requests, the NVFP4
+  ``_forward_prefill_mega`` over one chunk holding every request: the NVFP4
   compressed gather (ratio > 0), the MXFP8 SWA gather,
   ``combine_topk_swa_indices`` and one ``fused_norm_rope_attn_rope_cast_fwd``.
+  The fork's own planner runs with a budget that fits the whole batch, and the
+  workspace is reserved at that chunk's size, as the warmup reservation lays it
+  out (KV chunk and index scratch side by side).
   Outside the timed region, the output is checked against the Torch reference.
 - ``swapab_cutedsl`` times the same ``_forward_decode_mega`` with the layer's
   ``_use_swapab`` set, so the fork's own dispatch routes the call to
@@ -48,7 +51,11 @@ _HEAD_DIM = 512
 _ROPE_DIM = 64
 _WINDOW = 128
 _INDEX_TOPK = 512
+# The fork's PREFILL_CHUNK_SIZE; it only scales the planner budget, which the
+# prefill build sets to fit one chunk.
 _PREFILL_CHUNK_SIZE = 4
+# DeepSeek-V4.1's max_position_embeddings: the longest context a request has.
+_MAX_CONTEXT = 1_048_576
 _SUPPORTED_HEADS = (64, 128)
 # Live heads the swap-AB kernel takes, its token ceiling (the fork's
 # flash_mla_mega_attn._SWAPAB_MAX_TOKENS, asserted equal at run time) and the
@@ -77,8 +84,6 @@ class _Shape:
     num_heads: int
     # Heads of the Q buffer: num_heads, or the padded width under swap-AB.
     q_heads: int
-    max_model_len: int
-    max_num_batched_tokens: int
     extra_format: str | None
 
     @property
@@ -99,9 +104,6 @@ def _validate_args(
     num_heads: int,
     head_dim: int,
     rope_dim: int,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-    prefill_chunk_size: int,
     q_dtype: object,
     swa_cache_format: str,
     compressed_cache_format: str,
@@ -119,23 +121,18 @@ def _validate_args(
         query, context = pair
         if query <= 0 or context < query:
             raise ValueError("each pair must satisfy 0 < query <= context")
-    if type(max_model_len) is not int or not 1 <= max_model_len <= 1_048_576:
-        raise ValueError("max_model_len must be an integer in [1, 1048576]")
-    if max(context for _, context in query_context_pairs) > max_model_len:
-        raise ValueError("context length exceeds max_model_len")
+    if max(context for _, context in query_context_pairs) > _MAX_CONTEXT:
+        raise ProfilerNotImplemented(f"{KIND} supports contexts up to {_MAX_CONTEXT}")
     total = sum(query for query, _ in query_context_pairs)
-    if type(max_num_batched_tokens) is not int or not total <= max_num_batched_tokens <= 32768:
-        raise ValueError("max_num_batched_tokens must cover all query tokens and be <= 32768")
     if mode == "decode" and total > _MAX_DECODE_ROWS:
         raise ProfilerNotImplemented(f"{KIND} decode supports at most {_MAX_DECODE_ROWS} rows")
     if compress_ratio not in (0, 1, 2):
         raise ProfilerNotImplemented(f"{KIND} supports compress_ratio 0 (SWA only), 1 and 2")
-    model = (window_size, index_topk, head_dim, rope_dim, prefill_chunk_size)
-    expected = (_WINDOW, _INDEX_TOPK, _HEAD_DIM, _ROPE_DIM, _PREFILL_CHUNK_SIZE)
+    model = (window_size, index_topk, head_dim, rope_dim)
+    expected = (_WINDOW, _INDEX_TOPK, _HEAD_DIM, _ROPE_DIM)
     if model != expected:
         raise ProfilerNotImplemented(
-            f"{KIND} supports (window, index_topk, head_dim, rope_dim, prefill_chunk_size)="
-            f"{expected}, got {model}"
+            f"{KIND} supports (window, index_topk, head_dim, rope_dim)={expected}, got {model}"
         )
     if swapab:
         if mode != "decode" or compress_ratio == 0 or total > _SWAPAB_MAX_TOKENS:
@@ -171,8 +168,6 @@ def _validate_args(
         compress_ratio,
         num_heads,
         _SWAPAB_Q_HEADS if swapab else num_heads,
-        max_model_len,
-        max_num_batched_tokens,
         extra_format,
     )
 
@@ -549,6 +544,7 @@ def build_flashmla_mega(
         )
         from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
         from vllm.v1.worker.workspace import (
+            current_workspace_manager,
             init_workspace_manager,
             is_workspace_manager_initialized,
         )
@@ -571,7 +567,10 @@ def build_flashmla_mega(
         compress_ratio=shape.ratio,
         PREFILL_CHUNK_SIZE=_PREFILL_CHUNK_SIZE,
         window_size=_WINDOW,
-        max_num_batched_tokens=shape.max_num_batched_tokens,
+        # Sizes the index scratch rows; production sizes them for the step
+        # budget and slices them to the chunk's tokens, so the chunk's own
+        # token count gives the kernels the same views.
+        max_num_batched_tokens=num_tokens,
         topk_indices_buffer=work.topk_local,
         swa_cache_layer=types.SimpleNamespace(kv_cache=work.swa_cache),
         scale=_HEAD_DIM**-0.5,
@@ -618,16 +617,6 @@ def build_flashmla_mega(
 
         return work, run, out
 
-    if not is_workspace_manager_initialized():
-        init_workspace_manager(device)
-    # The warmup dummy run's reservation (flash_mla_mega_attn.py
-    # `_reserve_prefill_workspace`): the largest KV chunk and the index scratch
-    # side by side. Without it the workspace is only as large as this shape
-    # needs, so the KV chunk's retained tail span overlaps the head views
-    # `combine_topk_swa_indices` writes, and those indices/lengths overwrite
-    # gathered keys (wrong or NaN outputs at the overlapped columns).
-    layer.max_model_len = shape.max_model_len
-    DeepseekV4MegaAttnAttention._reserve_prefill_workspace(layer, q_fused)
     num_prefills = len(shape.pairs)
     query_start = torch.zeros(num_prefills + 1, dtype=torch.int32)
     query_start[1:] = torch.cumsum(work.query_lens.cpu(), 0)
@@ -635,6 +624,12 @@ def build_flashmla_mega(
     query_lens_cpu = work.query_lens.cpu()
     prefix = seq_lens_cpu - query_lens_cpu
     gather_lens = query_lens_cpu + prefix.clamp(max=_WINDOW - 1)
+    # One chunk holds every request: a planner budget of all requests at the
+    # widest one's padded width. The budget is the planner's only input from
+    # max_model_len / max_num_batched_tokens, so these two stand-ins pick the
+    # plan and nothing else.
+    compressed_width = max(c // shape.ratio for _, c in shape.pairs) if shape.ratio else 0
+    width = compressed_width + int(gather_lens.max())
     swa_metadata = types.SimpleNamespace(
         num_decodes=0,
         num_decode_tokens=0,
@@ -644,9 +639,9 @@ def build_flashmla_mega(
         prefill_seq_lens_cpu=seq_lens_cpu,
         prefill_query_lens_cpu=query_lens_cpu,
         prefill_gather_lens=gather_lens.to(torch.int32).to(device),
-        prefill_max_model_len=shape.max_model_len,
+        prefill_max_model_len=max(c for _, c in shape.pairs),
         prefill_window_size=_WINDOW,
-        prefill_max_num_batched_tokens=shape.max_num_batched_tokens,
+        prefill_max_num_batched_tokens=num_prefills * width,
         query_start_loc_cpu=query_start,
         query_start_loc=query_start.to(device),
         block_table=work.swa_block_table,
@@ -654,6 +649,29 @@ def build_flashmla_mega(
     )
     swa_metadata.get_prefill_chunk_plan = types.MethodType(
         DeepseekSparseSWAMetadata.get_prefill_chunk_plan, swa_metadata
+    )
+    plan = swa_metadata.get_prefill_chunk_plan(
+        compress_ratio=shape.ratio,
+        prefill_chunk_size=_PREFILL_CHUNK_SIZE,
+        has_compressed=shape.ratio > 0,
+    )
+    if plan != [(0, num_prefills, compressed_width, width)]:
+        raise KernelLaunchFailed(f"{KIND}: expected one prefill chunk, the fork planned {plan}")
+
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(device)
+    # The warmup dummy run's layout (flash_mla_mega_attn.py
+    # `_reserve_prefill_workspace`) at this chunk's size: the KV chunk and the
+    # index scratch side by side. Without it the workspace is only as large as
+    # the first request, so the KV chunk's retained tail span overlaps the head
+    # views `combine_topk_swa_indices` writes, and those indices/lengths
+    # overwrite gathered keys (wrong or NaN outputs at the overlapped columns).
+    # The kernels read views of the chunk's shape, so the workspace's total
+    # size does not reach their timing.
+    top_k = _INDEX_TOPK if shape.ratio else 0
+    current_workspace_manager().get_simultaneous(
+        ((num_prefills, width, q_fused.shape[-1]), torch.bfloat16),
+        *layer._prefill_index_workspace_specs(top_k),
     )
 
     def run() -> None:
