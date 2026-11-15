@@ -21,6 +21,7 @@ pytest.importorskip("torch")
 # 2720 metrics dicts pickle to about 130 KB, twice the pipe buffer; the
 # 2720-spec chunk that hung a profiling fill had that many results.
 _LARGE = 2720
+_LIMIT_S = 90.0
 
 
 def _rows(rank: int, world_size: int, n: int) -> list[dict] | None:
@@ -59,7 +60,7 @@ def _fail_on(rank: int, world_size: int, bad_rank: int) -> None:
 
 
 def test_a_result_larger_than_the_pipe_buffer_comes_back() -> None:
-    rows = _within(90, lambda: TorchMpLauncher(2, backend="gloo").run(_rows, n=_LARGE))
+    rows = _within(_LIMIT_S, lambda: TorchMpLauncher(2, backend="gloo").run(_rows, n=_LARGE))
     assert len(rows) == _LARGE
     assert rows[-1]["tflops"] == 1.0 + _LARGE - 1
 
@@ -67,4 +68,6 @@ def test_a_result_larger_than_the_pipe_buffer_comes_back() -> None:
 @pytest.mark.parametrize("bad_rank", [0, 1])
 def test_a_failing_rank_raises_instead_of_hanging(bad_rank: int) -> None:
     with pytest.raises(KernelLaunchFailed, match="failed on purpose"):
-        _within(90, lambda: TorchMpLauncher(2, backend="gloo").run(_fail_on, bad_rank=bad_rank))
+        _within(
+            _LIMIT_S, lambda: TorchMpLauncher(2, backend="gloo").run(_fail_on, bad_rank=bad_rank)
+        )

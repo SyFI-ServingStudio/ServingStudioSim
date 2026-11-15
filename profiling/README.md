@@ -277,8 +277,12 @@ historical results and record the selected database with the experiment.
    spec, and writes JSON results back.
    Each worker gets `floor + specs × per_spec` seconds of wall clock
    (`VIBESIM_PROFILE_CHUNK_TIMEOUT_FLOOR_S`, default 900, covers container start,
-   rank init and JIT; `VIBESIM_PROFILE_SPEC_TIMEOUT_S`, default 30, is far above
-   any measured spec). Past it the worker is killed (a container by its name),
+   rank init and JIT; `VIBESIM_PROFILE_SPEC_TIMEOUT_S`, default 5). The per-spec
+   bound is 10× the slowest measured: mega MoE fills of 40 chunks × 68 specs
+   (Slurm 22917) and 17 chunks × 431–494 specs (22920) took at most 0.50 s of
+   chunk wall clock per spec, start-up included (about 20 s per chunk). A
+   500-spec chunk thus gets 57 min, inside a 2 h job. Raise either variable for
+   a kernel whose specs are slower. Past it the worker is killed (a container by its name),
    every spec of the chunk fails with an error naming the chunk's first and last
    spec and the elapsed time, and the batch goes on with the other chunks.
    Multi-GPU runners hand rank 0's result back over a pipe; the launcher reads it

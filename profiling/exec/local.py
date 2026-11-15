@@ -51,15 +51,19 @@ from reference_engines.autotune_guard import (
 CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 
 # A chunk's worker gets ``floor + specs x per_spec`` seconds before it is
-# killed and the chunk is failed. The floor covers what every chunk pays once
-# (container start, rank init, JIT compiles: about 20 s of a 33 s 68-spec
-# mega MoE chunk); the per-spec bound is far above any measured spec (that
-# chunk spent about 0.2 s on each), so the limit only ends a worker that has
-# stopped making progress, never a slow but healthy one.
+# killed and the chunk is failed, so a hung worker is caught well inside a
+# Slurm job's --time. Both terms are measured, with a 10x margin on the
+# per-spec one. Mega MoE fills (wt-dsv41-deepinfer, slurm-22917.out: 40 chunks
+# of 68 specs, 30-34 s each; slurm-22920.out: 17 chunks of 431-494 specs,
+# 40-115 s each) spent at most 0.50 s of chunk wall clock per spec, start-up
+# included; 10x that is 5 s. The floor covers what a chunk pays once
+# (container start, rank init, JIT: about 20 s of each 68-spec chunk there)
+# with room for a cold JIT cache. Override both through the environment for a
+# kernel whose specs are slower.
 CHUNK_TIMEOUT_FLOOR_ENV = "VIBESIM_PROFILE_CHUNK_TIMEOUT_FLOOR_S"
 SPEC_TIMEOUT_ENV = "VIBESIM_PROFILE_SPEC_TIMEOUT_S"
 _DEFAULT_CHUNK_TIMEOUT_FLOOR_S = 900.0
-_DEFAULT_SPEC_TIMEOUT_S = 30.0
+_DEFAULT_SPEC_TIMEOUT_S = 5.0
 
 
 def chunk_timeout_s(num_specs: int) -> float:

@@ -1506,8 +1506,8 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
 
     captured: dict[str, object] = {}
 
-    def fake_subprocess_run(cmd, *, env, capture_output, text, check):
-        del capture_output, text, check
+    def fake_subprocess_run(cmd, *, env, capture_output, text, check, timeout):
+        del capture_output, text, check, timeout
         captured["cmd"] = cmd
         captured["env"] = env
         output_path = Path(cmd[cmd.index("--worker-output") + 1])
