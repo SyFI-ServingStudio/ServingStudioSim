@@ -60,7 +60,7 @@ use crate::arch::deepseek_v41_vllm::{
     DeepseekV41ReplayConfig, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
     LayerKind, PlanNode,
 };
-use crate::arch::kv_layout::KvCacheLayout;
+use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::op::attention::DeepseekV41CandidateRole;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -162,6 +162,121 @@ pub struct DeepInferEngine {
     /// place; `model_runner.py`: prompt steps never replay a CUDA graph).
     /// Priced as one `host_step` leaf per step; 0 = not modeled.
     pub host_step_us: u32,
+    /// GPU idle inside one step (µs): the short gaps between the kernels of
+    /// an eager prefill forward, summed. One `step_gaps` leaf per step; 0 =
+    /// not modeled.
+    pub step_gap_us: u32,
+    /// `max_num_seqs`: sizes the reserved state slots
+    /// ([`deepinfer_kv_cache_layout`]).
+    pub max_num_seqs: u32,
+}
+
+/// DeepInfer's KV cache (`worker/cache_engine.py`, `KVCacheManager` and
+/// `StateBlock`), for the KV sources a GPU holds: its own `sources` and the
+/// `copies` of sources another pipeline stage computes, over `swa_layers`
+/// runtime layers (body plus MTP).
+///
+/// Paged, 128-token blocks: each KV source keeps its compressed rows (V41
+/// FP4: `head_dim / 2` data + one e4m3 scale per 16 = 288 B) and, as the
+/// index-K source (`index_k_source_layer_ids` defaults to the KV sources,
+/// `hugging_face/config.py`), its FP4 indexer K (`index_head_dim / 2` + one
+/// UE8M0 per 32 = 68 B), each page 32 B aligned; the block stride rounds to
+/// `lcm(128, 288)` (DeepGEMM's 128 B block alignment and the main record).
+/// For DeepSeek-V4.1-Flash that is 114,048 B per block, 891 B per token.
+///
+/// Per sequence, a state slot outside the pool: every layer's sliding window
+/// (MXFP8 528 B rows) of `window + backtrack` rows, plus under YoCo the
+/// prefill-store extra (128) and the kept rows; and each owning ratio-2
+/// source's compressor ring of `ratio + backtrack - 1` fp32 `[kv, score]`
+/// rows (the `use_kproj` indexer keeps no state). The slot rounds to
+/// `lcm(32, 528)`. DeepInfer reserves `int(1.2 x max_num_seqs) + 1` slots
+/// twice (state store and copy buffer, `worker/base.py`) before sizing the
+/// pool, and one block and one slot are never handed out: the engine's fixed
+/// bytes.
+pub(crate) fn deepinfer_kv_cache_layout(
+    model: &DeepseekV41ModelCfg,
+    sources: &[u32],
+    copies: &[u32],
+    swa_layers: u64,
+    engine: &DeepInferEngine,
+) -> KvCacheLayout {
+    // DeepInfer engine defaults (`environ.py`): DEEPINFER_USE_NEXTN_DECODE 5,
+    // so backtracking max(1, 5 + 1); DEEPINFER_PREFILL_STORE_EXTRA_SIZE 128
+    // (on whenever YoCo truncates, `examples/benchmark.py`);
+    // DEEPINFER_NUM_STATE_SLOTS_RATIO 1.2.
+    const BACKTRACK: u64 = 6;
+    const STORE_EXTRA: u64 = 128;
+    const BLOCK_TOKENS: u64 = 128;
+    const BLOCK_ALIGN: u64 = 128;
+    const FP32: u64 = 4;
+    let head_dim = u64::from(model.head_dim);
+    let record = head_dim / 2 + head_dim / 16;
+    let index_row = u64::from(model.index_head_dim) / 2 + u64::from(model.index_head_dim) / 32;
+    let swa_row = head_dim + head_dim / 32;
+    debug_assert_eq!(
+        record,
+        u64::from(crate::timing::kernels::compressed_sparse_mla_rope_cast::NVFP4_RECORD_BYTES)
+    );
+    let align = |n: u64, to: u64| n.div_ceil(to) * to;
+
+    let held: Vec<u32> = copies.iter().chain(sources).copied().collect();
+    let mut block = 0;
+    let mut parts = Vec::new();
+    for (ratio, kv_name, index_name) in [(2, "c2_kv", "c2_indexer"), (1, "c1_kv", "c1_indexer")] {
+        let n = held
+            .iter()
+            .filter(|&&layer| model.compress_ratios[layer as usize] == ratio)
+            .count() as u64;
+        let entries = BLOCK_TOKENS / u64::from(ratio);
+        let (kv_page, index_page) = (align(entries * record, 32), align(entries * index_row, 32));
+        block += n * (kv_page + index_page);
+        parts.push((kv_name, ratio, n * record, n * kv_page / entries));
+        parts.push((index_name, ratio, n * index_row, n * index_page / entries));
+    }
+    let stride = align(block, lcm_u64(BLOCK_ALIGN, record));
+    let rounding = stride - block;
+    assert_eq!(
+        rounding % BLOCK_TOKENS,
+        0,
+        "block stride rounding must split per token"
+    );
+    if let Some(last) = parts.iter_mut().rev().find(|part| part.2 > 0) {
+        last.3 += rounding / BLOCK_TOKENS;
+    }
+
+    let keep = engine
+        .yoco_keep_tokens
+        .map_or(0, |keep| STORE_EXTRA + u64::from(keep));
+    let window_rows = u64::from(model.sliding_window) + BACKTRACK + keep;
+    let rings = sources
+        .iter()
+        .filter(|&&layer| model.compress_ratios[layer as usize] > 1)
+        .map(|&layer| {
+            (u64::from(model.compress_ratios[layer as usize]) + BACKTRACK - 1) * 2 * head_dim * FP32
+        })
+        .sum::<u64>();
+    let slot = align(
+        swa_layers * align(window_rows * swa_row, 32) + rings,
+        lcm_u64(32, swa_row),
+    );
+    let slots = u64::from(engine.max_num_seqs) * 6 / 5 + 1;
+
+    let mut layout = KvCacheLayout::new();
+    for (name, ratio, bytes, padded) in parts.into_iter().filter(|part| part.2 > 0) {
+        layout = layout.with_part(KvCachePart::compressed(name, ratio, bytes).padded_to(padded));
+    }
+    layout.with_engine(EngineOverhead {
+        block_tokens: Some(BLOCK_TOKENS as u32),
+        fixed_device_bytes: 2 * slots * slot + stride,
+    })
+}
+
+fn lcm_u64(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    a / x * b
 }
 
 /// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
@@ -419,7 +534,17 @@ pub fn build_configs(
                 .deepinfer
                 .map(|_| DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
         },
-        kv_cache_layout: tp_arch::kv_cache_layout(model, 1, 0),
+        kv_cache_layout: match &parallel.deepinfer {
+            Some(engine) => deepinfer_kv_cache_layout(
+                model,
+                &model.kv_source_layer_ids,
+                &[],
+                // DeepInfer keeps a window slot for each MTP layer too.
+                u64::from(model.num_layers + tp_arch::MTP_LAYERS),
+                engine,
+            ),
+            None => tp_arch::kv_cache_layout(model, 1, 0),
+        },
         replay,
         late_bodies,
         graphs,
@@ -877,6 +1002,9 @@ pub struct DeepseekV41VllmDpModel {
     /// DeepInfer's host time per step with the GPU idle (ms), one `host_step`
     /// leaf per step; 0 = no leaf.
     host_step_ms: f32,
+    /// DeepInfer's GPU idle inside one step (ms), one `step_gaps` leaf per
+    /// step; 0 = no leaf.
+    step_gap_ms: f32,
 }
 
 pub fn build(
@@ -940,6 +1068,7 @@ pub fn build(
         n_slots: 0,
         host_gather: None,
         host_step_ms: 0.0,
+        step_gap_ms: 0.0,
         name,
     };
     let tree = model.cost_tree();
@@ -959,9 +1088,11 @@ impl DeepseekV41VllmDpModel {
         self
     }
 
-    /// Price DeepInfer's host time per step (`DeepInferEngine::host_step_us`).
-    pub fn with_host_step_us(mut self, host_step_us: u32) -> Self {
+    /// Price DeepInfer's fixed per-step time: the host step and the in-step
+    /// gaps (`DeepInferEngine::{host_step_us, step_gap_us}`).
+    pub fn with_step_overheads(mut self, host_step_us: u32, step_gap_us: u32) -> Self {
         self.host_step_ms = host_step_us as f32 / 1000.0;
+        self.step_gap_ms = step_gap_us as f32 / 1000.0;
         let tree = self.cost_tree();
         self.cost_flat = tree.flatten();
         self.n_slots = tree.n_slots();
@@ -977,6 +1108,19 @@ impl DeepseekV41VllmDpModel {
                 child: Box::new(b.leaf(
                     format!("{}.host_step", self.name),
                     "host_step",
+                    serde_json::json!({}),
+                )),
+            });
+        }
+        if self.step_gap_ms > 0.0 {
+            sections.push(CostNode::Labeled {
+                label: format!(
+                    "{}.step_gaps [GPU idle between the kernels of one eager forward]",
+                    self.name
+                ),
+                child: Box::new(b.leaf(
+                    format!("{}.step_gaps", self.name),
+                    "step_gaps",
                     serde_json::json!({}),
                 )),
             });
@@ -1203,6 +1347,20 @@ impl DeepseekV41VllmDpModel {
                 ..LeafMetrics::ZERO
             };
             evaluator.push(host, || {
+                SlotInput::from(ElementwiseKernelInput {
+                    num_tokens: max_rows,
+                })
+            });
+        }
+        if self.step_gap_ms > 0.0 {
+            let gaps = LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.step_gap_ms,
+                    ..Metrics4::ZERO
+                },
+                ..LeafMetrics::ZERO
+            };
+            evaluator.push(gaps, || {
                 SlotInput::from(ElementwiseKernelInput {
                     num_tokens: max_rows,
                 })
@@ -1673,6 +1831,8 @@ mod tests {
             force_load_balance: false,
             prefill_chunk_tokens: None,
             host_step_us: 0,
+            step_gap_us: 0,
+            max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         assert!(configs.engram_prefetch.is_none());
@@ -1696,6 +1856,8 @@ mod tests {
             force_load_balance: false,
             prefill_chunk_tokens: None,
             host_step_us: 0,
+            step_gap_us: 0,
+            max_num_seqs: 256,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
     }
@@ -1723,6 +1885,8 @@ mod tests {
             force_load_balance: true,
             prefill_chunk_tokens: None,
             host_step_us: 0,
+            step_gap_us: 0,
+            max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         let metadata: Vec<Vec<u32>> = configs
@@ -2064,13 +2228,112 @@ mod tests {
     fn host_step_adds_one_leaf_per_step() {
         let plain = built();
         let names = |model: &DeepseekV41VllmDpModel| -> Vec<String> {
-            model.cost_tree().manifest().slots.iter().map(|s| s.name.clone()).collect()
+            model
+                .cost_tree()
+                .manifest()
+                .slots
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
         };
         assert!(!names(&plain).iter().any(|n| n.ends_with(".host_step")));
-        let with = built().with_host_step_us(6490);
+        let with = built().with_step_overheads(6490, 0);
         assert_eq!(with.host_step_ms, 6.49);
         let with_names = names(&with);
         assert_eq!(with_names.len(), names(&plain).len() + 1);
-        assert_eq!(with_names.iter().filter(|n| n.ends_with(".host_step")).count(), 1);
+        assert_eq!(
+            with_names
+                .iter()
+                .filter(|n| n.ends_with(".host_step"))
+                .count(),
+            1
+        );
+        let both = built().with_step_overheads(6490, 1570);
+        assert_eq!((both.host_step_ms, both.step_gap_ms), (6.49, 1.57));
+        let both_names = names(&both);
+        assert_eq!(both_names.len(), names(&plain).len() + 2);
+        assert_eq!(
+            both_names
+                .iter()
+                .filter(|n| n.ends_with(".step_gaps"))
+                .count(),
+            1
+        );
+    }
+
+    /// DeepInfer's own layout on the 1017 config (`examples/benchmark.py`
+    /// env: YoCo keep 140): `cache_engine.py` logs a 114,048 B block and a
+    /// 9,213,600 B state slot (77 slots at max_num_seqs 64, 149 at 124), and
+    /// the DP4 B200 captures size 633,898 / 567,746 blocks from what the
+    /// memory rule leaves (`base.py`: kv_cache_size after 2 x the slots).
+    #[test]
+    fn deepinfer_layout_matches_the_engine_log() {
+        let model = cfg();
+        let engine = |max_num_seqs| DeepInferEngine {
+            num_redundant_experts: 32,
+            yoco_keep_tokens: Some(140),
+            engram_fetch: false,
+            force_load_balance: false,
+            prefill_chunk_tokens: None,
+            host_step_us: 0,
+            step_gap_us: 0,
+            max_num_seqs,
+        };
+        const BLOCK: u64 = 114_048;
+        const SLOT: u64 = 9_213_600;
+        for (max_num_seqs, slots, blocks) in [(64u32, 77u64, 633_898u64), (124, 149, 567_746)] {
+            let layout = deepinfer_kv_cache_layout(
+                &model,
+                &model.kv_source_layer_ids,
+                &[],
+                u64::from(model.num_layers + tp_arch::MTP_LAYERS),
+                &engine(max_num_seqs),
+            );
+            // 890 B per token of pages, 891 with the 128 B stride rounding.
+            assert_eq!(layout.per_token_bytes(), 890);
+            assert_eq!(padded_per_token(&layout), BLOCK / 128);
+            assert_eq!(layout.engine.block_tokens, Some(128));
+            assert_eq!(layout.engine.fixed_device_bytes, 2 * slots * SLOT + BLOCK);
+            // The budget the engine had: its blocks plus both state copies.
+            let budget = blocks * BLOCK + 2 * slots * SLOT;
+            let usable = (budget - layout.engine.fixed_device_bytes) / BLOCK;
+            assert_eq!(usable, blocks - 1, "one block is the engine's");
+        }
+        // Without YoCo the window holds only window + backtracking rows.
+        let plain = DeepInferEngine {
+            yoco_keep_tokens: None,
+            ..engine(64)
+        };
+        let layout = deepinfer_kv_cache_layout(
+            &model,
+            &model.kv_source_layer_ids,
+            &[],
+            u64::from(model.num_layers + tp_arch::MTP_LAYERS),
+            &plain,
+        );
+        assert_eq!(layout.engine.fixed_device_bytes, 2 * 77 * 3_128_928 + BLOCK);
+        // The DP arch carries it under engine: deepinfer.
+        let mut p = parallel();
+        p.deepinfer = Some(engine(64));
+        let configs = build_configs(&model, &p, &uniform_demand()).unwrap();
+        assert_eq!(padded_per_token(&configs.kv_cache_layout), BLOCK / 128);
+    }
+
+    /// Charged bytes per token: each per-token part's padded entry over its
+    /// tokens per entry.
+    fn padded_per_token(layout: &KvCacheLayout) -> u64 {
+        layout
+            .parts
+            .iter()
+            .map(|part| match part.growth {
+                crate::arch::kv_layout::KvGrowth::PerToken { tokens_per_entry } => {
+                    part.overhead
+                        .padded_bytes_per_entry
+                        .unwrap_or(part.bytes_per_entry)
+                        / u64::from(tokens_per_entry)
+                }
+                _ => 0,
+            })
+            .sum()
     }
 }

@@ -127,7 +127,7 @@ pub fn deepseek_v41_dp_engine(
     engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
     force_load_balance: bool,
     prefill_chunk_tokens: u32,
-    host_step_us: u32,
+    step: DeepInferStepCfg,
 ) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
     let engram_fetch = engram_fetch != crate::arch::deepseek_v41_engram_fetch::EngramFetch::Off;
     match engine {
@@ -137,10 +137,11 @@ pub fn deepseek_v41_dp_engine(
                     && yoco_keep_tokens == 0
                     && !force_load_balance
                     && prefill_chunk_tokens == 0
-                    && host_step_us == 0,
+                    && step.host_step_us == 0
+                    && step.step_gap_us == 0,
                 "num_redundant_experts, yoco_keep_tokens, force_load_balance, \
-                 prefill_chunk_tokens and deepinfer_host_step_us are DeepInfer options; \
-                 set engine: deepinfer"
+                 prefill_chunk_tokens, deepinfer_host_step_us and deepinfer_step_gap_us are \
+                 DeepInfer options; set engine: deepinfer"
             );
             Ok(None)
         }
@@ -151,10 +152,25 @@ pub fn deepseek_v41_dp_engine(
                 engram_fetch,
                 force_load_balance,
                 prefill_chunk_tokens: (prefill_chunk_tokens > 0).then_some(prefill_chunk_tokens),
-                host_step_us,
+                host_step_us: step.host_step_us,
+                step_gap_us: step.step_gap_us,
+                max_num_seqs: step.max_num_seqs,
             },
         )),
     }
+}
+
+/// The DeepInfer per-step fields of the DP selector, passed through
+/// [`deepseek_v41_dp_engine`].
+#[derive(Clone, Copy, Debug)]
+pub struct DeepInferStepCfg {
+    pub host_step_us: u32,
+    pub step_gap_us: u32,
+    pub max_num_seqs: u32,
+}
+
+const fn default_deepinfer_max_num_seqs() -> u32 {
+    256
 }
 
 const fn default_engram_cpu_threads() -> u32 {
@@ -659,6 +675,19 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = 0, cache_key)]
         deepinfer_host_step_us: u32,
+        /// DeepInfer only: GPU idle inside one engine step, in microseconds:
+        /// the sum of the short (< 1 ms) gaps between the kernels of one eager
+        /// prefill forward. Measured, not tuned: set it from a capture and cite
+        /// the capture in the preset. 0 = not modeled.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        deepinfer_step_gap_us: u32,
+        /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
+        /// the per-sequence state slots DeepInfer reserves out of the KV budget
+        /// (`cache_engine.py`), so it moves the token capacity.
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
         /// DP ranks per replica, which are also its EP group (2, 4 or 8; the
         /// captured deployment is 4). A pool of `replicas` such groups places
         /// sessions by prefix affinity like the PP replicas.

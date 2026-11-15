@@ -94,7 +94,7 @@ pub(crate) const EP_SIZE: u32 = 4;
 
 // Checkpoint identity (HF text_config); `from_json` rejects anything else.
 pub(crate) const BODY_LAYERS: u32 = 40;
-const MTP_LAYERS: u32 = 3;
+pub(crate) const MTP_LAYERS: u32 = 3;
 const HIDDEN: u32 = 5120;
 const NUM_EXPERTS: u32 = 384;
 const TOP_K: u32 = 6;

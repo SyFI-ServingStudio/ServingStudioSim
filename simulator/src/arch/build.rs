@@ -1191,9 +1191,11 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         Some(gather) => model.with_engram_host_gather(gather),
         None => model,
     };
-    Ok(match deepinfer.map_or(0, |engine| engine.host_step_us) {
-        0 => model,
-        host_step_us => model.with_host_step_us(host_step_us),
+    Ok(match deepinfer {
+        Some(engine) if engine.host_step_us > 0 || engine.step_gap_us > 0 => {
+            model.with_step_overheads(engine.host_step_us, engine.step_gap_us)
+        }
+        _ => model,
     })
 }
 
@@ -2825,6 +2827,8 @@ pub fn build_iter_model(
             force_load_balance,
             prefill_chunk_tokens,
             deepinfer_host_step_us,
+            deepinfer_step_gap_us,
+            deepinfer_max_num_seqs,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2842,7 +2846,11 @@ pub fn build_iter_model(
                 *engram_fetch,
                 *force_load_balance,
                 *prefill_chunk_tokens,
-                *deepinfer_host_step_us,
+                crate::arch::config::DeepInferStepCfg {
+                    host_step_us: *deepinfer_host_step_us,
+                    step_gap_us: *deepinfer_step_gap_us,
+                    max_num_seqs: *deepinfer_max_num_seqs,
+                },
             )?,
             *engram_fetch,
             *engram_cpu_threads,

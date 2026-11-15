@@ -632,6 +632,8 @@ impl Deployment for UnifiedDeployment {
                 force_load_balance,
                 prefill_chunk_tokens,
                 deepinfer_host_step_us,
+                deepinfer_step_gap_us,
+                deepinfer_max_num_seqs,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
@@ -653,7 +655,11 @@ impl Deployment for UnifiedDeployment {
                         *engram_fetch,
                         *force_load_balance,
                         *prefill_chunk_tokens,
-                        *deepinfer_host_step_us,
+                        crate::arch::config::DeepInferStepCfg {
+                            host_step_us: *deepinfer_host_step_us,
+                            step_gap_us: *deepinfer_step_gap_us,
+                            max_num_seqs: *deepinfer_max_num_seqs,
+                        },
                     )?,
                     *engram_fetch,
                     *engram_cpu_threads,
