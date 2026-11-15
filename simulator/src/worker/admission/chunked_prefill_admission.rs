@@ -263,7 +263,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
                     prefix,
                     chunk,
                     resolved.resident_prefix_tokens(),
-                    finishes,
+                    prefix + resolved.remaining_prefill_tokens(),
                 ) {
                     current.push(BackEntry {
                         group: usize::from(partition),

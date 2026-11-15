@@ -72,9 +72,10 @@ pub enum BackRowsKind {
     #[default]
     VllmChunk,
     PromptTail,
+    ChunkTail,
 }
 
-const BACK_ROWS_CHOICES: [&str; 2] = ["vllm-chunk", "prompt-tail"];
+const BACK_ROWS_CHOICES: [&str; 3] = ["vllm-chunk", "prompt-tail", "chunk-tail"];
 
 fn default_back_flush_k() -> u32 {
     16
@@ -119,6 +120,7 @@ pub(crate) fn back_batching_spec(
     let rows = match rows {
         BackRowsKind::VllmChunk => BackRows::VllmChunk,
         BackRowsKind::PromptTail => BackRows::PromptTail,
+        BackRowsKind::ChunkTail => BackRows::ChunkTail,
     };
     let cap = match cap {
         BackCapKind::None => BackCap::None,
@@ -1075,8 +1077,11 @@ pub enum IterWorkerSel {
         #[serde(default = "default_back_flush_k")]
         #[param(default = 16)]
         back_flush_k: u32,
-        /// Rows a chunk leaves for the back pass: `vllm-chunk` (every chunk's
-        /// last `min(q, 128)`) or `prompt-tail` (the prompt's last 128 only).
+        /// Rows a chunk leaves for the back pass (`window` = the arch's
+        /// replay window): `vllm-chunk` (every chunk's last `min(q, window)`),
+        /// `prompt-tail` (the prompt's last `window`, from its final chunk
+        /// only) or `chunk-tail` (each chunk its share of the prompt's last
+        /// `window`, at least one row: DeepInfer's YoCo compact truncation).
         #[serde(default)]
         #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
         back_rows: BackRowsKind,

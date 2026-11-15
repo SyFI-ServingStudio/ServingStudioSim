@@ -540,7 +540,12 @@ where
                 let (prefix, chunk) = resolved.active_chunk();
                 let finishes = chunk == resolved.remaining_prefill_tokens();
                 if let Some((prefix, rows)) =
-                    stash.chunk_entry(prefix, chunk, resolved.resident_prefix_tokens(), finishes)
+                    stash.chunk_entry(
+                    prefix,
+                    chunk,
+                    resolved.resident_prefix_tokens(),
+                    prefix + resolved.remaining_prefill_tokens(),
+                )
                 {
                     ticket.back_entries.push(BackEntry {
                         group: 0,

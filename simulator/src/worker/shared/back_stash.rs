@@ -16,6 +16,12 @@
 //! - `PromptTail`: only a prompt's final chunk leaves an entry, the prompt's
 //!   last `min(window, rows computed this episode)` rows (DeepInfer: an
 //!   intermediate chunk's back rows are never read).
+//! - `ChunkTail`: every chunk leaves its rows inside the prompt's last
+//!   `window` rows, and at least one (DeepInfer's YoCo compact truncation,
+//!   `prepare_tensor_input_v4.cpp` `fill_yoco_truncation_metadata`: keep
+//!   `[data_len - keep, data_len) ∩ chunk`, a chunk wholly before it keeps
+//!   its last row as a placeholder). Same total tail as `PromptTail`, split
+//!   over the chunks that compute it, plus one row per earlier chunk.
 //!
 //! When to flush ([`BackFlush`]), with `S` = everything stashed (plus, where
 //! the engine can, this step's own tails) and `t(X)` the back pass's cost on
@@ -87,6 +93,7 @@ pub enum BackFlush {
 pub enum BackRows {
     VllmChunk,
     PromptTail,
+    ChunkTail,
 }
 
 /// How many rows one back pass may carry.
@@ -183,21 +190,27 @@ impl BackStash {
         self.entries.len()
     }
 
-    /// The entry a chunk `[prefix, prefix + chunk)` leaves, if any.
-    /// `episode_start` is the first position this prefill episode computed
-    /// (the resident prefix): rows before it have no layer input.
+    /// The entry a chunk `[prefix, prefix + chunk)` of a prompt ending at
+    /// `prompt_end` leaves, if any. `episode_start` is the first position
+    /// this prefill episode computed (the resident prefix): rows before it
+    /// have no layer input.
     pub fn chunk_entry(
         &self,
         prefix: u32,
         chunk: u32,
         episode_start: u32,
-        finishes: bool,
+        prompt_end: u32,
     ) -> Option<(u32, u32)> {
         let end = prefix + chunk;
+        let finishes = end == prompt_end;
         let rows = match self.spec.rows {
             BackRows::VllmChunk => chunk.min(self.window),
             BackRows::PromptTail if finishes => (end - episode_start).min(self.window),
             BackRows::PromptTail => return None,
+            BackRows::ChunkTail => {
+                let tail_start = prompt_end.saturating_sub(self.window).max(prefix);
+                end.saturating_sub(tail_start).max(chunk.min(1))
+            }
         };
         (rows > 0).then_some((end - rows, rows))
     }
@@ -432,12 +445,19 @@ mod tests {
     fn rows_rules_pick_the_chunk_or_the_prompt_tail() {
         let tail = stash(BackFlush::EveryStep, BackRows::PromptTail);
         // A 50-row final chunk takes 128 rows reaching into the previous chunk.
-        assert_eq!(tail.chunk_entry(8000, 50, 0, true), Some((7922, 128)));
+        assert_eq!(tail.chunk_entry(8000, 50, 0, 8050), Some((7922, 128)));
         // ...but not past the episode start (a resident prefix).
-        assert_eq!(tail.chunk_entry(8000, 50, 7990, true), Some((7990, 60)));
-        assert_eq!(tail.chunk_entry(0, 8192, 0, false), None);
+        assert_eq!(tail.chunk_entry(8000, 50, 7990, 8050), Some((7990, 60)));
+        assert_eq!(tail.chunk_entry(0, 8192, 0, 8242), None);
         let chunk = stash(BackFlush::EveryStep, BackRows::VllmChunk);
-        assert_eq!(chunk.chunk_entry(0, 8192, 0, false), Some((8064, 128)));
-        assert_eq!(chunk.chunk_entry(8192, 50, 0, true), Some((8192, 50)));
+        assert_eq!(chunk.chunk_entry(0, 8192, 0, 8242), Some((8064, 128)));
+        assert_eq!(chunk.chunk_entry(8192, 50, 0, 8242), Some((8192, 50)));
+        // DeepInfer: each chunk keeps its share of the last 128 rows...
+        let split = stash(BackFlush::EveryStep, BackRows::ChunkTail);
+        assert_eq!(split.chunk_entry(0, 8192, 0, 8242), Some((8114, 78)));
+        assert_eq!(split.chunk_entry(8192, 50, 0, 8242), Some((8192, 50)));
+        // ...and a chunk wholly before them one placeholder row.
+        assert_eq!(split.chunk_entry(0, 8192, 0, 20000), Some((8191, 1)));
+        assert_eq!(split.chunk_entry(0, 50, 0, 50), Some((0, 50)));
     }
 }
