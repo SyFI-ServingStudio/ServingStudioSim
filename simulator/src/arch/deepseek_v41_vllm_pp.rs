@@ -1199,7 +1199,13 @@ impl DeepseekV41VllmPpStageModel {
     ) -> Result<(DeepseekV41Step, NormalizedInput), String> {
         let step = DeepseekV41Step::from_unified(batch, self.max_model_len)?;
         let logits_rows = step.request_count();
-        let back = tp_arch::group_back_pairs(batch, self.max_model_len)?;
+        // A stage wholly before the cut (no replay rule) runs every row of
+        // its layers whether or not the back pass is deferred; the back pass
+        // is not its work.
+        let back = match self.replay_rule {
+            Some(_) => tp_arch::group_back_pairs(batch, self.max_model_len)?,
+            None => None,
+        };
         if self.deferred_only && back.is_none() && !step.prefill.is_empty() {
             return Err("a folded split runs prefill only with a deferred back pass".into());
         }
