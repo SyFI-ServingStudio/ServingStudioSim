@@ -64,7 +64,7 @@ const LARGE_TOKENS: [u32; 2] = [98304, 131072];
 
 /// The generic per-rank token axis, cut after the first point at or above
 /// `max_tokens_per_rank` so the deployment's largest batch interpolates.
-fn token_points(max_tokens_per_rank: u32) -> Vec<f64> {
+pub(crate) fn token_points(max_tokens_per_rank: u32) -> Vec<f64> {
     let full = Axis::chain([
         Axis::values(SMALL_TOKENS),
         Axis::token_axis(),
@@ -92,7 +92,8 @@ impl KernelSpec for MegaMoeSpec {
     }
 
     fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
-        anyhow::ensure!(config.ep_size >= 2, "mega_moe needs ep_size >= 2");
+        // ep_size 1: one GPU holds every expert (DeepGEMM's single-process mode).
+        anyhow::ensure!(config.ep_size >= 1, "mega_moe needs ep_size >= 1");
         anyhow::ensure!(
             config.num_experts % config.ep_size == 0,
             "num_experts {} must divide by ep_size {}",

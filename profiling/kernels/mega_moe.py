@@ -50,7 +50,10 @@ KIND = "mega_moe"
 
 @dataclass(frozen=True)
 class MegaMoeArgs(KernelArgs):
-    ep_size: int = arg(unit="GPUs", doc="GPUs in the expert-parallel group.")
+    ep_size: int = arg(
+        unit="GPUs",
+        doc="GPUs in the expert-parallel group; 1 runs every expert on one GPU (no NVLink traffic).",
+    )
     num_tokens: int = arg(
         unit="tokens",
         doc="Tokens entering the MoE layer on each GPU (every GPU has the same count).",

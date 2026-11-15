@@ -106,8 +106,10 @@ def _validate(
         raise ProfilerNotImplemented("deepgemm_sm100 mega_moe needs activation_dtype=mxfp8_e4m3")
     if DType.from_value(weight_dtype) is not DType.MXFP4_E2M1:
         raise ProfilerNotImplemented("deepgemm_sm100 mega_moe needs weight_dtype=mxfp4_e2m1")
-    if ep_size < 2:
-        raise ProfilerNotImplemented(f"mega_moe needs ep_size >= 2, got {ep_size}")
+    # ep_size 1 is DeepGEMM's single-process mode (tests/test_mega_moe.py
+    # --num-processes 1): every expert local, no NVLink traffic.
+    if ep_size < 1:
+        raise ValueError(f"mega_moe needs ep_size >= 1, got {ep_size}")
     if num_tokens < 1:
         raise ValueError("num_tokens must be positive")
     if num_experts % ep_size:
