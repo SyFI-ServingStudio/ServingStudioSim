@@ -4,6 +4,9 @@
 //!   per Engram layer reads the pinned host table over UVA on the GPU's SMs
 //!   (the profiled `engram_lookup` at `residency = host_uva`).
 //! - `off`: the fetch is priced out (the Engram blocks' compute stays).
+//! - `none`: Engram fully off, DeepInfer's `DEEPINFER_ENGRAM_SANITY_OFF=1`
+//!   (no fetch, no `wkv` GEMM, no gate): the baseline its CPU-fetch
+//!   captures are measured against.
 //! - `cpu_threads`: `engram_cpu_threads` host threads per rank, started at
 //!   the step's start, gather the step's rows into a pinned staging buffer,
 //!   one copy-engine H2D per layer moves it, and a device kernel unpacks
@@ -55,7 +58,8 @@
 //! a random gather from HBM either way (for the unpack, an upper bound on a
 //! sequential read of the packed buffer).
 
-use crate::arch::deepseek_v41_vllm::ENGRAM_TABLE_ROWS_RANK0;
+use crate::arch::deepseek_v41_vllm::{PlanNode, ENGRAM_TABLE_ROWS_RANK0};
+use crate::timing::{FlatCostNode, LeafMetrics};
 use crate::worklet::DeepseekV41EngramPrefetchLocalWorkletConfig;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,10 +75,20 @@ pub enum EngramFetch {
     /// The fetch priced out (the Engram blocks' compute stays): the engine's
     /// own fetch path cannot be measured here.
     Off,
+    /// No fetch and no Engram consumer (`wkv` + gate): DeepInfer's
+    /// `DEEPINFER_ENGRAM_SANITY_OFF=1`.
+    None,
+}
+
+impl EngramFetch {
+    /// Whether any Engram rows are fetched (`off` and `none` price none).
+    pub fn fetches(self) -> bool {
+        !matches!(self, Self::Off | Self::None)
+    }
 }
 
 /// The `engram_fetch` spellings: `uva`, `cpu_threads` (or `cpu_gather`),
-/// `prefetch` (or `cpu_gather_prefetch`), `gpu`, `off`, or a bool (`true` =
+/// `prefetch` (or `cpu_gather_prefetch`), `gpu`, `off`, `none`, or a bool (`true` =
 /// uva, `false` = off) as the DeepInfer engine option spells it.
 impl<'de> serde::Deserialize<'de> for EngramFetch {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -93,8 +107,9 @@ impl<'de> serde::Deserialize<'de> for EngramFetch {
                 "prefetch" | "cpu_gather_prefetch" => Ok(Self::Prefetch),
                 "gpu" => Ok(Self::Gpu),
                 "off" | "false" => Ok(Self::Off),
+                "none" => Ok(Self::None),
                 other => Err(serde::de::Error::custom(format!(
-                    "engram_fetch: expected uva, cpu_threads, prefetch, gpu or off, got {other}"
+                    "engram_fetch: expected uva, cpu_threads, prefetch, gpu, off or none, got {other}"
                 ))),
             },
         }
@@ -102,12 +117,13 @@ impl<'de> serde::Deserialize<'de> for EngramFetch {
 }
 
 /// The `engram_fetch` choices the launcher offers.
-pub const ENGRAM_FETCH_CHOICES: [&str; 7] = [
+pub const ENGRAM_FETCH_CHOICES: [&str; 8] = [
     "uva",
     "cpu_threads",
     "prefetch",
     "gpu",
     "off",
+    "none",
     "cpu_gather",
     "cpu_gather_prefetch",
 ];
@@ -200,7 +216,7 @@ impl EngramHostGather {
                 Self::from_prefetch(prefetch);
                 return None;
             }
-            EngramFetch::Uva | EngramFetch::Off => return None,
+            EngramFetch::Uva | EngramFetch::Off | EngramFetch::None => return None,
         };
         Some(Self {
             prefetch: early,
@@ -228,6 +244,63 @@ impl EngramHostGather {
         }
         exposed
     }
+}
+
+/// Decoder layers one plan node runs (a body is one layer).
+pub(crate) fn plan_layers(plan: &[PlanNode]) -> u32 {
+    plan.iter()
+        .map(|node| match node {
+            PlanNode::Body(_) => 1,
+            PlanNode::Repeat { n, body } => n * plan_layers(body),
+        })
+        .sum()
+}
+
+/// GPU time (ms) ahead of each local Engram consumer in one aggregated step:
+/// the time of the root `Sum`'s sections that run before the consumer's
+/// layer (its Engram block opens the layer). `sections[i]` is the decoder
+/// layers the root's `i`-th section runs (0 for a non-layer section: it counts
+/// when it runs between two layers ahead of the consumer, or right before
+/// it); `ahead[k]` is this GPU's layers before the `k`-th consumer. A section
+/// holding the consumer's layer inside it (a folded repeat) counts by its
+/// share of layers ahead. `scratch` is the node buffer
+/// [`crate::timing::CostTree::aggregate`] just filled.
+pub(crate) fn time_ahead_ms(
+    flat: &[FlatCostNode],
+    scratch: &[LeafMetrics],
+    sections: &[u32],
+    ahead: &[u32],
+) -> Vec<f64> {
+    let Some(FlatCostNode::Sum { children }) = flat.first() else {
+        panic!("the step's cost tree root must be a Sum of sections");
+    };
+    assert_eq!(
+        children.len(),
+        sections.len(),
+        "one layer count per root section"
+    );
+    let layers: u32 = sections.iter().sum();
+    assert!(
+        ahead.iter().all(|&a| a < layers),
+        "a consumer opens one of the {layers} layers"
+    );
+    ahead
+        .iter()
+        .map(|&target| {
+            let (mut layers, mut ms) = (0u32, 0.0f64);
+            for (node, &n) in children.clone().zip(sections) {
+                let t = f64::from(scratch[node].m.time_ms);
+                if layers + n <= target {
+                    ms += t;
+                    layers += n;
+                } else {
+                    ms += t * f64::from(target - layers) / f64::from(n);
+                    break;
+                }
+            }
+            ms
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -296,6 +369,37 @@ mod tests {
             (cfg.tp_size, cfg.table_rows, cfg.residency.as_str(), cfg.token_scale),
             (4, 96_000_564, "device", 4)
         );
+    }
+
+    #[test]
+    fn time_ahead_counts_the_priced_sections_before_each_consumer() {
+        // Root sections: embedding (no layer) 0.5, layer 0 2.0, layer 1 1.0,
+        // a 3-layer repeat of layers 2..5 3.0, the head 0.25, the host step 9.
+        let leaf = |ms: f32| {
+            let mut m = LeafMetrics::ZERO;
+            m.m.time_ms = ms;
+            m
+        };
+        let flat: Vec<FlatCostNode> = std::iter::once(FlatCostNode::Sum { children: 1..7 })
+            .chain((0..6).map(FlatCostNode::Leaf))
+            .collect();
+        let scratch: Vec<LeafMetrics> = [16.25, 0.5, 2.0, 1.0, 3.0, 0.25, 9.0]
+            .into_iter()
+            .map(leaf)
+            .collect();
+        let ahead = time_ahead_ms(&flat, &scratch, &[0, 1, 1, 3, 0, 0], &[0, 1, 3, 4]);
+        // Layer 0: what opens the step; layer 1: + layer 0; layers 3 and 4:
+        // + layer 1 and one or two of the repeat's three layers; never the
+        // head or the host step.
+        assert_eq!(ahead, vec![0.5, 2.5, 4.5, 5.5]);
+    }
+
+    #[test]
+    fn none_is_its_own_spelling_and_fetches_nothing() {
+        let none: EngramFetch = serde_json::from_str("\"none\"").unwrap();
+        assert_eq!(none, EngramFetch::None);
+        assert!(!none.fetches() && !EngramFetch::Off.fetches());
+        assert!(EngramFetch::CpuThreads.fetches() && EngramFetch::Uva.fetches());
     }
 
     #[test]

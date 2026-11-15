@@ -1177,8 +1177,14 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     let mut configs =
         deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
             .context("expanding DeepSeek-V4.1-Flash DP/EP architecture configs")?;
-    if engram_fetch == EngramFetch::Off {
+    if !engram_fetch.fetches() {
         configs.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        let layers = std::iter::once(&mut configs.layer0).chain(configs.bodies.iter_mut());
+        for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+            engram.consumer = false;
+        }
     }
     let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
         (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),

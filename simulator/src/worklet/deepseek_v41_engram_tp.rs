@@ -67,6 +67,11 @@ pub struct DeepseekV41EngramTpWorkletConfig {
     /// `Some` when the engine runs the attention RMSNorm + MXFP8 after the
     /// shifted pre as its own launch (DeepInfer `_norm_kernel`).
     pub attn_norm_backends: Option<Vec<&'static str>>,
+    /// `false`: the Engram consumer is skipped (DeepInfer
+    /// `DEEPINFER_ENGRAM_SANITY_OFF=1`): `wkv` and the gate cost nothing. The
+    /// hc post, shifted pre and attention norm stay: that engine runs them
+    /// either way (its Engram-off capture has the same mHC/norm launches).
+    pub consumer: bool,
 }
 
 /// The launch that folds the `wkv` output into the hc streams.
@@ -336,8 +341,18 @@ impl DeepseekV41EngramTpWorklet {
         if let Some(gather_copy) = &self.gather_copy {
             eval_or_zero(gather_copy, ew.clone(), zero, ev);
         }
-        eval_or_zero(&self.wkv, SingleGemmKernelInput { m: rows }, zero, ev);
-        self.post_wkv.eval(rows, ev);
+        let consumer_rows = if self.resolved.raw_cfg.consumer {
+            rows
+        } else {
+            0
+        };
+        eval_or_zero(
+            &self.wkv,
+            SingleGemmKernelInput { m: consumer_rows },
+            consumer_rows == 0,
+            ev,
+        );
+        self.post_wkv.eval(consumer_rows, ev);
         for op in [&self.hc_prenorm, &self.pre_big_fuse].into_iter().flatten() {
             eval_or_zero(op, ew.clone(), zero, ev);
         }
@@ -367,6 +382,7 @@ pub(crate) mod tests {
             all_gather_backends: vec!["nccl"],
             elementwise_backends: vec!["triton"],
             engram_gate_backends: None,
+            consumer: true,
             max_rank_tokens: 8192,
             mhc_unfused_backends: None,
             attn_norm_backends: None,

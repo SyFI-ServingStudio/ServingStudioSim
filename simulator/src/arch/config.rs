@@ -129,7 +129,7 @@ pub fn deepseek_v41_dp_engine(
     prefill_chunk_tokens: u32,
     step: DeepInferStepCfg,
 ) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
-    let engram_fetch = engram_fetch != crate::arch::deepseek_v41_engram_fetch::EngramFetch::Off;
+    let engram_fetch = engram_fetch.fetches();
     match engine {
         DeepseekV41Engine::Vllm => {
             anyhow::ensure!(

@@ -53,7 +53,7 @@ use anyhow::Result;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
+use crate::arch::deepseek_v41_engram_fetch::{self, EngramHostGather};
 use crate::arch::deepseek_v41_vllm::{
     self as tp_arch, fold_layers, index_plan, layer_config, layer_input, prefill_pairs,
     replay_rows, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg,
@@ -996,6 +996,9 @@ pub struct DeepseekV41VllmDpModel {
     graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
+    /// Decoder layers of each root section of the cost tree, in order (see
+    /// [`deepseek_v41_engram_fetch::time_ahead_ms`]).
+    section_layers: Vec<u32>,
     /// `Some` under the `cpu_gather` Engram fetch: the last slot is the GPU
     /// time each step waits for host-gathered rows.
     host_gather: Option<EngramHostGather>,
@@ -1066,14 +1069,13 @@ pub fn build(
         graphs: resolved.graphs,
         cost_flat: Vec::new(),
         n_slots: 0,
+        section_layers: Vec::new(),
         host_gather: None,
         host_step_ms: 0.0,
         step_gap_ms: 0.0,
         name,
     };
-    let tree = model.cost_tree();
-    model.cost_flat = tree.flatten();
-    model.n_slots = tree.n_slots();
+    model.recompile();
     Ok(model)
 }
 
@@ -1082,9 +1084,7 @@ impl DeepseekV41VllmDpModel {
     /// unpack's prefetch config, [`EngramHostGather::from_prefetch`]).
     pub fn with_engram_host_gather(mut self, gather: EngramHostGather) -> Self {
         self.host_gather = Some(gather);
-        let tree = self.cost_tree();
-        self.cost_flat = tree.flatten();
-        self.n_slots = tree.n_slots();
+        self.recompile();
         self
     }
 
@@ -1093,10 +1093,35 @@ impl DeepseekV41VllmDpModel {
     pub fn with_step_overheads(mut self, host_step_us: u32, step_gap_us: u32) -> Self {
         self.host_step_ms = host_step_us as f32 / 1000.0;
         self.step_gap_ms = step_gap_us as f32 / 1000.0;
+        self.recompile();
+        self
+    }
+
+    fn recompile(&mut self) {
         let tree = self.cost_tree();
         self.cost_flat = tree.flatten();
         self.n_slots = tree.n_slots();
-        self
+        // The root sections of `cost_tree`: layer 0, the plan's nodes, the
+        // head, then the optional host step, step gaps and host-gather wait.
+        let mut layers = vec![1];
+        layers.extend(
+            self.plan
+                .iter()
+                .map(|node| deepseek_v41_engram_fetch::plan_layers(std::slice::from_ref(node))),
+        );
+        layers.push(0);
+        layers.extend(
+            [
+                self.host_step_ms > 0.0,
+                self.step_gap_ms > 0.0,
+                self.host_gather.is_some(),
+            ]
+            .into_iter()
+            .filter(|&on| on)
+            .map(|_| 0),
+        );
+        assert_eq!(layers.iter().sum::<u32>(), tp_arch::BODY_LAYERS);
+        self.section_layers = layers;
     }
 
     pub fn cost_tree(&self) -> CostTree {
@@ -1382,15 +1407,17 @@ impl DeepseekV41VllmDpModel {
         let mut total = CostTree::aggregate(&self.cost_flat, slots, scratch);
         if let Some(gather) = &self.host_gather {
             // The ranks run in lockstep: the step waits for its slowest rank's
-            // rows. GPU time ahead of layer L: the step's mean per-layer time
-            // times the L layers before it.
-            // GPU time only: the host step runs before the forward.
+            // rows. GPU time ahead of layer L: the priced sections before it
+            // (prologue, layer 0 ... layer L-1; the host step runs before the
+            // forward and the step gaps are not placed, so neither counts).
+            // `gpu_ms` (the prefetch head start) is the step's GPU time.
             let gpu_ms = f64::from(total.m.time_ms - self.host_step_ms);
-            let per_layer = gpu_ms / f64::from(tp_arch::BODY_LAYERS);
-            let available: Vec<f64> = tp_arch::ENGRAM_LAYERS
-                .iter()
-                .map(|&layer| per_layer * f64::from(layer))
-                .collect();
+            let available = deepseek_v41_engram_fetch::time_ahead_ms(
+                &self.cost_flat,
+                scratch,
+                &self.section_layers,
+                &tp_arch::ENGRAM_LAYERS,
+            );
             let wait = gather.exposed_ms(max_rows, &available, gpu_ms) as f32;
             slots[self.n_slots - 1].m.time_ms = wait;
             total.m.time_ms += wait;

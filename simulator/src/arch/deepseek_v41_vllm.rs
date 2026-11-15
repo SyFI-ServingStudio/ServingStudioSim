@@ -1118,6 +1118,7 @@ pub(crate) fn layer_config(
             max_rank_tokens: parallel.max_num_batched_tokens,
             mhc_unfused_backends: None,
             attn_norm_backends: None,
+            consumer: true,
         }),
         attention: DeepseekV41AttentionTpWorkletConfig {
             layer: kind.attention,
