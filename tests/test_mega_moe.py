@@ -49,9 +49,48 @@ def test_validate_rejects_non_mxfp4_weights() -> None:
         top_k=6,
         activation_dtype="mxfp8_e4m3",
         weight_dtype="fp8_e4m3",
+        per_slot_rows=[16 * 4 * 6 // 416] * 416,
     )
     with pytest.raises(Exception, match="mxfp4_e2m1"):
         runner._validate(**spec)
+
+
+@pytest.mark.parametrize("ep_size", [1, 4])
+def test_slot_topk_realizes_the_histogram_with_distinct_slots(ep_size: int) -> None:
+    """The profiled routing must be exactly the histogram in the key, and a token
+    may not pick one slot twice (the kernel would double-count it)."""
+    import numpy as np
+
+    num_tokens, top_k, slots = 96, 6, 32
+    rng = np.random.default_rng(1)
+    group = ep_size * num_tokens
+    weights = np.r_[[8.0] * 4, [1.0] * (slots - 4)]
+    rows = rng.multinomial(group * top_k, weights / weights.sum())
+    # Clip a too-hot slot to the group's token count, moving its excess round-robin.
+    while rows.max() > group:
+        hot = rows.argmax()
+        rows[(hot + 1) % slots] += rows[hot] - group
+        rows[hot] = group
+    ids = runner.slot_topk(rows.tolist(), ep_size, num_tokens, top_k)
+    assert ids.shape == (ep_size, num_tokens, top_k)
+    assert np.array_equal(np.bincount(ids.ravel(), minlength=slots), rows)
+    flat = ids.reshape(-1, top_k)
+    assert all(len(set(t)) == top_k for t in flat.tolist())
+    spec = dict(
+        ep_size=ep_size,
+        num_tokens=num_tokens,
+        hidden_size=5120,
+        intermediate_size=2304,
+        num_experts=slots,
+        num_shared_experts=1,
+        top_k=top_k,
+        activation_dtype="mxfp8_e4m3",
+        weight_dtype="mxfp4_e2m1",
+        per_slot_rows=rows.tolist(),
+    )
+    runner._validate(**spec)
+    with pytest.raises(ValueError, match="sum"):
+        runner._validate(**{**spec, "per_slot_rows": [0] * slots})
 
 
 def test_reference_routes_each_choice_to_its_slot() -> None:

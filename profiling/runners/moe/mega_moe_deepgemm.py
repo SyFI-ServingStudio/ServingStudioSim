@@ -4,7 +4,9 @@ Mirrors DeepInfer's production call (``v4_modules/mlp.py`` ``mega_moe_forward``)
 MXFP8 tokens and their top-k slots already sit in the symmetric buffer, the
 shared expert is fused (``shared_l1_weights``/``shared_l2_weights``), the
 EPLB expert counter is passed, SwiGLU clamp 10, ``fast_math=True``. Inputs are
-built as DeepGEMM's own ``tests/test_mega_moe.py`` builds them.
+built as DeepGEMM's own ``tests/test_mega_moe.py`` builds them, except the top-k
+slot ids, which realize the spec's ``per_slot_rows`` exactly
+(:func:`slot_topk`).
 
 The rank group is spawned once per chunk. Specs with the same geometry share
 one symmetric buffer and one set of weights; the buffer's capacity
@@ -101,6 +103,7 @@ def _validate(
     top_k: int,
     activation_dtype: DType | str,
     weight_dtype: DType | str,
+    per_slot_rows: list[int] | tuple[int, ...],
 ) -> None:
     if DType.from_value(activation_dtype) is not DType.MXFP8_E4M3:
         raise ProfilerNotImplemented("deepgemm_sm100 mega_moe needs activation_dtype=mxfp8_e4m3")
@@ -119,6 +122,37 @@ def _validate(
         raise ValueError("hidden_size and intermediate_size must be multiples of 128")
     if num_shared_experts < 0 or not 1 <= top_k <= num_experts:
         raise ValueError("bad num_shared_experts or top_k")
+    rows = [int(r) for r in per_slot_rows]
+    if len(rows) != num_experts:
+        raise ValueError(f"per_slot_rows has {len(rows)} entries, num_experts={num_experts}")
+    group_tokens = ep_size * num_tokens
+    if min(rows) < 0 or sum(rows) != group_tokens * top_k:
+        raise ValueError("per_slot_rows must be non-negative and sum to ep_size*num_tokens*top_k")
+    if max(rows) > group_tokens:
+        raise ValueError("a slot cannot receive more rows than the group has tokens")
+
+
+def slot_topk(per_slot_rows: list[int], ep_size: int, num_tokens: int, top_k: int) -> Any:
+    """``[ep_size, num_tokens, top_k]`` distinct slot ids whose histogram is
+    exactly ``per_slot_rows``.
+
+    The ``ep_size * num_tokens * top_k`` (token, k) pairs are filled column by
+    column (pair ``j`` is token ``j % N``, choice ``j // N``) with every slot
+    repeated by its row count. A slot never covers more than ``N`` consecutive
+    pairs, so a token never meets the same slot twice, whatever order the slots
+    come in. The slot order and the group tokens are shuffled (fixed seed), so
+    a slot's rows come from scattered tokens of every source rank and a
+    token's slots are unrelated, as with a real router; filling in slot order
+    instead gives each slot one contiguous run of tokens.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(_SEED)
+    n = ep_size * num_tokens
+    order = rng.permutation(len(per_slot_rows))
+    flat = np.repeat(order.astype(np.int64), np.asarray(per_slot_rows, dtype=np.int64)[order])
+    pairs = flat.reshape(top_k, n).T[rng.permutation(n)]  # [group token, k]
+    return pairs.reshape(ep_size, num_tokens, top_k)
 
 
 def _geometry(spec: dict) -> tuple:
@@ -154,7 +188,9 @@ def _per_rank_batch(
             for capacity, members in buckets.items():
                 layer.allocate(capacity)
                 for i in members:
-                    payloads[i] = layer.measure(int(specs[i]["num_tokens"]))
+                    payloads[i] = layer.measure(
+                        int(specs[i]["num_tokens"]), specs[i]["per_slot_rows"]
+                    )
         finally:
             layer.destroy()
         torch.cuda.empty_cache()
@@ -244,19 +280,25 @@ class _Layer:
             mma_type=MMA_TYPE,
         )
 
-    def _inputs(self, num_tokens: int) -> dict[str, Any]:
+    def _inputs(self, num_tokens: int, per_slot_rows: Any = None) -> dict[str, Any]:
         torch = self.torch
         generator = torch.Generator(device="cuda").manual_seed(_SEED * 7 + self.rank)
         x = torch.randn(
             (num_tokens, self.hidden), device="cuda", dtype=torch.bfloat16, generator=generator
         )
         x_fp8, x_sf, _ = _cast_fp8(torch, x)
-        # Uniform distinct slots, as DeepGEMM's store_random_topk_token draws them.
-        topk_idx = (
-            torch.rand((num_tokens, self.num_experts), device="cuda", generator=generator)
-            .topk(self.top_k, dim=1)
-            .indices
-        )
+        if per_slot_rows is None:
+            # Uniform distinct slots (the correctness check only).
+            topk_idx = (
+                torch.rand((num_tokens, self.num_experts), device="cuda", generator=generator)
+                .topk(self.top_k, dim=1)
+                .indices
+            )
+        else:
+            ids = slot_topk(
+                [int(r) for r in per_slot_rows], self.world_size, num_tokens, self.top_k
+            )[self.rank]
+            topk_idx = torch.from_numpy(ids.copy()).to(device="cuda", dtype=torch.int64)
         topk_weights = torch.rand(
             (num_tokens, self.top_k), device="cuda", dtype=torch.float, generator=generator
         )
@@ -361,7 +403,7 @@ class _Layer:
         self.check_diff = max(diffs)
 
     # ---- timing --------------------------------------------------------
-    def measure(self, num_tokens: int) -> dict:
+    def measure(self, num_tokens: int, per_slot_rows: Any) -> dict:
         import torch.distributed as dist
 
         from profiling.profilers.cupti_kernel_profiler import (
@@ -374,7 +416,7 @@ class _Layer:
         if num_tokens > self.buffer.num_max_tokens_per_rank:
             raise ValueError("num_tokens exceeds the symmetric buffer")
         block_m = self._block_m(num_tokens)
-        inputs = self._inputs(num_tokens)
+        inputs = self._inputs(num_tokens, per_slot_rows)
         y = torch.empty((num_tokens, self.hidden), device="cuda", dtype=torch.bfloat16)
         token = torch.zeros((1,), device="cuda")
 

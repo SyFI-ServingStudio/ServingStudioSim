@@ -2816,6 +2816,8 @@ pub fn build_iter_model(
             yoco_keep_tokens,
             engram_fetch,
             dp_size,
+            force_load_balance,
+            prefill_chunk_tokens,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2831,6 +2833,8 @@ pub fn build_iter_model(
                 *num_redundant_experts,
                 *yoco_keep_tokens,
                 *engram_fetch,
+                *force_load_balance,
+                *prefill_chunk_tokens,
             )?,
             *engram_fetch,
             *dp_size,

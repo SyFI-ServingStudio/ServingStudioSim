@@ -64,6 +64,7 @@ use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
@@ -140,6 +141,13 @@ pub struct DeepInferEngine {
     /// vLLM host-UVA lookup stands in. Off leaves the fetch out; the Engram
     /// blocks' own compute stays.
     pub engram_fetch: bool,
+    /// The benchmark's forced load balance: uniform random distinct slots
+    /// instead of the router's experts (`SlotPlacement::ForcedBalance`).
+    pub force_load_balance: bool,
+    /// A request's prompt chunk in a prefill batch: the length of the
+    /// contiguous corpus segments the mega MoE's routes are drawn in.
+    /// `None`: independent tokens.
+    pub prefill_chunk_tokens: Option<u32>,
 }
 
 /// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
@@ -221,6 +229,14 @@ pub fn build_configs(
             model.num_experts
         )));
     }
+    if parallel.deepinfer.is_some() {
+        // The mega MoE prices each layer from its own routes.
+        for layer in 0..model.num_layers {
+            demand
+                .layer(layer as usize)
+                .map_err(|err| fit_failed(format!("mega MoE demand: {err:#}")))?;
+        }
+    }
     let layer0_kind = model.layer_kind(0);
     if layer0_kind.engram || layer0_kind.attention.entry != DeepseekV41AttentionEntry::Layer0Pre {
         return Err(fit_failed("layer 0 must be the plain layer-0 entry"));
@@ -251,7 +267,10 @@ pub fn build_configs(
         }
         let mut layer = dp_layer_config(tp1, max_rank_tokens);
         if let Some(engine) = &parallel.deepinfer {
-            layer.mega = Some(mega_ffn_config(&layer.ffn, engine, max_rank_tokens));
+            layer.mega = Some(
+                mega_ffn_config(&layer.ffn, &layer.layers, engine, max_rank_tokens)
+                    .expect("every layer's demand was checked above"),
+            );
         }
         layer
     };
@@ -270,7 +289,10 @@ pub fn build_configs(
     };
     let (replay, late_bodies) = if replay_on {
         let mut rule = BoundedReplay::from_model(model)?;
-        if let Some(keep) = parallel.deepinfer.and_then(|engine| engine.yoco_keep_tokens) {
+        if let Some(keep) = parallel
+            .deepinfer
+            .and_then(|engine| engine.yoco_keep_tokens)
+        {
             if keep < rule.window {
                 return Err(fit_failed(format!(
                     "yoco_keep_tokens {keep} must cover the sliding window {}",
@@ -312,17 +334,20 @@ pub fn build_configs(
             all_reduce_backends: tp_arch::ALL_REDUCE_BACKENDS.to_vec(),
             elementwise_backends: tp_arch::ELEMENTWISE_BACKENDS.to_vec(),
         },
-        engram_prefetch: parallel.deepinfer.map_or(true, |engine| engine.engram_fetch).then(|| DeepseekV41EngramPrefetchLocalWorkletConfig {
-            tp_size: 1,
-            engram_num_heads: model.engram_hash_heads,
-            engram_head_dim: model.engram_head_dim,
-            quant_block_size: 32,
-            table_rows: ENGRAM_TABLE_ROWS_TP1,
-            residency: "host_uva".into(),
-            weight_dtype: DType::Fp8E4m3,
-            gpu_name: gpu.clone(),
-            backends: tp_arch::ENGRAM_LOOKUP_BACKENDS.to_vec(),
-        }),
+        engram_prefetch: parallel
+            .deepinfer
+            .map_or(true, |engine| engine.engram_fetch)
+            .then(|| DeepseekV41EngramPrefetchLocalWorkletConfig {
+                tp_size: 1,
+                engram_num_heads: model.engram_hash_heads,
+                engram_head_dim: model.engram_head_dim,
+                quant_block_size: 32,
+                table_rows: ENGRAM_TABLE_ROWS_TP1,
+                residency: "host_uva".into(),
+                weight_dtype: DType::Fp8E4m3,
+                gpu_name: gpu.clone(),
+                backends: tp_arch::ENGRAM_LOOKUP_BACKENDS.to_vec(),
+            }),
         layer0: dp_layer(layer0_kind, vec![0]),
         bodies,
         plan,
@@ -378,9 +403,10 @@ fn deepinfer_backends(tp1: &mut DeepseekV41LayerConfig) {
 /// logical experts plus the EPLB redundant slots.
 fn mega_ffn_config(
     vllm: &DeepseekV41MoeFfnDpEpWorkletConfig,
+    layers: &[u32],
     engine: &DeepInferEngine,
     max_rank_tokens: u32,
-) -> DeepseekV41MegaMoeFfnDpEpWorkletConfig {
+) -> std::result::Result<DeepseekV41MegaMoeFfnDpEpWorkletConfig, BuildError> {
     let f = &vllm.ffn;
     let intermediate = f.moe_intermediate_size.get();
     assert_eq!(
@@ -388,7 +414,7 @@ fn mega_ffn_config(
         0,
         "the shared expert must be whole experts of the routed width"
     );
-    DeepseekV41MegaMoeFfnDpEpWorkletConfig {
+    Ok(DeepseekV41MegaMoeFfnDpEpWorkletConfig {
         ep_size: f.ep_size,
         hidden_size: f.hidden_size.clone(),
         hc_mult: f.hc_mult,
@@ -406,7 +432,30 @@ fn mega_ffn_config(
         mega_gate_backends: DEEPINFER_MEGA_GATE_BACKENDS.to_vec(),
         mega_moe_backends: DEEPINFER_MEGA_MOE_BACKENDS.to_vec(),
         elementwise_backends: f.elementwise_backends.clone(),
-    }
+        // Every layer routes and is placed from its own history.
+        layer_demands: layers
+            .iter()
+            .map(|&layer| {
+                let demand = match engine.prefill_chunk_tokens {
+                    Some(chunk) => f.expert_demand.with_group_size(chunk),
+                    None => f.expert_demand.clone(),
+                };
+                demand
+                    .layer(layer as usize)
+                    .map_err(|err| fit_failed(format!("mega MoE demand: {err:#}")))
+            })
+            .collect::<std::result::Result<_, _>>()?,
+        placement: if engine.force_load_balance {
+            SlotPlacement::ForcedBalance {
+                num_redundant: engine.num_redundant_experts,
+            }
+        } else {
+            // DeepInfer's EPLB over its redundant slots.
+            SlotPlacement::Eplb {
+                num_redundant: engine.num_redundant_experts,
+            }
+        },
+    })
 }
 
 pub struct DeepseekV41DpLayerResolved {
@@ -462,7 +511,9 @@ pub(crate) fn resolve_layer(config: &DeepseekV41DpLayerConfig) -> DeepseekV41DpL
             .map(DeepseekV41EngramTpWorklet::resolve_config),
         attention: DeepseekV41AttentionTpWorklet::resolve_config(&config.attention),
         ffn: match &config.mega {
-            Some(mega) => DpFfnResolved::Mega(DeepseekV41MegaMoeFfnDpEpWorklet::resolve_config(mega)),
+            Some(mega) => {
+                DpFfnResolved::Mega(DeepseekV41MegaMoeFfnDpEpWorklet::resolve_config(mega))
+            }
             None => DpFfnResolved::Vllm(DeepseekV41MoeFfnDpEpWorklet::resolve_config(&config.ffn)),
         },
     }
@@ -525,9 +576,11 @@ impl DpLayerBody {
                 bridge,
             )?,
             ffn: match resolved.ffn {
-                DpFfnResolved::Vllm(ffn) => {
-                    DpFfn::Vllm(DeepseekV41MoeFfnDpEpWorklet::build(format!("{name}.ffn"), ffn, bridge)?)
-                }
+                DpFfnResolved::Vllm(ffn) => DpFfn::Vllm(DeepseekV41MoeFfnDpEpWorklet::build(
+                    format!("{name}.ffn"),
+                    ffn,
+                    bridge,
+                )?),
                 DpFfnResolved::Mega(ffn) => DpFfn::Mega(DeepseekV41MegaMoeFfnDpEpWorklet::build(
                     format!("{name}.ffn"),
                     ffn,
@@ -1252,7 +1305,10 @@ pub(crate) fn normalize_dp_steps(
     // MRV2 builds an idle rank's dummy batch with every row marked padding
     // (`InputBatch.make_dummy(..., is_padding=not is_profile)`): nothing it
     // runs is scheduled.
-    let idle: Vec<bool> = steps.iter().map(|&step| std::ptr::eq(step, &dummy)).collect();
+    let idle: Vec<bool> = steps
+        .iter()
+        .map(|&step| std::ptr::eq(step, &dummy))
+        .collect();
     let unscheduled = |mut layer: LayerInput, idle: bool| {
         if idle {
             layer.scheduled_rows = 0;
@@ -1265,7 +1321,10 @@ pub(crate) fn normalize_dp_steps(
             .zip(&rows)
             .zip(&idle)
             .map(|((step, &rows), &idle)| {
-                unscheduled(layer_input(mode, rows, step.prefill.clone(), &step.decode), idle)
+                unscheduled(
+                    layer_input(mode, rows, step.prefill.clone(), &step.decode),
+                    idle,
+                )
             })
             .collect(),
     );
@@ -1455,7 +1514,15 @@ mod tests {
         assert_eq!(resolved.head.lm_head.n.get(), 129_280);
         assert!(resolved.head.logits_all_gather.is_none());
         assert!(resolved.prologue.embedding_all_reduce.is_none());
-        assert_eq!(resolved.engram_prefetch.as_ref().unwrap().lookup.local_heads, 24);
+        assert_eq!(
+            resolved
+                .engram_prefetch
+                .as_ref()
+                .unwrap()
+                .lookup
+                .local_heads,
+            24
+        );
         let engram = resolved.bodies[0].engram.as_ref().unwrap();
         assert!(engram.all_gather.is_none());
     }
@@ -1467,13 +1534,18 @@ mod tests {
             num_redundant_experts: 32,
             yoco_keep_tokens: Some(140),
             engram_fetch: false,
+            force_load_balance: false,
+            prefill_chunk_tokens: None,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
         assert!(configs.engram_prefetch.is_none());
         assert_eq!(configs.replay.as_ref().unwrap().rule.window, 140);
         for body in configs.bodies.iter().chain([&configs.layer0]) {
             let mega = body.mega.as_ref().unwrap();
-            assert_eq!((mega.num_physical_experts, mega.num_shared_experts), (416, 1));
+            assert_eq!(
+                (mega.num_physical_experts, mega.num_shared_experts),
+                (416, 1)
+            );
             assert_eq!(mega.num_logical_experts.get(), 384);
             assert_eq!(body.attention.gemm_backends, DEEPINFER_GEMM_BACKENDS);
             // The kernels both engines share keep the fork's backends.
@@ -1484,12 +1556,18 @@ mod tests {
             num_redundant_experts: 30,
             yoco_keep_tokens: Some(140),
             engram_fetch: true,
+            force_load_balance: false,
+            prefill_chunk_tokens: None,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
     }
 
     fn configs_vllm_mega_attn() -> Vec<&'static str> {
-        build_configs(&cfg(), &parallel(), &uniform_demand()).unwrap().layer0.attention.mega_attn_backends
+        build_configs(&cfg(), &parallel(), &uniform_demand())
+            .unwrap()
+            .layer0
+            .attention
+            .mega_attn_backends
     }
 
     #[test]

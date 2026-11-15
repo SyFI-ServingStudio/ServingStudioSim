@@ -6,11 +6,14 @@
 //! and the fused shared expert. DeepInfer calls it once per MoE layer
 //! (`v4_modules/mlp.py` `mega_moe_forward`).
 //!
-//! The query is the per-rank token count; every rank carries the same count
-//! and routing is uniform over the physical slots (DeepInfer's load-balanced
-//! mode), so the profiled time is the layer's time on any rank. The kernel's
-//! tile choice (`get_block_m_for_mega_moe`) follows from `ep_size`,
-//! `num_experts`, `top_k` and the token count, all in the key.
+//! The query is the per-rank token count. The key also carries the rows every
+//! physical slot of the group receives (`per_slot_rows`), drawn from the
+//! deployment's expert demand and placed by its [`SlotPlacement`]: a rank's
+//! work is its slots' M blocks (`ceil(rows / block_m)` per slot, DeepGEMM
+//! `scheduler/mega_moe.cuh`) plus the shared expert on its own tokens, and
+//! the combine waits for every peer, so the slowest rank sets the layer's
+//! time. The tile (`get_block_m_for_mega_moe`) follows from `ep_size`,
+//! `num_experts`, `top_k` and the token count only, all in the key.
 //!
 //! `max_tokens_per_rank` (the symmetric buffer's capacity, a kernel template
 //! argument) only bounds the token axis; it is not a profiler key because an
@@ -18,6 +21,8 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -46,6 +51,10 @@ pub struct MegaMoeKernelConfig {
     /// Largest per-rank token count the deployment runs (the symmetric
     /// buffer's capacity). Bounds the token axis only.
     pub max_tokens_per_rank: u32,
+    /// Where the routed rows come from (over the logical experts).
+    pub expert_demand: ExpertDemand,
+    /// How the logical experts sit on the `num_experts` physical slots.
+    pub placement: SlotPlacement,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -84,7 +93,9 @@ impl KernelSpec for MegaMoeSpec {
     const KIND: KernelKind = "mega_moe";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![token_points(config.max_tokens_per_rank)])
+        SweepGrid::new(vec![config
+            .expert_demand
+            .token_axis(token_points(config.max_tokens_per_rank))])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -109,7 +120,17 @@ impl KernelSpec for MegaMoeSpec {
             config.max_tokens_per_rank >= 1,
             "max_tokens_per_rank must be positive"
         );
-        Ok(())
+        let slots = config
+            .placement
+            .num_slots(config.expert_demand.num_experts());
+        anyhow::ensure!(
+            slots == config.num_experts as usize,
+            "{:?} over {} experts gives {slots} slots, config has {}",
+            config.placement,
+            config.expert_demand.num_experts(),
+            config.num_experts
+        );
+        config.expert_demand.prepare().map(|_| ())
     }
 
     fn enumerate(
@@ -117,6 +138,19 @@ impl KernelSpec for MegaMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        // The group's histogram at the group's token count; drawn for the
+        // whole axis at once (see `ExpertDemand::per_slot_batches`).
+        let global: Vec<u32> = grid.expand_1d(|num_tokens| num_tokens as u32 * config.ep_size);
+        let mut slots = config
+            .expert_demand
+            .per_slot_batches(
+                config.top_k,
+                &global,
+                config.placement,
+                config.ep_size as usize,
+            )
+            .expect("validate_config proved this source readable")
+            .into_iter();
         grid.expand_1d(|num_tokens| {
             ArgsPayload::new()
                 .with("backend", backend)
@@ -129,6 +163,10 @@ impl KernelSpec for MegaMoeSpec {
                 .with("top_k", config.top_k)
                 .with("activation_dtype", config.activation_dtype.as_str())
                 .with("weight_dtype", config.weight_dtype.as_str())
+                .with(
+                    "per_slot_rows",
+                    slots.next().expect("one histogram per grid point"),
+                )
         })
     }
 }
@@ -153,6 +191,11 @@ mod tests {
             activation_dtype: DType::Mxfp8E4m3,
             weight_dtype: DType::Mxfp4E2m1,
             max_tokens_per_rank,
+            expert_demand: ExpertDemand::popularity(
+                &crate::timing::routing::RoutingDistribution::uniform(384),
+                2,
+            ),
+            placement: SlotPlacement::Eplb { num_redundant: 32 },
         }
     }
 
@@ -180,10 +223,19 @@ mod tests {
                 "num_experts",
                 "num_shared_experts",
                 "num_tokens",
+                "per_slot_rows",
                 "top_k",
                 "weight_dtype",
             ]
         );
+        let rows: Vec<u64> = fields["per_slot_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(rows.len(), 416);
+        assert_eq!(rows.iter().sum::<u64>(), 140 * 4 * 6);
         assert_eq!(fields["num_tokens"], Value::from(140_u32));
         assert_eq!(fields["weight_dtype"], Value::from("mxfp4_e2m1"));
     }
@@ -199,6 +251,15 @@ mod tests {
         assert_eq!(token_points(65536).last(), Some(&65536.0));
         assert_eq!(token_points(1_000_000).last(), Some(&131072.0));
         assert!(token_points(1_000_000).len() <= 500);
+    }
+
+    #[test]
+    fn config_rejects_slots_the_placement_does_not_make() {
+        let mut config = dsv41_flash_ep4(4096);
+        config.placement = SlotPlacement::Contiguous;
+        assert!(MegaMoeSpec::validate_config(&config).is_err());
+        config.num_experts = 384;
+        assert!(MegaMoeSpec::validate_config(&config).is_ok());
     }
 
     #[test]

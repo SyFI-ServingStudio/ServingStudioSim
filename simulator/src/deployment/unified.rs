@@ -628,6 +628,8 @@ impl Deployment for UnifiedDeployment {
                 yoco_keep_tokens,
                 engram_fetch,
                 dp_size,
+                force_load_balance,
+                prefill_chunk_tokens,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
@@ -647,6 +649,8 @@ impl Deployment for UnifiedDeployment {
                         *num_redundant_experts,
                         *yoco_keep_tokens,
                         *engram_fetch,
+                        *force_load_balance,
+                        *prefill_chunk_tokens,
                     )?,
                     *engram_fetch,
                     *dp_size,

@@ -125,14 +125,19 @@ pub fn deepseek_v41_dp_engine(
     num_redundant_experts: u32,
     yoco_keep_tokens: u32,
     engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+    force_load_balance: bool,
+    prefill_chunk_tokens: u32,
 ) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
     let engram_fetch = engram_fetch != crate::arch::deepseek_v41_engram_fetch::EngramFetch::Off;
     match engine {
         DeepseekV41Engine::Vllm => {
             anyhow::ensure!(
-                num_redundant_experts == 0 && yoco_keep_tokens == 0,
-                "num_redundant_experts and yoco_keep_tokens are DeepInfer options; set \
-                 engine: deepinfer"
+                num_redundant_experts == 0
+                    && yoco_keep_tokens == 0
+                    && !force_load_balance
+                    && prefill_chunk_tokens == 0,
+                "num_redundant_experts, yoco_keep_tokens, force_load_balance and \
+                 prefill_chunk_tokens are DeepInfer options; set engine: deepinfer"
             );
             Ok(None)
         }
@@ -141,6 +146,8 @@ pub fn deepseek_v41_dp_engine(
                 num_redundant_experts,
                 yoco_keep_tokens: (yoco_keep_tokens > 0).then_some(yoco_keep_tokens),
                 engram_fetch,
+                force_load_balance,
+                prefill_chunk_tokens: (prefill_chunk_tokens > 0).then_some(prefill_chunk_tokens),
             }))
         }
     }
@@ -634,6 +641,21 @@ pub enum IterArchSel {
         #[serde(default = "default_deepseek_v41_dp_size")]
         #[param(default = 4, cache_key)]
         dp_size: u32,
+        /// DeepInfer only: its benchmark's `DEEPINFER_FORCE_LOAD_BALANCE=1`
+        /// (`examples/benchmark.py`): every token takes top-k distinct slots
+        /// uniformly at random instead of the router's experts. For
+        /// reproducing DeepInfer's own benchmark numbers only.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        force_load_balance: bool,
+        /// DeepInfer only, `routing: corpus`: the tokens one request
+        /// contributes to a prefill batch (its prompt chunk). The mega MoE
+        /// draws a batch's routes as contiguous corpus segments of this
+        /// length, because one request's tokens route alike; 0 draws
+        /// independent tokens.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        prefill_chunk_tokens: u32,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

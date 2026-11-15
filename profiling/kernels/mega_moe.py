@@ -24,10 +24,15 @@ less than the 0.9% between two runs at one capacity. The tile size
 (``get_block_m_for_mega_moe``) is a function of ``ep_size``, ``num_experts``,
 ``top_k`` and ``num_tokens`` only, all of which are in the key.
 
-Routing follows DeepInfer's load-balanced benchmark mode
-(``DEEPINFER_FORCE_LOAD_BALANCE=1`` -> DeepGEMM ``store_random_topk_token``):
-every token picks ``top_k`` distinct physical slots uniformly among all
-``num_experts``, so the per-rank load is balanced in expectation.
+Routing is an input: ``per_slot_rows`` gives the rows every physical slot of
+the group receives (rank ``r`` owns slots ``[r * L, (r + 1) * L)``, ``L =
+num_experts / ep_size``). DeepGEMM's scheduler (``scheduler/mega_moe.cuh``)
+gives each rank ``sum(ceil(rows / block_m))`` M blocks over its slots plus the
+shared expert's blocks on its own tokens, the dispatch pulls exactly those rows
+over NVLink, and the combine waits for every peer, so the slot histogram -- not
+the token count alone -- sets the time. The simulator draws it from the
+deployment's routing and expert placement (EPLB replicas included); the runner
+builds top-k ids that realize it exactly.
 """
 
 from __future__ import annotations
@@ -52,7 +57,9 @@ KIND = "mega_moe"
 class MegaMoeArgs(KernelArgs):
     ep_size: int = arg(
         unit="GPUs",
-        doc="GPUs in the expert-parallel group; 1 runs every expert on one GPU (no NVLink traffic).",
+        doc=(
+            "GPUs in the expert-parallel group; 1 runs every expert on one GPU (no NVLink traffic)."
+        ),
     )
     num_tokens: int = arg(
         unit="tokens",
@@ -82,6 +89,13 @@ class MegaMoeArgs(KernelArgs):
             "shared expert's weights are mxfp8_e4m3."
         )
     )
+    per_slot_rows: tuple[int, ...] = arg(
+        unit="rows",
+        doc=(
+            "Rows each physical slot receives over the whole group, rank-major "
+            "(num_experts entries summing to ep_size * num_tokens * top_k)."
+        ),
+    )
 
 
 DOC = KernelDoc(
@@ -98,15 +112,16 @@ DOC = KernelDoc(
         "down GEMM, sends each result row back to its source GPU and sums the top-k "
         "rows there. The shared expert runs on the GPU's own tokens inside the same "
         "launch. Activations are MXFP8, routed weights MXFP4, the output bf16. "
-        "Tokens pick their slots uniformly at random, as DeepInfer's load-balanced "
-        "mode does, so every GPU receives about num_tokens x top_k rows."
+        "The rows each slot receives are an input, drawn from the deployment's "
+        "routing and expert placement, so a skewed router or an unbalanced "
+        "placement loads the busiest GPU as it does in serving."
     ),
     category="MoE",
     subcategory="Expert compute",
     formula=(
-        "routed rows per GPU ~ num_tokens · top_k",
-        "FLOPs per GPU = 6 · hidden_size · intermediate_size · num_tokens · "
-        "(top_k + num_shared_experts)",
+        "routed rows of GPU r = sum(per_slot_rows[r·L:(r+1)·L]), L = num_experts / ep_size",
+        "FLOPs per GPU = 6 · hidden_size · intermediate_size · "
+        "(routed rows + num_tokens · num_shared_experts)",
         "bytes per GPU = touched local expert weights + shared weights + routed "
         "activations (fp8 in, fp8 intermediate, bf16 out) + bf16 output",
     ),
@@ -118,8 +133,8 @@ DOC = KernelDoc(
         "time in that launch."
     ),
     caveats=(
-        "Routing is uniform over the physical slots (balanced in expectation); a "
-        "skewed router loads some GPUs more than this measures.",
+        "Which source GPU a routed row comes from is not an input: the runner "
+        "spreads each slot's rows over the source GPUs round-robin.",
         "Every GPU runs the same token count; unequal per-GPU counts are not measured.",
         "Energy is the mean per-GPU energy of back-to-back launches.",
     ),

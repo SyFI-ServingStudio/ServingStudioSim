@@ -14,7 +14,8 @@
 //! expert, all-gather, reduce-scatter or residual add (DeepInfer capture,
 //! `wt-dsv41-deepinfer/logs/20261114_2_deepinfer_prefill/nsys`). Its EP group
 //! synchronizes inside the kernel, so the group section is one leaf priced at
-//! the busiest rank's token count.
+//! the busiest rank's token count, with every slot's rows drawn from the
+//! routed demand under DeepInfer's EPLB placement.
 //!
 
 use std::sync::Arc;
@@ -25,10 +26,13 @@ use super::deepseek_v41_common::{
 use super::deepseek_v41_moe_ffn_dp_ep::{
     DeepseekV41MoeFfnDpEpWorkletInput, DeepseekV41MoeFfnDpRankInput,
 };
+use crate::op::moe::MegaMoeLayersOp;
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::{
-    MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaMoeKernel, MegaMoeKernelConfig,
+    MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaMoeKernelConfig,
     MegaMoeKernelInput, MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput,
 };
@@ -57,6 +61,10 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletConfig {
     pub mega_gate_backends: Vec<&'static str>,
     pub mega_moe_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// Each layer this body stands for, its routed demand over the logical
+    /// experts; with the placement it sets every rank's rows in that layer.
+    pub layer_demands: Vec<ExpertDemand>,
+    pub placement: SlotPlacement,
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +73,8 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletResolved {
     pub entry: MhcRmsNormKernelConfig,
     pub mhc_overlap: MhcOverlapBoundaryResolved,
     pub gate: MegaGateKernelConfig,
-    pub mega_moe: MegaMoeKernelConfig,
+    /// One config per layer the body stands for.
+    pub mega_moe: Vec<MegaMoeKernelConfig>,
 }
 
 pub struct DeepseekV41MegaMoeFfnDpEpWorklet {
@@ -73,7 +82,7 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorklet {
     pub entry: Op<MhcFusedPostPreRmsNormKernel>,
     pub mhc_overlap: MhcOverlapBoundary,
     pub gate: Op<MegaGateKernel>,
-    pub mega_moe: Op<MegaMoeKernel>,
+    pub mega_moe: MegaMoeLayersOp,
     resolved: DeepseekV41MegaMoeFfnDpEpWorkletResolved,
 }
 
@@ -117,7 +126,10 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
                 dtype: DType::Bf16,
                 max_tokens_per_rank: cfg.max_rank_tokens,
             },
-            mega_moe: MegaMoeKernelConfig {
+            mega_moe: cfg
+                .layer_demands
+                .iter()
+                .map(|demand| MegaMoeKernelConfig {
                 backends: cfg.mega_moe_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 ep_size: cfg.ep_size,
@@ -130,7 +142,10 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
                 activation_dtype: DType::Mxfp8E4m3,
                 weight_dtype: DType::Mxfp4E2m1,
                 max_tokens_per_rank: cfg.max_rank_tokens,
-            },
+                expert_demand: demand.clone(),
+                placement: cfg.placement,
+            })
+                .collect(),
             raw_cfg: cfg.clone(),
         }
     }
@@ -162,7 +177,7 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
                 bridge,
             )?,
             gate: op!(MegaGateKernel, r.gate, "routed.mega_gate"),
-            mega_moe: op!(MegaMoeKernel, r.mega_moe, "routed.mega_moe"),
+            mega_moe: MegaMoeLayersOp::build(format!("{name}.routed.mega_moe"), &r.mega_moe, bridge)?,
             name,
             resolved,
         })
@@ -230,14 +245,14 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             .map(|rank| rank.num_tokens)
             .max()
             .unwrap_or(0);
-        eval_or_zero(
-            &self.mega_moe,
-            MegaMoeKernelInput {
-                num_tokens: busiest,
-            },
-            busiest == 0,
-            ev,
-        );
+        let group = MegaMoeKernelInput {
+            num_tokens: busiest,
+        };
+        if busiest == 0 {
+            self.mega_moe.eval_zero(&group, ev);
+        } else {
+            self.mega_moe.eval(&group, ev);
+        }
         for rank in &input.ranks {
             let live = rank.num_tokens > 0 && rank.mhc_overlap;
             self.mhc_overlap.eval_side(rank.num_tokens, live, false, ev);
