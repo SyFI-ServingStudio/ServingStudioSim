@@ -14,6 +14,11 @@ uses the same engine choices over the PP arch's vLLM defaults:
   loading area of 10% of HBM (`st10`). Staged reads take no read-wait bound (the engine does not use it either,
   `engine/scheduler.py`); the bound applies only to the unstaged reads of `check_tier_read.yaml`.
 
+`ssengine.yaml` is SSEngine as built (128-token pages, the compact KDA state, two kept states) with every mechanism
+its own key; `ssengine.md` gives each key's engine source and the key an ablation changes. The other presets keep
+the simulator's default KV accounting (`kv_overhead: vllm`: 8,576-token blocks, the KDA state padded to whole
+blocks, one kept state), as in the evaluation (eval_m6.md, engine a78dc6f).
+
 KV budget in HBM is 100.18 GB per GPU (149.84 GB minus the largest stage's NVFP4 weights) unless a preset says
 otherwise. Run any preset from the repository root:
 `uv run python -m launcher presets/glm53_flash_prefill/<preset> --no-gpu`
@@ -21,6 +26,7 @@ otherwise. Run any preset from the repository root:
 
 | Preset | What it runs |
 | --- | --- |
+| `ssengine.yaml` | SSEngine as built, v3 M6 sessions, N = 300, full setting: the one preset each ablation changes |
 | `iteration_predict.json` | One iteration of fresh prefill, 1k-32k tokens, and the four 32k chunks of a 128k prompt |
 | `check_single_request.yaml` | One request alone, 1k-128k tokens, five per length |
 | `check_saturated.yaml` | A batch of same-length requests all at t = 0, 1k-128k tokens |

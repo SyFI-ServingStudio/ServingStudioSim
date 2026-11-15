@@ -37,7 +37,7 @@ def _missing_traces(member: dict) -> list[str]:
 
 def test_the_presets_are_there():
     names = {path.stem for path in PRESETS}
-    assert {"check_scheduler_order", "check_tier_read", "v3_m6_full"} <= names
+    assert {"ssengine", "check_scheduler_order", "check_tier_read", "v3_m6_full"} <= names
 
 
 @pytest.mark.presets
