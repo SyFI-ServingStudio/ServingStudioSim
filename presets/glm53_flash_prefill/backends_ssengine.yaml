@@ -1,0 +1,229 @@
+# SSEngine's kernel backends on the PP stage pool: every role of the PP arch, as the launcher requires, at its
+# vLLM default (`--emit-backends`) except SSEngine's choices: FlashInfer persistent KDA chunked prefill, Dao
+# channel-last short conv, DeepGEMM mega mHC on every fused post/pre boundary, and the DSA top-k per launch the
+# faster of DeepSelect and vLLM (a launch packing several requests runs on vLLM only, which takes row starts).
+# The timing-predict config carries the same choices under the `unified.` roles (iteration_predict.json).
+backends:
+  stage/pp.first_kda_dense.attn_mhc_pre:
+  - vllm_tilelang
+  stage/pp.first_kda_dense.kda.in_proj:
+  - torch_linear_vllm
+  stage/pp.first_kda_dense.kda.f_b_proj:
+  - torch_linear_vllm
+  stage/pp.first_kda_dense.kda.g_b_proj:
+  - torch_linear_vllm
+  stage/pp.first_kda_dense.kda.short_conv_prefill:
+  - dao_channellast
+  stage/pp.first_kda_dense.kda.short_conv_decode:
+  - vllm_triton
+  stage/pp.first_kda_dense.kda.prefill_glue:
+  - triton
+  stage/pp.first_kda_dense.kda.state_gather:
+  - triton
+  stage/pp.first_kda_dense.kda.chunk_prefill:
+  - flashinfer_cute_persistent
+  stage/pp.first_kda_dense.kda.recurrent_decode:
+  - vllm_triton
+  stage/pp.first_kda_dense.kda.state_scatter:
+  - triton
+  stage/pp.first_kda_dense.kda.gated_norm:
+  - triton
+  stage/pp.first_kda_dense.kda.o_proj:
+  - torch_linear_vllm
+  stage/pp.first_kda_dense.dense_ffn.gate_up_input_quant:
+  - vllm_cuda
+  stage/pp.first_kda_dense.dense_ffn.gate_up:
+  - flashinfer_cutedsl
+  stage/pp.first_kda_dense.dense_ffn.act_and_mul:
+  - triton
+  stage/pp.first_kda_dense.dense_ffn.down_input_quant:
+  - vllm_cuda
+  stage/pp.first_kda_dense.dense_ffn.down:
+  - flashinfer_cutedsl
+  stage/pp.first_kda_dense.ffn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.kda_dense.attn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.kda_dense.kda.in_proj:
+  - torch_linear_vllm
+  stage/pp.kda_dense.kda.f_b_proj:
+  - torch_linear_vllm
+  stage/pp.kda_dense.kda.g_b_proj:
+  - torch_linear_vllm
+  stage/pp.kda_dense.kda.short_conv_prefill:
+  - dao_channellast
+  stage/pp.kda_dense.kda.short_conv_decode:
+  - vllm_triton
+  stage/pp.kda_dense.kda.prefill_glue:
+  - triton
+  stage/pp.kda_dense.kda.state_gather:
+  - triton
+  stage/pp.kda_dense.kda.chunk_prefill:
+  - flashinfer_cute_persistent
+  stage/pp.kda_dense.kda.recurrent_decode:
+  - vllm_triton
+  stage/pp.kda_dense.kda.state_scatter:
+  - triton
+  stage/pp.kda_dense.kda.gated_norm:
+  - triton
+  stage/pp.kda_dense.kda.o_proj:
+  - torch_linear_vllm
+  stage/pp.kda_dense.dense_ffn.gate_up_input_quant:
+  - vllm_cuda
+  stage/pp.kda_dense.dense_ffn.gate_up:
+  - flashinfer_cutedsl
+  stage/pp.kda_dense.dense_ffn.act_and_mul:
+  - triton
+  stage/pp.kda_dense.dense_ffn.down_input_quant:
+  - vllm_cuda
+  stage/pp.kda_dense.dense_ffn.down:
+  - flashinfer_cutedsl
+  stage/pp.kda_dense.ffn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.dsa_moe.attn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.dsa_moe.dsa.fused_qkv_a:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.q_kv_a_norm:
+  - vllm_triton
+  stage/pp.dsa_moe.dsa.q_b_proj:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.indexer.wq_b:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.indexer.wk_weights:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.indexer.head_weights:
+  - torch_cublas
+  stage/pp.dsa_moe.dsa.indexer.k_norm:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.q_fwht_quant:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.weight_scale:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.kpool_gate_score:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.indexer.prefill_gather:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.kpool_decode_update:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.kpool_prefill_write:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.kpool_tail_seed:
+  - triton
+  stage/pp.dsa_moe.dsa.indexer.mqa_logits_decode:
+  - deepgemm_fp8
+  stage/pp.dsa_moe.dsa.indexer.topk_decode:
+  - vllm_cuda
+  stage/pp.dsa_moe.dsa.indexer.mqa_logits_prefill:
+  - deepgemm_fp8
+  stage/pp.dsa_moe.dsa.indexer.topk_prefill:
+  - deep_select
+  - vllm_cuda
+  stage/pp.dsa_moe.dsa.indexer.expand_pools:
+  - triton
+  stage/pp.dsa_moe.dsa.q_absorb:
+  - torch_mla_q_absorb_no_rope
+  stage/pp.dsa_moe.dsa.q_concat:
+  - triton
+  stage/pp.dsa_moe.dsa.q_fp8_quant:
+  - triton
+  stage/pp.dsa_moe.dsa.sparse_mla.mla_cache_append:
+  - vllm_cuda
+  stage/pp.dsa_moe.dsa.sparse_mla.index_remap:
+  - vllm_triton
+  stage/pp.dsa_moe.dsa.sparse_mla.prefill:
+  - flashinfer_trtllm_fp8
+  stage/pp.dsa_moe.dsa.sparse_mla.decode:
+  - flashinfer_trtllm_fp8
+  stage/pp.dsa_moe.dsa.output_copy:
+  - triton
+  stage/pp.dsa_moe.dsa.v_up:
+  - torch_mla_v_up_unpadded
+  stage/pp.dsa_moe.dsa.o_proj:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.dsa.glue:
+  - triton
+  stage/pp.dsa_moe.dsa.prefill_glue:
+  - triton
+  stage/pp.dsa_moe.moe.router.gate:
+  - torch_cublas
+  stage/pp.dsa_moe.moe.router.gate_recompute:
+  - torch_cublas
+  stage/pp.dsa_moe.moe.input_glue:
+  - triton
+  stage/pp.dsa_moe.moe.shared_expert.gate_up:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.moe.shared_expert.act_and_mul:
+  - triton
+  stage/pp.dsa_moe.moe.shared_expert.down:
+  - torch_linear_vllm
+  stage/pp.dsa_moe.moe.routed_rank0.input_quant:
+  - vllm_cuda
+  stage/pp.dsa_moe.moe.routed_rank0.fused_moe:
+  - flashinfer_trtllm_sm100
+  stage/pp.dsa_moe.moe.combine_glue:
+  - triton
+  stage/pp.dsa_moe.ffn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.kda_moe.attn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.kda_moe.kda.in_proj:
+  - torch_linear_vllm
+  stage/pp.kda_moe.kda.f_b_proj:
+  - torch_linear_vllm
+  stage/pp.kda_moe.kda.g_b_proj:
+  - torch_linear_vllm
+  stage/pp.kda_moe.kda.short_conv_prefill:
+  - dao_channellast
+  stage/pp.kda_moe.kda.short_conv_decode:
+  - vllm_triton
+  stage/pp.kda_moe.kda.prefill_glue:
+  - triton
+  stage/pp.kda_moe.kda.state_gather:
+  - triton
+  stage/pp.kda_moe.kda.chunk_prefill:
+  - flashinfer_cute_persistent
+  stage/pp.kda_moe.kda.recurrent_decode:
+  - vllm_triton
+  stage/pp.kda_moe.kda.state_scatter:
+  - triton
+  stage/pp.kda_moe.kda.gated_norm:
+  - triton
+  stage/pp.kda_moe.kda.o_proj:
+  - torch_linear_vllm
+  stage/pp.kda_moe.moe.router.gate:
+  - torch_cublas
+  stage/pp.kda_moe.moe.router.gate_recompute:
+  - torch_cublas
+  stage/pp.kda_moe.moe.input_glue:
+  - triton
+  stage/pp.kda_moe.moe.shared_expert.gate_up:
+  - torch_linear_vllm
+  stage/pp.kda_moe.moe.shared_expert.act_and_mul:
+  - triton
+  stage/pp.kda_moe.moe.shared_expert.down:
+  - torch_linear_vllm
+  stage/pp.kda_moe.moe.routed_rank0.input_quant:
+  - vllm_cuda
+  stage/pp.kda_moe.moe.routed_rank0.fused_moe:
+  - flashinfer_trtllm_sm100
+  stage/pp.kda_moe.moe.combine_glue:
+  - triton
+  stage/pp.kda_moe.ffn_mhc_post_pre:
+  - deepgemm_mega_nonshifted
+  stage/pp.embedding:
+  - triton
+  stage/pp.hc_expand:
+  - triton
+  stage/pp.final_mhc_post.fused_reference:
+  - vllm_tilelang
+  stage/pp.final_mhc_post.pre_reference:
+  - vllm_tilelang
+  stage/pp.hc_contract_mean:
+  - triton
+  stage/pp.final_norm:
+  - vllm_cuda
+  stage/pp.lm_head:
+  - torch_linear_vllm
+  stage/pp_activation_transfer:
+  - nccl
