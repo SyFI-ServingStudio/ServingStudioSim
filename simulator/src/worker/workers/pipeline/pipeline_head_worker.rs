@@ -168,6 +168,10 @@ where
             active_requests: self.kv_store.status_active(0),
         }
     }
+
+    fn retained_prefix_tokens(&self, session_input: crate::common::SessionInput) -> u32 {
+        self.kv_store.retained_prefix_tokens(session_input)
+    }
 }
 
 impl<K, A, E> PipelineHeadWorker<K, A, E>

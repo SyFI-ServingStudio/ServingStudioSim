@@ -23,7 +23,7 @@
 //!
 //! [`PipelineHeadWorker`]: crate::worker::workers::pipeline::PipelineHeadWorker
 
-use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, Request, RequestId, SessionInput, SharedRequests, Time, WorkerId};
 use crate::worker::{
     CostSource, GpuCluster, IterWorker, PipelineHeadEvent, PipelineHeadMsg, PipelineStageEvent,
     PipelineStageMsg, SharedGpuCluster,
@@ -32,6 +32,7 @@ use crate::worker::{
 use std::collections::HashMap;
 
 use super::super::{Flow, OrchAction};
+use super::simple_dp::session_affine_worker;
 
 /// The single pool of a `pp` deployment.
 pub const PP_STAGE_POOL: PoolId = PoolId(0);
@@ -128,16 +129,30 @@ where
         }
     }
 
-    /// Place `request`, whose prompt has `prompt_tokens` tokens to prefill. A
-    /// session's later rounds go where its first went.
-    pub fn admit(&mut self, request: RequestId, prompt_tokens: u64, session: Option<u32>) {
-        let sticky = session.and_then(|session| self.session_replica.get(&session).copied());
-        let replica = sticky.unwrap_or_else(|| self.place(prompt_tokens));
-        if let Some(session) = session {
+    /// Place `request`, whose prompt has `prompt_tokens` tokens to prefill:
+    /// on the replica whose head retains the most of the session's prefix,
+    /// else where the session's earlier rounds went, else by the placement
+    /// policy.
+    pub fn admit(&mut self, request: RequestId, prompt_tokens: u64, session_input: SessionInput) {
+        let replica = self.choose_replica(prompt_tokens, session_input);
+        if let Some(session) = session_input.session_id() {
             self.session_replica.insert(session, replica);
         }
         self.assigned.insert(request, (replica, prompt_tokens));
         self.route_to_head(replica, PipelineHeadMsg::Request(request));
+    }
+
+    /// The replica for a prompt of `prompt_tokens` tokens of `session_input`
+    /// (see [`Self::admit`]).
+    fn choose_replica(&mut self, prompt_tokens: u64, session_input: SessionInput) -> usize {
+        let session = session_input.session_id();
+        let retained = self
+            .replicas
+            .iter()
+            .map(|pipeline| pipeline.head.retained_prefix_tokens(session_input));
+        session_affine_worker(retained)
+            .or_else(|| session.and_then(|session| self.session_replica.get(&session).copied()))
+            .unwrap_or_else(|| self.place(prompt_tokens))
     }
 
     fn place(&mut self, prompt_tokens: u64) -> usize {
@@ -346,7 +361,7 @@ where
     fn on_arrival(&mut self, req: Request) {
         let id = req.core.id;
         let prompt_tokens = u64::from(req.definition.prompt_tokens);
-        let session = req.definition.session.session_id();
+        let session = req.definition.session;
         self.requests.borrow_mut().insert(req);
         self.stage_pool.admit(id, prompt_tokens, session);
     }
@@ -585,5 +600,44 @@ mod tests {
                 (RequestId(1), Time::from_ms(2.0)),
             ]
         );
+    }
+
+    fn session(session_id: u32, declared_prefix_tokens: u32) -> SessionInput {
+        SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens,
+        }
+    }
+
+    #[test]
+    fn a_session_turn_returns_to_the_replica_retaining_its_prefix() {
+        let (mut flow, _store) = build_flow(2, 2, 64);
+        let mut first = text_request(RequestId(0), 16, 1, Time::ZERO);
+        first.definition.session = session(7, 0);
+        flow.on_arrival(first);
+        run(&mut flow, 50, 0.1);
+        // Replica 0 now gets a queued request, so load alone would pick replica 1.
+        flow.on_arrival(text_request(RequestId(1), 16, 1, Time::from_ms(5.0)));
+        let pool = &mut flow.stage_pool;
+        let retained: Vec<u32> = pool
+            .replicas
+            .iter()
+            .map(|r| r.head.retained_prefix_tokens(session(7, 16)))
+            .collect();
+        assert!(retained[0] > 0 && retained[1] == 0, "{retained:?}");
+        assert_eq!(pool.choose_replica(16, SessionInput::Standalone), 1);
+        // The second turn must still go back to replica 0.
+        assert_eq!(pool.choose_replica(16, session(7, 16)), 0);
+        // A session with nothing retained (cold, or evicted everywhere) falls
+        // back to least-queued.
+        assert_eq!(pool.choose_replica(16, session(9, 16)), 1);
+    }
+
+    #[test]
+    fn session_affinity_picks_the_most_retained_worker_or_none() {
+        assert_eq!(session_affine_worker([0, 0]), None);
+        assert_eq!(session_affine_worker([0, 5, 5]), Some(1));
+        assert_eq!(session_affine_worker([3, 8, 2]), Some(1));
     }
 }
