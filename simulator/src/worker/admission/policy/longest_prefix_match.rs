@@ -72,6 +72,7 @@ impl PartialEq for MostPrefixMatched {
 pub struct LongestPrefixMatch {
     queue: BinaryHeap<MostPrefixMatched>,
     queued_kv_tokens: u64,
+    queued_prompt_tokens: u64,
 }
 
 impl LongestPrefixMatch {
@@ -85,6 +86,7 @@ impl PendingOrderPolicy for LongestPrefixMatch {
 
     fn push(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
         self.queue.push(MostPrefixMatched {
             matched_prefix_tokens: candidate.resident_prefix_tokens,
             candidate,
@@ -115,6 +117,7 @@ impl PendingOrderPolicy for LongestPrefixMatch {
     fn pop(&mut self, _context: &mut Self::Context) -> Option<AdmissionCandidate> {
         let candidate = self.queue.pop()?.candidate;
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -137,6 +140,7 @@ impl PendingOrderPolicy for LongestPrefixMatch {
         self.queue = BinaryHeap::from(retained);
         if let Some(candidate) = removed {
             self.queued_kv_tokens -= candidate.queued_kv_tokens();
+            self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         }
         removed
     }
@@ -153,6 +157,10 @@ impl PendingOrderPolicy for LongestPrefixMatch {
 
     fn queued_kv_tokens(&self) -> u64 {
         self.queued_kv_tokens
+    }
+
+    fn queued_prompt_tokens(&self) -> u64 {
+        self.queued_prompt_tokens
     }
 }
 

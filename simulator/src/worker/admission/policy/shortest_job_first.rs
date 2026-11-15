@@ -1,4 +1,5 @@
-//! Incremental shortest-job-first pending-request selection.
+//! Incremental shortest-job-first pending-request selection, keyed on the
+//! request's whole KV footprint or on the prefill it still has to compute.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -7,21 +8,44 @@ use crate::common::RequestId;
 
 use super::{AdmissionCandidate, PendingOrderPolicy};
 
-struct ShortestWorkFirst(AdmissionCandidate);
+/// What "job size" means for [`ShortestJobFirst`]. Frozen at enqueue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JobSize {
+    /// Prompt, declared prefix and remaining output: the KV the request holds.
+    #[default]
+    KvTokens,
+    /// Prefill tokens to compute: the fresh prompt plus the part of the
+    /// declared prefix that was not resident at enqueue, the work between the
+    /// request and its first token.
+    PrefillTokens,
+}
 
-impl ShortestWorkFirst {
-    #[inline]
-    fn work(&self) -> u64 {
-        self.0.queued_kv_tokens()
+impl JobSize {
+    fn of(self, candidate: &AdmissionCandidate) -> u64 {
+        match self {
+            Self::KvTokens => candidate.queued_kv_tokens(),
+            Self::PrefillTokens => {
+                let declared = candidate.session_input.declared_prefix_tokens();
+                u64::from(candidate.fresh_prompt_tokens)
+                    + u64::from(declared.saturating_sub(candidate.resident_prefix_tokens))
+            }
+        }
     }
+}
+
+struct ShortestWorkFirst {
+    candidate: AdmissionCandidate,
+    work: u64,
 }
 
 impl Ord for ShortestWorkFirst {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .work()
-            .cmp(&self.work())
-            .then_with(|| other.0.enqueue_sequence.cmp(&self.0.enqueue_sequence))
+        other.work.cmp(&self.work).then_with(|| {
+            other
+                .candidate
+                .enqueue_sequence
+                .cmp(&self.candidate.enqueue_sequence)
+        })
     }
 }
 
@@ -43,11 +67,21 @@ impl PartialEq for ShortestWorkFirst {
 pub struct ShortestJobFirst {
     queue: BinaryHeap<ShortestWorkFirst>,
     queued_kv_tokens: u64,
+    queued_prompt_tokens: u64,
+    size: JobSize,
 }
 
 impl ShortestJobFirst {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Order by `size` instead of the KV footprint.
+    pub fn by(size: JobSize) -> Self {
+        Self {
+            size,
+            ..Self::default()
+        }
     }
 }
 
@@ -56,16 +90,19 @@ impl PendingOrderPolicy for ShortestJobFirst {
 
     fn push(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
-        self.queue.push(ShortestWorkFirst(candidate));
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
+        let work = self.size.of(&candidate);
+        self.queue.push(ShortestWorkFirst { candidate, work });
     }
 
     fn peek(&self) -> Option<AdmissionCandidate> {
-        self.queue.peek().map(|entry| entry.0)
+        self.queue.peek().map(|entry| entry.candidate)
     }
 
     fn pop(&mut self, _context: &mut Self::Context) -> Option<AdmissionCandidate> {
-        let candidate = self.queue.pop()?.0;
+        let candidate = self.queue.pop()?.candidate;
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -77,8 +114,8 @@ impl PendingOrderPolicy for ShortestJobFirst {
             .into_vec()
             .into_iter()
             .filter_map(|entry| {
-                if entry.0.request_id == request {
-                    removed = Some(entry.0);
+                if entry.candidate.request_id == request {
+                    removed = Some(entry.candidate);
                     None
                 } else {
                     Some(entry)
@@ -88,6 +125,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
         self.queue = BinaryHeap::from(retained);
         if let Some(candidate) = removed {
             self.queued_kv_tokens -= candidate.queued_kv_tokens();
+            self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         }
         removed
     }
@@ -95,7 +133,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
     fn contains(&self, request: RequestId) -> bool {
         self.queue
             .iter()
-            .any(|candidate| candidate.0.request_id == request)
+            .any(|entry| entry.candidate.request_id == request)
     }
 
     fn len(&self) -> usize {
@@ -104,6 +142,10 @@ impl PendingOrderPolicy for ShortestJobFirst {
 
     fn queued_kv_tokens(&self) -> u64 {
         self.queued_kv_tokens
+    }
+
+    fn queued_prompt_tokens(&self) -> u64 {
+        self.queued_prompt_tokens
     }
 }
 
@@ -151,6 +193,27 @@ mod tests {
     }
 
     #[test]
+    fn prefill_size_ignores_a_resident_prefix_and_counts_a_missing_one() {
+        let mut policy = ShortestJobFirst::by(JobSize::PrefillTokens);
+        // 900 fresh tokens behind a fully resident 100k prefix: 900 to compute.
+        let mut cached = candidate(0, 0, 900, 1);
+        cached.session_input = SessionInput::PinnedPrefix {
+            prefix_tokens: 100_000,
+        };
+        cached.resident_prefix_tokens = 100_000;
+        // 500 fresh tokens whose 1000-token prefix is gone: 1500 to compute.
+        let mut evicted = candidate(1, 1, 500, 1);
+        evicted.session_input = SessionInput::PinnedPrefix {
+            prefix_tokens: 1_000,
+        };
+        policy.push(evicted, &mut ());
+        policy.push(cached, &mut ());
+
+        assert_eq!(policy.pop(&mut ()).unwrap().request_id, RequestId(0));
+        assert_eq!(policy.pop(&mut ()).unwrap().request_id, RequestId(1));
+    }
+
+    #[test]
     fn remove_updates_membership_and_queued_kv() {
         let mut policy = ShortestJobFirst::new();
         policy.push(candidate(0, 0, 10, 2), &mut ());
@@ -162,5 +225,6 @@ mod tests {
         );
         assert!(!policy.contains(RequestId(0)));
         assert_eq!(policy.queued_kv_tokens(), 5);
+        assert_eq!(policy.queued_prompt_tokens(), 4);
     }
 }
