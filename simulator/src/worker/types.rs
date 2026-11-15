@@ -601,6 +601,9 @@ pub struct WorkerConfig {
     /// Which round-end recurrent states a retained context keeps. Only the
     /// two chunked recipes set it.
     pub state_retention: crate::worker::kv::StateRetention,
+    /// Each anchor stays in the host tier it first lands in. Only the
+    /// pipeline recipe reads it.
+    pub recurrent_state_anchors_in_place: bool,
     /// Decode runs elsewhere: the pipeline head completes a request at its
     /// first token and takes its context back from the decode.
     pub external_decode: bool,
@@ -670,6 +673,7 @@ impl Default for WorkerConfig {
             kv_part_padding: Vec::new(),
             kv_block_tokens: None,
             state_retention: crate::worker::kv::StateRetention::Latest { k: 1 },
+            recurrent_state_anchors_in_place: false,
             external_decode: false,
             prefix_tiers: Vec::new(),
             prefix_tier_balanced_load: false,

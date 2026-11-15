@@ -409,6 +409,15 @@ impl TieredPrefixKv for KvCacheStore {
             .tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
             .filter(|(hit, _)| hit.tokens > resident)?;
         let chain = &self.tier_chains[partition as usize];
+        // With anchors in place a round resuming from an anchor a tier holds
+        // moves only that state: the KV of HBM's entry up to the hit counts
+        // as resident.
+        let resident = if chain.anchors_in_place() && !seeded {
+            let retained = self.prefix_caches[partition as usize].entry_tokens(session_id);
+            resident.max(retained.min(hit.tokens))
+        } else {
+            resident
+        };
         let earlier = if seeded {
             0
         } else {

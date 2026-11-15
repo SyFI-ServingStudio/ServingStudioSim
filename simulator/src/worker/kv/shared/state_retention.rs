@@ -130,6 +130,22 @@ impl StateRetention {
         }
     }
 
+    /// Whether each of `states` (ascending, one per position, as an entry
+    /// keeps them, its end last) is an anchor: neither the latest handed-back
+    /// decode's end nor the latest pass's end. `Latest` keeps none.
+    pub(crate) fn anchors(self, states: &[RoundState]) -> Vec<bool> {
+        match self {
+            Self::Latest { .. } => vec![false; states.len()],
+            Self::Anchors { .. } => {
+                let handback = states.iter().rposition(|state| state.tag.handback);
+                let pass = states.iter().rposition(|state| !state.tag.handback);
+                (0..states.len())
+                    .map(|index| Some(index) != handback && Some(index) != pass)
+                    .collect()
+            }
+        }
+    }
+
     /// Of `states` (ascending, at or before the resume point of a round that
     /// resumed from a `resume` state), those still kept once that round adds
     /// its `added` states: its pass's end, and with 2 a handed-back decode's

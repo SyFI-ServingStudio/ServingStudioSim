@@ -283,6 +283,13 @@ impl PrefixCache {
         self.used_units
     }
 
+    /// Context tokens of the session's entry; 0 without one.
+    pub(crate) fn entry_tokens(&self, session_id: u32) -> u64 {
+        self.entries
+            .get(&session_id)
+            .map_or(0, |entry| entry.positions.end())
+    }
+
     /// Pure preview used by admission's token-budget and capacity gates: the
     /// largest position or kept state of the entry within `requested_tokens`.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {

@@ -94,6 +94,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         TierStateOptions {
             added_per_round: 1 + u32::from(config.external_decode),
             compression_ratio: config.tier_state_compression_ratio,
+            anchors_in_place: config.recurrent_state_anchors_in_place,
         },
     );
     let kv_store = if config.prefix_tier_loading_area > 0.0 {

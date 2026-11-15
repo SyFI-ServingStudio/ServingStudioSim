@@ -340,6 +340,18 @@ pub struct StateRetentionSpec {
     #[serde(default = "one_round")]
     #[param(default = 1)]
     recurrent_state_anchor_stride: u32,
+    /// With `recurrent_state_anchors` and a host tier: an anchor, immutable
+    /// once written, is written once, to the tier its context first lands in
+    /// below HBM, and stays there. A read moves only the state its round
+    /// resumes from (an anchor only when an inside round resumes from it,
+    /// with the KV HBM's entry for the session still holds counted as
+    /// resident); an exclusive DRAM keeps a read entry cut to its latest
+    /// surviving anchor; a demotion does not rewrite an anchor (a tier
+    /// evicting the context drops its anchors). Needs
+    /// `recurrent_state_anchors` > 0. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    recurrent_state_anchors_in_place: bool,
 }
 
 const fn one_state() -> u32 {
@@ -356,11 +368,21 @@ impl Default for StateRetentionSpec {
             recurrent_state_checkpoints: one_state(),
             recurrent_state_anchors: 0,
             recurrent_state_anchor_stride: one_round(),
+            recurrent_state_anchors_in_place: false,
         }
     }
 }
 
 impl StateRetentionSpec {
+    /// Whether anchors stay in the tier they first land in.
+    pub(crate) fn anchors_in_place(self, owner: &str) -> Result<bool> {
+        ensure!(
+            !self.recurrent_state_anchors_in_place || self.recurrent_state_anchors > 0,
+            "{owner}: recurrent_state_anchors_in_place needs recurrent_state_anchors > 0"
+        );
+        Ok(self.recurrent_state_anchors_in_place)
+    }
+
     /// The retention; at least one state, the end's.
     pub(crate) fn resolve(self, owner: &str) -> Result<StateRetention> {
         ensure!(
@@ -1201,6 +1223,7 @@ impl IterWorkerSel {
         };
         config.force_schedule_after = force_schedule.resolve(owner)?;
         config.state_retention = state_retention.resolve(owner)?;
+        config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
         Ok(())
     }
 
@@ -1630,6 +1653,12 @@ mod tests {
         assert!(
             pipeline("recurrent_state_anchors: 1\nrecurrent_state_anchor_stride: 0\n").is_err()
         );
+        assert!(
+            pipeline("recurrent_state_anchors: 1\nrecurrent_state_anchors_in_place: true\n")
+                .unwrap()
+                .recurrent_state_anchors_in_place
+        );
+        assert!(pipeline("recurrent_state_anchors_in_place: true\n").is_err());
     }
 
     fn prefix_tiers(keys: &str) -> Result<WorkerConfig> {
