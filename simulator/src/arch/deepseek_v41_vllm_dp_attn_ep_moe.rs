@@ -1043,7 +1043,8 @@ impl DeepseekV41VllmDpModel {
                 .iter()
                 .map(|&layer| per_layer * f64::from(layer))
                 .collect();
-            let wait = gather.exposed_ms(max_rows, &available) as f32;
+            let wait = gather.exposed_ms(max_rows, &available, f64::from(total.m.time_ms))
+                as f32;
             slots[self.n_slots - 1].m.time_ms = wait;
             total.m.time_ms += wait;
         }

@@ -622,10 +622,11 @@ pub enum IterArchSel {
         yoco_keep_tokens: u32,
         /// How Engram rows reach the GPU: `uva` (vLLM's host-UVA lookup),
         /// `cpu_gather` (host gather + one H2D copy per layer + device unpack;
-        /// `arch::deepseek_v41_engram_fetch`), or `off` (the fetch priced out,
+        /// `arch::deepseek_v41_engram_fetch`), `cpu_gather_prefetch` (the same,
+        /// started during the previous step), or `off` (the fetch priced out,
         /// the Engram blocks' compute stays). `true`/`false` read as uva/off.
         #[serde(default)]
-        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]
+        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "cpu_gather_prefetch", "off"], cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
         /// DP ranks per replica, which are also its EP group (2, 4 or 8; the
         /// captured deployment is 4). A pool of `replicas` such groups places
