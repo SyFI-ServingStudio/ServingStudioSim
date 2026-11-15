@@ -147,6 +147,10 @@ const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
 /// (DeepInfer's V4 attention `wv`).
 const DEEPINFER_WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out"];
 const DEEPINFER_MEGA_MOE_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// DeepGEMM `bf16_mega_gate` (DeepInfer `v4_modules/mlp.py` `use_mega_gate`).
+const DEEPINFER_MEGA_GATE_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// TileKernels `engram_gate_fwd` (DeepInfer `v4_modules/engram.py`).
+const DEEPINFER_ENGRAM_GATE_BACKENDS: &[&str] = &["tile_kernels"];
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -363,6 +367,7 @@ fn deepinfer_backends(tp1: &mut DeepseekV41LayerConfig) {
     tp1.attention.wo_a_backends = DEEPINFER_WO_A_BACKENDS.to_vec();
     if let Some(engram) = &mut tp1.engram {
         engram.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
+        engram.engram_gate_backends = Some(DEEPINFER_ENGRAM_GATE_BACKENDS.to_vec());
     }
 }
 
@@ -388,12 +393,14 @@ fn mega_ffn_config(
         num_physical_experts: f.num_experts.get() + engine.num_redundant_experts,
         num_shared_experts: f.shared_intermediate_size.get() / intermediate,
         top_k: f.top_k,
+        // The V4.1 config parser accepts only `sqrtsoftplus`.
+        scoring_func: "sqrtsoftplus".to_string(),
         moe_intermediate_size: f.moe_intermediate_size.clone(),
         max_rank_tokens,
         gpu_name: f.gpu_name.clone(),
         mhc_backends: f.mhc_backends.clone(),
         mhc_tilelang_backends: f.mhc_tilelang_backends.clone(),
-        router_backends: f.router_backends.clone(),
+        mega_gate_backends: DEEPINFER_MEGA_GATE_BACKENDS.to_vec(),
         mega_moe_backends: DEEPINFER_MEGA_MOE_BACKENDS.to_vec(),
         elementwise_backends: f.elementwise_backends.clone(),
     }

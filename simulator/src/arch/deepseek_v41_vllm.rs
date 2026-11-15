@@ -1101,6 +1101,8 @@ pub(crate) fn layer_config(
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            engram_gate_backends: None,
+            max_rank_tokens: parallel.max_num_batched_tokens,
         }),
         attention: DeepseekV41AttentionTpWorkletConfig {
             layer: kind.attention,

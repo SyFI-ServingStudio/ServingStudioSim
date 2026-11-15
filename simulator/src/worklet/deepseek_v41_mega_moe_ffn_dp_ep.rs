@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! per rank   entry mHC (its FP8 output is written straight into the
-//!            DeepGEMM symmetric buffer) -> gate + top-k
+//!            DeepGEMM symmetric buffer) -> DeepGEMM mega gate (router GEMM,
+//!            scoring, top-k, EPLB slot map in one launch)
 //! group      DeepGEMM fp8_fp4_mega_moe: dispatch, routed experts, the fused
 //!            shared expert and the combine in one kernel over the EP group
 //! ```
@@ -15,22 +16,19 @@
 //! synchronizes inside the kernel, so the group section is one leaf priced at
 //! the busiest rank's token count.
 //!
-//! The gate is DeepGEMM's `mega_gate` (bf16 gate GEMM fused with top-k); until
-//! that kind is profiled the router GEMM + top-k leaves of the vLLM worklet
-//! stand in for it (0.6-0.9% of a DeepInfer prefill step in the capture).
 
 use std::sync::Arc;
 
 use super::deepseek_v41_common::{
-    eval_or_zero, placeholder, MhcOverlapBoundary, MhcOverlapBoundaryConfig,
-    MhcOverlapBoundaryResolved,
+    eval_or_zero, MhcOverlapBoundary, MhcOverlapBoundaryConfig, MhcOverlapBoundaryResolved,
 };
-use super::deepseek_v41_moe_ffn_dp_ep::{DeepseekV41MoeFfnDpEpWorkletInput, DeepseekV41MoeFfnDpRankInput};
+use super::deepseek_v41_moe_ffn_dp_ep::{
+    DeepseekV41MoeFfnDpEpWorkletInput, DeepseekV41MoeFfnDpRankInput,
+};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
-    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, MegaMoeKernel, MegaMoeKernelConfig,
+    MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaMoeKernel, MegaMoeKernelConfig,
     MegaMoeKernelInput, MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput,
 };
@@ -48,13 +46,15 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletConfig {
     pub num_physical_experts: u32,
     pub num_shared_experts: u32,
     pub top_k: u32,
+    /// The router's scoring function (the model config's `scoring_func`).
+    pub scoring_func: String,
     pub moe_intermediate_size: Dim,
     /// One rank's token budget: the mega MoE symmetric buffer's capacity.
     pub max_rank_tokens: u32,
     pub gpu_name: String,
     pub mhc_backends: Vec<&'static str>,
     pub mhc_tilelang_backends: Vec<&'static str>,
-    pub router_backends: Vec<&'static str>,
+    pub mega_gate_backends: Vec<&'static str>,
     pub mega_moe_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
@@ -64,8 +64,7 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletResolved {
     pub raw_cfg: DeepseekV41MegaMoeFfnDpEpWorkletConfig,
     pub entry: MhcRmsNormKernelConfig,
     pub mhc_overlap: MhcOverlapBoundaryResolved,
-    pub gate: GemmFp32OutputKernelConfig,
-    pub topk: ElementwiseKernelConfig,
+    pub gate: MegaGateKernelConfig,
     pub mega_moe: MegaMoeKernelConfig,
 }
 
@@ -73,8 +72,7 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorklet {
     pub name: String,
     pub entry: Op<MhcFusedPostPreRmsNormKernel>,
     pub mhc_overlap: MhcOverlapBoundary,
-    pub gate: Op<GemmFp32OutputKernel>,
-    pub topk: Op<ElementwiseKernel>,
+    pub gate: Op<MegaGateKernel>,
     pub mega_moe: Op<MegaMoeKernel>,
     resolved: DeepseekV41MegaMoeFfnDpEpWorkletResolved,
 }
@@ -93,7 +91,6 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             cfg.num_physical_experts >= cfg.num_logical_experts.get(),
             "every logical expert needs a physical slot"
         );
-        let gpu = cfg.gpu_name.as_str();
         DeepseekV41MegaMoeFfnDpEpWorkletResolved {
             entry: MhcRmsNormKernelConfig {
                 backends: cfg.mhc_backends.clone(),
@@ -109,20 +106,17 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
                 mhc_tilelang_backends: cfg.mhc_tilelang_backends.clone(),
                 elementwise_backends: cfg.elementwise_backends.clone(),
             }),
-            gate: GemmFp32OutputKernelConfig {
-                backends: cfg.router_backends.clone(),
+            gate: MegaGateKernelConfig {
+                backends: cfg.mega_gate_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.num_logical_experts.clone(),
-                k: cfg.hidden_size.clone(),
-                input_dtype: DType::Bf16,
+                hidden_size: cfg.hidden_size.clone(),
+                num_experts: cfg.num_logical_experts.get(),
+                num_physical_experts: cfg.num_physical_experts,
+                top_k: cfg.top_k,
+                scoring_func: cfg.scoring_func.clone(),
+                dtype: DType::Bf16,
+                max_tokens_per_rank: cfg.max_rank_tokens,
             },
-            // fp32 logits in, top-k fp32 weights + int32 ids out.
-            topk: placeholder(
-                &cfg.elementwise_backends,
-                gpu,
-                cfg.num_logical_experts.get() * 4,
-                cfg.top_k * 8,
-            ),
             mega_moe: MegaMoeKernelConfig {
                 backends: cfg.mega_moe_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -157,10 +151,17 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
         }
         let r = resolved.clone();
         Ok(Self {
-            entry: op!(MhcFusedPostPreRmsNormKernel, r.entry, "entry.mega_mhc_post_pre"),
-            mhc_overlap: MhcOverlapBoundary::build(&format!("{name}.entry"), r.mhc_overlap, bridge)?,
-            gate: op!(GemmFp32OutputKernel, r.gate, "routed.gate"),
-            topk: op!(ElementwiseKernel, r.topk, "routed.topk"),
+            entry: op!(
+                MhcFusedPostPreRmsNormKernel,
+                r.entry,
+                "entry.mega_mhc_post_pre"
+            ),
+            mhc_overlap: MhcOverlapBoundary::build(
+                &format!("{name}.entry"),
+                r.mhc_overlap,
+                bridge,
+            )?,
+            gate: op!(MegaGateKernel, r.gate, "routed.mega_gate"),
             mega_moe: op!(MegaMoeKernel, r.mega_moe, "routed.mega_moe"),
             name,
             resolved,
@@ -171,7 +172,7 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
     pub fn compile_local(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
         let mut leaves = vec![self.entry.compile(b)];
         leaves.extend(self.mhc_overlap.compile_entry(b));
-        leaves.extend([self.gate.compile(b), self.topk.compile(b)]);
+        leaves.push(self.gate.compile(b));
         leaves
     }
 
@@ -190,7 +191,9 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             label: format!(
                 "{} exchange [DeepGEMM mega MoE over EP{}: dispatch, {} physical expert slots, \
                  fused shared expert, combine; busiest rank]",
-                self.name, self.resolved.raw_cfg.ep_size, self.resolved.raw_cfg.num_physical_experts
+                self.name,
+                self.resolved.raw_cfg.ep_size,
+                self.resolved.raw_cfg.num_physical_experts
             ),
             child: Box::new(CostNode::Parallel {
                 overlap: 1.0,
@@ -210,17 +213,28 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             ev,
         );
         self.mhc_overlap.eval_entry(rows, mhc_overlap, ev);
-        eval_or_zero(&self.gate, GemmFp32OutputKernelInput { m: rows }, zero, ev);
-        eval_or_zero(&self.topk, ElementwiseKernelInput { num_tokens: rows }, zero, ev);
+        eval_or_zero(
+            &self.gate,
+            MegaGateKernelInput { num_tokens: rows },
+            zero,
+            ev,
+        );
     }
 
     pub fn eval_exchange(&self, input: &DeepseekV41MoeFfnDpEpWorkletInput, ev: &mut Evaluator) {
         // Every rank's rows enter the kernel (padding included: DeepInfer
         // routes them like any other); the group waits for the busiest.
-        let busiest = input.ranks.iter().map(|rank| rank.num_tokens).max().unwrap_or(0);
+        let busiest = input
+            .ranks
+            .iter()
+            .map(|rank| rank.num_tokens)
+            .max()
+            .unwrap_or(0);
         eval_or_zero(
             &self.mega_moe,
-            MegaMoeKernelInput { num_tokens: busiest },
+            MegaMoeKernelInput {
+                num_tokens: busiest,
+            },
             busiest == 0,
             ev,
         );
