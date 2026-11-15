@@ -10,7 +10,11 @@ has the image. Workers overlay the checkout's ``profiling/``, ``launcher/`` and
 
 The `vllm` and `sglang` images are the reference engines (`reference_engines/`):
 the official image pinned by digest, with the engine's patches, serving both
-L1 kernels and alignment captures.
+L1 kernels and alignment captures. `deepinfer` is a reference engine with no
+official image: its Dockerfile builds BASE.yaml's upstream commit (and the
+vendor submodules it pins) with the patches on the pinned CUDA image. It serves
+no profile env yet and runs no alignment capture (no req-frontend, no capture
+interpreter); it runs DeepInfer's own benchmark.
 
 ``VIBESIM_PROFILE_IMAGES`` (a JSON object, env name -> tag) overrides the
 computed tags; `--remote` uses it to hand a job the tags its sender verified,
@@ -82,20 +86,22 @@ def _engine_base(engine: str) -> Callable[[Path], str]:
     return base
 
 
-def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
+def _engine_args(engine: str, req_frontend: bool = True) -> Callable[[Path], dict[str, str]]:
     def args(root: Path) -> dict[str, str]:
         from reference_engines import host_platform, parse_base
 
         base = parse_base((root / "reference_engines" / engine / "BASE.yaml").read_text())
         platform = host_platform()
         digest = base.digests[platform].removeprefix("sha256:")
-        return {
+        args = {
             "VIBESIM_UPSTREAM_COMMIT": base.commit_for(platform),
-            "VIBESIM_REQ_FRONTEND_REVISION": gitlink(root, _REQ_FRONTEND),
             # The engine half of the persistent-cache key (the official base),
             # read at run time by profiling/exec/local.py:image_cache_key.
             "VIBESIM_CACHE_KEY": f"{engine}-{digest[:12]}",
         }
+        if req_frontend:
+            args["VIBESIM_REQ_FRONTEND_REVISION"] = gitlink(root, _REQ_FRONTEND)
+        return args
 
     return args
 
@@ -178,6 +184,19 @@ IMAGES = {
             ("sglang_env",),
             "/opt/sglang/bin/python",
             inputs=("reference_engines/complete_flashinfer_aot.py",),
+        ),
+        Image(
+            "deepinfer",
+            "reference_engines/deepinfer/Dockerfile",
+            (),
+            python="/opt/deepinfer-venv/bin/python",
+            inputs=(
+                "reference_engines/deepinfer/BASE.yaml",
+                "reference_engines/deepinfer/patches",
+                "reference_engines/autotune_guard.py",
+            ),
+            build_args=_engine_args("deepinfer", req_frontend=False),
+            base_image=_engine_base("deepinfer"),
         ),
         Image(
             "flashinfer-kda",

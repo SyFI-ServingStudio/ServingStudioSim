@@ -15,6 +15,7 @@ kept as an official base plus our patches. One directory per engine:
 | --- | --- | --- |
 | `vllm` | main `5629b26` (2026-11-07) | `public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26…` (vLLM's post-merge CI image); arm64: `…:b4dffa50…-arm64` |
 | `sglang` | main `9d547e19` (2026-11-08) | `lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19` |
+| `deepinfer` | main `a679bb8` | none; built from source on `nvidia/cuda:13.3.1-devel-ubuntu24.04` |
 
 vLLM's CI publishes no arm64 image of `5629b26`; the arm64 base is
 `b4dffa50`, 3 commits earlier, which differs from it only in `recipes/` and
@@ -22,7 +23,19 @@ vLLM's CI publishes no arm64 image of `5629b26`; the arm64 base is
 own `image`, `upstream_commit` and a `note` saying why). SGLang's tag is a
 multi-platform index; BASE.yaml pins both platforms' manifests. The arm64 images are build-verified only.
 
-Both bases are main/nightly builds, not releases: vLLM is on main because
+DeepInfer publishes no image (its README builds from source with
+`scripts/build.sh`), so its BASE.yaml pins the CUDA devel image its Dockerfile
+builds on, and records under `submodules` the commits `a679bb8` pins the four
+NVIDIA vendor operators at (DeepEP, DeepGEMM, DeepSelect, FlashMLA). The
+Dockerfile fetches the upstream commit and those submodules, checks them
+against BASE.yaml, applies the patches (any path: the whole tree is built),
+builds the vendor wheels and the engine as `build.sh` does, and adds the guard,
+the Sim code and the manifest. It has no capture interpreter or req-frontend
+and serves no profile env yet; it runs DeepInfer's own `examples/benchmark.py`
+(its patch adds `--profiler nsys`). `materialize` checks the pins but does
+not fetch the submodules. Only the amd64 image has been built.
+
+Both vLLM and SGLang bases are main/nightly builds, not releases: vLLM is on main because
 DeepSeek-V4.1 needs SwapAB and other paths v0.33.0 does not have. The next bump
 should move both to a stable release and its official image.
 
