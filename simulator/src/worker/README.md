@@ -43,7 +43,7 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | `pd_decode` | `KvCacheStore` less the reserved pull budget, no prefix tier | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `KvCacheStore` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
-| `pipeline_chunked_prefill`, stage 0 | `KvCacheStore`, one partition, sized by the most constrained stage's `KvCacheLayout` | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
+| `pipeline_chunked_prefill`, stage 0 | `KvCacheStore`, one partition, sized by the most constrained stage's `KvCacheLayout`, optional host DRAM/SSD tiers | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
 | `pipeline_chunked_prefill`, stages 1..N-1 | none | none; L6 hands over microbatches | `UnifiedIterExecution` (as `PipelineStageExecution`) | `PipelineStageWorker` |
 
 Hybrid archs (sliding-window, recurrent, or compressed state: Inkling,
@@ -188,6 +188,20 @@ counts make the stream replayable. An `activate` row's `full_hit_tokens` is the
 hit the entry would give if every position were resumable. The logger is an
 observer of the same `KvCacheStore`; it does not infer operations from `kv_snapshot` or maintain shadow
 residency.
+
+The pipeline head may put host tiers behind its prefix cache
+(`PrefixTierSpec`: `dram_tier_*`, `ssd_tier_*`, `prefix_tier_*`). Each
+partition's `TierChain` (`kv/shared/tier_chain.rs`) keeps one entry per session
+per tier in tier tokens (one GPU's per-token bytes, `TierBytes`, which the
+deployment derives from the stages' layouts), written through or as the victim
+tier of the one above, LRU-evicted, and cut at admission when a victim entry
+outgrows what the request shares. `TieredPrefixKv` plans, starts, lands and
+restores reads (`kv/shared/tier_reads.rs`): a read holds its request's whole
+footprint on HBM until its landed context is put back just before admission.
+Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
+counters become the pool's `tiers` in `raw/kv_cache.json`, written when the
+store is dropped and rewritten after the run. Rules:
+`doc/detailed_design/L5.md` §3.3.
 
 ## Admission axis
 
@@ -411,6 +425,13 @@ pipeline head) take the same scheduling options, all off by default (vLLM):
   `Deadline<P>` (`policy/deadline.rs`), which serves a request that has waited
   past the bound before the rest of its queue; `promote(now)` runs at the start
   of each formation.
+
+On the pipeline head with host tiers, a fresh request whose context a tier
+holds beyond HBM goes pending -> reading -> landed -> started; landed requests
+are offered first. `prefix_tier_max_read_wait_ms` with
+`prefix_tier_read_wait_policy` (`ReadWait`, `admission/read_wait.rs`) passes
+over or stops at a request whose read would wait too long for its channel. The
+shell wakes at each landing (`MicrobatchAdmission::next_read_landing`).
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
