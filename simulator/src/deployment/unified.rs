@@ -623,6 +623,10 @@ impl Deployment for UnifiedDeployment {
                 decoder_swa_bounded_replay,
                 max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                engine,
+                num_redundant_experts,
+                yoco_keep_tokens,
+                engram_fetch,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
@@ -637,6 +641,12 @@ impl Deployment for UnifiedDeployment {
                     *decoder_swa_bounded_replay,
                     *max_num_batched_tokens,
                     cudagraph_capture_sizes,
+                    crate::arch::config::deepseek_v41_dp_engine(
+                        *engine,
+                        *num_redundant_experts,
+                        *yoco_keep_tokens,
+                        *engram_fetch,
+                    )?,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

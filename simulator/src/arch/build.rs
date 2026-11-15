@@ -1140,6 +1140,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     decoder_swa_bounded_replay: bool,
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
+    deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1155,6 +1156,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        deepinfer,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1206,6 +1208,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        deepinfer: None,
     };
     let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
     let (target_demand, draft_demand) = dspark_demands(
@@ -2791,6 +2794,10 @@ pub fn build_iter_model(
             decoder_swa_bounded_replay,
             max_num_batched_tokens,
             cudagraph_capture_sizes,
+            engine,
+            num_redundant_experts,
+            yoco_keep_tokens,
+            engram_fetch,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2801,6 +2808,12 @@ pub fn build_iter_model(
             *decoder_swa_bounded_replay,
             *max_num_batched_tokens,
             cudagraph_capture_sizes,
+            super::config::deepseek_v41_dp_engine(
+                *engine,
+                *num_redundant_experts,
+                *yoco_keep_tokens,
+                *engram_fetch,
+            )?,
             gpu,
             name,
             bridge,

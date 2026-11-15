@@ -76,7 +76,9 @@ use crate::worklet::{
     DeepseekV41EngramPrefetchLocalWorkletInput, DeepseekV41EngramPrefetchLocalWorkletResolved,
     DeepseekV41EngramTpWorklet, DeepseekV41EngramTpWorkletConfig, DeepseekV41EngramTpWorkletInput,
     DeepseekV41EngramTpWorkletResolved, DeepseekV41HeadTpWorklet, DeepseekV41HeadTpWorkletConfig,
-    DeepseekV41HeadTpWorkletInput, DeepseekV41HeadTpWorkletResolved, DeepseekV41MoeFfnDpEpWorklet,
+    DeepseekV41HeadTpWorkletInput, DeepseekV41HeadTpWorkletResolved,
+    DeepseekV41MegaMoeFfnDpEpWorklet, DeepseekV41MegaMoeFfnDpEpWorkletConfig,
+    DeepseekV41MegaMoeFfnDpEpWorkletResolved, DeepseekV41MoeFfnDpEpWorklet,
     DeepseekV41MoeFfnDpEpWorkletConfig, DeepseekV41MoeFfnDpEpWorkletInput,
     DeepseekV41MoeFfnDpEpWorkletResolved, DeepseekV41MoeFfnDpRankInput,
     DeepseekV41PrologueTpWorklet, DeepseekV41PrologueTpWorkletConfig,
@@ -111,7 +113,36 @@ pub struct DeepseekV41VllmDpParallel {
     /// `--cudagraph-capture-sizes` per rank (PIECEWISE token sizes; empty =
     /// eager), as for the TP arch ([`DeepseekV41CudaGraphs`]).
     pub cudagraph_capture_sizes: Vec<u32>,
+    /// `Some`: the DeepInfer engine's kernels on the same layer skeleton.
+    pub deepinfer: Option<DeepInferEngine>,
 }
+
+/// DeepInfer (deepseek-ai/DeepInfer a679bb8) on the DP4/EP4 skeleton: the MoE
+/// is DeepGEMM's mega MoE over `num_experts + num_redundant_experts` physical
+/// slots, the dense linears are DeepGEMM's MXFP8 GEMM, and YoCo prefill
+/// truncation is the bounded-replay cut keeping `yoco_keep_tokens` rows per
+/// request (DeepInfer `DEEPINFER_YOCO_PREFILL_KEEP_TOKENS`, its benchmark's
+/// `--yoco_clip` 140 = window 128 + 12 backtracking tokens). The other kernels
+/// (FlashMLA attention, mHC, indexer logits and top-k, norms) are the vLLM
+/// fork's own, which vendors the same FlashMLA/DeepGEMM kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepInferEngine {
+    /// EPLB redundant expert slots over the EP group (`num_extra_experts`).
+    pub num_redundant_experts: u32,
+    /// `None`: YoCo truncation off (every layer runs every row).
+    pub yoco_keep_tokens: Option<u32>,
+    /// Price the Engram table fetch (the prologue's lookups). DeepInfer reads
+    /// the tables from host memory over GPU-initiated RDMA (DeepEP
+    /// EngramBuffer, NCCL GIN), which this arch does not model: when on, the
+    /// vLLM host-UVA lookup stands in. Off leaves the fetch out; the Engram
+    /// blocks' own compute stays.
+    pub engram_fetch: bool,
+}
+
+/// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
+/// `layers/linear.py` `apply_weight_fp8`).
+const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
+const DEEPINFER_MEGA_MOE_BACKENDS: &[&str] = &["deepgemm_sm100"];
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -119,12 +150,16 @@ pub struct DeepseekV41DpLayerConfig {
     pub layers: Vec<u32>,
     pub engram: Option<DeepseekV41EngramTpWorkletConfig>,
     pub attention: DeepseekV41AttentionTpWorkletConfig,
+    /// The vLLM FFN; under DeepInfer it only carries the geometry.
     pub ffn: DeepseekV41MoeFfnDpEpWorkletConfig,
+    /// `Some` under DeepInfer: the mega MoE FFN that replaces [`Self::ffn`].
+    pub mega: Option<DeepseekV41MegaMoeFfnDpEpWorkletConfig>,
 }
 
 pub struct DeepseekV41VllmDpConfigs {
     pub prologue: DeepseekV41PrologueTpWorkletConfig,
-    pub engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletConfig,
+    /// `None` with the Engram fetch priced out (DeepInfer `engram_fetch: false`).
+    pub engram_prefetch: Option<DeepseekV41EngramPrefetchLocalWorkletConfig>,
     pub layer0: DeepseekV41DpLayerConfig,
     /// Bodies of layers 1..40, in first-visit order of `plan`.
     pub bodies: Vec<DeepseekV41DpLayerConfig>,
@@ -158,6 +193,16 @@ pub fn build_configs(
             model.num_experts
         )));
     }
+    if let Some(engine) = &parallel.deepinfer {
+        let slots = model.num_experts + engine.num_redundant_experts;
+        if slots % DP_SIZE != 0 {
+            return Err(fit_failed(format!(
+                "{slots} physical expert slots ({} experts + {} redundant) must split over \
+                 {DP_SIZE} EP ranks",
+                model.num_experts, engine.num_redundant_experts
+            )));
+        }
+    }
     if demand.num_experts() != model.num_experts as usize {
         return Err(fit_failed(format!(
             "expert demand covers {} experts, expected {}",
@@ -189,10 +234,15 @@ pub fn build_configs(
     // A rank's rows: its scheduled tokens, or the graph it pads to.
     let max_rank_tokens = parallel.max_num_batched_tokens.max(graphs.max_tokens());
     let dp_layer = |kind: LayerKind, layers: Vec<u32>| {
-        dp_layer_config(
-            layer_config(model, &local, demand, kind, layers),
-            max_rank_tokens,
-        )
+        let mut tp1 = layer_config(model, &local, demand, kind, layers);
+        if parallel.deepinfer.is_some() {
+            deepinfer_backends(&mut tp1);
+        }
+        let mut layer = dp_layer_config(tp1, max_rank_tokens);
+        if let Some(engine) = &parallel.deepinfer {
+            layer.mega = Some(mega_ffn_config(&layer.ffn, engine, max_rank_tokens));
+        }
+        layer
     };
     let tail: Vec<(u32, LayerKind)> = (1..model.num_layers)
         .map(|layer| (layer, model.layer_kind(layer)))
@@ -203,8 +253,21 @@ pub fn build_configs(
         bodies.len() - 1
     });
     let gpu = parallel.gpu_name.clone();
-    let (replay, late_bodies) = if parallel.decoder_swa_bounded_replay {
-        let rule = BoundedReplay::from_model(model)?;
+    let replay_on = match &parallel.deepinfer {
+        Some(engine) => engine.yoco_keep_tokens.is_some(),
+        None => parallel.decoder_swa_bounded_replay,
+    };
+    let (replay, late_bodies) = if replay_on {
+        let mut rule = BoundedReplay::from_model(model)?;
+        if let Some(keep) = parallel.deepinfer.and_then(|engine| engine.yoco_keep_tokens) {
+            if keep < rule.window {
+                return Err(fit_failed(format!(
+                    "yoco_keep_tokens {keep} must cover the sliding window {}",
+                    rule.window
+                )));
+            }
+            rule.window = keep;
+        }
         let late_bodies = bodies
             .iter()
             .map(|body: &DeepseekV41DpLayerConfig| rule.is_late(&body.layers))
@@ -238,7 +301,7 @@ pub fn build_configs(
             all_reduce_backends: tp_arch::ALL_REDUCE_BACKENDS.to_vec(),
             elementwise_backends: tp_arch::ELEMENTWISE_BACKENDS.to_vec(),
         },
-        engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletConfig {
+        engram_prefetch: parallel.deepinfer.map_or(true, |engine| engine.engram_fetch).then(|| DeepseekV41EngramPrefetchLocalWorkletConfig {
             tp_size: 1,
             engram_num_heads: model.engram_hash_heads,
             engram_head_dim: model.engram_head_dim,
@@ -248,7 +311,7 @@ pub fn build_configs(
             weight_dtype: DType::Fp8E4m3,
             gpu_name: gpu.clone(),
             backends: tp_arch::ENGRAM_LOOKUP_BACKENDS.to_vec(),
-        },
+        }),
         layer0: dp_layer(layer0_kind, vec![0]),
         bodies,
         plan,
@@ -284,6 +347,50 @@ pub(crate) fn dp_layer_config(
             collective_backends: COLLECTIVE_BACKENDS.to_vec(),
             max_rank_tokens,
         },
+        mega: None,
+    }
+}
+
+/// DeepInfer's dense linears: DeepGEMM MXFP8 for every MXFP8 projection the
+/// vLLM fork runs through FlashInfer.
+fn deepinfer_backends(tp1: &mut DeepseekV41LayerConfig) {
+    tp1.attention.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
+    tp1.attention.prequantized_gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
+    if let Some(engram) = &mut tp1.engram {
+        engram.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
+    }
+}
+
+/// DeepInfer's FFN from the vLLM FFN's geometry: the mega MoE over the
+/// logical experts plus the EPLB redundant slots.
+fn mega_ffn_config(
+    vllm: &DeepseekV41MoeFfnDpEpWorkletConfig,
+    engine: &DeepInferEngine,
+    max_rank_tokens: u32,
+) -> DeepseekV41MegaMoeFfnDpEpWorkletConfig {
+    let f = &vllm.ffn;
+    let intermediate = f.moe_intermediate_size.get();
+    assert_eq!(
+        f.shared_intermediate_size.get() % intermediate,
+        0,
+        "the shared expert must be whole experts of the routed width"
+    );
+    DeepseekV41MegaMoeFfnDpEpWorkletConfig {
+        ep_size: f.ep_size,
+        hidden_size: f.hidden_size.clone(),
+        hc_mult: f.hc_mult,
+        num_logical_experts: f.num_experts.clone(),
+        num_physical_experts: f.num_experts.get() + engine.num_redundant_experts,
+        num_shared_experts: f.shared_intermediate_size.get() / intermediate,
+        top_k: f.top_k,
+        moe_intermediate_size: f.moe_intermediate_size.clone(),
+        max_rank_tokens,
+        gpu_name: f.gpu_name.clone(),
+        mhc_backends: f.mhc_backends.clone(),
+        mhc_tilelang_backends: f.mhc_tilelang_backends.clone(),
+        router_backends: f.router_backends.clone(),
+        mega_moe_backends: DEEPINFER_MEGA_MOE_BACKENDS.to_vec(),
+        elementwise_backends: f.elementwise_backends.clone(),
     }
 }
 
@@ -291,12 +398,24 @@ pub struct DeepseekV41DpLayerResolved {
     pub(crate) layers: Vec<u32>,
     pub(crate) engram: Option<DeepseekV41EngramTpWorkletResolved>,
     pub(crate) attention: DeepseekV41AttentionTpWorkletResolved,
-    pub(crate) ffn: DeepseekV41MoeFfnDpEpWorkletResolved,
+    pub(crate) ffn: DpFfnResolved,
+}
+
+/// The FFN a body runs: vLLM's all-gather / fused MoE / reduce-scatter, or
+/// DeepInfer's mega MoE.
+pub(crate) enum DpFfnResolved {
+    Vllm(DeepseekV41MoeFfnDpEpWorkletResolved),
+    Mega(DeepseekV41MegaMoeFfnDpEpWorkletResolved),
+}
+
+pub(crate) enum DpFfn {
+    Vllm(DeepseekV41MoeFfnDpEpWorklet),
+    Mega(DeepseekV41MegaMoeFfnDpEpWorklet),
 }
 
 pub struct DeepseekV41VllmDpResolved {
     prologue: DeepseekV41PrologueTpWorkletResolved,
-    engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletResolved,
+    engram_prefetch: Option<DeepseekV41EngramPrefetchLocalWorkletResolved>,
     layer0: DeepseekV41DpLayerResolved,
     bodies: Vec<DeepseekV41DpLayerResolved>,
     plan: Vec<PlanNode>,
@@ -324,16 +443,20 @@ pub(crate) fn resolve_layer(config: &DeepseekV41DpLayerConfig) -> DeepseekV41DpL
             .as_ref()
             .map(DeepseekV41EngramTpWorklet::resolve_config),
         attention: DeepseekV41AttentionTpWorklet::resolve_config(&config.attention),
-        ffn: DeepseekV41MoeFfnDpEpWorklet::resolve_config(&config.ffn),
+        ffn: match &config.mega {
+            Some(mega) => DpFfnResolved::Mega(DeepseekV41MegaMoeFfnDpEpWorklet::resolve_config(mega)),
+            None => DpFfnResolved::Vllm(DeepseekV41MoeFfnDpEpWorklet::resolve_config(&config.ffn)),
+        },
     }
 }
 
 pub fn resolve_configs(configs: &DeepseekV41VllmDpConfigs) -> DeepseekV41VllmDpResolved {
     DeepseekV41VllmDpResolved {
         prologue: DeepseekV41PrologueTpWorklet::resolve_config(&configs.prologue),
-        engram_prefetch: DeepseekV41EngramPrefetchLocalWorklet::resolve_config(
-            &configs.engram_prefetch,
-        ),
+        engram_prefetch: configs
+            .engram_prefetch
+            .as_ref()
+            .map(DeepseekV41EngramPrefetchLocalWorklet::resolve_config),
         layer0: resolve_layer(&configs.layer0),
         bodies: configs.bodies.iter().map(resolve_layer).collect(),
         plan: configs.plan.clone(),
@@ -358,7 +481,7 @@ pub(crate) struct DpLayerBody {
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorklet>,
     attention: DeepseekV41AttentionTpWorklet,
-    ffn: DeepseekV41MoeFfnDpEpWorklet,
+    ffn: DpFfn,
 }
 
 impl DpLayerBody {
@@ -382,7 +505,16 @@ impl DpLayerBody {
                 resolved.attention,
                 bridge,
             )?,
-            ffn: DeepseekV41MoeFfnDpEpWorklet::build(format!("{name}.ffn"), resolved.ffn, bridge)?,
+            ffn: match resolved.ffn {
+                DpFfnResolved::Vllm(ffn) => {
+                    DpFfn::Vllm(DeepseekV41MoeFfnDpEpWorklet::build(format!("{name}.ffn"), ffn, bridge)?)
+                }
+                DpFfnResolved::Mega(ffn) => DpFfn::Mega(DeepseekV41MegaMoeFfnDpEpWorklet::build(
+                    format!("{name}.ffn"),
+                    ffn,
+                    bridge,
+                )?),
+            },
             layers: resolved.layers,
             name,
         })
@@ -395,20 +527,27 @@ impl DpLayerBody {
             leaves.push(engram.compile(b));
         }
         leaves.push(self.attention.compile(b));
-        leaves.extend(self.ffn.compile_local(b));
+        leaves.extend(match &self.ffn {
+            DpFfn::Vllm(ffn) => ffn.compile_local(b),
+            DpFfn::Mega(ffn) => ffn.compile_local(b),
+        });
         leaves
     }
 
     /// The exchange and every rank's post-combine add.
     fn compile_tail(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
         let ranks = DP_SIZE as usize;
-        vec![
-            self.ffn.compile_exchange(ranks, b),
-            labeled_max(
-                format!("{}.ffn.residual_add [Max over DP ranks]", self.name),
-                (0..ranks).map(|_| self.ffn.compile_post(b)).collect(),
-            ),
-        ]
+        match &self.ffn {
+            DpFfn::Vllm(ffn) => vec![
+                ffn.compile_exchange(ranks, b),
+                labeled_max(
+                    format!("{}.ffn.residual_add [Max over DP ranks]", self.name),
+                    (0..ranks).map(|_| ffn.compile_post(b)).collect(),
+                ),
+            ],
+            // The mega MoE writes routed + shared; the next mHC takes the residual.
+            DpFfn::Mega(ffn) => vec![ffn.compile_exchange(ranks, b)],
+        }
     }
 
     /// The whole layer; at the replay cut each rank's segment opens with the
@@ -458,13 +597,21 @@ impl DpLayerBody {
             );
         }
         self.attention.eval(&rank.attention, ev);
-        self.ffn.eval_local(&ffn_rank_input(rank), ev);
+        match &self.ffn {
+            DpFfn::Vllm(ffn) => ffn.eval_local(&ffn_rank_input(rank), ev),
+            DpFfn::Mega(ffn) => ffn.eval_local(&ffn_rank_input(rank), ev),
+        }
     }
 
     fn eval_tail(&self, input: &DpLayerInput, ev: &mut Evaluator) {
-        self.ffn.eval_exchange(&input.exchange, ev);
-        for rank in &input.exchange.ranks {
-            self.ffn.eval_post(rank, ev);
+        match &self.ffn {
+            DpFfn::Vllm(ffn) => {
+                ffn.eval_exchange(&input.exchange, ev);
+                for rank in &input.exchange.ranks {
+                    ffn.eval_post(rank, ev);
+                }
+            }
+            DpFfn::Mega(ffn) => ffn.eval_exchange(&input.exchange, ev),
         }
     }
 
@@ -547,7 +694,7 @@ impl DpReplayBoundary {
 pub struct DeepseekV41VllmDpModel {
     name: String,
     prologue: DeepseekV41PrologueTpWorklet,
-    engram_prefetch: DeepseekV41EngramPrefetchLocalWorklet,
+    engram_prefetch: Option<DeepseekV41EngramPrefetchLocalWorklet>,
     layer0: DpLayerBody,
     bodies: Vec<DpLayerBody>,
     plan: Vec<PlanNode>,
@@ -601,11 +748,14 @@ pub fn build(
             resolved.prologue,
             bridge,
         )?,
-        engram_prefetch: DeepseekV41EngramPrefetchLocalWorklet::build(
-            format!("{name}.engram_prefetch"),
-            resolved.engram_prefetch,
-            bridge,
-        )?,
+        engram_prefetch: match resolved.engram_prefetch {
+            Some(prefetch) => Some(DeepseekV41EngramPrefetchLocalWorklet::build(
+                format!("{name}.engram_prefetch"),
+                prefetch,
+                bridge,
+            )?),
+            None => None,
+        },
         layer0: DpLayerBody::build(&name, resolved.layer0, bridge)?,
         bodies,
         plan: resolved.plan,
@@ -655,7 +805,10 @@ impl DeepseekV41VllmDpModel {
             .map(|_| {
                 let mut main = vec![self.prologue.compile(b)];
                 main.extend(self.layer0.compile_rank(b));
-                self.engram_prefetch.compile_joined(b, CostNode::Sum(main))
+                match &self.engram_prefetch {
+                    Some(prefetch) => prefetch.compile_joined(b, CostNode::Sum(main)),
+                    None => CostNode::Sum(main),
+                }
             })
             .collect();
         let mut layer0 = vec![labeled_max(
@@ -758,10 +911,12 @@ impl DeepseekV41VllmDpModel {
                 ev,
             );
             self.layer0.eval_rank(rank, ev);
-            self.engram_prefetch.eval(
-                &DeepseekV41EngramPrefetchLocalWorkletInput { num_tokens: tokens },
-                ev,
-            );
+            if let Some(prefetch) = &self.engram_prefetch {
+                prefetch.eval(
+                    &DeepseekV41EngramPrefetchLocalWorkletInput { num_tokens: tokens },
+                    ev,
+                );
+            }
         }
         self.layer0.eval_tail(&step.full, ev);
         self.eval_plan(&self.plan, step, ev);
@@ -1159,6 +1314,7 @@ mod tests {
             decoder_swa_bounded_replay: true,
             max_num_batched_tokens: 2048,
             cudagraph_capture_sizes: tp_arch::vllm_default_cudagraph_capture_sizes(2048),
+            deepinfer: None,
         }
     }
 
@@ -1206,16 +1362,51 @@ mod tests {
         let resolved = resolve_configs(&configs);
         for body in resolved.bodies.iter().chain([&resolved.layer0]) {
             assert_eq!(body.attention.raw_cfg.tp_size, 1);
-            assert_eq!(body.ffn.ffn.fused_moe.num_local_experts.get(), 96);
-            assert!(body.ffn.ffn.all_reduce.is_none());
-            assert_eq!(body.ffn.dispatch.num_gpus, 4);
+            let DpFfnResolved::Vllm(ffn) = &body.ffn else {
+                panic!("the vLLM engine runs the vLLM FFN")
+            };
+            assert_eq!(ffn.ffn.fused_moe.num_local_experts.get(), 96);
+            assert!(ffn.ffn.all_reduce.is_none());
+            assert_eq!(ffn.dispatch.num_gpus, 4);
         }
         assert_eq!(resolved.head.lm_head.n.get(), 129_280);
         assert!(resolved.head.logits_all_gather.is_none());
         assert!(resolved.prologue.embedding_all_reduce.is_none());
-        assert_eq!(resolved.engram_prefetch.lookup.local_heads, 24);
+        assert_eq!(resolved.engram_prefetch.as_ref().unwrap().lookup.local_heads, 24);
         let engram = resolved.bodies[0].engram.as_ref().unwrap();
         assert!(engram.all_gather.is_none());
+    }
+
+    #[test]
+    fn deepinfer_swaps_the_ffn_linears_and_replay_window_only() {
+        let mut p = parallel();
+        p.deepinfer = Some(DeepInferEngine {
+            num_redundant_experts: 32,
+            yoco_keep_tokens: Some(140),
+            engram_fetch: false,
+        });
+        let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
+        assert!(configs.engram_prefetch.is_none());
+        assert_eq!(configs.replay.as_ref().unwrap().rule.window, 140);
+        for body in configs.bodies.iter().chain([&configs.layer0]) {
+            let mega = body.mega.as_ref().unwrap();
+            assert_eq!((mega.num_physical_experts, mega.num_shared_experts), (416, 1));
+            assert_eq!(mega.num_logical_experts.get(), 384);
+            assert_eq!(body.attention.gemm_backends, DEEPINFER_GEMM_BACKENDS);
+            // The kernels both engines share keep the fork's backends.
+            assert_eq!(body.attention.mega_attn_backends, configs_vllm_mega_attn());
+        }
+        // 384 + 30 slots do not split over 4 ranks.
+        p.deepinfer = Some(DeepInferEngine {
+            num_redundant_experts: 30,
+            yoco_keep_tokens: Some(140),
+            engram_fetch: true,
+        });
+        assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
+    }
+
+    fn configs_vllm_mega_attn() -> Vec<&'static str> {
+        build_configs(&cfg(), &parallel(), &uniform_demand()).unwrap().layer0.attention.mega_attn_backends
     }
 
     #[test]

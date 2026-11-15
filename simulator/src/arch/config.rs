@@ -101,6 +101,50 @@ const fn default_decoder_swa_bounded_replay() -> bool {
     true
 }
 
+const fn default_true_engram_fetch() -> bool {
+    true
+}
+
+/// The `engine` choices of `deepseek_v41_vllm_dp_attn_ep_moe` (mirror of
+/// [`DeepseekV41Engine`]).
+const DEEPSEEK_V41_ENGINES: [&str; 2] = ["vllm", "deepinfer"];
+
+/// Which engine's kernels `deepseek_v41_vllm_dp_attn_ep_moe` composes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepseekV41Engine {
+    #[default]
+    Vllm,
+    Deepinfer,
+}
+
+/// The DeepInfer options of `deepseek_v41_vllm_dp_attn_ep_moe`, `None` under
+/// vLLM; DeepInfer-only fields set under vLLM are an error.
+pub fn deepseek_v41_dp_engine(
+    engine: DeepseekV41Engine,
+    num_redundant_experts: u32,
+    yoco_keep_tokens: u32,
+    engram_fetch: bool,
+) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
+    match engine {
+        DeepseekV41Engine::Vllm => {
+            anyhow::ensure!(
+                num_redundant_experts == 0 && yoco_keep_tokens == 0 && engram_fetch,
+                "num_redundant_experts, yoco_keep_tokens and engram_fetch are DeepInfer \
+                 options; set engine: deepinfer"
+            );
+            Ok(None)
+        }
+        DeepseekV41Engine::Deepinfer => {
+            Ok(Some(super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine {
+                num_redundant_experts,
+                yoco_keep_tokens: (yoco_keep_tokens > 0).then_some(yoco_keep_tokens),
+                engram_fetch,
+            }))
+        }
+    }
+}
+
 const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
     crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS
 }
@@ -559,6 +603,27 @@ pub enum IterArchSel {
         /// Empty: eager.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+        /// Serving engine whose kernels run the layers: `vllm` (the fork) or
+        /// `deepinfer` (DeepGEMM mega MoE, DeepGEMM MXFP8 linears, YoCo
+        /// prefill truncation; `DeepInferEngine`).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: EPLB redundant expert slots (`num_extra_experts`).
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        num_redundant_experts: u32,
+        /// DeepInfer only: YoCo prefill truncation keeps this many rows per
+        /// request past the cut layer (`DEEPINFER_YOCO_PREFILL_KEEP_TOKENS`);
+        /// 0 = off. `decoder_swa_bounded_replay` is vLLM's and is ignored.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
+        /// DeepInfer only: price the Engram table fetch (false leaves it out;
+        /// the Engram blocks' compute stays).
+        #[serde(default = "default_true_engram_fetch")]
+        #[param(default = true, cache_key)]
+        engram_fetch: bool,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
