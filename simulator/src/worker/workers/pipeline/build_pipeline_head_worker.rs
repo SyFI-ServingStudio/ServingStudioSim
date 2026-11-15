@@ -24,7 +24,8 @@ use super::PipelineHead;
 /// prefix caching on and a resumable recurrent state in the layout (vLLM's
 /// Mamba `align` mode), every non-final chunk ends on the layout's block.
 /// Host tiers, if the config has any, sit behind the prefix cache, each GPU
-/// storing and reading `layout.tier_bytes`.
+/// storing and reading `layout.tier_bytes`, with reads staged through loading
+/// areas when the config has one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     id: WorkerId,
@@ -86,6 +87,11 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         prefix_cache_logger,
     )
     .with_prefix_tiers(&config.prefix_tiers, layout.tier_bytes);
+    let kv_store = if config.prefix_tier_loading_area > 0.0 {
+        kv_store.with_loading_area(config.prefix_tier_loading_area)
+    } else {
+        kv_store
+    };
     let kv_store = if config.prefix_tier_warm_start {
         kv_store.with_tier_warm_start()
     } else {

@@ -1580,4 +1580,78 @@ mod tests {
             );
         }
     }
+
+    /// 40% of HBM's 120 tokens is the loading area: 48 tokens.
+    fn staged_config(prefix_tiers: Vec<crate::worker::kv::TierSpec>) -> WorkerConfig {
+        WorkerConfig {
+            prefix_tiers,
+            prefix_tier_warm_start: true,
+            prefix_tier_loading_area: 0.4,
+            ..tiered_config()
+        }
+    }
+
+    #[test]
+    fn staged_reads_start_in_order_and_a_later_one_never_jumps_the_head() {
+        // Pre-run contexts of 40, 30 and 5 tokens in DRAM. Session 7's read
+        // takes 40 of the 48-token area; session 8's does not fit beside it,
+        // and session 9's would but may not jump it. Both wait in the queue,
+        // passed over: the plain prompt behind them runs at once.
+        let store = shared_with(&[(0, 4, 1), (1, 4, 1), (2, 4, 1), (3, 8, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 8, 30, 0.0);
+        as_session(&store, 2, 9, 5, 0.0);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            staged_config(tiered_config().prefix_tiers),
+        );
+        for id in 0..4 {
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(id)));
+        }
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        assert_eq!(worker.admission.reading_requests(), 1);
+        run_until(&mut worker, Time::ZERO, Time::from_ms(60.0), &mut events);
+        assert_eq!(launched(&events)[0], (1, 8, Time::from_ms(1.0)));
+        assert_eq!(completed(&events).len(), 4);
+        for (id, hit) in [(0, 40), (1, 30), (2, 5)] {
+            assert_eq!(hit_tokens(&store, id), Some(hit));
+        }
+    }
+
+    #[test]
+    fn a_staged_ssd_read_lands_in_dram_and_hops_on_to_hbm() {
+        // Session 7's 40 pre-run tokens are in SSD (5 tokens per ms): they
+        // reach DRAM's loading area at 8 ms and hop on to HBM on DRAM's
+        // channel (50 tokens per ms) by 8.8 ms; then the request launches.
+        let store = shared_with(&[(0, 4, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        let mut tiers = tiered_config().prefix_tiers;
+        tiers.push(crate::worker::kv::TierSpec {
+            name: "ssd",
+            capacity_gb: 1e-5,
+            read_gb_per_s: 1e-5,
+            writes: crate::worker::kv::TierWrites::EveryContext,
+        });
+        let mut worker = head_with(Rc::clone(&store), staged_config(tiers));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        assert_eq!(
+            worker.tick(Time::ZERO, &mut events),
+            Some(Time::from_ms(8.0))
+        );
+        assert_eq!(
+            worker.tick(Time::from_ms(8.0), &mut events),
+            Some(Time::from_ms(8.8))
+        );
+        assert!(events.is_empty());
+        run_until(
+            &mut worker,
+            Time::from_ms(8.8),
+            Time::from_ms(60.0),
+            &mut events,
+        );
+        assert_eq!(launched(&events), [(1, 4, Time::from_ms(9.8))]);
+        assert_eq!(hit_tokens(&store, 0), Some(40));
+    }
 }

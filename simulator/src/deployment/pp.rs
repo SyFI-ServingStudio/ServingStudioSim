@@ -99,8 +99,8 @@ impl Deployment for PpDeployment {
                             .stages()
                             .iter()
                             .map(|stage| stage.kv_cache_layout()),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -183,8 +183,8 @@ impl Deployment for PpDeployment {
                             .stages()
                             .iter()
                             .map(|stage| stage.kv_cache_layout()),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -274,10 +274,20 @@ fn worker_config(
 
 /// What each GPU stores in and reads from a host tier, from every stage's
 /// layout: the first stage with the most KV bytes per token, or with
-/// `balanced` the stages' means.
-fn tier_bytes(stages: impl Iterator<Item = KvCacheLayout>, balanced: bool) -> TierBytes {
+/// `prefix_tier_balanced_load` the stages' means. A loading area needs a
+/// recurrent state in the tiers.
+fn tier_bytes(
+    stages: impl Iterator<Item = KvCacheLayout>,
+    config: &WorkerConfig,
+) -> anyhow::Result<TierBytes> {
     let stages: Vec<TierBytes> = stages.map(|layout| TierBytes::of_layout(&layout)).collect();
-    TierBytes::of_stages(&stages, balanced)
+    let bytes = TierBytes::of_stages(&stages, config.prefix_tier_balanced_load);
+    ensure!(
+        config.prefix_tier_loading_area == 0.0 || bytes.state > 0,
+        "pp: prefix_tier_loading_area needs an arch with recurrent state; this one is full \
+         attention"
+    );
+    Ok(bytes)
 }
 
 /// Stages of one pipeline share an NVLink domain, so activations move on the
@@ -333,4 +343,26 @@ where
             )
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::kv_layout::KvCachePart;
+
+    #[test]
+    fn a_loading_area_needs_an_arch_with_recurrent_state() {
+        let full_attention = || KvCacheLayout::new().with_part(KvCachePart::per_token("mla", 545));
+        let hybrid = || full_attention().with_part(KvCachePart::per_request("kda", 1_000));
+        let staged = WorkerConfig {
+            prefix_tier_loading_area: 0.1,
+            ..WorkerConfig::default()
+        };
+        assert!(tier_bytes([full_attention()].into_iter(), &staged).is_err());
+        assert!(tier_bytes([full_attention()].into_iter(), &WorkerConfig::default()).is_ok());
+        assert_eq!(
+            tier_bytes([hybrid()].into_iter(), &staged).unwrap().state,
+            1_000
+        );
+    }
 }

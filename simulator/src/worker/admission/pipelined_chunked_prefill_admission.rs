@@ -51,6 +51,16 @@
 //! stops at a request whose tier would begin its read too late
 //! (`read_wait.rs`).
 //!
+//! Under staged loading (a loading area, not vLLM) reads start in a loading
+//! pass before each fresh-admission pass instead: it walks the overdue
+//! requests, then the pending order, and starts each read the KV store's
+//! loading area has room for. A read that does not fit stops its landing
+//! queue (HBM's, or DRAM's for an SSD read that hops on) for the rest of the
+//! pass, so no later read jumps it; requests that start no read keep their
+//! places. Admission passes over a request still needing a read, holding
+//! nothing, and a landed one whose context HBM evicted again goes back to
+//! the pending order to be read again.
+//!
 //! KV reserves the full request footprint once at admission and releases it at
 //! completion. A hybrid recurrent model with prefix caching ends every non-final
 //! chunk on a state-checkpoint boundary (vLLM's `_mamba_block_aligned_split`,
@@ -60,7 +70,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
+use crate::worker::kv::{ChunkedPrefillKv, LoadingQueue, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
@@ -253,6 +263,59 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         }
     }
 
+    /// Staged loading: start the reads of the overdue requests, then of the
+    /// pending order, in order, while the loading area each lands in has room
+    /// (module docs). The pass ends once both landing queues have stopped.
+    fn start_staged_reads<K: TieredPrefixKv>(&mut self, kv_store: &mut K, now: Time) {
+        let (mut hbm_stopped, mut dram_stopped) = (false, false);
+        let mut kept = Vec::new();
+        while !(hbm_stopped && dram_stopped) {
+            let source = if self.policy.head_is_overdue() {
+                FreshSource::Overdue
+            } else {
+                self.policy.refresh_head(&mut |candidate| {
+                    kv_store.reusable_prefix_tokens(
+                        candidate.fresh_prompt_tokens,
+                        candidate.session_input,
+                    )
+                });
+                FreshSource::Pending
+            };
+            let Some(candidate) = self.policy.pop(&mut self.policy_context) else {
+                break;
+            };
+            let Some(read) = kv_store.plan_tier_read(
+                PARTITION,
+                candidate.request_id,
+                candidate.fresh_prompt_tokens,
+                candidate.remaining_output_tokens,
+                candidate.session_input,
+                now,
+            ) else {
+                kept.push((source, candidate));
+                continue;
+            };
+            let stopped = match read.staged.expect("a staged read").queue {
+                LoadingQueue::Hbm => &mut hbm_stopped,
+                LoadingQueue::Dram => &mut dram_stopped,
+            };
+            if *stopped || !kv_store.has_loading_room(PARTITION, &read) {
+                *stopped = true;
+                kept.push((source, candidate));
+                continue;
+            }
+            kv_store.start_tier_read(
+                PARTITION,
+                candidate.request_id,
+                candidate.session_input,
+                read,
+                now,
+            );
+            self.reading.insert(candidate.request_id, candidate);
+        }
+        self.return_passed_over(kept);
+    }
+
     /// Move the reads landed by `now` from reading to landed; returns the
     /// latest landing.
     fn land<K: TieredPrefixKv>(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
@@ -351,6 +414,10 @@ where
     ) -> u32 {
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
+        let staged = kv_store.stages_tier_reads();
+        if staged && gate != FreshGate::OverdueOnly {
+            self.start_staged_reads(kv_store, now);
+        }
         while remaining_budget > 0 {
             let Some((source, candidate)) = self.peek_fresh(kv_store, gate) else {
                 break;
@@ -368,6 +435,12 @@ where
                 candidate.session_input,
                 now,
             ) {
+                if staged {
+                    // Not landed: a loading pass starts its read.
+                    self.take_fresh(source, candidate);
+                    passed_over.push((source, candidate));
+                    continue;
+                }
                 if let Some(read_wait) = self
                     .read_wait
                     .filter(|read_wait| read_wait.exceeded(read.queue_wait))

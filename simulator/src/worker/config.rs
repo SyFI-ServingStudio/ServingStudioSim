@@ -415,6 +415,16 @@ pub struct PrefixTierSpec {
     #[serde(default)]
     #[param(default = false)]
     prefix_tier_warm_start: bool,
+    /// Staged loading (not vLLM): reads go through loading areas of this
+    /// fraction of HBM and, with an SSD behind DRAM, of DRAM, kept free for
+    /// them. Before each admission pass, reads start in queue order while the
+    /// area each lands in has room, and admission takes a request only once
+    /// its read has landed. `0`: a read starts when admission reaches its
+    /// request. In `[0, 0.5)`; needs a tier and a recurrent-state arch, and
+    /// takes no read-wait bound.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    prefix_tier_loading_area: f64,
 }
 
 const fn default_dram_tier_gb_per_s() -> f64 {
@@ -438,6 +448,7 @@ impl Default for PrefixTierSpec {
             prefix_tier_max_read_wait_ms: 0.0,
             prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
             prefix_tier_warm_start: false,
+            prefix_tier_loading_area: 0.0,
         }
     }
 }
@@ -500,6 +511,21 @@ impl PrefixTierSpec {
             max: Time::from_ms(ms),
             policy: self.prefix_tier_read_wait_policy,
         });
+        let area = self.prefix_tier_loading_area;
+        ensure!(
+            (0.0..0.5).contains(&area),
+            "{owner}: prefix_tier_loading_area ({area}) must be in [0, 0.5)"
+        );
+        ensure!(
+            area == 0.0 || !config.prefix_tiers.is_empty(),
+            "{owner}: prefix_tier_loading_area needs dram_tier_gb or ssd_tier_gb > 0"
+        );
+        ensure!(
+            area == 0.0 || ms == 0.0,
+            "{owner}: prefix_tier_max_read_wait_ms does not apply to staged reads \
+             (prefix_tier_loading_area > 0)"
+        );
+        config.prefix_tier_loading_area = area;
         config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
         config.prefix_tier_warm_start = self.prefix_tier_warm_start;
         Ok(())
@@ -1625,5 +1651,23 @@ mod tests {
             .map(|wait| wait.policy),
             Some(ReadWaitPolicy::Block)
         );
+    }
+
+    #[test]
+    fn a_loading_area_is_a_fraction_below_half_that_needs_a_tier_and_no_read_wait() {
+        let dram = "dram_tier_gb: 50.0\n";
+        let area = |extra: &str| prefix_tiers(extra).map(|config| config.prefix_tier_loading_area);
+        assert_eq!(area(dram).unwrap(), 0.0);
+        assert_eq!(
+            area(&format!("{dram}prefix_tier_loading_area: 0.1\n")).unwrap(),
+            0.1
+        );
+        assert!(area(&format!("{dram}prefix_tier_loading_area: 0.5\n")).is_err());
+        assert!(area(&format!("{dram}prefix_tier_loading_area: -0.1\n")).is_err());
+        assert!(area("prefix_tier_loading_area: 0.1\n").is_err());
+        assert!(area(&format!(
+            "{dram}prefix_tier_loading_area: 0.1\nprefix_tier_max_read_wait_ms: 1000.0\n"
+        ))
+        .is_err());
     }
 }
