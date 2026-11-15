@@ -570,6 +570,27 @@ pub(crate) fn dp_layer_config(
     }
 }
 
+/// One GPU's layer under DeepInfer: its EP group is the GPU itself (the PP
+/// arch's stages), so the mega MoE spans `ffn.ep_size` GPUs.
+pub(crate) fn deepinfer_layer(
+    tp1: &mut DeepseekV41LayerConfig,
+    model: &DeepseekV41ModelCfg,
+    kind: &LayerKind,
+    engine: &DeepInferEngine,
+    max_gpu_tokens: u32,
+) {
+    deepinfer_backends(tp1, model, kind, max_gpu_tokens);
+    let vllm = DeepseekV41MoeFfnDpEpWorkletConfig {
+        ffn: tp1.ffn.clone(),
+        collective_backends: Vec::new(),
+        max_rank_tokens: max_gpu_tokens,
+    };
+    tp1.mega = Some(
+        mega_ffn_config(&vllm, &tp1.layers, engine, max_gpu_tokens)
+            .expect("the caller checked every layer's demand"),
+    );
+}
+
 /// DeepInfer's kernels on a body layer: DeepGEMM MXFP8 for every MXFP8
 /// projection the vLLM fork runs through FlashInfer, and DeepInfer's own
 /// mHC, prefill indexer and prefill attention kinds.
@@ -1450,6 +1471,10 @@ impl DeepseekV41VllmDpModel {
 }
 
 impl IterwiseUnifiedModel for DeepseekV41VllmDpModel {
+    fn back_pass_window(&self) -> Option<u32> {
+        self.replay_rule.map(|rule| rule.window)
+    }
+
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
         self.normalize(batch).map(|_| ())
     }

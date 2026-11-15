@@ -125,7 +125,9 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     let admission = match config.back_batching {
         Some(spec) => admission.with_back_stash(BackStash::new(
             spec,
-            back_window(&model.kv_cache_layout()),
+            model
+                .back_pass_window()
+                .unwrap_or_else(|| back_window(&model.kv_cache_layout())),
             num_partitions,
             model_probe(Arc::clone(&model), num_partitions),
         )),

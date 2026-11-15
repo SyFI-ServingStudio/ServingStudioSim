@@ -772,6 +772,16 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "v1", choices = ["v1", "v2", "v3"], cache_key)]
         cut_handoff: crate::arch::deepseek_v41_vllm_pp::CutHandoff,
+        /// Serving engine whose kernels run each stage, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe` (`deepinfer`: DeepGEMM mega MoE
+        /// over the GPU's own 384 experts, DeepGEMM MXFP8 linears, YoCo).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: YoCo keep rows per request past the cut; 0 = off.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
         /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
         #[serde(default)]
         #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]

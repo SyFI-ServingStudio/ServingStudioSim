@@ -668,6 +668,9 @@ pub struct DeepseekV41LayerConfig {
     pub engram: Option<DeepseekV41EngramTpWorkletConfig>,
     pub attention: DeepseekV41AttentionTpWorkletConfig,
     pub ffn: DeepseekV41MoeFfnEpWorkletConfig,
+    /// `Some`: DeepGEMM's mega MoE (one GPU's whole EP group) replaces
+    /// [`Self::ffn`], which then only carries the geometry.
+    pub mega: Option<crate::worklet::DeepseekV41MegaMoeFfnDpEpWorkletConfig>,
 }
 
 /// Fold plan with each body replaced by its index into the body list.
@@ -740,7 +743,19 @@ pub struct DeepseekV41LayerResolved {
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorkletResolved>,
     attention: DeepseekV41AttentionTpWorkletResolved,
-    ffn: DeepseekV41MoeFfnEpWorkletResolved,
+    ffn: LayerFfnResolved,
+}
+
+/// The FFN a body runs: the vLLM fork's fused MoE worklet, or DeepGEMM's mega
+/// MoE over the GPU's EP group.
+enum LayerFfnResolved {
+    Vllm(DeepseekV41MoeFfnEpWorkletResolved),
+    Mega(crate::worklet::DeepseekV41MegaMoeFfnDpEpWorkletResolved),
+}
+
+enum LayerFfn {
+    Vllm(DeepseekV41MoeFfnEpWorklet),
+    Mega(crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet),
 }
 
 pub struct DeepseekV41VllmResolved {
@@ -1279,6 +1294,7 @@ pub(crate) fn layer_config(
             folded_rank_position: 0,
             skip_padding_rows: MOE_SKIP_PADDING,
         },
+        mega: None,
     }
 }
 
@@ -1290,7 +1306,12 @@ pub(crate) fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41Layer
             .as_ref()
             .map(DeepseekV41EngramTpWorklet::resolve_config),
         attention: DeepseekV41AttentionTpWorklet::resolve_config(&config.attention),
-        ffn: DeepseekV41MoeFfnEpWorklet::resolve_config(&config.ffn),
+        ffn: match &config.mega {
+            Some(mega) => LayerFfnResolved::Mega(
+                crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet::resolve_config(mega),
+            ),
+            None => LayerFfnResolved::Vllm(DeepseekV41MoeFfnEpWorklet::resolve_config(&config.ffn)),
+        },
     }
 }
 
@@ -1326,7 +1347,7 @@ pub(crate) struct DeepseekV41LayerBody {
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorklet>,
     attention: DeepseekV41AttentionTpWorklet,
-    ffn: DeepseekV41MoeFfnEpWorklet,
+    ffn: LayerFfn,
 }
 
 impl DeepseekV41LayerBody {
@@ -1350,7 +1371,20 @@ impl DeepseekV41LayerBody {
                 resolved.attention,
                 bridge,
             )?,
-            ffn: DeepseekV41MoeFfnEpWorklet::build(format!("{name}.ffn"), resolved.ffn, bridge)?,
+            ffn: match resolved.ffn {
+                LayerFfnResolved::Vllm(ffn) => LayerFfn::Vllm(DeepseekV41MoeFfnEpWorklet::build(
+                    format!("{name}.ffn"),
+                    ffn,
+                    bridge,
+                )?),
+                LayerFfnResolved::Mega(mega) => LayerFfn::Mega(
+                    crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet::build(
+                        format!("{name}.ffn"),
+                        mega,
+                        bridge,
+                    )?,
+                ),
+            },
             layers: resolved.layers,
             name,
         })
@@ -1362,7 +1396,14 @@ impl DeepseekV41LayerBody {
             children.push(engram.compile(builder));
         }
         children.push(self.attention.compile(builder));
-        children.push(self.ffn.compile(builder));
+        match &self.ffn {
+            LayerFfn::Vllm(ffn) => children.push(ffn.compile(builder)),
+            // One GPU is the whole group: its local launches, then the kernel.
+            LayerFfn::Mega(mega) => {
+                children.extend(mega.compile_local(builder));
+                children.push(mega.compile_exchange(1, builder));
+            }
+        }
         CostNode::Labeled {
             label: format!("{} [layers {:?}]", self.name, self.layers),
             child: Box::new(CostNode::Sum(children)),
@@ -1393,14 +1434,31 @@ impl DeepseekV41LayerBody {
             );
         }
         self.attention.eval(&input.attention, evaluator);
-        self.ffn.eval(
-            &DeepseekV41MoeFfnEpWorkletInput {
-                num_tokens: input.rows,
-                scheduled_tokens: input.scheduled_rows,
-                mhc_overlap: input.attention.mhc_overlap,
-            },
-            evaluator,
-        );
+        match &self.ffn {
+            LayerFfn::Vllm(ffn) => ffn.eval(
+                &DeepseekV41MoeFfnEpWorkletInput {
+                    num_tokens: input.rows,
+                    scheduled_tokens: input.scheduled_rows,
+                    mhc_overlap: input.attention.mhc_overlap,
+                },
+                evaluator,
+            ),
+            LayerFfn::Mega(mega) => {
+                let rank = crate::worklet::DeepseekV41MoeFfnDpRankInput {
+                    num_tokens: input.rows,
+                    scheduled_tokens: input.scheduled_rows,
+                    mhc_overlap: input.attention.mhc_overlap,
+                };
+                mega.eval_local(&rank, evaluator);
+                mega.eval_exchange(
+                    &crate::worklet::DeepseekV41MoeFfnDpEpWorkletInput {
+                        ranks: vec![rank],
+                        collective_tokens: vec![input.rows],
+                    },
+                    evaluator,
+                );
+            }
+        }
     }
 }
 

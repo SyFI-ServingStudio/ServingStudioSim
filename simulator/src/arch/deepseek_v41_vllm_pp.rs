@@ -63,7 +63,7 @@ use crate::arch::deepseek_v41_vllm::{
     DeepseekV41Step, DeepseekV41VllmParallel, LayerKind, NormalizedInput, PlanNode,
 };
 use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
-use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::ENGRAM_TABLE_ROWS_TP1;
+use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{self as dp_arch, DeepInferEngine, ENGRAM_TABLE_ROWS_TP1};
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
@@ -123,6 +123,10 @@ pub struct DeepseekV41VllmPpParallel {
     pub stage_layers: Vec<Vec<(u32, u32)>>,
     /// How the cut layer's input reaches it ([`CutHandoff`]).
     pub cut_handoff: CutHandoff,
+    /// `Some`: the DeepInfer engine's kernels on every stage (DeepGEMM mega
+    /// MoE over the GPU's own 384 experts, DeepGEMM MXFP8 linears, YoCo keep
+    /// rows), as for the DP arch ([`DeepInferEngine`]).
+    pub deepinfer: Option<DeepInferEngine>,
 }
 
 /// Where the replay cut layer's `write_kv` runs and what carries the rows
@@ -552,7 +556,8 @@ pub struct DeepseekV41VllmPpConfigs {
     /// Embedding and Engram hash, at TP1 (on the stages that run them).
     pub prologue: DeepseekV41PrologueTpWorkletConfig,
     /// One host-UVA lookup per Engram layer, at TP1.
-    pub engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletConfig,
+    /// `None`: the Engram fetch priced out.
+    pub engram_prefetch: Option<DeepseekV41EngramPrefetchLocalWorkletConfig>,
     pub head: DeepseekV41HeadTpWorkletConfig,
     pub stages: Vec<DeepseekV41PpStageConfigs>,
     /// Whether the pinned vLLM fork runs this split ([`fork_accepts`]).
@@ -599,10 +604,46 @@ pub fn build_configs(
         max_num_batched_tokens: parallel.max_num_batched_tokens,
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
     };
-    let rule = if parallel.decoder_swa_bounded_replay {
-        Some(BoundedReplay::from_model(model)?)
+    // DeepInfer's YoCo truncation is the bounded-replay cut keeping
+    // `yoco_keep_tokens` rows per request (as in the DP arch).
+    let replay_on = match &parallel.deepinfer {
+        Some(engine) => engine.yoco_keep_tokens.is_some(),
+        None => parallel.decoder_swa_bounded_replay,
+    };
+    let rule = if replay_on {
+        let mut rule = BoundedReplay::from_model(model)?;
+        if let Some(keep) = parallel.deepinfer.and_then(|engine| engine.yoco_keep_tokens) {
+            if keep < rule.window {
+                return Err(fit_failed(format!(
+                    "yoco_keep_tokens {keep} must cover the sliding window {}",
+                    rule.window
+                )));
+            }
+            rule.window = keep;
+        }
+        Some(rule)
     } else {
         None
+    };
+    if parallel.deepinfer.is_some_and(|engine| engine.num_redundant_experts > 0) {
+        return Err(fit_failed(
+            "a PP stage holds every expert (EP1): no redundant expert slots",
+        ));
+    }
+    let graphs = DeepseekV41CudaGraphs::new(
+        &parallel.cudagraph_capture_sizes,
+        tp_arch::MAX_NUM_SEQS,
+        &[1],
+    );
+    let max_gpu_tokens = parallel.max_num_batched_tokens.max(graphs.max_tokens());
+    // A layer's configs on one GPU: the TP arch's at TP1/EP1, with the
+    // engine's kernels.
+    let stage_layer = |kind: LayerKind, layers: Vec<u32>| {
+        let mut config = layer_config(model, &local, demand, kind, layers);
+        if let Some(engine) = &parallel.deepinfer {
+            dp_arch::deepinfer_layer(&mut config, engine, max_gpu_tokens);
+        }
+        config
     };
     let multi_range = lists.iter().any(|list| list.len() > 1);
     if multi_range && rule.is_none() {
@@ -638,7 +679,7 @@ pub fn build_configs(
     for (index, list) in lists.iter().enumerate() {
         let segments = stage_segments(list, geometry.cut);
         let layer0 = (segments[0].0 == 0)
-            .then(|| layer_config(model, &local, demand, layer0_kind, vec![0]));
+            .then(|| stage_layer(layer0_kind, vec![0]));
         let mut bodies = Vec::new();
         let mut plan = Vec::new();
         let mut front_nodes = 0;
@@ -647,7 +688,7 @@ pub fn build_configs(
                 .map(|layer| (layer, model.layer_kind(layer)))
                 .collect();
             let nodes = index_plan(&fold_layers(&tail), &mut |kind, layers| {
-                bodies.push(layer_config(model, &local, demand, kind, layers.to_vec()));
+                bodies.push(stage_layer(kind, layers.to_vec()));
                 bodies.len() - 1
             });
             if geometry.is_front(start) {
@@ -668,14 +709,8 @@ pub fn build_configs(
         };
         let cut = match rule.filter(|_| cut_stage == Some(index as u16)) {
             Some(rule) => {
-                let write_kv = layer_config(
-                    model,
-                    &local,
-                    demand,
-                    model.layer_kind(rule.cut_layer),
-                    vec![rule.cut_layer],
-                )
-                .attention;
+                let write_kv = stage_layer(model.layer_kind(rule.cut_layer), vec![rule.cut_layer])
+                    .attention;
                 Some(DeepseekV41ReplayConfig::new(rule, 0, write_kv, model, &gpu))
             }
             None => None,
@@ -734,7 +769,7 @@ pub fn build_configs(
             all_reduce_backends: tp_arch::ALL_REDUCE_BACKENDS.to_vec(),
             elementwise_backends: tp_arch::ELEMENTWISE_BACKENDS.to_vec(),
         },
-        engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletConfig {
+        engram_prefetch: Some(DeepseekV41EngramPrefetchLocalWorkletConfig {
             tp_size: 1,
             engram_num_heads: model.engram_hash_heads,
             engram_head_dim: model.engram_head_dim,
@@ -744,7 +779,7 @@ pub fn build_configs(
             weight_dtype: DType::Fp8E4m3,
             gpu_name: gpu.clone(),
             backends: tp_arch::ENGRAM_LOOKUP_BACKENDS.to_vec(),
-        },
+        }),
         head: DeepseekV41HeadTpWorkletConfig {
             tp_size: 1,
             hidden_size: model.hidden_size.into(),
@@ -758,12 +793,8 @@ pub fn build_configs(
         fork_accepts: fork_accepts_lists(model, &lists, rule.is_some()),
         stages,
         kv_cache_layout,
-        window: model.sliding_window,
-        graphs: DeepseekV41CudaGraphs::new(
-            &parallel.cudagraph_capture_sizes,
-            tp_arch::MAX_NUM_SEQS,
-            &[1],
-        ),
+        window: rule.map_or(model.sliding_window, |rule| rule.window),
+        graphs,
     })
 }
 
@@ -794,7 +825,7 @@ pub struct DeepseekV41VllmPpResolved {
     engram_layer_ids: Vec<u32>,
     embedding: ElementwiseKernelConfig,
     engram_hash: ElementwiseKernelConfig,
-    engram_prefetch: DeepseekV41EngramPrefetchLocalWorkletResolved,
+    engram_prefetch: Option<DeepseekV41EngramPrefetchLocalWorkletResolved>,
     head: DeepseekV41HeadTpWorkletResolved,
     stages: Vec<DeepseekV41PpStageResolved>,
     fork_accepts: bool,
@@ -812,9 +843,10 @@ pub fn resolve_configs(configs: &DeepseekV41VllmPpConfigs) -> DeepseekV41VllmPpR
         engram_layer_ids: configs.engram_layer_ids.clone(),
         embedding: prologue.embedding,
         engram_hash: prologue.engram_hash,
-        engram_prefetch: DeepseekV41EngramPrefetchLocalWorklet::resolve_config(
-            &configs.engram_prefetch,
-        ),
+        engram_prefetch: configs
+            .engram_prefetch
+            .as_ref()
+            .map(DeepseekV41EngramPrefetchLocalWorklet::resolve_config),
         head: DeepseekV41HeadTpWorklet::resolve_config(&configs.head),
         stages: configs
             .stages
@@ -874,7 +906,7 @@ struct StageContext<'a> {
     engram_layer_ids: &'a [u32],
     embedding: &'a ElementwiseKernelConfig,
     engram_hash: &'a ElementwiseKernelConfig,
-    engram_prefetch: &'a DeepseekV41EngramPrefetchLocalWorkletResolved,
+    engram_prefetch: Option<&'a DeepseekV41EngramPrefetchLocalWorkletResolved>,
     head: &'a DeepseekV41HeadTpWorkletResolved,
     graphs: &'a DeepseekV41CudaGraphs,
     max_model_len: u32,
@@ -940,13 +972,14 @@ impl DeepseekV41VllmPpStageModel {
             .collect();
         let engram_lookups = local_engram
             .iter()
-            .map(|layer| {
+            .filter_map(|layer| ctx.engram_prefetch.map(|prefetch| (layer, prefetch)))
+            .map(|(layer, prefetch)| {
                 let leaf = format!("{name}.engram_prefetch.layer{layer}.engram_lookup");
                 Ok(Op::new(
                     leaf.clone(),
                     Arc::new(EngramLookupKernel::build(
                         leaf,
-                        ctx.engram_prefetch.lookup.clone(),
+                        prefetch.lookup.clone(),
                         bridge,
                     )?),
                 ))
@@ -1426,6 +1459,10 @@ impl DeepseekV41VllmPpStageModel {
 }
 
 impl IterwiseUnifiedModel for DeepseekV41VllmPpStageModel {
+    fn back_pass_window(&self) -> Option<u32> {
+        Some(self.window)
+    }
+
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
         self.normalize(batch).map(|_| ())
     }
@@ -1522,7 +1559,7 @@ pub fn build_with_engram_fetch(
         engram_layer_ids: &engram_layer_ids,
         embedding: &embedding,
         engram_hash: &engram_hash,
-        engram_prefetch: &engram_prefetch,
+        engram_prefetch: engram_prefetch.as_ref(),
         head: &head,
         graphs: &graphs,
         max_model_len: parallel.max_model_len,
@@ -1633,6 +1670,10 @@ impl DeepseekV41VllmPpModel {
 }
 
 impl IterwiseUnifiedModel for DeepseekV41VllmPpModel {
+    fn back_pass_window(&self) -> Option<u32> {
+        self.stages[0].back_pass_window()
+    }
+
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
         self.stages[0].check_input(batch)
     }
@@ -1713,6 +1754,7 @@ mod tests {
             cudagraph_capture_sizes: Vec::new(),
             stage_layers: Vec::new(),
             cut_handoff: CutHandoff::V1,
+            deepinfer: None,
         }
     }
 
@@ -1943,6 +1985,43 @@ mod tests {
         assert_eq!(model.activation_bytes_per_token(), 4 * 5120 * 2 + 4 * 4);
         // Fork-legal: replay only on the last stage.
         assert!(stages[5].cut.is_some() && stages[..5].iter().all(|s| s.replay_rule.is_none()));
+    }
+
+    #[test]
+    fn deepinfer_stages_run_an_ep1_mega_moe_and_keep_yoco_rows() {
+        let engine = DeepInferEngine {
+            num_redundant_experts: 0,
+            yoco_keep_tokens: Some(140),
+            engram_fetch: false,
+        };
+        let fold = DeepseekV41VllmPpParallel {
+            deepinfer: Some(engine),
+            ..fold_parallel(30, CutHandoff::V3)
+        };
+        let cfgs = build_configs(&model_cfg(), &fold, &uniform()).unwrap();
+        assert_eq!(cfgs.window, 140);
+        for stage in &cfgs.stages {
+            for body in stage.bodies.iter().chain(&stage.layer0) {
+                let mega = body.mega.as_ref().expect("every DeepInfer body runs the mega MoE");
+                assert_eq!((mega.ep_size, mega.num_physical_experts), (1, 384));
+                assert_eq!(body.attention.gemm_backends, vec!["deepgemm_mxfp8"]);
+            }
+        }
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let model = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
+        assert_eq!(model.back_pass_window(), Some(140));
+        let manifest = format!("{:?}", model.stages()[0].cost_log_manifest());
+        assert!(manifest.contains("mega_moe"), "no mega_moe leaf on stage 0");
+        // Redundant slots have no meaning when one GPU holds every expert.
+        let redundant = DeepseekV41VllmPpParallel {
+            deepinfer: Some(DeepInferEngine {
+                num_redundant_experts: 32,
+                ..engine
+            }),
+            ..fold_parallel(30, CutHandoff::V3)
+        };
+        assert!(build_configs(&model_cfg(), &redundant, &uniform()).is_err());
     }
 
     #[test]

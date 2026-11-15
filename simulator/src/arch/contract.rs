@@ -143,6 +143,13 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Rows a deferred back pass keeps per request past the replay cut, when
+    /// the model's rule differs from its cache's sliding window (DeepInfer's
+    /// YoCo keeps 140 for a 128 window). `None`: the sliding window.
+    fn back_pass_window(&self) -> Option<u32> {
+        None
+    }
+
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
     /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),

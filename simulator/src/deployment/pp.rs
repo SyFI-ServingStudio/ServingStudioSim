@@ -232,6 +232,8 @@ impl Deployment for PpDeployment {
                 cudagraph_capture_sizes,
                 stage_layers,
                 cut_handoff,
+                engine,
+                yoco_keep_tokens,
                 engram_fetch,
                 ..
             } => {
@@ -249,6 +251,12 @@ impl Deployment for PpDeployment {
                     cudagraph_capture_sizes,
                     stage_layers,
                     *cut_handoff,
+                    crate::arch::config::deepseek_v41_dp_engine(
+                        *engine,
+                        0,
+                        *yoco_keep_tokens,
+                        *engram_fetch,
+                    )?,
                     *engram_fetch,
                     &gpu_name,
                     MODEL_NAME,

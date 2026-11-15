@@ -157,7 +157,14 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
     if let Some(spec) = config.back_batching {
         let probe = back_probe.expect("back batching on a pipeline needs the pipeline's probe");
         admission =
-            admission.with_back_stash(BackStash::new(spec, back_window(kv_cache_layout), 1, probe));
+            admission.with_back_stash(BackStash::new(
+                spec,
+                stage_model
+                    .back_pass_window()
+                    .unwrap_or_else(|| back_window(kv_cache_layout)),
+                1,
+                probe,
+            ));
     }
 
     let head = PipelineHeadWorker::from_components(
