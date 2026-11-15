@@ -4,11 +4,13 @@
 //! A read starts when admission reaches its request (`TieredPrefixKv`), lands
 //! when its tier's channel has moved it, and ends when admission puts its
 //! context back into HBM. A context put back but evicted again before its
-//! request is admitted is read again.
+//! request is admitted is read again. A staged SSD read with a DRAM loading
+//! area lands in DRAM first, waits there for room in HBM's area, in landing
+//! order, and then hops on to HBM.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::rc::Rc;
 
 use serde::Serialize;
@@ -16,13 +18,19 @@ use serde::Serialize;
 use crate::common::{RequestId, Time};
 use crate::worker::shared::advance_scope::PartitionId;
 
-use super::tier_chain::{TierBytes, TierHit, TierRead, TierReport};
+use super::tier_chain::{LoadingReport, StagedCharge, TierBytes, TierHit, TierRead, TierReport};
 
 /// Where a read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadPhase {
-    /// On its tier's channel.
+    /// On its tier's channel, into HBM.
     Reading,
+    /// On SSD's channel, into DRAM's loading area.
+    IntoDram,
+    /// In DRAM's loading area, waiting for room in HBM's.
+    InDram,
+    /// On DRAM's channel, from DRAM's loading area into HBM's.
+    Hop,
     /// Moved, its request still holding its HBM footprint.
     Landed,
     /// Its context back in HBM, its request not yet admitted.
@@ -36,6 +44,11 @@ pub(crate) struct ReadRecord {
     pub(crate) hit: TierHit,
     pub(crate) read: TierRead,
     pub(crate) phase: ReadPhase,
+    /// HBM units it holds from its start, or from its hop when it lands in
+    /// DRAM first, until its context is put back.
+    pub(crate) hold_units: u64,
+    /// What it holds in the loading areas; `None` unstaged.
+    pub(crate) staged: Option<StagedCharge>,
 }
 
 /// What one partition's session admissions found where.
@@ -73,6 +86,9 @@ pub struct TiersReport {
     /// Reads of a context an earlier read put back but HBM evicted before
     /// admission.
     pub rereads: u64,
+    /// Staged loading's areas; absent without.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loading: Option<LoadingReport>,
     pub tiers: Vec<TierReport>,
 }
 
@@ -84,6 +100,8 @@ pub(crate) struct TierReads {
     records: HashMap<RequestId, ReadRecord>,
     /// Reads on a channel, by landing time.
     landing: BinaryHeap<Reverse<(Time, RequestId)>>,
+    /// Per partition: reads in DRAM's loading area, in landing order.
+    in_dram: Vec<VecDeque<RequestId>>,
     /// Per partition: the longest context the run stored for each session.
     stored: Vec<HashMap<u32, u64>>,
     stats: Vec<AdmissionStats>,
@@ -94,6 +112,7 @@ impl TierReads {
         Self {
             records: HashMap::new(),
             landing: BinaryHeap::new(),
+            in_dram: vec![VecDeque::new(); num_partitions],
             stored: vec![HashMap::new(); num_partitions],
             stats: vec![
                 AdmissionStats {
@@ -127,7 +146,8 @@ impl TierReads {
         self.landing.peek().map(|Reverse((ready, _))| *ready)
     }
 
-    /// Land every read done by `now`, in landing order.
+    /// Land every read done by `now` in HBM, in landing order; one landing
+    /// in DRAM's loading area waits there for its hop instead.
     pub(crate) fn land(&mut self, now: Time) -> Vec<(RequestId, Time)> {
         let mut landed = Vec::new();
         while let Some(&Reverse((ready, request))) = self.landing.peek() {
@@ -139,10 +159,36 @@ impl TierReads {
                 .records
                 .get_mut(&request)
                 .expect("a landing belongs to a read");
-            record.phase = ReadPhase::Landed;
-            landed.push((request, ready));
+            if record.phase == ReadPhase::IntoDram {
+                record.phase = ReadPhase::InDram;
+                self.in_dram[record.partition as usize].push_back(request);
+            } else {
+                record.phase = ReadPhase::Landed;
+                landed.push((request, ready));
+            }
         }
         landed
+    }
+
+    /// The read longest in `partition`'s DRAM loading area.
+    pub(crate) fn next_hop(&self, partition: PartitionId) -> Option<(RequestId, &ReadRecord)> {
+        let request = *self.in_dram[partition as usize].front()?;
+        Some((request, &self.records[&request]))
+    }
+
+    /// The read [`Self::next_hop`] returned hops on to HBM, landing at
+    /// `ready`.
+    pub(crate) fn start_hop(&mut self, partition: PartitionId, ready: Time) {
+        let request = self.in_dram[partition as usize]
+            .pop_front()
+            .expect("a hop starts from DRAM's loading area");
+        let record = self
+            .records
+            .get_mut(&request)
+            .expect("a read in DRAM has a record");
+        record.phase = ReadPhase::Hop;
+        record.read.ready = ready;
+        self.landing.push(Reverse((ready, request)));
     }
 
     /// The landed read of `request`, now restored into HBM.

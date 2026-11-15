@@ -58,6 +58,7 @@ impl PrefixCacheJournal {
             }
             TierEventKind::Cut => PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::TierCut),
             TierEventKind::Read => PrefixCacheEventKind::Activate(PrefixCacheActivation::TierRead),
+            TierEventKind::Hop => PrefixCacheEventKind::Activate(PrefixCacheActivation::TierHop),
         };
         let requested_tokens = match kind {
             PrefixCacheEventKind::Activate(_) => event.hit_tokens,

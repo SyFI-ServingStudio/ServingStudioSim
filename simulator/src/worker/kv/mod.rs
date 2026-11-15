@@ -19,7 +19,7 @@ pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResum
 pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::state_retention::StateRetention;
-pub use shared::tier_chain::{TierBytes, TierSpec, TierWrites};
+pub use shared::tier_chain::{LoadingQueue, StagedCharge, TierBytes, TierSpec, TierWrites};
 pub use shared::tier_reads::{SharedTiersReports, TiersReport};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
@@ -327,16 +327,22 @@ pub struct TierReadPlan<F> {
     /// Tokens the read resumes from, and of them what HBM already holds.
     pub hit_tokens: u64,
     pub resident_tokens: u64,
-    /// What the read holds in HBM from its start until its context is put
-    /// back: the request's whole footprint and every earlier state it moves.
+    /// What the read holds in HBM until its context is put back: unstaged,
+    /// from its start, the request's whole footprint; staged, from when it
+    /// lands in HBM's loading area, the KV it lands. Both with every earlier
+    /// state it moves.
     pub hold: F,
+    /// Staged loading: what it holds in the loading areas; `None` unstaged.
+    pub staged: Option<StagedCharge>,
 }
 
 /// Prefix refinement with host DRAM/SSD tiers behind HBM, read when admission
 /// reaches a request, as vLLM's KV connector does (`WAITING_FOR_REMOTE_KVS`).
 /// The store decides what a read moves and how long it takes; admission only
 /// decides when to start one and when to admit its request. Without tiers no
-/// request needs a read.
+/// request needs a read. With a loading area (staged loading, not vLLM) reads
+/// go through loading areas the store keeps free, each landing queue in
+/// order: admission starts a read only while its area has room.
 pub trait TieredPrefixKv: ChunkedPrefillKv {
     /// The longer of HBM's resident prefix and what a tier would read back:
     /// what a cache-aware order ranks a request by.
@@ -353,8 +359,19 @@ pub trait TieredPrefixKv: ChunkedPrefillKv {
         session_input: SessionInput,
         now: Time,
     ) -> Option<TierReadPlan<Self::Footprint>>;
+    /// Whether reads stage through loading areas.
+    fn stages_tier_reads(&self) -> bool;
+    /// Staged loading: whether the planned read may start, in an area it
+    /// fits in or an empty one.
+    fn has_loading_room(
+        &self,
+        partition: PartitionId,
+        plan: &TierReadPlan<Self::Footprint>,
+    ) -> bool;
     /// Start the planned read, holding its footprint until the context is
-    /// put back.
+    /// put back. A staged read takes its share of the loading area it lands
+    /// in first; one landing in DRAM holds nothing in HBM until it hops on,
+    /// in landing order, once HBM's area has room.
     fn start_tier_read(
         &mut self,
         partition: PartitionId,
@@ -365,11 +382,12 @@ pub trait TieredPrefixKv: ChunkedPrefillKv {
     );
     /// When the next read lands.
     fn next_tier_landing(&self) -> Option<Time>;
-    /// The requests whose reads landed by `now`, in landing order, each with
-    /// its landing time.
+    /// The requests whose reads landed in HBM by `now`, in landing order,
+    /// each with its landing time; then the hops that now fit start.
     fn take_landed_reads(&mut self, now: Time) -> Vec<(RequestId, Time)>;
-    /// Put a landed request's context back into HBM, ending its hold, just
-    /// before admission resolves its prefix.
+    /// Put a landed request's context back into HBM, ending its hold and
+    /// giving its share of HBM's loading area back, just before admission
+    /// resolves its prefix.
     fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time);
 }
 

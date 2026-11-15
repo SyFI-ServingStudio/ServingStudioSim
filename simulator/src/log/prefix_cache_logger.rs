@@ -26,6 +26,8 @@ pub enum PrefixCacheActivation {
     Miss,
     /// A host tier's entry read toward HBM.
     TierRead,
+    /// A staged SSD read moving on from DRAM's loading area to HBM's.
+    TierHop,
 }
 
 /// Why a retained prefix-cache entry was evicted.
@@ -82,6 +84,7 @@ impl PrefixCacheEventKind {
             Self::Activate(PrefixCacheActivation::Hit) => "hit",
             Self::Activate(PrefixCacheActivation::Miss) => "miss",
             Self::Activate(PrefixCacheActivation::TierRead) => "read",
+            Self::Activate(PrefixCacheActivation::TierHop) => "hop",
             Self::Evict(PrefixCacheEvictionReason::ActiveKvPressure) => "active-kv-pressure",
             Self::Evict(PrefixCacheEvictionReason::ReplacementPolicy) => "replacement-policy",
             Self::Evict(PrefixCacheEvictionReason::RetentionCapacity) => "retention-capacity",

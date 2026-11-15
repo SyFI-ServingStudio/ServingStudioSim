@@ -43,7 +43,7 @@ use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::shared::state_retention::Carried;
 use crate::worker::kv::shared::tier_chain::{
-    LeavingContext, RoundContext, TierBytes, TierChain, TierHit, TierSpec,
+    LeavingContext, LoadingQueue, RoundContext, TierBytes, TierChain, TierHit, TierSpec,
 };
 use crate::worker::kv::shared::tier_reads::{
     ReadPhase, ReadRecord, SharedTiersReports, TierReads, TiersReport,
@@ -413,19 +413,37 @@ impl TieredPrefixKv for KvCacheStore {
         } else {
             chain.read_states(session_id, hit).len() as u64
         };
+        let staged = chain.staged_charge(hit.tier, hit.tokens - resident, 1 + earlier);
+        // Staged, the read holds only what it lands; its request's footprint
+        // waits for admission.
+        let (context, outputs) = match staged {
+            Some(_) => (hit.tokens - resident, 0),
+            None => (
+                u64::from(resolved.post_prefill_context_tokens()),
+                u64::from(remaining_output_tokens),
+            ),
+        };
         Some(TierReadPlan {
             tier: hit.tier,
             queue_wait: chain.queue_wait(hit.tier, now),
             hit_tokens: hit.tokens,
             resident_tokens: resident,
             hold: KvFootprint {
-                reserved_units: self.accounting.footprint(
-                    u64::from(resolved.post_prefill_context_tokens()),
-                    u64::from(remaining_output_tokens),
-                ) + earlier * self.accounting.reusable_state_units(),
+                reserved_units: self.accounting.footprint(context, outputs)
+                    + earlier * self.accounting.reusable_state_units(),
                 basis: ReservationBasis::FullFootprint,
             },
+            staged,
         })
+    }
+
+    fn stages_tier_reads(&self) -> bool {
+        self.tier_chains.first().is_some_and(TierChain::is_staged)
+    }
+
+    fn has_loading_room(&self, partition: PartitionId, plan: &TierReadPlan<KvFootprint>) -> bool {
+        let staged = plan.staged.expect("a staged read");
+        self.tier_chains[partition as usize].area_fits(staged.queue, staged)
     }
 
     fn start_tier_read(
@@ -449,22 +467,19 @@ impl TieredPrefixKv for KvCacheStore {
             .tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
             .expect("a planned read has a hit");
         debug_assert_eq!((hit.tier, hit.tokens), (plan.tier, plan.hit_tokens));
-        self.ledger
-            .hold(request, partition, plan.hold.reserved_units(), hit.tokens);
-        // What the hold pushes out of HBM reaches a victim tier after the
-        // read: the read touches its entry first.
-        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
-        let mut evicted = Vec::new();
-        for eviction in evictions {
-            evicted.extend(self.journal_mutation(
-                request,
-                partition,
-                now,
-                eviction,
-                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
-                0,
-            ));
+        let hold_units = plan.hold.reserved_units();
+        let into_dram = plan
+            .staged
+            .is_some_and(|staged| staged.queue == LoadingQueue::Dram);
+        if let Some(staged) = plan.staged {
+            self.tier_chains[partition as usize].take_area(staged.queue, staged);
         }
+        // One landing in DRAM holds HBM from its hop on.
+        let evicted = if into_dram {
+            Vec::new()
+        } else {
+            self.hold_for_read(request, partition, hold_units, hit.tokens, now)
+        };
         let reads = self.tier_reads.as_mut().expect("a read implies tiers");
         let chain = &mut self.tier_chains[partition as usize];
         if seeded {
@@ -483,7 +498,13 @@ impl TieredPrefixKv for KvCacheStore {
                 session_id,
                 hit,
                 read,
-                phase: ReadPhase::Reading,
+                phase: if into_dram {
+                    ReadPhase::IntoDram
+                } else {
+                    ReadPhase::Reading
+                },
+                hold_units,
+                staged: plan.staged,
             },
         );
         for context in evicted {
@@ -497,9 +518,23 @@ impl TieredPrefixKv for KvCacheStore {
     }
 
     fn take_landed_reads(&mut self, now: Time) -> Vec<(RequestId, Time)> {
-        self.tier_reads
-            .as_mut()
-            .map_or_else(Vec::new, |reads| reads.land(now))
+        let Some(reads) = self.tier_reads.as_mut() else {
+            return Vec::new();
+        };
+        let landed = reads.land(now);
+        for (request, _) in &landed {
+            let record = reads.record(*request).expect("a landed read");
+            if let Some(staged) = record
+                .staged
+                .filter(|staged| staged.queue == LoadingQueue::Dram)
+            {
+                // Its hop landed: DRAM's area is free of it.
+                self.tier_chains[record.partition as usize]
+                    .release_area(LoadingQueue::Dram, staged);
+            }
+        }
+        self.start_hops(now);
+        landed
     }
 
     fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time) {
@@ -510,6 +545,9 @@ impl TieredPrefixKv for KvCacheStore {
             .expect("a landed read implies tiers")
             .restore(request)
             .clone();
+        if let Some(staged) = record.staged {
+            self.tier_chains[partition as usize].release_area(LoadingQueue::Hbm, staged);
+        }
         let physical_limit = self.prefix_cache_physical_limit(partition);
         let insert_result = self.prefix_caches[partition as usize].restore(
             record.session_id,
@@ -740,6 +778,21 @@ impl KvCacheStore {
         self
     }
 
+    /// Stage tier reads through loading areas of `fraction` of HBM and, with
+    /// an SSD behind DRAM, of DRAM (`TierChain::set_loading_area`). HBM's
+    /// area is also kept free of admission and retained prefixes: a
+    /// partition holds at least that much.
+    pub(crate) fn with_loading_area(mut self, fraction: f64) -> Self {
+        assert!(!self.tier_chains.is_empty(), "a loading area needs a tier");
+        let bytes_per_unit = self.accounting.bytes_per_unit();
+        for (partition, chain) in self.tier_chains.iter_mut().enumerate() {
+            let area = (self.partitions[partition].capacity_units() as f64 * fraction) as u64;
+            self.ledger.set_loading_area(partition as PartitionId, area);
+            chain.set_loading_area(fraction, area * bytes_per_unit);
+        }
+        self
+    }
+
     /// Treat a declared prefix longer than anything the run stored for the
     /// session, by more than one token, as a conversation that began before
     /// the run: its context is in the slowest tier, as a long-lived session's
@@ -777,6 +830,7 @@ impl KvCacheStore {
                     warm_start_reads: stats.warm_start_reads,
                     warm_start_tokens: stats.warm_start_tokens,
                     rereads: stats.rereads,
+                    loading: chain.loading_report(),
                     tiers: (0..chain.len())
                         .map(|tier| {
                             chain.report(
@@ -789,6 +843,66 @@ impl KvCacheStore {
                 }
             })
             .collect()
+    }
+
+    /// Hold `units` of `partition` for `request`'s read of `kv_tokens`; what
+    /// the hold pushes out of HBM is returned for a victim tier, which takes
+    /// it after the read touched its entry.
+    fn hold_for_read(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        units: u64,
+        kv_tokens: u64,
+        now: Time,
+    ) -> Vec<LeavingContext> {
+        self.ledger.hold(request, partition, units, kv_tokens);
+        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
+        let mut evicted = Vec::new();
+        for eviction in evictions {
+            evicted.extend(self.journal_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            ));
+        }
+        evicted
+    }
+
+    /// Hop the reads waiting in each partition's DRAM loading area on to
+    /// HBM's, in landing order, while HBM's area has room.
+    fn start_hops(&mut self, now: Time) {
+        for partition in 0..self.tier_chains.len() {
+            let partition = partition as PartitionId;
+            loop {
+                let reads = self.tier_reads.as_ref().expect("a hop implies tiers");
+                let Some((request, record)) = reads.next_hop(partition) else {
+                    break;
+                };
+                let staged = record.staged.expect("a hop is staged");
+                let chain = &self.tier_chains[partition as usize];
+                if !chain.area_fits(LoadingQueue::Hbm, staged) {
+                    break;
+                }
+                let (session_id, hit_tokens, hold_units) =
+                    (record.session_id, record.hit.tokens, record.hold_units);
+                let evicted = self.hold_for_read(request, partition, hold_units, hit_tokens, now);
+                let chain = &mut self.tier_chains[partition as usize];
+                chain.take_area(LoadingQueue::Hbm, staged);
+                let ready = chain.hop(session_id, hit_tokens, staged, now);
+                for context in evicted {
+                    chain.take_hbm_eviction(context);
+                }
+                self.tier_reads
+                    .as_mut()
+                    .expect("a hop implies tiers")
+                    .start_hop(partition, ready);
+                self.log_tier_events(partition, request, now);
+            }
+        }
     }
 
     /// Where a read of the session's `declared` prefix on `partition` would
@@ -1551,6 +1665,174 @@ mod tests {
             (1, 6_000)
         );
         assert_eq!(stats.rereads, 0);
+    }
+
+    /// A plain-token store of 100,000 tokens with a 10% loading area (10,000
+    /// tokens) and tiers of 1 B per token: DRAM holds 1M tokens read at 1000
+    /// per ms, written through, or with `ssd` as HBM's victim tier in front of
+    /// a written-through SSD of 10M read at 100 per ms. Sessions 1.. each
+    /// complete a context of `contexts[i]` tokens, which only the tiers keep.
+    fn staged_store(contexts: &[u32], ssd: bool) -> KvCacheStore {
+        let dram = TierSpec {
+            name: "dram",
+            capacity_gb: 1e-3,
+            read_gb_per_s: 1e-3,
+            writes: if ssd {
+                TierWrites::Evictions
+            } else {
+                TierWrites::EveryContext
+            },
+        };
+        let ssd_tier = TierSpec {
+            name: "ssd",
+            capacity_gb: 1e-2,
+            read_gb_per_s: 1e-4,
+            writes: TierWrites::EveryContext,
+        };
+        let specs = if ssd {
+            vec![dram, ssd_tier]
+        } else {
+            vec![dram]
+        };
+        let mut kv_store = KvCacheStore::new(
+            1,
+            KvAccounting::tokens_for_test(100_000),
+            capped_prefix_cache(100_000, PrefixCachePolicy::Lru),
+            None,
+            None,
+        )
+        .with_prefix_tiers(
+            &specs,
+            TierBytes {
+                per_token: 1,
+                state: 0,
+            },
+        )
+        .with_loading_area(0.1);
+        for (i, &tokens) in contexts.iter().enumerate() {
+            let id = i as u32 + 1;
+            complete(&mut kv_store, 100 + id, session(id, 0), tokens);
+        }
+        kv_store.prefix_caches[0].shrink_to(0);
+        kv_store
+    }
+
+    /// Start request `id`'s read of session `id`'s `declared` context if its
+    /// loading area has room.
+    fn stage(kv_store: &mut KvCacheStore, id: u32, declared: u32, now: Time) -> bool {
+        let read = plan(kv_store, id, session(id, declared), 10, now).expect("a tier holds it");
+        if !kv_store.has_loading_room(0, &read) {
+            return false;
+        }
+        kv_store.start_tier_read(0, RequestId(id), session(id, declared), read, now);
+        true
+    }
+
+    #[test]
+    fn a_loading_area_is_kept_free_and_a_staged_read_holds_only_what_it_lands() {
+        let mut kv_store = staged_store(&[6_000], false);
+        assert!(kv_store.stages_tier_reads());
+        assert_eq!(kv_store.ledger.partition_held(0), 10_000);
+        let read = plan(&kv_store, 1, session(1, 6_000), 10, Time::ZERO).unwrap();
+        assert_eq!(
+            read.hold.reserved_units(),
+            6_000,
+            "not its 6,011-token footprint"
+        );
+        kv_store.start_tier_read(0, RequestId(1), session(1, 6_000), read, Time::ZERO);
+        assert_eq!(
+            kv_store.ledger.partition_held(0),
+            10_000,
+            "inside the area it adds nothing"
+        );
+        let reports = kv_store.tiers_reports();
+        let loading = reports[0].loading.unwrap();
+        assert_eq!(
+            (loading.hbm_area_units, loading.dram_area_units),
+            (10_000, 0)
+        );
+    }
+
+    #[test]
+    fn a_staged_read_holds_its_area_until_its_context_is_put_back() {
+        let mut kv_store = staged_store(&[6_000, 4_000, 4_000], false);
+        assert!(stage(&mut kv_store, 1, 6_000, Time::ZERO));
+        assert!(stage(&mut kv_store, 2, 4_000, Time::ZERO));
+        assert!(!stage(&mut kv_store, 3, 4_000, Time::ZERO));
+        // 6000 tokens at 1000 per ms land at 6 ms; landed, they still hold
+        // the area until admission puts them back.
+        let at = Time::from_ms(6.0);
+        assert_eq!(kv_store.take_landed_reads(at), [(RequestId(1), at)]);
+        assert!(!stage(&mut kv_store, 3, 4_000, at));
+        kv_store.restore_landed_read(0, RequestId(1), at);
+        assert!(stage(&mut kv_store, 3, 4_000, at));
+    }
+
+    #[test]
+    fn a_read_larger_than_the_area_starts_when_it_is_empty() {
+        let mut kv_store = staged_store(&[25_000, 100], false);
+        assert!(stage(&mut kv_store, 1, 25_000, Time::ZERO));
+        assert!(!stage(&mut kv_store, 2, 100, Time::ZERO));
+        assert_eq!(
+            kv_store.ledger.partition_held(0),
+            25_000,
+            "past the area it holds what it lands"
+        );
+        let at = Time::from_ms(25.0);
+        kv_store.take_landed_reads(at);
+        assert!(!stage(&mut kv_store, 2, 100, at));
+        kv_store.restore_landed_read(0, RequestId(1), at);
+        assert!(stage(&mut kv_store, 2, 100, at));
+    }
+
+    #[test]
+    fn an_ssd_read_lands_in_dram_and_hops_on_to_hbm_when_its_area_has_room() {
+        // DRAM's area is 10% of its 1M tokens. Session 1's 6000 tokens are
+        // in DRAM and land in HBM's area; sessions 2 and 3 (5000 each) are
+        // only in SSD.
+        let mut kv_store = staged_store(&[6_000, 5_000, 5_000], true);
+        kv_store.tier_chains[0].take_hbm_eviction(LeavingContext {
+            session_id: 1,
+            positions: kv_store.accounting.resume_positions(6_000, 6_000),
+            end: StateTag::default(),
+            earlier: Vec::new(),
+        });
+        assert!(stage(&mut kv_store, 1, 6_000, Time::ZERO));
+        assert!(stage(&mut kv_store, 2, 5_000, Time::ZERO));
+        assert!(stage(&mut kv_store, 3, 5_000, Time::ZERO));
+        assert_eq!(
+            kv_store.tiers_reports()[0].loading.unwrap().dram_area_units,
+            100_000
+        );
+        assert_eq!(
+            kv_store.ledger.partition_held(0),
+            10_000,
+            "SSD reads hold no HBM yet"
+        );
+        // SSD moves 100 tokens per ms: session 2 is in DRAM at 50 ms, 3 at
+        // 100 ms. Session 1 (landed at 6 ms) fills HBM's area, so neither hops.
+        assert_eq!(
+            kv_store.take_landed_reads(Time::from_ms(100.0)),
+            [(RequestId(1), Time::from_ms(6.0))]
+        );
+        assert_eq!(kv_store.next_tier_landing(), None);
+        kv_store.restore_landed_read(0, RequestId(1), Time::from_ms(100.0));
+        // The next landing pass hops session 2 on (5 ms on DRAM's channel),
+        // then session 3 behind it, in landing order.
+        assert!(kv_store.take_landed_reads(Time::from_ms(101.0)).is_empty());
+        assert_eq!(kv_store.next_tier_landing(), Some(Time::from_ms(106.0)));
+        assert_eq!(
+            kv_store.take_landed_reads(Time::from_ms(111.0)),
+            [
+                (RequestId(2), Time::from_ms(106.0)),
+                (RequestId(3), Time::from_ms(111.0))
+            ]
+        );
+        assert_eq!(
+            kv_store.tier_chains[0].counters(0).loads,
+            1,
+            "hops are no DRAM reads"
+        );
     }
 
     #[test]

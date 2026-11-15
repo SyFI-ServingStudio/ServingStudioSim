@@ -36,6 +36,14 @@
 //! that survive the round it serves ([`StateRetention::survivors`]): the state
 //! it resumes from and the latest earlier ones still kept once the round adds
 //! its own. Writes are free: only counted.
+//!
+//! Staged loading ([`TierChain::set_loading_area`]) puts reads through loading
+//! areas, each a fraction of its tier: HBM's, in tier tokens, which every read
+//! lands in, and with an SSD behind DRAM, DRAM's, carved out of DRAM's
+//! capacity, where an SSD read lands before it hops on to HBM on DRAM's
+//! channel. A read may start in an area it fits in, or in an empty one (a read
+//! larger than the whole area); it holds its share until the store gives it
+//! back.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -127,6 +135,65 @@ impl TierBytes {
             })
             .unwrap_or_default()
     }
+}
+
+/// The loading area a staged read lands in first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadingQueue {
+    /// HBM's: a read from the fastest tier, or from SSD without a DRAM area.
+    Hbm,
+    /// DRAM's: an SSD read, which then hops on to HBM's.
+    Dram,
+}
+
+/// What a staged read holds in the loading areas, in tier tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedCharge {
+    pub queue: LoadingQueue,
+    /// In HBM's area: what lands in HBM.
+    pub(crate) landed: u64,
+    /// In DRAM's area (an SSD read): what the tier reads.
+    pub(crate) read: u64,
+}
+
+impl StagedCharge {
+    /// Its share of `queue`'s area.
+    fn in_area(self, queue: LoadingQueue) -> u64 {
+        match queue {
+            LoadingQueue::Hbm => self.landed,
+            LoadingQueue::Dram => self.read,
+        }
+    }
+}
+
+/// Room staged reads land in, in tier tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoadingArea {
+    size: u64,
+    used: u64,
+}
+
+impl LoadingArea {
+    /// Whether a read of `charge` may start: it fits, or the area is empty.
+    fn fits(self, charge: u64) -> bool {
+        self.used == 0 || self.used + charge <= self.size
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoadingAreas {
+    fraction: f64,
+    hbm: LoadingArea,
+    /// Size 0 without an SSD behind DRAM.
+    dram: LoadingArea,
+}
+
+/// A chain's loading areas, for `kv_cache.json`; in tier tokens.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct LoadingReport {
+    pub fraction: f64,
+    pub hbm_area_units: u64,
+    pub dram_area_units: u64,
 }
 
 /// A finished request's context, as a write-through tier stores it.
@@ -228,6 +295,9 @@ pub(crate) enum TierEventKind {
     Cut,
     /// A read of the entry's first `hit_tokens`.
     Read,
+    /// A staged SSD read of `hit_tokens` moving on from DRAM's loading area
+    /// to HBM's, on DRAM's channel; the entry is unchanged.
+    Hop,
 }
 
 /// One entry change, for the prefix-cache event log.
@@ -359,6 +429,8 @@ pub(crate) struct TierChain {
     /// One state in tier tokens.
     state_tokens: u64,
     retention: StateRetention,
+    /// Staged loading; `None`: reads land straight in HBM.
+    loading: Option<LoadingAreas>,
     /// Entry changes since the last [`Self::take_events`], when recorded.
     events: Option<Vec<TierEvent>>,
 }
@@ -393,8 +465,129 @@ impl TierChain {
             bytes,
             state_tokens: bytes.state_tokens(),
             retention,
+            loading: None,
             events: None,
         }
+    }
+
+    /// Stage reads through loading areas: HBM's, `hbm_area_bytes` per GPU,
+    /// and with an SSD behind DRAM, DRAM's, `fraction` of DRAM taken out of
+    /// its capacity.
+    pub(crate) fn set_loading_area(&mut self, fraction: f64, hbm_area_bytes: u64) {
+        assert!(
+            fraction > 0.0 && fraction < 0.5,
+            "a loading area is a fraction in (0, 0.5)"
+        );
+        let dram = if self.tiers.len() == 2 {
+            let size = (self.tiers[0].capacity as f64 * fraction) as u64;
+            self.tiers[0].capacity -= size;
+            size
+        } else {
+            0
+        };
+        self.loading = Some(LoadingAreas {
+            fraction,
+            hbm: LoadingArea {
+                size: hbm_area_bytes / self.bytes.per_token.max(1),
+                used: 0,
+            },
+            dram: LoadingArea {
+                size: dram,
+                used: 0,
+            },
+        });
+    }
+
+    /// Whether reads stage through loading areas.
+    pub(crate) fn is_staged(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// What a staged read from `tier` of `kv` context tokens and `states`
+    /// states holds in the loading areas: an SSD read lands in DRAM's area
+    /// when there is one, every other read in HBM's. `None` without staged
+    /// loading.
+    pub(crate) fn staged_charge(&self, tier: usize, kv: u64, states: u64) -> Option<StagedCharge> {
+        let loading = self.loading?;
+        let queue = if tier == 1 && loading.dram.size > 0 {
+            LoadingQueue::Dram
+        } else {
+            LoadingQueue::Hbm
+        };
+        Some(StagedCharge {
+            queue,
+            landed: self.landed_units_of(kv, states),
+            read: self.read_units_of(kv, states),
+        })
+    }
+
+    fn area(&self, queue: LoadingQueue) -> LoadingArea {
+        let loading = self.loading.expect("staged loading");
+        match queue {
+            LoadingQueue::Hbm => loading.hbm,
+            LoadingQueue::Dram => loading.dram,
+        }
+    }
+
+    fn area_mut(&mut self, queue: LoadingQueue) -> &mut LoadingArea {
+        let loading = self.loading.as_mut().expect("staged loading");
+        match queue {
+            LoadingQueue::Hbm => &mut loading.hbm,
+            LoadingQueue::Dram => &mut loading.dram,
+        }
+    }
+
+    /// Whether `queue`'s area has room for the read `charge` describes.
+    pub(crate) fn area_fits(&self, queue: LoadingQueue, charge: StagedCharge) -> bool {
+        self.area(queue).fits(charge.in_area(queue))
+    }
+
+    /// The read `charge` describes takes its share of `queue`'s area.
+    pub(crate) fn take_area(&mut self, queue: LoadingQueue, charge: StagedCharge) {
+        self.area_mut(queue).used += charge.in_area(queue);
+    }
+
+    /// The read `charge` describes gives its share of `queue`'s area back.
+    pub(crate) fn release_area(&mut self, queue: LoadingQueue, charge: StagedCharge) {
+        self.area_mut(queue).used -= charge.in_area(queue);
+    }
+
+    /// Hop an SSD read of `hit_tokens` from DRAM's area on to HBM's: queue
+    /// what it lands on DRAM's channel behind its earlier reads; returns when
+    /// it lands. Counts no tier access.
+    pub(crate) fn hop(
+        &mut self,
+        session_id: u32,
+        hit_tokens: u64,
+        charge: StagedCharge,
+        now: Time,
+    ) -> Time {
+        let per_token = self.bytes.per_token.max(1) as f64;
+        let before = self.used(0);
+        let dram = &mut self.tiers[0];
+        let started = dram.channel_free.max(now);
+        let ready = started
+            + Time::from_s(charge.landed as f64 * per_token / (dram.spec.read_gb_per_s * 1e9));
+        dram.channel_free = ready;
+        let entry_tokens = dram.entries.get(&session_id).map_or(0, TierEntry::tokens);
+        self.log(
+            0,
+            TierEventKind::Hop,
+            session_id,
+            (entry_tokens, entry_tokens),
+            before,
+            hit_tokens,
+            Some(ready),
+        );
+        ready
+    }
+
+    pub(crate) fn loading_report(&self) -> Option<LoadingReport> {
+        self.loading.map(|loading| LoadingReport {
+            fraction: loading.fraction,
+            hbm_area_units: loading.hbm.size,
+            dram_area_units: loading.dram.size,
+        })
     }
 
     /// Keep every entry change from now on, for [`Self::take_events`].
@@ -789,7 +982,18 @@ impl TierChain {
     /// state at the hit and the earlier states it moves.
     pub(crate) fn read_units(&self, session_id: u32, hit: TierHit, resident: u64) -> u64 {
         let states = 1 + self.read_states(session_id, hit).len() as u64;
-        hit.tokens.saturating_sub(resident) + states * self.state_tokens
+        self.read_units_of(hit.tokens.saturating_sub(resident), states)
+    }
+
+    /// Tier tokens a tier reads for `kv` context tokens and `states` states.
+    fn read_units_of(&self, kv: u64, states: u64) -> u64 {
+        kv + states * self.state_tokens
+    }
+
+    /// Tier tokens `kv` context tokens and `states` states take in HBM.
+    /// Tiers store states as HBM holds them, so this is what a tier reads.
+    fn landed_units_of(&self, kv: u64, states: u64) -> u64 {
+        self.read_units_of(kv, states)
     }
 
     /// How long a read queued on `tier` now waits for its channel.
@@ -1455,5 +1659,73 @@ mod tests {
             .state_tokens(),
             23_904
         );
+    }
+
+    #[test]
+    fn a_loading_area_shrinks_the_tier_and_hops_queue_on_its_channel() {
+        // DRAM holds 1M tokens and reads 10,000 tokens per ms.
+        let mut chain = chain(
+            &[
+                spec(DRAM, 1.0, 10.0, TierWrites::Evictions),
+                spec(SSD, 10.0, 1.0, TierWrites::Evictions),
+            ],
+            0,
+            1,
+        );
+        let capacity = chain.tiers[0].capacity;
+        chain.set_loading_area(0.05, 100_000_500);
+        let report = chain.loading_report().unwrap();
+        assert_eq!(report.dram_area_units, capacity / 20);
+        assert_eq!(chain.tiers[0].capacity, capacity - capacity / 20);
+        assert_eq!(report.hbm_area_units, 100_000, "whole tier tokens");
+        // 1M tokens take 100 ms, back to back, and a DRAM read queues behind.
+        let charge = StagedCharge {
+            queue: LoadingQueue::Dram,
+            landed: 1_000_000,
+            read: 1_000_000,
+        };
+        assert_eq!(
+            chain.hop(1, 1_000_000, charge, Time::ZERO),
+            Time::from_ms(100.0)
+        );
+        assert_eq!(
+            chain.hop(2, 1_000_000, charge, Time::ZERO),
+            Time::from_ms(200.0)
+        );
+        assert_eq!(chain.queue_wait(0, Time::ZERO), Time::from_ms(200.0));
+        assert_eq!(chain.counters(0).loads, 0, "a hop is no tier access");
+    }
+
+    #[test]
+    fn only_an_ssd_read_behind_a_dram_area_lands_in_dram_first() {
+        // A state is one tier token.
+        let staged = |specs: &[TierSpec], tier: usize| {
+            let mut chain = chain(specs, 1_000, 1);
+            chain.set_loading_area(0.1, 100_000_000);
+            chain
+                .staged_charge(tier, 400, 1)
+                .map(|charge| (charge.queue, charge.landed, charge.read))
+        };
+        let dram = spec(DRAM, 1.0, 10.0, TierWrites::EveryContext);
+        let ssd = spec(SSD, 10.0, 1.0, TierWrites::EveryContext);
+        assert_eq!(
+            staged(&[dram, ssd], 1),
+            Some((LoadingQueue::Dram, 401, 401))
+        );
+        assert_eq!(staged(&[dram, ssd], 0), Some((LoadingQueue::Hbm, 401, 401)));
+        assert_eq!(
+            staged(&[ssd], 0),
+            Some((LoadingQueue::Hbm, 401, 401)),
+            "SSD alone is the fastest tier"
+        );
+        assert_eq!(chain(&[dram], 0, 1).staged_charge(0, 400, 1), None);
+    }
+
+    #[test]
+    fn a_read_starts_in_an_area_it_fits_in_or_an_empty_one() {
+        let area = |used| LoadingArea { size: 100, used };
+        assert!(area(0).fits(500));
+        assert!(area(40).fits(60));
+        assert!(!area(41).fits(60));
     }
 }
