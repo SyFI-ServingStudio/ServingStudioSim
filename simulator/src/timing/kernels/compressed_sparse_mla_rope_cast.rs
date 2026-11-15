@@ -25,14 +25,22 @@
 //!   single-wave batch with a few long rows costs the same as an all-long batch.
 //!   In prefill, this is the mean key count per token; the fused attention scales
 //!   with it.
-//! - `excess_gather_rows`: prefill with ratio > 0 only. The compressed gather
-//!   splits a fixed pool of 2048 workers across the requests of the chunk, so
-//!   the cost follows the padded area `chunk requests * max rows / ratio`, not
-//!   the row total: two requests with 25000 rows cost the same as one with
-//!   50000. The coordinate is that area minus `tokens / ratio + index_topk`.
-//!   That is the most area any (tokens, keys) point needs without extra
+//! - `excess_gather_rows`: prefill with ratio > 0 only. The chunk's compressed
+//!   rows, `sum(context / ratio)` over its requests, minus `tokens / ratio +
+//!   index_topk`, the most rows any (tokens, keys) point needs without extra
 //!   context, so the lowest grid plane is reachable across the whole
-//!   (tokens, keys) plane.
+//!   (tokens, keys) plane. The NVFP4 gather (fork `common/ops/cache_utils.py`
+//!   `_dequantize_and_gather_k_nvfp4_kernel`) launches `requests x
+//!   min(ceil(max rows / 8), 8192)` programs, but each program strides 8-row
+//!   tiles over its own request's `context / ratio` rows only and the rest
+//!   exit at once, so the bytes moved are the rows, not the padded area
+//!   `requests x max rows`. The tokens also attend only to their own
+//!   request's rows, so the attention's key working set grows with the same
+//!   rows.
+//!
+//! Prefill chunks run up to 65536 tokens: a chunk holds at most one step's
+//! tokens, and the planner fits a single request of `max_num_batched_tokens`
+//! (65536 in the largest deployments run) at any context.
 //!
 //! Decode at 16 or 32 heads is vLLM's swap-AB kernel (backend
 //! `swapab_cutedsl`, fork `nvidia/ops/swapab_decode_attn.py`), which
@@ -47,9 +55,14 @@
 //! Measured B200 behaviour behind the axes: at 2048 prefill tokens (ratio 2),
 //! mean keys 240 -> 640 moves time 116 -> 183 us. The gather alone costs about
 //! 80 us for 100000 rows (ratio 1). Decode steps at every 148 rows (148 SMs).
-//! Known residual: the gather's per-chunk cost varies up to about 2x with the
-//! chunk size (power-of-two worker counts are slower); the area coordinate
-//! scales it linearly.
+//! At 64 tokens (ratio 1) and the same 262144 rows of padded area, one request
+//! of 262720 rows takes 92.7 us, two requests holding 131435 rows 62.0 us and
+//! four holding 65743 rows 50.3 us. Known residuals: the programs past a short
+//! request's rows still launch, so a chunk of many short requests and one
+//! longer one runs up to 25% over the cache (about 0.2-0.5 ns per idle
+//! program); and the canonical batches put a point's rows in as few requests
+//! as possible, so long rows spread over several requests (4 x (4096, 131072))
+//! run 5-18% under the cache.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -72,6 +85,12 @@ const MAX_REQUESTS: u32 = 256;
 const MAX_CONTEXT: u32 = 1_048_576;
 /// Decode rows the profiler accepts.
 const MAX_DECODE_ROWS: u32 = 2048;
+/// The largest step budget (`max_num_batched_tokens`) the V4.1 deployments
+/// run, and the fork's `PREFILL_CHUNK_SIZE`: with [`MAX_CONTEXT`] they set the
+/// largest chunk the planner can form. The prefill grid only profiles chunks
+/// that this plan keeps whole.
+const MAX_STEP_TOKENS: u32 = 65_536;
+const PREFILL_CHUNK_SIZE: u32 = 4;
 /// SMs on the only supported GPU (NVIDIA B200); the decode wave width at 64 heads.
 const B200_SMS: u32 = 148;
 /// `_SWAPAB_MAX_TOKENS` (fork `flash_mla_mega_attn.py`): the most decode rows
@@ -331,14 +350,13 @@ pub fn prefill_chunk_plan(
     chunks
 }
 
-/// The padded compressed-gather area of one chunk: `requests * max
-/// compressed rows`.
-fn gather_area(pairs: &[(u32, u32)], ratio: u32) -> u64 {
+/// The compressed rows one chunk gathers: `context / ratio` per request, the
+/// `seq_lens // compress_ratio` the fork hands the NVFP4 gather.
+fn gathered_rows(pairs: &[(u32, u32)], ratio: u32) -> u64 {
     if ratio == 0 {
         return 0;
     }
-    let longest = pairs.iter().map(|&(_, c)| c / ratio).max().unwrap_or(0);
-    pairs.len() as u64 * u64::from(longest)
+    pairs.iter().map(|&(_, c)| u64::from(c / ratio)).sum()
 }
 
 /// Bytes of one cache record: the SWA cache is always MXFP8; the compressed
@@ -395,8 +413,8 @@ fn logical_bytes(
         + (swa_keys + extra_keys) * (bf16_row + 4.0)
 }
 
-/// The gather area every (tokens, keys) point reaches without extra context.
-fn area_floor(tokens: u32, ratio: u32) -> f64 {
+/// The gathered rows every (tokens, keys) point reaches without extra context.
+fn rows_floor(tokens: u32, ratio: u32) -> f64 {
     f64::from(tokens.div_ceil(ratio) + INDEX_TOPK)
 }
 
@@ -411,7 +429,7 @@ fn project(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfi
     let excess = if ratio == 0 {
         0.0
     } else {
-        (gather_area(pairs, ratio) as f64 - area_floor(tokens, ratio)).max(0.0)
+        (gathered_rows(pairs, ratio) as f64 - rows_floor(tokens, ratio)).max(0.0)
     };
     [f64::from(tokens), keys, excess]
 }
@@ -484,8 +502,8 @@ fn key_tolerance(keys: f64) -> f64 {
     (0.02 * keys).max(1.0)
 }
 
-fn area_tolerance(area: f64) -> f64 {
-    (0.02 * area).max(1.0)
+fn rows_tolerance(rows: f64) -> f64 {
+    (0.02 * rows).max(1.0)
 }
 
 /// Smallest `x` in `lo..=hi` with `f(x) >= target`, assuming `f` rises with `x`.
@@ -540,13 +558,29 @@ fn on_point(
     let floor = if is_decode(config) || config.compress_ratio == 0 {
         0.0
     } else {
-        area_floor(point[0] as u32, config.compress_ratio)
+        rows_floor(point[0] as u32, config.compress_ratio)
     };
     pairs.len() <= MAX_REQUESTS as usize
         && pairs.iter().all(|&(_, c)| c <= MAX_CONTEXT)
+        && (is_decode(config) || one_chunk(pairs, config))
         && projected[0] == point[0]
         && (projected[1] - point[1]).abs() <= key_tolerance(point[1])
-        && (projected[2] - point[2]).abs() <= area_tolerance(floor + point[2])
+        && (projected[2] - point[2]).abs() <= rows_tolerance(floor + point[2])
+}
+
+/// Whether the planner at its widest budget keeps `pairs` in one chunk. A
+/// chunk it would split (many requests padded to one long one) never reaches
+/// the kernel, and its padded workspace would not fit the GPU either.
+fn one_chunk(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
+    let plan = prefill_chunk_plan(
+        pairs,
+        config.compress_ratio,
+        config.window_size,
+        MAX_CONTEXT,
+        MAX_STEP_TOKENS,
+        PREFILL_CHUNK_SIZE,
+    );
+    plan.len() == 1
 }
 
 /// A decode batch of `rows` flattened rows over at most 256 requests.
@@ -572,9 +606,11 @@ fn canonical_decode(
     on_point(&pairs, point, config).then_some(pairs)
 }
 
-/// A prefill batch with the fewest requests reaching the keys. It adds gather
-/// area by lengthening every context while the keys stay put (saturated
-/// tokens); otherwise it appends one single-token request with a long context.
+/// A prefill batch with the fewest requests reaching the keys. It adds gathered
+/// rows by lengthening every context while the keys stay put (saturated
+/// tokens), splitting the tokens over more requests when one context cannot
+/// hold the rows; otherwise it appends one single-token request with a long
+/// context.
 fn canonical_prefill(
     point: &[f64],
     config: &CompressedSparseMlaRopeCastKernelConfig,
@@ -589,20 +625,25 @@ fn canonical_prefill(
         if ratio == 0 {
             return on_point(&base, point, config).then_some(base);
         }
-        let target = area_floor(tokens, ratio) + point[2];
-        let area = gather_area(&base, ratio) as f64;
-        if area > target + area_tolerance(target) {
+        let target = rows_floor(tokens, ratio) + point[2];
+        if gathered_rows(&base, ratio) as f64 > target + rows_tolerance(target) {
             return None;
         }
         if on_point(&base, point, config) {
             return Some(base);
         }
-        let stretched = lower_bound(base[0].1, MAX_CONTEXT, target, |context| {
-            gather_area(&uniform_pairs(tokens, count, context), ratio) as f64
-        });
-        let stretched = uniform_pairs(tokens, count, stretched);
-        if on_point(&stretched, point, config) {
-            return Some(stretched);
+        // Requests whose longest contexts together hold the target rows.
+        let longest = f64::from(MAX_CONTEXT / ratio);
+        let spread = count.max((target / longest).ceil() as u32);
+        if spread <= tokens.min(MAX_REQUESTS - 1) {
+            let lowest = base[0].1.max(tokens.div_ceil(spread));
+            let context = lower_bound(lowest, MAX_CONTEXT, target, |context| {
+                gathered_rows(&uniform_pairs(tokens, spread, context), ratio) as f64
+            });
+            let stretched = uniform_pairs(tokens, spread, context);
+            if on_point(&stretched, point, config) {
+                return Some(stretched);
+            }
         }
         return (count..tokens.min(MAX_REQUESTS - 1))
             .find_map(|count| with_filler(point, count, target, config));
@@ -611,7 +652,7 @@ fn canonical_prefill(
 }
 
 /// `count` uniform requests over `tokens - 1` queries plus a trailing
-/// `(1, context)` request sized to reach `target` gather area.
+/// `(1, context)` request sized to reach `target` gathered rows.
 fn with_filler(
     point: &[f64],
     count: u32,
@@ -636,7 +677,7 @@ fn with_filler(
             candidate
         };
         filler = lower_bound(1, MAX_CONTEXT, target, |context| {
-            gather_area(&with(context), ratio) as f64
+            gathered_rows(&with(context), ratio) as f64
         });
         pairs = with(filler);
     }
@@ -666,13 +707,16 @@ fn token_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
         axis.sort_unstable();
         return Axis::values(axis);
     }
-    // One chunk holds at most one step's tokens; 16384 is the largest step
+    // One chunk holds at most one step's tokens, and the planner fits one
+    // request of the whole step at any context: 65536 is the largest step
     // budget the V4.1 deployments run. Larger chunks hold the edge bandwidth.
     Axis::values(PREFILL_TOKENS)
 }
 
 /// The prefill query-token axis.
-const PREFILL_TOKENS: [u32; 11] = [1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384];
+const PREFILL_TOKENS: [u32; 13] = [
+    1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
 
 fn key_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     match (is_decode(config), config.compress_ratio) {
@@ -690,11 +734,11 @@ fn excess_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     }
     // The planes step by 4x up to the 256K-row middle, then one and two
     // longest-context requests at the largest token count; the second covers
-    // chunks that pad to two long requests. Larger areas hold the edge
-    // bandwidth (the gather is a streaming copy).
+    // chunks holding two long requests. More rows hold the edge bandwidth
+    // (the gather is a streaming copy).
     let ratio = config.compress_ratio;
     let longest = f64::from(MAX_CONTEXT / ratio);
-    let floor = area_floor(*PREFILL_TOKENS.last().unwrap(), ratio);
+    let floor = rows_floor(*PREFILL_TOKENS.last().unwrap(), ratio);
     let (one, two) = (longest - floor, 2.0 * longest - floor);
     let mut axis = Axis::values([0, 1024, 4096, 16384, 65536, 262144])
         .into_iter()
@@ -926,18 +970,33 @@ mod tests {
         assert!(plan(&[], 2, 131072, 2048).is_empty());
     }
 
-    /// Catches a gather coordinate that sums rows instead of padding the chunk
-    /// to its longest request.
+    /// Catches a gather coordinate that pads every request to the chunk's
+    /// longest one: the NVFP4 gather's programs walk only their own
+    /// request's rows (`_dequantize_and_gather_k_nvfp4_kernel`).
     #[test]
-    fn prefill_gather_area_pads_the_chunk() {
-        assert_eq!(gather_area(&[(1, 50000)], 1), 50000);
-        assert_eq!(gather_area(&[(1, 25000), (1, 25000)], 1), 50000);
-        assert_eq!(gather_area(&[(16, 16), (1, 100000)], 1), 200000);
+    fn prefill_gather_counts_each_requests_own_rows() {
+        assert_eq!(gathered_rows(&[(1, 50000)], 1), 50000);
+        assert_eq!(gathered_rows(&[(1, 25000), (1, 25000)], 1), 50000);
+        assert_eq!(gathered_rows(&[(16, 16), (1, 100000)], 1), 100016);
+        assert_eq!(gathered_rows(&[(16, 16), (1, 100000)], 2), 50008);
         let pairs = [(1912, 1912), (91, 4096)];
         let projected = coords("prefill", 2, &pairs);
         let keys = (keys_prefix(1912, 2) + keys_prefix(4096, 2) - keys_prefix(4005, 2)) as f64;
         assert_eq!(projected[1], keys / 2003.0);
-        assert_eq!(projected[2], 2.0 * 2048.0 - (1002.0 + 512.0));
+        assert_eq!(projected[2], (956.0 + 2048.0) - (1002.0 + 512.0));
+    }
+
+    /// Catches profiling chunks the planner never forms: many short requests
+    /// padded to one near-1M request split at every deployment's budget (and
+    /// their padded workspace overflows the GPU), while one step-sized request
+    /// at the longest context, or two long ones, stay whole.
+    #[test]
+    fn prefill_grid_keeps_only_chunks_the_planner_forms() {
+        let ratio1 = config("prefill", 1);
+        let padded = [vec![(96, 96); 171], vec![(1, 983_008)]].concat();
+        assert!(!one_chunk(&padded, &ratio1));
+        assert!(one_chunk(&[(65_536, 1_048_576)], &ratio1));
+        assert!(one_chunk(&[(32_768, 1_048_576); 2], &config("prefill", 2)));
     }
 
     /// Catches canonical profiling batches that miss the grid point they fill,
@@ -970,18 +1029,18 @@ mod tests {
         });
     }
 
-    /// The gather-area planes: a 4x ladder to 256K rows, then one and two
+    /// The gathered-row planes: a 4x ladder to 256K rows, then one and two
     /// longest-context requests, the same for every deployment.
     #[test]
     fn excess_planes_ladder_up_to_the_longest_requests() {
         let planes = |ratio| excess_axis(&config("prefill", ratio));
         assert_eq!(
             planes(1),
-            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1031680.0, 2080256.0]
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 982528.0, 2031104.0]
         );
         assert_eq!(
             planes(2),
-            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 515584.0, 1039872.0]
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 491008.0, 1015296.0]
         );
         assert_eq!(excess_axis(&config("decode", 2)), [0.0]);
     }
