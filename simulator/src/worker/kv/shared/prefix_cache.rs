@@ -13,12 +13,25 @@
 //! for its per-token parts up to its last position plus the window tails and
 //! states at each position ([`KvAccounting::entry_charge`]); with only
 //! per-token parts that is its token count, as before.
+//!
+//! ## Round-end states
+//!
+//! Under a [`StateRetention`] that keeps earlier states, an entry resumable
+//! only at its context end also keeps the session's latest round-end states
+//! below that end, one reusable state each, and a prompt that ends inside the
+//! context resumes from the latest of them at or before it. The entry is one
+//! unit with them. A request that takes it carries the states that survive
+//! its round, charged here but not evictable, until its context returns
+//! ([`PrefixCache::take_carried`], [`PrefixCache::insert_sharing`]).
 
 use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
 
 use crate::worker::kv::shared::kv_accounting::{KvAccounting, ResumePositions, SharedKvAccounting};
+use crate::worker::kv::shared::state_retention::{
+    normalize, Carried, RoundState, StateRetention, StateTag,
+};
 
 /// Whether completed-session KV may be retained after a request finishes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -121,14 +134,46 @@ impl PrefixCacheConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PrefixEntry {
     positions: ResumePositions,
+    /// The state at `positions.end()`.
+    end: StateTag,
+    /// Round-end states kept below `positions.end()`, ascending; empty unless
+    /// the retention keeps earlier states.
+    earlier: Vec<RoundState>,
     /// Units the entry occupies.
     charge: u64,
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
+}
+
+impl PrefixEntry {
+    /// Its states, the end's last.
+    fn states(&self) -> impl Iterator<Item = RoundState> + '_ {
+        self.earlier
+            .iter()
+            .copied()
+            .chain(std::iter::once(RoundState {
+                at: self.positions.end(),
+                tag: self.end,
+            }))
+    }
+
+    /// The state a prompt sharing `declared` tokens resumes from: the
+    /// largest position at or below it, else the latest earlier state there.
+    fn resume_state(&self, declared: u64) -> Option<RoundState> {
+        let at = self.positions.floor(declared);
+        if at > 0 {
+            return Some(RoundState { at, tag: self.end });
+        }
+        self.earlier
+            .iter()
+            .rev()
+            .copied()
+            .find(|state| state.at <= declared)
+    }
 }
 
 /// Replacement metadata that follows a destructively consumed session until
@@ -184,13 +229,18 @@ pub(crate) struct PrefixCacheInsertResult {
 /// One attention partition's evictable retained-session tier.
 pub(crate) struct PrefixCache {
     accounting: SharedKvAccounting,
+    retention: StateRetention,
     max_retained_units: u64,
-    /// Units the entries occupy, the sum of their charges.
+    /// Units the entries occupy, the sum of their charges, plus the states
+    /// running requests carry.
     used_units: u64,
     /// Context tokens the entries keep; reported in receipts.
     used_tokens: u64,
     policy: PrefixCachePolicy,
     entries: HashMap<u32, PrefixEntry>,
+    /// The states a running request of the session carries from the entry it
+    /// took, until its context returns.
+    carried: HashMap<u32, Carried>,
     /// `entries` ordered by the policy's eviction key, session id last, so the
     /// victim is the first element. A retained entry never changes (a hit
     /// removes it), so only insert and remove touch this.
@@ -202,11 +252,13 @@ impl PrefixCache {
     pub(crate) fn new(accounting: SharedKvAccounting, budget: PrefixCacheBudget) -> Self {
         Self {
             max_retained_units: budget.max_retained_units.min(accounting.capacity_units()),
+            retention: accounting.state_retention(),
             accounting,
             used_units: 0,
             used_tokens: 0,
             policy: budget.policy,
             entries: HashMap::new(),
+            carried: HashMap::new(),
             eviction_order: BTreeSet::new(),
             next_sequence: 0,
         }
@@ -224,30 +276,54 @@ impl PrefixCache {
     }
 
     /// Pure preview used by admission's token-budget and capacity gates: the
-    /// largest position of the entry within `requested_tokens`.
+    /// largest position or kept state of the entry within `requested_tokens`.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries
             .get(&session_id)
-            .map(|entry| entry.positions.floor(u64::from(requested_tokens)) as u32)
-            .unwrap_or(0)
+            .and_then(|entry| entry.resume_state(u64::from(requested_tokens)))
+            .map_or(0, |state| state.at as u32)
     }
 
     /// Move one retained session into an active request.
     ///
     /// The whole entry is removed even when the request declares a shorter
     /// prefix: count-only traces cannot prove that the unused remainder is a
-    /// separately reusable page range.
+    /// separately reusable page range. A hit on an entry with earlier states
+    /// carries those that survive the round, still charged here, until the
+    /// request's context returns.
     pub(crate) fn take(&mut self, session_id: u32, requested_tokens: u32) -> PrefixCacheTakeResult {
         let cache_used_before = self.used_tokens;
         let hit_tokens = self.peek(session_id, requested_tokens);
         let removed_entry = self.remove(session_id);
         let entry_tokens = removed_entry
+            .as_ref()
             .map(|entry| entry.positions.end())
             .unwrap_or(0);
-        let return_metadata = removed_entry.map(|entry| PrefixCacheReturnMetadata {
-            insertion_sequence: entry.insertion_sequence,
-            frequency: entry.frequency.saturating_add(1),
-        });
+        let return_metadata = removed_entry
+            .as_ref()
+            .map(|entry| PrefixCacheReturnMetadata {
+                insertion_sequence: entry.insertion_sequence,
+                frequency: entry.frequency.saturating_add(1),
+            });
+        if let Some(entry) =
+            removed_entry.filter(|_| self.retention.keeps_earlier() && hit_tokens > 0)
+        {
+            let resume = entry
+                .resume_state(u64::from(requested_tokens))
+                .expect("a hit resumes from a state");
+            let below: Vec<RoundState> = entry
+                .states()
+                .filter(|state| state.at <= u64::from(hit_tokens))
+                .collect();
+            let carried = Carried {
+                states: self.retention.survivors(&below, resume.tag),
+                resume: Some(resume.tag),
+            };
+            self.used_units += self.state_units(carried.states.len());
+            if let Some(previous) = self.carried.insert(session_id, carried) {
+                self.used_units -= self.state_units(previous.states.len());
+            }
+        }
         PrefixCacheTakeResult {
             hit_tokens,
             full_hit_tokens: entry_tokens.min(u64::from(requested_tokens)) as u32,
@@ -258,13 +334,18 @@ impl PrefixCache {
         }
     }
 
-    /// Retain a completed request's physically resident KV: `context_tokens`
-    /// of context after a `prompt_tokens` prompt.
-    ///
-    /// `physical_limit` is the current slack left by active/promised/held KV in
-    /// the partition. An optional experiment ceiling was already resolved into
-    /// `max_retained_units`; the entry is cut at the last position that fits the
-    /// smaller limit.
+    /// The states a running request of the session carries ([`Self::take`]),
+    /// out of this cache's charge: they return with its context
+    /// ([`Self::insert_sharing`]). Empty when it carries none.
+    pub(crate) fn take_carried(&mut self, session_id: u32) -> Carried {
+        let carried = self.carried.remove(&session_id).unwrap_or_default();
+        self.used_units -= self.state_units(carried.states.len());
+        carried
+    }
+
+    /// [`Self::insert_sharing`] of a context that shares nothing with the
+    /// session's previous one and carries no states.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         session_id: u32,
@@ -273,7 +354,66 @@ impl PrefixCache {
         physical_limit: u64,
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
+        self.insert_sharing(
+            session_id,
+            prompt_tokens,
+            context_tokens,
+            0,
+            Carried::default(),
+            physical_limit,
+            return_metadata,
+        )
+    }
+
+    /// Retain a completed request's physically resident KV: `context_tokens`
+    /// of context after a `prompt_tokens` prompt, of which the first
+    /// `shared_tokens` it shares with the session's previous context, arriving
+    /// with the `incoming` states its request carried.
+    ///
+    /// `physical_limit` is the current slack left by active/promised/held KV in
+    /// the partition. An optional experiment ceiling was already resolved into
+    /// `max_retained_units`; the entry is cut at the last position that fits the
+    /// smaller limit. Under a retention that keeps earlier states, the session
+    /// entry's and the incoming states within the shared tokens stay below the
+    /// new end as the retention picks them, and the entry is kept with all of
+    /// them or not at all.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_sharing(
+        &mut self,
+        session_id: u32,
+        prompt_tokens: u64,
+        context_tokens: u64,
+        shared_tokens: u64,
+        incoming: Carried,
+        physical_limit: u64,
+        return_metadata: Option<PrefixCacheReturnMetadata>,
+    ) -> PrefixCacheInsertResult {
         let mut mutations = Vec::new();
+        let own = self
+            .accounting
+            .resume_positions(prompt_tokens, context_tokens);
+        let end = StateTag::after(incoming.resume);
+        let earlier = if self.retention.keeps_earlier() {
+            let limit = shared_tokens.min(context_tokens.saturating_sub(1));
+            let mut states: Vec<RoundState> = self
+                .entries
+                .get(&session_id)
+                .into_iter()
+                .flat_map(PrefixEntry::states)
+                .chain(incoming.states)
+                .filter(|state| state.at > 0 && state.at <= limit)
+                .collect();
+            normalize(&mut states);
+            states.push(RoundState {
+                at: own.end(),
+                tag: end,
+            });
+            let mut kept = self.retention.keep(states);
+            kept.pop();
+            kept
+        } else {
+            Vec::new()
+        };
         if let Some(mutation) =
             self.remove_with_receipt(session_id, PrefixCacheMutationKind::SameSessionReplacement)
         {
@@ -282,13 +422,13 @@ impl PrefixCache {
         let effective_capacity = self.max_retained_units.min(physical_limit);
         mutations.extend(self.shrink_to(effective_capacity));
         // Only kept positions are resumable, so context past the last one that
-        // fits is dropped rather than retained as unusable KV.
+        // fits is dropped rather than retained as unusable KV. Earlier states
+        // exist only beside a single context-end position, which fits whole
+        // or not at all.
+        let earlier_units = self.state_units(earlier.len());
         let positions = self
             .accounting
-            .resume_positions(prompt_tokens, context_tokens);
-        let positions = self
-            .accounting
-            .largest_fitting(&positions, effective_capacity);
+            .largest_fitting(&own, effective_capacity.saturating_sub(earlier_units));
         let retained_tokens = positions.end();
         if retained_tokens == 0 {
             return PrefixCacheInsertResult {
@@ -296,7 +436,7 @@ impl PrefixCache {
                 retained_tokens,
             };
         }
-        let charge = self.accounting.entry_charge(&positions);
+        let charge = self.accounting.entry_charge(&positions) + earlier_units;
         while self.used_units.saturating_add(charge) > effective_capacity {
             let Some(victim) = self.victim() else {
                 break;
@@ -315,6 +455,8 @@ impl PrefixCache {
         let cache_used_before = self.used_tokens;
         let entry = PrefixEntry {
             positions,
+            end,
+            earlier,
             charge,
             insertion_sequence,
             last_access_sequence: sequence,
@@ -403,6 +545,11 @@ impl PrefixCache {
         })
     }
 
+    /// Units `count` reusable states occupy.
+    fn state_units(&self, count: usize) -> u64 {
+        count as u64 * self.accounting.reusable_state_units()
+    }
+
     fn take_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -434,6 +581,11 @@ mod tests {
     /// One unit per token plus a 500-unit recurrent state, resumable only at
     /// a context's end, `capacity` units in all.
     fn end_state_cache(capacity: u64) -> PrefixCache {
+        round_end_cache(capacity, 1)
+    }
+
+    /// [`end_state_cache`] keeping up to `states` round-end states per entry.
+    fn round_end_cache(capacity: u64, states: u32) -> PrefixCache {
         let layout = KvCacheLayout::new()
             .with_part(KvCachePart::per_token("kv", 1))
             .with_part(KvCachePart::per_request("state", 500));
@@ -441,6 +593,7 @@ mod tests {
             &layout,
             KvAccountingOptions {
                 resume_points: Some(PrefixResumePoints::ContextEnd),
+                state_retention: StateRetention::Latest { k: states },
                 ..KvAccountingOptions::default()
             },
             capacity,
@@ -618,5 +771,156 @@ mod tests {
         let result = cache.insert(3, 8_000, 8_000, 8_000, None);
         assert_eq!(result.retained_tokens, 0);
         assert_eq!(cache.peek(3, 8_000), 0);
+    }
+
+    impl PrefixCache {
+        /// [`Self::insert_sharing`] of a `tokens`-token context sharing
+        /// `shared` tokens with the session's previous one, whose request
+        /// carried `incoming`.
+        fn share(
+            &mut self,
+            session_id: u32,
+            tokens: u64,
+            shared: u64,
+            incoming: Carried,
+            physical_limit: u64,
+        ) -> PrefixCacheInsertResult {
+            self.insert_sharing(
+                session_id,
+                tokens,
+                tokens,
+                shared,
+                incoming,
+                physical_limit,
+                None,
+            )
+        }
+    }
+
+    fn positions(carried: &Carried) -> Vec<u64> {
+        carried.states.iter().map(|state| state.at).collect()
+    }
+
+    #[test]
+    fn earlier_round_end_states_serve_a_prompt_that_ends_inside_the_context() {
+        let mut cache = round_end_cache(100_000, 3);
+        cache.insert(1, 1_000, 1_000, 100_000, None);
+        // Two more rounds, each extending the context the previous one left.
+        cache.share(1, 1_500, 1_000, Carried::default(), 100_000);
+        cache.share(1, 2_000, 1_500, Carried::default(), 100_000);
+        assert_eq!(cache.used_units(), 2_000 + 3 * 500);
+        assert_eq!(cache.peek(1, 2_001), 2_000);
+        assert_eq!(cache.peek(1, 1_999), 1_500);
+        assert_eq!(cache.peek(1, 1_200), 1_000);
+        assert_eq!(cache.peek(1, 999), 0);
+        // A fourth state pushes the oldest out.
+        cache.share(1, 2_500, 2_000, Carried::default(), 100_000);
+        assert_eq!(cache.peek(1, 1_200), 0);
+        assert_eq!(cache.used_units(), 2_500 + 3 * 500);
+    }
+
+    #[test]
+    fn a_truncating_round_keeps_only_the_states_before_the_cut() {
+        let mut cache = round_end_cache(100_000, 4);
+        cache.insert(1, 1_000, 1_000, 100_000, None);
+        cache.share(1, 2_000, 1_000, Carried::default(), 100_000);
+        // A context that shares only 1_500 tokens: the state at 2_000 is on
+        // another branch.
+        cache.share(1, 1_800, 1_500, Carried::default(), 100_000);
+        assert_eq!(cache.peek(1, 1_799), 1_000);
+        assert_eq!(cache.used_units(), 1_800 + 2 * 500);
+    }
+
+    #[test]
+    fn a_taken_entry_carries_its_states_back_with_its_context() {
+        let mut cache = round_end_cache(100_000, 3);
+        cache.insert(1, 1_000, 1_000, 100_000, None);
+        cache.share(1, 2_000, 1_000, Carried::default(), 100_000);
+        // The round resumes at 1_000 (its prompt shares 1_200): the request
+        // takes the KV and carries the state at 1_000, still charged here
+        // but not an entry.
+        let take = cache.take(1, 1_200);
+        assert_eq!(take.hit_tokens, 1_000);
+        assert_eq!(cache.used_tokens(), 0);
+        assert_eq!(cache.used_units(), 500);
+        assert_eq!(cache.peek(1, 1_200), 0, "no entry while the request runs");
+        assert!(
+            cache.shrink_to(0).is_empty(),
+            "a carried state is not evictable"
+        );
+        // Its context returns with the carried state below its own end.
+        let carried = cache.take_carried(1);
+        assert_eq!(positions(&carried), [1_000]);
+        assert_eq!(cache.used_units(), 0);
+        cache.share(1, 1_300, 1_200, carried, 100_000);
+        assert_eq!(cache.used_units(), 1_300 + 2 * 500);
+        assert_eq!(cache.peek(1, 1_100), 1_000);
+        // Resuming at the end carries the latest k - 1 states, the end's
+        // included; the returning context appends its own and keeps 3.
+        cache.take(1, 1_301);
+        let carried = cache.take_carried(1);
+        assert_eq!(positions(&carried), [1_000, 1_300]);
+        cache.share(1, 1_600, 1_301, carried, 100_000);
+        assert_eq!(cache.peek(1, 1_350), 1_300);
+        assert_eq!(cache.peek(1, 1_100), 1_000);
+        assert_eq!(cache.used_units(), 1_600 + 3 * 500);
+    }
+
+    #[test]
+    fn eviction_takes_whole_entries_with_all_their_states() {
+        let mut cache = round_end_cache(4_000, 2);
+        cache.insert(1, 1_000, 1_000, 4_000, None);
+        cache.share(1, 1_200, 1_000, Carried::default(), 4_000); // 1_200 + 2 x 500
+        cache.insert(2, 1_000, 1_000, 4_000, None); // 1_000 + 500
+        assert_eq!(cache.used_units(), 3_700);
+        // Session 3 needs 800: the LRU entry, session 1, goes whole, its
+        // earlier state with it.
+        let result = cache.insert(3, 300, 300, 4_000, None);
+        let evicted: Vec<_> = result
+            .mutations
+            .iter()
+            .map(|m| (m.kind, m.session_id, m.entry_tokens_before))
+            .collect();
+        assert_eq!(
+            evicted,
+            [
+                (PrefixCacheMutationKind::ReplacementPolicyEviction, 1, 1_200),
+                (PrefixCacheMutationKind::Retain, 3, 0)
+            ]
+        );
+        assert_eq!(cache.peek(1, 1_200), 0);
+        assert_eq!(cache.peek(2, 1_000), 1_000);
+        assert_eq!(cache.used_units(), 1_500 + 800);
+    }
+
+    #[test]
+    fn an_entry_is_kept_with_all_its_states_or_not_at_all() {
+        let mut cache = round_end_cache(2_500, 3);
+        cache.insert(1, 1_000, 1_000, 2_500, None);
+        // 1_200 + 2 x 500 = 2_200 fits; 1_400 + 3 x 500 does not, and no
+        // state is dropped to make it fit.
+        cache.share(1, 1_200, 1_000, Carried::default(), 2_500);
+        let result = cache.share(1, 1_400, 1_200, Carried::default(), 2_500);
+        assert_eq!(result.retained_tokens, 0);
+        assert_eq!(cache.used_units(), 0);
+    }
+
+    #[test]
+    fn one_state_per_entry_keeps_no_earlier_state() {
+        let mut cache = round_end_cache(100_000, 1);
+        cache.insert(1, 1_000, 1_000, 100_000, None);
+        let incoming = Carried {
+            states: vec![RoundState {
+                at: 1_000,
+                tag: StateTag::default(),
+            }],
+            resume: None,
+        };
+        cache.share(1, 2_000, 1_000, incoming, 100_000);
+        assert_eq!(cache.peek(1, 1_500), 0);
+        assert_eq!(cache.used_units(), 2_500);
+        cache.take(1, 2_001);
+        assert_eq!(cache.used_units(), 0);
+        assert!(cache.take_carried(1).states.is_empty());
     }
 }

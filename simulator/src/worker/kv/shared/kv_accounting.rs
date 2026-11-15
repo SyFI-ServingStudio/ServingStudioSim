@@ -33,6 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart, KvGrowth};
 
+use super::state_retention::StateRetention;
+
 /// Whether KV charges include what the serving engine allocates on top of the
 /// model's own state.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -165,6 +167,8 @@ pub struct KvAccountingOptions {
     pub resume_points: Option<PrefixResumePoints>,
     /// Also resume at every multiple of this many tokens.
     pub resume_interval: Option<u32>,
+    /// Which round-end states a retained entry keeps below its end.
+    pub state_retention: StateRetention,
     /// Tokens one step may have in flight across the batch (vLLM:
     /// `max_concurrent_batches × max_num_batched_tokens`). It caps what
     /// admission charges a sliding window; `None` charges the whole prompt.
@@ -334,6 +338,18 @@ impl KvAccounting {
                 "prefix_resume_interval {interval} must be a positive multiple of the engine block ({block_tokens} tokens)"
             );
         }
+        if options.state_retention.keeps_earlier() {
+            ensure!(
+                resume_points == PrefixResumePoints::ContextEnd && resume_interval.is_none(),
+                "recurrent_state_checkpoints > 1 keeps the states left at earlier context ends: \
+                 it needs prefix_resume_points: context_end and no prefix_resume_interval"
+            );
+            ensure!(
+                windows.iter().all(|part| !part.prefix_reusable),
+                "recurrent_state_checkpoints > 1 does not charge a reusable sliding window's tail \
+                 at an earlier state"
+            );
+        }
 
         Ok(Self {
             layout: layout.clone(),
@@ -424,6 +440,15 @@ impl KvAccounting {
 
     pub(super) fn resume_points(&self) -> PrefixResumePoints {
         self.resume_points
+    }
+
+    pub(super) fn state_retention(&self) -> StateRetention {
+        self.options.state_retention
+    }
+
+    /// Units of one reusable state, what each kept round-end state costs.
+    pub(super) fn reusable_state_units(&self) -> u64 {
+        self.reusable_state_units
     }
 
     /// The longest context whose running charge fits `units`.
@@ -1191,5 +1216,25 @@ mod tests {
         for malformed in ["kda", "kda=compact", "kda=-1"] {
             assert!(parse(malformed).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn earlier_states_need_context_end_positions_only() {
+        let resolve = |layout: &KvCacheLayout, points, interval| {
+            KvAccounting::resolve(
+                layout,
+                KvAccountingOptions {
+                    resume_points: Some(points),
+                    resume_interval: interval,
+                    state_retention: StateRetention::Latest { k: 2 },
+                    ..options(KvOverhead::Vllm)
+                },
+                1 << 40,
+            )
+        };
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::ContextEnd, None).is_ok());
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::PromptEnd, None).is_err());
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::ContextEnd, Some(1_056)).is_err());
+        assert!(resolve(&swa_layout(), PrefixResumePoints::ContextEnd, None).is_err());
     }
 }

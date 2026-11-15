@@ -40,6 +40,7 @@ use crate::worker::kv::shared::prefix_cache::{
 use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
+use crate::worker::kv::shared::state_retention::Carried;
 use crate::worker::kv::{
     ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
     SlotPipelineKv,
@@ -654,7 +655,20 @@ impl KvCacheStore {
         self.ledger.forget_chunked_prefill(request);
         self.partitions[partition as usize].release_decode(request);
         self.ledger.forget_placement(request);
-        self.ledger.take_prefill_context(request);
+        self.drop_carried_states(request, partition);
+    }
+
+    /// Forget `request`'s prefill context, and with it the states it carried
+    /// from its session's entry: a context released without retention leaves
+    /// them nowhere to return to.
+    fn drop_carried_states(&mut self, request: RequestId, partition: PartitionId) {
+        if let Some(session_id) = self
+            .ledger
+            .take_prefill_context(request)
+            .and_then(|context| context.session_id())
+        {
+            self.prefix_caches[partition as usize].take_carried(session_id);
+        }
     }
 
     pub(crate) fn release_retaining_prefix(
@@ -670,8 +684,13 @@ impl KvCacheStore {
             .decode_current_kv(request)
             .unwrap_or(prompt_tokens);
         let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
+        let shared_tokens =
+            resolved_prefill.map_or(0, |value| u64::from(value.declared_prefix_tokens()));
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
+        let carried = session_id
+            .map(|session_id| self.prefix_caches[partition as usize].take_carried(session_id))
+            .unwrap_or_default();
         self.release(request, partition);
         if let Some(session_id) = session_id {
             self.retain_prefix(
@@ -680,6 +699,8 @@ impl KvCacheStore {
                 session_id,
                 prompt_tokens,
                 retained_tokens,
+                shared_tokens,
+                carried,
                 cache_return_metadata,
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
@@ -706,7 +727,7 @@ impl KvCacheStore {
         partition_state.remove_prefill_admit(request);
         self.ledger.forget_promise(request);
         self.ledger.forget_chunked_prefill(request);
-        self.ledger.take_prefill_context(request);
+        self.drop_carried_states(request, partition);
         Some(partition)
     }
 
@@ -726,13 +747,18 @@ impl KvCacheStore {
         let prompt_tokens = resolved_prefill.map_or(kv_tokens, |value| {
             u64::from(value.post_prefill_context_tokens())
         });
+        let shared_tokens =
+            resolved_prefill.map_or(0, |value| u64::from(value.declared_prefix_tokens()));
         if let Some(session_id) = session_id {
+            let carried = self.prefix_caches[partition as usize].take_carried(session_id);
             self.retain_prefix(
                 request,
                 partition,
                 session_id,
                 prompt_tokens,
                 kv_tokens,
+                shared_tokens,
+                carried,
                 cache_return_metadata,
                 now,
                 PrefixCacheRetentionReason::HandoffComplete,
@@ -865,6 +891,7 @@ impl KvCacheStore {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn retain_prefix(
         &mut self,
         request: RequestId,
@@ -872,15 +899,19 @@ impl KvCacheStore {
         session_id: u32,
         prompt_tokens: u64,
         tokens: u64,
+        shared_tokens: u64,
+        carried: Carried,
         cache_return_metadata: Option<PrefixCacheReturnMetadata>,
         now: Time,
         retain_reason: PrefixCacheRetentionReason,
     ) {
         let physical_limit = self.prefix_cache_physical_limit(partition);
-        let insert_result = self.prefix_caches[partition as usize].insert(
+        let insert_result = self.prefix_caches[partition as usize].insert_sharing(
             session_id,
             prompt_tokens,
             tokens,
+            shared_tokens,
+            carried,
             physical_limit,
             cache_return_metadata,
         );
@@ -1245,6 +1276,7 @@ mod tests {
 
     use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
     use crate::worker::kv::shared::kv_accounting::{KvAccountingOptions, PrefixResumePoints};
+    use crate::worker::kv::StateRetention;
     use crate::worker::shared::advance_scope::AdvanceScope;
 
     /// Qwen3.6-35B-A3B TP1: 30 GDN layers of state over a 10-GQA-layer token
@@ -1552,6 +1584,69 @@ mod tests {
             0,
             "no state inside the context to resume from"
         );
+    }
+
+    /// A hit on an entry with an earlier state carries it while the request
+    /// runs: back into the entry when the context is retained, dropped when
+    /// it is released without retention.
+    #[test]
+    fn carried_states_return_with_the_context_or_leave_with_the_request() {
+        let mut kv_store = KvCacheStore::new(
+            1,
+            Arc::new(
+                KvAccounting::resolve(
+                    &KvCacheLayout::new()
+                        .with_part(KvCachePart::per_token("gqa", 1))
+                        .with_part(KvCachePart::per_request("gdn", STATE_TOKENS)),
+                    KvAccountingOptions {
+                        resume_points: Some(PrefixResumePoints::ContextEnd),
+                        state_retention: StateRetention::Latest { k: 2 },
+                        ..KvAccountingOptions::default()
+                    },
+                    10_000_000,
+                )
+                .unwrap(),
+            ),
+            capped_prefix_cache(10_000_000, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        let round = |kv_store: &mut KvCacheStore, request: u32, declared: u32, retain: bool| {
+            let session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: declared,
+            };
+            let resolved = kv_store.preview_prefill_context(0, 1_000, session);
+            let context = resolved.post_prefill_context_tokens();
+            let footprint = kv_store.footprint(RequestId(request), context, 0);
+            kv_store.reserve_prefill_context(
+                RequestId(request),
+                0,
+                resolved,
+                footprint,
+                Time::ZERO,
+            );
+            kv_store.drain_ready();
+            kv_store.commit_resident(RequestId(request), 0, u64::from(context), 0);
+            if retain {
+                kv_store.release_retaining_prefix(RequestId(request), 0, Time::ZERO);
+            } else {
+                kv_store.release(RequestId(request), 0);
+            }
+        };
+        round(&mut kv_store, 0, 0, true);
+        round(&mut kv_store, 1, 1_000, true);
+        // States at 1_000 and 2_000 beside 2_000 tokens.
+        assert_eq!(
+            kv_store.prefix_caches[0].used_units(),
+            2_000 + 2 * STATE_TOKENS
+        );
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 1_500), 1_000);
+        // A third round resumes at 2_000 and is released without retention:
+        // the state it carried goes with it.
+        round(&mut kv_store, 2, 2_000, false);
+        assert_eq!(kv_store.prefix_caches[0].used_units(), 0);
     }
 
     /// The reusable length is bounded by the attention KV **and** by the last

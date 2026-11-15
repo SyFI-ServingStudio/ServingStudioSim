@@ -1395,6 +1395,7 @@ mod tests {
             srpt: false,
             microbatch_budget: Default::default(),
             force_schedule: Default::default(),
+            state_retention: Default::default(),
         }
     }
 

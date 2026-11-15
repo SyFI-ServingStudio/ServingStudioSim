@@ -23,7 +23,7 @@ use super::admission::{
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
-    PrefixResumePoints,
+    PrefixResumePoints, StateRetention,
 };
 use super::types::WorkerConfig;
 
@@ -298,6 +298,45 @@ impl KvAccountingSpec {
             config.kv_part_padding.push(padding);
         }
         Ok(())
+    }
+}
+
+/// Which round-end recurrent states a retained context keeps. Flattened into
+/// both chunked selectors; absent keeps the end state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ParamStruct)]
+pub struct StateRetentionSpec {
+    /// Round-end states a retained context keeps: its end's and the latest
+    /// earlier rounds', so a prompt ending inside the context resumes from
+    /// the latest kept state at or before it. A context and its states are
+    /// charged, kept and evicted as one. Above 1 needs `prefix_resume_points:
+    /// context_end`. Not vLLM.
+    #[serde(default = "one_state")]
+    #[param(default = 1)]
+    recurrent_state_checkpoints: u32,
+}
+
+const fn one_state() -> u32 {
+    1
+}
+
+impl Default for StateRetentionSpec {
+    fn default() -> Self {
+        Self {
+            recurrent_state_checkpoints: one_state(),
+        }
+    }
+}
+
+impl StateRetentionSpec {
+    /// The retention; at least one state, the end's.
+    pub(crate) fn resolve(self, owner: &str) -> Result<StateRetention> {
+        ensure!(
+            self.recurrent_state_checkpoints >= 1,
+            "{owner}: recurrent_state_checkpoints must be >= 1 (a context keeps its end state)"
+        );
+        Ok(StateRetention::Latest {
+            k: self.recurrent_state_checkpoints,
+        })
     }
 }
 
@@ -643,6 +682,10 @@ pub enum IterWorkerSel {
         /// Per-rank force-schedule bound; see [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Round-end states a retained context keeps; see
+        /// [`StateRetentionSpec`].
+        #[serde(flatten)]
+        state_retention: StateRetentionSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -764,6 +807,10 @@ pub enum IterWorkerSel {
         /// [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Round-end states a retained context keeps; see
+        /// [`StateRetentionSpec`].
+        #[serde(flatten)]
+        state_retention: StateRetentionSpec,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -828,35 +875,40 @@ impl IterWorkerSel {
         owner: &str,
         config: &mut WorkerConfig,
     ) -> Result<()> {
-        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, pipelined) = match self {
-            Self::ChunkedPrefill {
-                max_batch_tokens,
-                srpt,
-                microbatch_budget,
-                force_schedule,
-                ..
-            } => (
-                max_batch_tokens,
-                srpt,
-                microbatch_budget,
-                force_schedule,
-                false,
-            ),
-            Self::PipelineChunkedPrefill {
-                max_batch_tokens,
-                srpt,
-                microbatch_budget,
-                force_schedule,
-                ..
-            } => (
-                max_batch_tokens,
-                srpt,
-                microbatch_budget,
-                force_schedule,
-                true,
-            ),
-            _ => return Ok(()),
-        };
+        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, state_retention, pipelined) =
+            match self {
+                Self::ChunkedPrefill {
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    ..
+                } => (
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    false,
+                ),
+                Self::PipelineChunkedPrefill {
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    ..
+                } => (
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    true,
+                ),
+                _ => return Ok(()),
+            };
         config.microbatch_budget =
             microbatch_budget.resolve(owner, *max_batch_tokens, pipelined)?;
         config.started_order = if *srpt {
@@ -865,6 +917,7 @@ impl IterWorkerSel {
             StartedOrder::StartOrder
         };
         config.force_schedule_after = force_schedule.resolve(owner)?;
+        config.state_retention = state_retention.resolve(owner)?;
         Ok(())
     }
 
@@ -1259,5 +1312,21 @@ mod tests {
         let twice = apply("kv_part_padding: [kda=unpadded, kda=padded]\n").unwrap_err();
         assert!(twice.to_string().contains("twice"), "{twice}");
         assert!(apply("kv_part_padding: [kda]\n").is_err());
+    }
+
+    #[test]
+    fn recurrent_state_checkpoints_keep_at_least_the_end_state() {
+        let pipeline = |keys: &str| chunked_scheduling("pipeline_chunked_prefill", keys);
+        assert_eq!(
+            pipeline("").unwrap().state_retention,
+            StateRetention::Latest { k: 1 }
+        );
+        assert_eq!(
+            chunked_scheduling("chunked_prefill", "recurrent_state_checkpoints: 2\n")
+                .unwrap()
+                .state_retention,
+            StateRetention::Latest { k: 2 }
+        );
+        assert!(pipeline("recurrent_state_checkpoints: 0\n").is_err());
     }
 }

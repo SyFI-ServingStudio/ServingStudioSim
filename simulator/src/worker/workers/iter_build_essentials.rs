@@ -50,6 +50,7 @@ pub(crate) fn resolve_kv_accounting(
         part_padding: config.kv_part_padding.clone(),
         resume_points: config.prefix_resume_points,
         resume_interval: config.prefix_resume_interval,
+        state_retention: config.state_retention,
         max_in_flight_tokens: config.kv_max_in_flight_tokens.or_else(|| {
             config
                 .max_batch_tokens

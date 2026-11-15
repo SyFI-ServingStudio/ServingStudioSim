@@ -163,7 +163,9 @@ An entry resumes only at the `ResumePositions` its request left behind: any
 length for per-token parts, but only where a sliding-window tail or recurrent
 state was kept for the others (`prefix_resume_points`, default `prompt_end`
 under `vllm`; `context_end` keeps the state at the unfloored context end, so a
-hit is the whole context or nothing). A hit is the largest position at or below the declared prefix.
+hit is the whole context or nothing; with it, `recurrent_state_checkpoints: k`
+on the chunked selectors keeps the latest `k` round-end states per entry, one
+unit with the context, `kv/shared/state_retention.rs`). A hit is the largest position at or below the declared prefix.
 A running request's tails and states at positions it has already passed are
 live checkpoints: like retained entries they are a soft, evictable tier that
 never enters `fits` or `kv_usage`, and they win the slack over retained
