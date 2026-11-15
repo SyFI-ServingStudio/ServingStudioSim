@@ -177,6 +177,9 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
 
     /// The group kernel, with every rank's mHC coefficient branch beside it.
     pub fn compile_exchange(&self, ranks: usize, b: &mut CostTreeBuilder) -> CostNode {
+        // Slots are assigned in compile order and filled in `eval_exchange`
+        // order: the group kernel first.
+        let mega_moe = self.mega_moe.compile(b);
         let coefficients = CostNode::Max {
             overlap: 1.0,
             children: (0..ranks)
@@ -191,7 +194,7 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             ),
             child: Box::new(CostNode::Parallel {
                 overlap: 1.0,
-                children: vec![self.mega_moe.compile(b), coefficients],
+                children: vec![mega_moe, coefficients],
             }),
         }
     }
