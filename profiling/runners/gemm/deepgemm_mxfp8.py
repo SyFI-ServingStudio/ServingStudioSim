@@ -82,7 +82,12 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
     def quantize_activation(x: Any) -> tuple[Any, Any]:
         return tile_kernels.quant.per_token_cast(x, **get_fp8_cast_params())
 
-    return torch, ReplicatedLinear, quantize_activation, (per_token_cast_to_fp8, per_block_cast_to_fp8)
+    return (
+        torch,
+        ReplicatedLinear,
+        quantize_activation,
+        (per_token_cast_to_fp8, per_block_cast_to_fp8),
+    )
 
 
 def _dequantize(torch: Any, data: Any, scale: Any, block_rows: int) -> Any:

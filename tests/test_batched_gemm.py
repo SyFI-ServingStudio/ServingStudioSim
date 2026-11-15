@@ -60,6 +60,7 @@ def test_kind_table_backend_and_runner_ref_contract():
         "torch_mla_v_up_unpadded",
         _WO_A_BACKEND,
         "torch_bmm_packed_lhs",
+        "deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out",
     ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
