@@ -220,11 +220,12 @@ impl KvAdmissionSpec {
 }
 
 const KV_OVERHEAD_CHOICES: [&str; 2] = ["vllm", "none"];
-const PREFIX_RESUME_POINTS_CHOICES: [&str; 4] = [
+const PREFIX_RESUME_POINTS_CHOICES: [&str; 5] = [
     "prompt_end",
     "response_end",
     "prompt_and_response_end",
     "every_block",
+    "context_end",
 ];
 
 /// How a worker turns the arch's `KvCacheLayout` into charges: whether the
@@ -242,7 +243,8 @@ pub struct KvAccountingSpec {
     kv_overhead: KvOverhead,
     /// Where a finished request keeps sliding-window tails and recurrent state
     /// for a later request to resume from. Absent follows `kv_overhead`:
-    /// `prompt_end` under `vllm`, `response_end` under `none`. A layout of
+    /// `prompt_end` under `vllm`, `response_end` under `none`. `context_end`
+    /// (not vLLM) keeps it at the unfloored context end only. A layout of
     /// per-token parts only resumes anywhere and ignores it.
     #[serde(default)]
     #[param(string, choices = PREFIX_RESUME_POINTS_CHOICES)]

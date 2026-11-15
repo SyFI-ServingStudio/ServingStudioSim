@@ -412,7 +412,11 @@ impl PrefixCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
+    use crate::worker::kv::shared::kv_accounting::{KvAccountingOptions, PrefixResumePoints};
 
     /// Plain token accounting: every prefix length is resumable and a retained
     /// entry costs exactly its tokens. Positions and charges of other layouts
@@ -427,17 +431,36 @@ mod tests {
         )
     }
 
+    /// One unit per token plus a 500-unit recurrent state, resumable only at
+    /// a context's end, `capacity` units in all.
+    fn end_state_cache(capacity: u64) -> PrefixCache {
+        let layout = KvCacheLayout::new()
+            .with_part(KvCachePart::per_token("kv", 1))
+            .with_part(KvCachePart::per_request("state", 500));
+        let accounting = KvAccounting::resolve(
+            &layout,
+            KvAccountingOptions {
+                resume_points: Some(PrefixResumePoints::ContextEnd),
+                ..KvAccountingOptions::default()
+            },
+            capacity,
+        )
+        .unwrap();
+        PrefixCache::new(
+            Arc::new(accounting),
+            PrefixCacheBudget {
+                max_retained_units: capacity,
+                policy: PrefixCachePolicy::Lru,
+            },
+        )
+    }
+
     #[test]
     fn runtime_config_resolves_disabled_uncapped_and_bounded_unit_limits() {
         // 2000-byte units, 1000 of them over two shards.
-        let layout = crate::arch::kv_layout::KvCacheLayout::new()
-            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 2_000));
-        let accounting = KvAccounting::resolve(
-            &layout,
-            crate::worker::kv::shared::kv_accounting::KvAccountingOptions::default(),
-            2_000_000,
-        )
-        .unwrap();
+        let layout = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 2_000));
+        let accounting =
+            KvAccounting::resolve(&layout, KvAccountingOptions::default(), 2_000_000).unwrap();
         assert_eq!(
             PrefixCacheConfig::Disabled.resolve_units(&accounting, 2),
             PrefixCacheBudget::DISABLED
@@ -565,5 +588,35 @@ mod tests {
         assert_eq!(take.entry_tokens, 60);
         assert_eq!(take.cache_used_before, 60);
         assert_eq!(take.cache_used_after, 0);
+    }
+
+    #[test]
+    fn end_state_reuses_the_whole_context_or_nothing() {
+        let mut cache = end_state_cache(10_000);
+        cache.insert(1, 2_000, 2_345, 10_000, None);
+        assert_eq!(cache.used_units(), 2_345 + 500);
+        // A prompt that extends the kept context resumes from its end state.
+        assert_eq!(cache.peek(1, 2_345), 2_345);
+        assert_eq!(cache.peek(1, 2_346), 2_345);
+        // One that ends inside it has no state to resume from.
+        assert_eq!(cache.peek(1, 2_344), 0);
+        assert_eq!(cache.take(1, 1_000).hit_tokens, 0);
+        assert_eq!(cache.used_units(), 0, "the unusable entry is consumed");
+    }
+
+    #[test]
+    fn end_state_charges_one_state_per_entry_and_keeps_entries_whole() {
+        let mut cache = end_state_cache(10_000);
+        cache.insert(1, 2_000, 2_345, 10_000, None);
+        // A second entry needs its own state: 6_000 + 500 does not fit beside
+        // 2_845, so session 1 is evicted.
+        cache.insert(2, 6_000, 6_000, 9_000, None);
+        assert_eq!(cache.peek(1, 2_345), 0);
+        assert_eq!(cache.used_units(), 6_500);
+        // A context larger than the room left is not cut to fit: a cut-off part
+        // has no state at its end.
+        let result = cache.insert(3, 8_000, 8_000, 8_000, None);
+        assert_eq!(result.retained_tokens, 0);
+        assert_eq!(cache.peek(3, 8_000), 0);
     }
 }

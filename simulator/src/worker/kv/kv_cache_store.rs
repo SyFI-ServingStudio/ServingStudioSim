@@ -1514,6 +1514,46 @@ mod tests {
         assert_eq!(every_block.prefix_caches[0].peek(7, 4_095), 2_048);
     }
 
+    /// A state saved where the context ended resumes the whole context or
+    /// nothing. The position is not floored to the engine block; the KV it
+    /// keeps is still charged in whole blocks.
+    #[test]
+    fn end_state_reuse_hits_a_whole_context_or_nothing() {
+        let mut kv_store = state_store(
+            10_000_000,
+            STATE_TOKENS,
+            Some(CHECKPOINT_INTERVAL),
+            Some(PrefixResumePoints::ContextEnd),
+        );
+        let session = SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: 0,
+        };
+        let resolved_prefill = kv_store.preview_prefill_context(0, 5_000, session);
+        let footprint = kv_store.footprint(RequestId(0), 5_000, 0);
+        kv_store.reserve_prefill_context(RequestId(0), 0, resolved_prefill, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(0), 0, 5_000, 0);
+        assert_eq!(
+            kv_store.partitions[0].live_checkpoint_units(),
+            0,
+            "a running request keeps no state behind it"
+        );
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+        assert_eq!(kv_store.prefix_caches[0].used_tokens(), 5_000);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_units(),
+            3 * 2_048 + STATE_TOKENS
+        );
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 5_001), 5_000);
+        assert_eq!(
+            kv_store.prefix_caches[0].peek(7, 4_999),
+            0,
+            "no state inside the context to resume from"
+        );
+    }
+
     /// The reusable length is bounded by the attention KV **and** by the last
     /// kept state. One entry carries both at its positions: they are sized,
     /// charged and evicted together, so they cannot drift apart.

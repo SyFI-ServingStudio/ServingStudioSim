@@ -81,6 +81,11 @@ pub enum PrefixResumePoints {
     PromptAndResponseEnd,
     /// Every engine block (vLLM's `prefix_cache_retention_interval = None`).
     EveryBlock,
+    /// The end of the request's context, not floored to the engine block: an
+    /// engine that saves the state where its pass ended, so a later prompt
+    /// resumes from the whole context when it extends it, else from nothing.
+    /// Not vLLM.
+    ContextEnd,
 }
 
 impl PrefixResumePoints {
@@ -89,6 +94,7 @@ impl PrefixResumePoints {
         "response_end",
         "prompt_and_response_end",
         "every_block",
+        "context_end",
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -97,6 +103,7 @@ impl PrefixResumePoints {
             Self::ResponseEnd => "response_end",
             Self::PromptAndResponseEnd => "prompt_and_response_end",
             Self::EveryBlock => "every_block",
+            Self::ContextEnd => "context_end",
         }
     }
 }
@@ -543,6 +550,7 @@ impl KvAccounting {
                 ([Some(prompt_end), Some(response_end)], self.resume_interval)
             }
             PrefixResumePoints::EveryBlock => ([None, None], Some(block)),
+            PrefixResumePoints::ContextEnd => ([Some(context_tokens), None], self.resume_interval),
         };
         ResumePositions::new(explicit, every, context_tokens)
     }
@@ -952,6 +960,34 @@ mod tests {
         // A history edited below the only position resumes nowhere.
         let none = resolve(&gdn_layout(), KvOverhead::None, None);
         assert_eq!(none.resume_positions(8_000, 8_500).floor(8_400), 0);
+    }
+
+    #[test]
+    fn resume_points_bound_what_a_shorter_prompt_reuses() {
+        let resolve = |layout: &KvCacheLayout, points| {
+            KvAccounting::resolve(
+                layout,
+                KvAccountingOptions {
+                    resume_points: Some(points),
+                    ..options(KvOverhead::Vllm)
+                },
+                1 << 40,
+            )
+            .unwrap()
+        };
+        let any = resolve(&full_only(8), PrefixResumePoints::ContextEnd);
+        let every_block = resolve(&gdn_layout(), PrefixResumePoints::EveryBlock);
+        let context_end = resolve(&gdn_layout(), PrefixResumePoints::ContextEnd);
+        let hit = |accounting: &KvAccounting, declared| {
+            accounting.resume_positions(5_000, 5_000).floor(declared)
+        };
+        assert_eq!(hit(&any, 3_210), 3_210);
+        assert_eq!(hit(&every_block, 3_210), 3_168);
+        assert_eq!(hit(&context_end, 3_210), 0, "no state inside the context");
+        // The context end is not floored to the 1056-token block.
+        assert_eq!(hit(&context_end, 5_000), 5_000);
+        assert_eq!(hit(&context_end, 5_001), 5_000);
+        assert_eq!(context_end.checkpoint_units(5_000, 4_999), 0);
     }
 
     #[test]
