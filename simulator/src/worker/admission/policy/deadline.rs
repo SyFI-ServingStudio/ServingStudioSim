@@ -122,14 +122,16 @@ struct AtRiskIndex {
 }
 
 impl AtRiskIndex {
-    /// Prefill tokens an overdue miss computes: its prompt less the prefix it
-    /// held at promotion.
+    /// Prefill tokens an overdue miss computes: its fresh tokens plus the
+    /// part of its declared prefix not held at promotion.
     fn compute_tokens_of(candidate: &AdmissionCandidate) -> u64 {
-        u64::from(
-            candidate
-                .fresh_prompt_tokens
-                .saturating_sub(candidate.resident_prefix_tokens),
-        )
+        u64::from(candidate.fresh_prompt_tokens)
+            + u64::from(
+                candidate
+                    .session_input
+                    .declared_prefix_tokens()
+                    .saturating_sub(candidate.resident_prefix_tokens),
+            )
     }
 
     fn track_in(&mut self, candidate: &AdmissionCandidate) {
@@ -663,7 +665,8 @@ mod tests {
             let arrival = Time::from_ms(if id == 3 { 5.0 } else { 0.0 });
             deadline.push_arrived(candidate, arrival, &mut ());
         }
-        // Request 1 holds 80 of its prefix: it computes 20 of its 100 tokens.
+        // Each request computes its 100 fresh tokens and the part of its
+        // 80-token prefix not held: request 1 holds all 80.
         deadline.promote(Time::from_ms(10.0), |c| {
             if c.request_id == RequestId(1) {
                 80
@@ -671,7 +674,7 @@ mod tests {
                 0
             }
         });
-        assert_eq!(deadline.at_risk_horizon(), Some(220));
+        assert_eq!(deadline.at_risk_horizon(), Some(460));
         // Session 0's latest request (3) is still pending; session 2's (2)
         // is an overdue miss.
         let queued = |deadline: &Deadline<FifoOrder>, session| {
@@ -681,11 +684,11 @@ mod tests {
         assert_eq!(queued(&deadline, 2), Some(2));
         assert!(deadline.remove(RequestId(2)).is_some());
         assert_eq!(queued(&deadline, 2), None);
-        assert_eq!(deadline.at_risk_horizon(), Some(120));
+        assert_eq!(deadline.at_risk_horizon(), Some(280));
         let first = deadline.pop(&mut ()).unwrap();
-        assert_eq!(deadline.at_risk_horizon(), Some(20));
+        assert_eq!(deadline.at_risk_horizon(), Some(100));
         deadline.push_front_overdue(first, false);
-        assert_eq!(deadline.at_risk_horizon(), Some(120));
+        assert_eq!(deadline.at_risk_horizon(), Some(280));
         // Turned on, the split classifies later promotions only.
         deadline.set_hits_first(true);
         deadline.promote(Time::from_ms(15.0), |_| 80);
