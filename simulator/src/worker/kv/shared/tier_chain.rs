@@ -192,8 +192,8 @@ struct LoadingAreas {
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct LoadingReport {
     pub fraction: f64,
-    pub hbm_area_units: u64,
-    pub dram_area_units: u64,
+    pub hbm_area: u64,
+    pub dram_area: u64,
 }
 
 /// A finished request's context, as a write-through tier stores it.
@@ -585,8 +585,8 @@ impl TierChain {
     pub(crate) fn loading_report(&self) -> Option<LoadingReport> {
         self.loading.map(|loading| LoadingReport {
             fraction: loading.fraction,
-            hbm_area_units: loading.hbm.size,
-            dram_area_units: loading.dram.size,
+            hbm_area: loading.hbm.size,
+            dram_area: loading.dram.size,
         })
     }
 
@@ -1675,9 +1675,9 @@ mod tests {
         let capacity = chain.tiers[0].capacity;
         chain.set_loading_area(0.05, 100_000_500);
         let report = chain.loading_report().unwrap();
-        assert_eq!(report.dram_area_units, capacity / 20);
+        assert_eq!(report.dram_area, capacity / 20);
         assert_eq!(chain.tiers[0].capacity, capacity - capacity / 20);
-        assert_eq!(report.hbm_area_units, 100_000, "whole tier tokens");
+        assert_eq!(report.hbm_area, 100_000, "whole tier tokens");
         // 1M tokens take 100 ms, back to back, and a DRAM read queues behind.
         let charge = StagedCharge {
             queue: LoadingQueue::Dram,

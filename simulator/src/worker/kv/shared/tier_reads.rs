@@ -86,8 +86,8 @@ pub struct TiersReport {
     /// Reads of a context an earlier read put back but HBM evicted before
     /// admission.
     pub rereads: u64,
-    /// Staged loading's areas; absent without.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Staged loading's fraction and areas; absent without.
+    #[serde(flatten)]
     pub loading: Option<LoadingReport>,
     pub tiers: Vec<TierReport>,
 }

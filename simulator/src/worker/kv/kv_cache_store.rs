@@ -1746,10 +1746,15 @@ mod tests {
             "inside the area it adds nothing"
         );
         let reports = kv_store.tiers_reports();
-        let loading = reports[0].loading.unwrap();
+        let json = serde_json::to_value(&reports[0]).unwrap();
         assert_eq!(
-            (loading.hbm_area_units, loading.dram_area_units),
-            (10_000, 0)
+            (&json["fraction"], &json["hbm_area"], &json["dram_area"]),
+            (
+                &serde_json::json!(0.1),
+                &serde_json::json!(10_000),
+                &serde_json::json!(0)
+            ),
+            "kv_cache.json's tiers carry the fraction and both areas in tier tokens"
         );
     }
 
@@ -1801,7 +1806,7 @@ mod tests {
         assert!(stage(&mut kv_store, 2, 5_000, Time::ZERO));
         assert!(stage(&mut kv_store, 3, 5_000, Time::ZERO));
         assert_eq!(
-            kv_store.tiers_reports()[0].loading.unwrap().dram_area_units,
+            kv_store.tiers_reports()[0].loading.unwrap().dram_area,
             100_000
         );
         assert_eq!(
