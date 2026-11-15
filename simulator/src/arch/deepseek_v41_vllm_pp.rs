@@ -540,6 +540,9 @@ pub struct DeepseekV41PpStageConfigs {
     /// The scatter back to batch rows, on the last stage.
     pub scatter: Option<ElementwiseKernelConfig>,
     pub late_bodies: Vec<bool>,
+    /// The cut layer's own body, on the stage holding it: on a replay step
+    /// the cut's `write_kv` already stored its KV.
+    pub cut_body: Option<usize>,
     /// What this stage sends to the next one; `None` on the last stage.
     pub send: Option<HopPayload>,
     /// What the last stage sends back to the first (a folded split).
@@ -727,6 +730,26 @@ pub fn build_configs(
                 .collect::<Result<Vec<_>, _>>()?,
             None => vec![false; bodies.len()],
         };
+        let cut_body = match rule.filter(|rule| geometry.place[rule.cut_layer as usize] == index as u16) {
+            Some(rule) => {
+                let body = bodies
+                    .iter()
+                    .position(|body| body.layers == [rule.cut_layer])
+                    .ok_or_else(|| {
+                        fit_failed(format!(
+                            "decoder SWA bounded replay: cut layer {} shares its body",
+                            rule.cut_layer
+                        ))
+                    })?;
+                // As in the DP arch: DeepInfer rebuilds `kv_swa_full_index`
+                // for the compact rows at the cut.
+                if let Some(di) = bodies[body].attention.deepinfer.as_mut() {
+                    di.builds_swa_index = true;
+                }
+                Some(body)
+            }
+            None => None,
+        };
         let cut = match rule.filter(|_| cut_stage == Some(index as u16)) {
             Some(rule) => {
                 let write_kv = stage_layer(model.layer_kind(rule.cut_layer), vec![rule.cut_layer])
@@ -768,6 +791,7 @@ pub fn build_configs(
             cut_at: front_nodes,
             scatter,
             late_bodies,
+            cut_body,
             send: (index != last).then(|| geometry.forward(index as u16)),
             return_hop: (index == last).then(|| return_hop.clone()).flatten(),
             deferred_only,
@@ -831,6 +855,7 @@ pub struct DeepseekV41PpStageResolved {
     cut: Option<CutResolved>,
     scatter: Option<ElementwiseKernelConfig>,
     late_bodies: Vec<bool>,
+    cut_body: Option<usize>,
     send: Option<HopPayload>,
     return_hop: Option<HopPayload>,
     deferred_only: bool,
@@ -889,6 +914,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmPpConfigs) -> DeepseekV41VllmPpR
                 }),
                 scatter: stage.scatter.clone(),
                 late_bodies: stage.late_bodies.clone(),
+                cut_body: stage.cut_body,
                 send: stage.send.clone(),
                 return_hop: stage.return_hop.clone(),
                 deferred_only: stage.deferred_only,
@@ -962,6 +988,9 @@ pub struct DeepseekV41VllmPpStageModel {
     cut: Option<StageCut>,
     scatter: Option<Op<ElementwiseKernel>>,
     late_bodies: Vec<bool>,
+    /// The cut layer's body: on a replay step it skips the KV stores the
+    /// cut's `write_kv` ran.
+    cut_body: Option<usize>,
     head: Option<DeepseekV41HeadTpWorklet>,
     send: Option<HopPayload>,
     return_hop: Option<HopPayload>,
@@ -1068,6 +1097,7 @@ impl DeepseekV41VllmPpStageModel {
                 None => None,
             },
             late_bodies: stage.late_bodies,
+            cut_body: stage.cut_body,
             head: match is_last {
                 true => Some(DeepseekV41HeadTpWorklet::build(
                     format!("{name}.head"),
@@ -1352,6 +1382,13 @@ impl DeepseekV41VllmPpStageModel {
             match node {
                 PlanNode::Body(index) => {
                     let body_input = match &input.replay {
+                        Some(late) if self.cut_body == Some(*index) => {
+                            // The cut's `write_kv` stored this layer's main and index KV.
+                            let mut late = late.clone();
+                            late.attention.kv_written = true;
+                            self.bodies[*index].eval(&late, ev);
+                            continue;
+                        }
                         Some(late) if self.late_bodies[*index] => late,
                         _ => &input.full,
                     };
@@ -1379,6 +1416,7 @@ impl DeepseekV41VllmPpStageModel {
                 full_graph: false,
                 mhc_overlap: false,
                 write_kv_only: true,
+                kv_written: false,
             }
         };
         cut.write_kv.eval(&write_kv, ev);
@@ -2051,6 +2089,17 @@ mod tests {
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(metadata, [vec![24], vec![32]]);
+        // `kv_swa_full_index` is built by layer 0 and again at the YOCO cut.
+        let swa_index: Vec<Vec<u32>> = cfgs
+            .stages
+            .iter()
+            .flat_map(|stage| stage.layer0.iter().chain(&stage.bodies))
+            .filter(|body| body.attention.deepinfer.as_ref().unwrap().builds_swa_index)
+            .map(|body| body.layers.clone())
+            .collect();
+        assert_eq!(swa_index, [vec![0], vec![20]]);
+        assert_eq!(cfgs.stages[0].cut_body.map(|b| cfgs.stages[0].bodies[b].layers.clone()), Some(vec![20]));
+        assert_eq!(cfgs.stages[1].cut_body, None);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let model = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
