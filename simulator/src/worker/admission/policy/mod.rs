@@ -20,7 +20,7 @@ mod longest_prefix_match;
 mod session_start;
 mod shortest_job_first;
 
-pub use deadline::Deadline;
+pub use deadline::{Deadline, ForceSchedule, HitsFirst, QueueAccess, Queued};
 pub use fifo::FifoOrder;
 pub use longest_prefix_match::LongestPrefixMatch;
 pub use session_start::SessionStartOrder;

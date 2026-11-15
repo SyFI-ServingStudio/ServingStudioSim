@@ -247,7 +247,8 @@ mod tests {
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{
-        FifoOrder, LoadBudget, MicrobatchBudget, PendingOrderKind, ShortestJobFirst, StartedOrder,
+        FifoOrder, ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind,
+        ShortestJobFirst, StartedOrder,
     };
     use crate::worker::config::{BoundedFutureKvAdmissionConfig, DpPlacement};
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
@@ -709,7 +710,10 @@ mod tests {
             WorkerConfig {
                 max_batch_tokens: Some(1_000),
                 pending_order: PendingOrderKind::ShortestPrefillFirst,
-                force_schedule_after,
+                force_schedule: force_schedule_after.map(|after| ForceSchedule {
+                    after,
+                    hits_first: HitsFirst::Off,
+                }),
                 ..WorkerConfig::default()
             },
         );

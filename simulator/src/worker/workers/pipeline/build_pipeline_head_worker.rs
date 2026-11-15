@@ -122,8 +122,8 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
     }
-    if let Some(after) = config.force_schedule_after {
-        admission = admission.with_force_schedule_after(after);
+    if let Some(schedule) = config.force_schedule {
+        admission = admission.with_force_schedule(schedule);
     }
     if let Some(read_wait) = config.prefix_tier_read_wait {
         admission = admission.with_read_wait(read_wait);

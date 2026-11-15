@@ -38,6 +38,7 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
 use super::microbatch_budget::{MicrobatchBudget, PrefillSplit};
+use super::policy::{ForceSchedule, Queued};
 use super::started_order::{FreshGate, PrefillFill, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
@@ -212,11 +213,12 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     }
 
     /// Serve a queued request that has waited `after` since arrival before the
-    /// rest of its partition's queue. Not vLLM.
-    pub(crate) fn with_force_schedule_after(mut self, after: Time) -> Self {
+    /// rest of its partition's queue, in the cost classes `schedule` names.
+    /// Not vLLM.
+    pub(crate) fn with_force_schedule(mut self, schedule: ForceSchedule) -> Self {
         self.partition_policies = std::mem::take(&mut self.partition_policies)
             .into_iter()
-            .map(|(policy, context)| (policy.with_bound(after), context))
+            .map(|(policy, context)| (policy.with_force_schedule(schedule), context))
             .collect();
         self
     }
@@ -471,6 +473,12 @@ where
             .is_overdue(arrival, now)
     }
 
+    fn splits_by_class(&self, partition: u16) -> bool {
+        self.partition_policies[usize::from(partition)]
+            .0
+            .splits_by_class()
+    }
+
     fn started_prefills_mut(&mut self, partition: u16) -> &mut Vec<AdmissionCandidate> {
         &mut self.started_prefills[usize::from(partition)]
     }
@@ -494,15 +502,14 @@ where
         let mut remaining_budget = budget;
         while step.admits && remaining_budget > drafting_slots {
             let (policy, policy_context) = &mut self.partition_policies[partition_index];
-            let overdue = policy.head_is_overdue();
-            if gate == FreshGate::OverdueOnly && !overdue {
-                break;
-            }
-            policy.refresh_head(&mut |candidate| {
-                kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
-            });
-            let Some(candidate) = policy.peek() else {
+            let Some((candidate, queued)) =
+                policy.peek_head(gate.queues, policy_context, &mut |candidate| {
+                    kv_store.resident_prefix_tokens(
+                        candidate.fresh_prompt_tokens,
+                        candidate.session_input,
+                    )
+                })
+            else {
                 break;
             };
             if candidate.remaining_output_tokens > 1 && step.future_decode_slots == Some(0) {
@@ -513,7 +520,10 @@ where
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
-            if !gate.admits(overdue, resolved_prefill.remaining_prefill_tokens()) {
+            if !gate.admits(
+                queued == Queued::Pending,
+                resolved_prefill.remaining_prefill_tokens(),
+            ) {
                 break;
             }
             // A fresh prompt whose first chunk cannot end on a checkpoint
@@ -559,8 +569,8 @@ where
             if !fits {
                 break;
             }
-            let popped = policy.pop(policy_context);
-            debug_assert_eq!(popped, Some(candidate));
+            let taken = policy.take_head(queued, policy_context);
+            debug_assert_eq!(taken, candidate);
             self.admission_order
                 .insert(candidate.request_id, self.next_admission);
             self.next_admission += 1;
@@ -600,6 +610,8 @@ where
                 self.started_prefills[partition_index].push(candidate);
             }
         }
+        let (policy, policy_context) = &mut self.partition_policies[partition_index];
+        policy.restore_set_aside(policy_context);
         budget - remaining_budget
     }
 
@@ -685,8 +697,13 @@ where
     ) -> bool {
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
+        // A hit computes only its new tokens: its context is in HBM. Without
+        // tiers no held context is at risk, so `WhenAtRisk` never splits here.
         for (policy, _) in &mut self.partition_policies {
-            policy.promote(now);
+            policy.promote(now, |candidate| {
+                kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+            });
         }
         self.started_prefills.resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);

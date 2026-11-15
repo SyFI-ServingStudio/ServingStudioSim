@@ -354,6 +354,8 @@ mod tests {
                 "load_budget_backlog_lo_tokens",
                 "load_budget_backlog_hi_tokens",
                 "force_schedule_after_ms",
+                "force_schedule_hits_first",
+                "force_schedule_hits_first_when_at_risk",
             ] {
                 assert_eq!(
                     params.iter().filter(|param| param["name"] == name).count(),

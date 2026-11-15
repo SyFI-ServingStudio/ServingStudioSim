@@ -91,8 +91,8 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     }
     .with_microbatch_budget(config.microbatch_budget)
     .with_started_order(config.started_order);
-    let admission = match config.force_schedule_after {
-        Some(after) => admission.with_force_schedule_after(after),
+    let admission = match config.force_schedule {
+        Some(schedule) => admission.with_force_schedule(schedule),
         None => admission,
     };
 

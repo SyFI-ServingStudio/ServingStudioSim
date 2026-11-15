@@ -19,8 +19,8 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use crate::common::Time;
 
 use super::admission::{
-    LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit, ReadWait, ReadWaitPolicy,
-    StartedOrder,
+    ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit,
+    ReadWait, ReadWaitPolicy, StartedOrder,
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
@@ -770,17 +770,56 @@ pub struct ForceScheduleSpec {
     #[serde(default)]
     #[param(default = 0.0)]
     force_schedule_after_ms: f64,
+    /// With `force_schedule_after_ms` and `srpt`: requests split by cost
+    /// class. Those whose session's context is held (HBM or a tier), so they
+    /// compute only their new tokens, go first (overdue ones oldest first,
+    /// then shortest first); those that compute their context (a new session,
+    /// an evicted one, a prompt ending inside its context) follow in the same
+    /// order. Waiting behind recomputes cannot then turn a held context into
+    /// one. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    force_schedule_hits_first: bool,
+    /// With `force_schedule_hits_first`: split by cost class only while
+    /// serving the overdue requests oldest first would evict some queued
+    /// request's held context from every prefix tier holding it (its LRU
+    /// distance to eviction against the prefill tokens those requests
+    /// compute); otherwise oldest first. Without tiers nothing is at risk.
+    /// Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    force_schedule_hits_first_when_at_risk: bool,
 }
 
 impl ForceScheduleSpec {
-    /// The bound, `None` when off.
-    pub(crate) fn resolve(self, owner: &str) -> Result<Option<Time>> {
+    /// The bound and its class order, `None` when off. `srpt`: the started
+    /// order is shortest remaining first, the only one that splits by class.
+    pub(crate) fn resolve(self, owner: &str, srpt: bool) -> Result<Option<ForceSchedule>> {
         let ms = self.force_schedule_after_ms;
         ensure!(
             ms.is_finite() && ms >= 0.0,
             "{owner}: force_schedule_after_ms ({ms}) must be a finite value >= 0"
         );
-        Ok((ms > 0.0).then(|| Time::from_ms(ms)))
+        ensure!(
+            !self.force_schedule_hits_first || (ms > 0.0 && srpt),
+            "{owner}: force_schedule_hits_first needs force_schedule_after_ms > 0 and srpt"
+        );
+        ensure!(
+            !self.force_schedule_hits_first_when_at_risk || self.force_schedule_hits_first,
+            "{owner}: force_schedule_hits_first_when_at_risk needs force_schedule_hits_first"
+        );
+        let hits_first = match (
+            self.force_schedule_hits_first,
+            self.force_schedule_hits_first_when_at_risk,
+        ) {
+            (false, _) => HitsFirst::Off,
+            (true, false) => HitsFirst::Always,
+            (true, true) => HitsFirst::WhenAtRisk,
+        };
+        Ok((ms > 0.0).then(|| ForceSchedule {
+            after: Time::from_ms(ms),
+            hits_first,
+        }))
     }
 }
 
@@ -1221,7 +1260,7 @@ impl IterWorkerSel {
         } else {
             StartedOrder::StartOrder
         };
-        config.force_schedule_after = force_schedule.resolve(owner)?;
+        config.force_schedule = force_schedule.resolve(owner, *srpt)?;
         config.state_retention = state_retention.resolve(owner)?;
         config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
         Ok(())
@@ -1367,7 +1406,7 @@ mod tests {
             "the default is vLLM's greedy fill"
         );
         assert_eq!(config.started_order, StartedOrder::StartOrder);
-        assert_eq!(config.force_schedule_after, None);
+        assert_eq!(config.force_schedule, None);
 
         let error = pipeline("min_microbatch_tokens: 1024\n").unwrap_err();
         assert!(
@@ -1394,7 +1433,7 @@ mod tests {
         let config = chunked("").unwrap();
         assert_eq!(config.microbatch_budget, MicrobatchBudget::default());
         assert_eq!(config.started_order, StartedOrder::StartOrder);
-        assert_eq!(config.force_schedule_after, None);
+        assert_eq!(config.force_schedule, None);
 
         // The floor needs ordered bounds, the bounds need the floor, and the
         // floor cannot exceed the cap.
@@ -1427,8 +1466,39 @@ mod tests {
             config.microbatch_budget.long_prefill_token_threshold,
             Some(4096)
         );
-        assert_eq!(config.force_schedule_after, Some(Time::from_ms(2500.0)));
+        assert_eq!(
+            config.force_schedule,
+            Some(ForceSchedule {
+                after: Time::from_ms(2500.0),
+                hits_first: HitsFirst::Off,
+            })
+        );
         assert!(chunked("force_schedule_after_ms: -1.0\n").is_err());
+
+        // Hits first splits the srpt fill and the overdue queue: it needs both.
+        let srpt_force = "pending_order: shortest-prefill-first\nsrpt: true\n\
+                          force_schedule_after_ms: 2500\n";
+        let order = |keys: &str| {
+            chunked(&format!("{srpt_force}{keys}"))
+                .map(|config| config.force_schedule.map(|schedule| schedule.hits_first))
+        };
+        assert_eq!(
+            order("force_schedule_hits_first: true\n").unwrap(),
+            Some(HitsFirst::Always)
+        );
+        assert_eq!(
+            order(
+                "force_schedule_hits_first: true\n\
+                 force_schedule_hits_first_when_at_risk: true\n"
+            )
+            .unwrap(),
+            Some(HitsFirst::WhenAtRisk)
+        );
+        assert!(order("force_schedule_hits_first_when_at_risk: true\n").is_err());
+        assert!(chunked("srpt: true\nforce_schedule_hits_first: true\n").is_err());
+        assert!(
+            chunked("force_schedule_after_ms: 2500\nforce_schedule_hits_first: true\n").is_err()
+        );
     }
 
     #[test]

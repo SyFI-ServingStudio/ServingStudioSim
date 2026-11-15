@@ -320,11 +320,11 @@ mod tests {
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{
-        FifoOrder, LoadBudget, MicrobatchBudget, PendingOrderKind,
+        FifoOrder, ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind,
         PipelinedChunkedPrefillAdmission, PrefillSplit, ReadWait, ReadWaitPolicy, StartedOrder,
     };
     use crate::worker::execution::UnifiedIterExecution;
-    use crate::worker::kv::{KvCacheStore, PrefixKv};
+    use crate::worker::kv::{KvCacheStore, PrefixKv, TieredPrefixKv};
     use crate::worker::types::WorkerConfig;
     use crate::worker::workers::pipeline::{build_pipeline_head_worker, PipelineHead};
 
@@ -1147,7 +1147,10 @@ mod tests {
         let mut worker = depth4_head(
             Rc::clone(&store),
             WorkerConfig {
-                force_schedule_after,
+                force_schedule: force_schedule_after.map(|after| ForceSchedule {
+                    after,
+                    hits_first: HitsFirst::Off,
+                }),
                 ..srpt_config()
             },
         );
@@ -1687,5 +1690,123 @@ mod tests {
         );
         assert_eq!(launched(&events), [(1, 4, Time::from_ms(9.8))]);
         assert_eq!(hit_tokens(&store, 0), Some(40));
+    }
+
+    // ── Force-schedule cost classes ──────────────────────────────────────────
+
+    fn hits_first(hits_first: HitsFirst, after_ms: f64) -> Option<ForceSchedule> {
+        Some(ForceSchedule {
+            after: Time::from_ms(after_ms),
+            hits_first,
+        })
+    }
+
+    #[test]
+    fn hits_first_admits_an_overdue_hit_before_an_older_overdue_miss() {
+        // HBM holds 120 tokens and session 7's 50. A 100-token prompt of
+        // session 8 (arrived 4 ms) and session 7's round 1 (5 ms) are both
+        // overdue when the head first looks at 10 ms. Oldest first admits the
+        // prompt, whose footprint evicts session 7, so round 1 recomputes;
+        // hits first admits round 1 on its context first. Gated on an at-risk
+        // tier context, hits first stays off without tiers: oldest first.
+        for (order, hit) in [
+            (HitsFirst::Off, 0),
+            (HitsFirst::Always, 50),
+            (HitsFirst::WhenAtRisk, 0),
+        ] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 4.0);
+            as_session(&store, 2, 7, 51, 5.0);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    force_schedule: hits_first(order, 2.0),
+                    ..srpt_config()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(10.0),
+                Time::from_ms(80.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events).len(), 3, "{order:?}");
+            assert_eq!(hit_tokens(&store, 2), Some(hit), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn hits_first_when_at_risk_splits_only_while_the_overdue_misses_would_evict_a_held_context() {
+        // Session 7's 50 tokens and session 8's 100 are in DRAM; HBM (120
+        // tokens) holds only session 8's. At 10 ms a 100-token prompt of
+        // session 9 (arrived 4 ms) is overdue and session 7's round 1 (9 ms)
+        // is not. Oldest first runs the prompt, whose footprint leaves no room
+        // for round 1's read; its context is then written through DRAM. In a
+        // 150-token DRAM that write evicts session 7, so round 1 recomputes:
+        // the context is at risk and the gated split reads it first. In a
+        // 500-token DRAM it is not at risk: the gate keeps oldest first and
+        // round 1 still finds its context after the prompt.
+        for (dram_tokens, order, hit, round1_first) in [
+            (150, HitsFirst::Off, 0, false),
+            (150, HitsFirst::Always, 50, true),
+            (150, HitsFirst::WhenAtRisk, 50, true),
+            (500, HitsFirst::Always, 50, true),
+            (500, HitsFirst::WhenAtRisk, 50, false),
+        ] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 100, 1), (3, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 3.0);
+            as_session(&store, 2, 9, 0, 4.0);
+            as_session(&store, 3, 7, 51, 9.0);
+            let mut config = tiered_config();
+            config.prefix_tiers[0].capacity_gb = f64::from(2 * dram_tokens) * 1e-9;
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    force_schedule: hits_first(order, 5.0),
+                    ..WorkerConfig {
+                        pending_order: PendingOrderKind::ShortestPrefillFirst,
+                        started_order: StartedOrder::ShortestRemaining,
+                        ..config
+                    }
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(2.0), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            run_until(
+                &mut worker,
+                Time::from_ms(3.0),
+                Time::from_ms(9.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+            let round1 = store.borrow()[RequestId(3)].request.definition.session;
+            assert_eq!(worker.kv_store.resident_prefix_tokens(4, round1), 0);
+            assert_eq!(worker.kv_store.reusable_prefix_tokens(4, round1), 50);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(3)));
+            run_until(
+                &mut worker,
+                Time::from_ms(10.0),
+                Time::from_ms(80.0),
+                &mut events,
+            );
+            let label = format!("DRAM {dram_tokens}, {order:?}");
+            let done = completed(&events);
+            assert_eq!(done.len(), 4, "{label}");
+            assert_eq!(hit_tokens(&store, 3), Some(hit), "{label}");
+            let position = |id| done.iter().position(|&request| request == RequestId(id));
+            assert_eq!(position(3) < position(2), round1_first, "{label}: {done:?}");
+        }
     }
 }

@@ -32,8 +32,8 @@ pub use placement::LoadBalance;
 pub(crate) use placement::PartitionLoad;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
-    AdmissionCandidate, Deadline, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,
-    PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
+    AdmissionCandidate, Deadline, FifoOrder, ForceSchedule, HitsFirst, LongestPrefixMatch,
+    PendingOrder, PendingOrderKind, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
 pub use read_wait::{ReadWait, ReadWaitPolicy};

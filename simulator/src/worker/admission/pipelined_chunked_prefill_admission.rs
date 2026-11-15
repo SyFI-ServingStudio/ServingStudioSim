@@ -31,7 +31,10 @@
 //! series.
 //!
 //! The pending policy owns fresh requests, behind a force-schedule `Deadline`
-//! that is a pass-through unless a bound is set. A prompt that has started and
+//! that is a pass-through unless a bound is set. Under hits-first-when-at-risk
+//! the lifecycle turns the deadline's cost-class split on at each formation
+//! while serving the overdue misses oldest first would evict a queued
+//! request's held tier context ([`TieredPrefixKv::tier_sessions_at_risk`]). A prompt that has started and
 //! still has unscheduled prefill tokens stays in `started_prefills`, in start
 //! order, and keeps priority over fresh prompts unless the started order is
 //! shortest-remaining (`started_order.rs`). A request whose last chunk is in flight
@@ -78,6 +81,7 @@ use crate::worker::types::IterBatchPlan;
 use super::chunked_prefill_admission::ChunkEndAlignment;
 use super::external_decode::ExternalDecode;
 use super::microbatch_budget::MicrobatchBudget;
+use super::policy::{ForceSchedule, QueueAccess, Queued};
 use super::read_wait::{ReadWait, ReadWaitPolicy};
 use super::started_order::{FreshGate, PrefillFill, StartedOrder};
 use super::{
@@ -136,8 +140,7 @@ struct Landed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FreshSource {
     Landed,
-    Overdue,
-    Pending,
+    Queued(Queued),
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -216,34 +219,26 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
-    /// The next fresh candidate: a landed read, an overdue request, then the
-    /// pending order's head re-ranked by what HBM or a tier now holds. Under
-    /// `OverdueOnly` only overdue requests.
+    /// The next fresh candidate: a landed read, then what `queues` offers of
+    /// the overdue requests and the pending order, whose head is re-ranked by
+    /// what HBM or a tier now holds. Landed reads come only with the pending
+    /// order.
     fn peek_fresh<K: TieredPrefixKv>(
         &mut self,
         kv_store: &K,
-        gate: FreshGate,
+        queues: QueueAccess,
     ) -> Option<(FreshSource, AdmissionCandidate)> {
-        if gate != FreshGate::OverdueOnly {
+        if queues.takes_pending() {
             if let Some(landed) = self.landed.front() {
                 return Some((FreshSource::Landed, landed.candidate));
             }
         }
-        if self.policy.head_is_overdue() {
-            return self
-                .policy
-                .peek()
-                .map(|candidate| (FreshSource::Overdue, candidate));
-        }
-        if gate == FreshGate::OverdueOnly {
-            return None;
-        }
-        self.policy.refresh_head(&mut |candidate| {
-            kv_store.reusable_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
-        });
         self.policy
-            .peek()
-            .map(|candidate| (FreshSource::Pending, candidate))
+            .peek_head(queues, &mut self.policy_context, &mut |candidate| {
+                kv_store
+                    .reusable_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+            })
+            .map(|(candidate, queued)| (FreshSource::Queued(queued), candidate))
     }
 
     /// Take the candidate [`Self::peek_fresh`] returned out of its source.
@@ -253,24 +248,26 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 let landed = self.landed.pop_front();
                 debug_assert_eq!(landed.map(|landed| landed.candidate), Some(candidate));
             }
-            FreshSource::Overdue | FreshSource::Pending => {
-                let popped = self.policy.pop(&mut self.policy_context);
-                debug_assert_eq!(popped, Some(candidate));
+            FreshSource::Queued(queued) => {
+                let taken = self.policy.take_head(queued, &mut self.policy_context);
+                debug_assert_eq!(taken, candidate);
             }
         }
     }
 
     /// Put the candidates passed over this pass back at the front of the
-    /// queues they came from, in their order. A landed one, whose context HBM
-    /// evicted again, goes back to the pending order.
+    /// queues they came from, in their order, after the pending requests a
+    /// hits-only pass went past. A landed one, whose context HBM evicted
+    /// again, goes back to the pending order.
     fn return_passed_over(&mut self, passed_over: Vec<(FreshSource, AdmissionCandidate)>) {
+        self.policy.restore_set_aside(&mut self.policy_context);
         for (source, candidate) in passed_over.into_iter().rev() {
-            match source {
-                FreshSource::Overdue => self.policy.push_front_overdue(candidate),
-                FreshSource::Landed | FreshSource::Pending => {
-                    self.policy.push_front(candidate, &mut self.policy_context);
-                }
-            }
+            let queued = match source {
+                FreshSource::Landed => Queued::Pending,
+                FreshSource::Queued(queued) => queued,
+            };
+            self.policy
+                .return_head(candidate, queued, &mut self.policy_context);
         }
     }
 
@@ -281,20 +278,20 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         let (mut hbm_stopped, mut dram_stopped) = (false, false);
         let mut kept = Vec::new();
         while !(hbm_stopped && dram_stopped) {
-            let source = if self.policy.head_is_overdue() {
-                FreshSource::Overdue
-            } else {
-                self.policy.refresh_head(&mut |candidate| {
+            let Some((candidate, queued)) = self.policy.peek_head(
+                QueueAccess::All,
+                &mut self.policy_context,
+                &mut |candidate| {
                     kv_store.reusable_prefix_tokens(
                         candidate.fresh_prompt_tokens,
                         candidate.session_input,
                     )
-                });
-                FreshSource::Pending
-            };
-            let Some(candidate) = self.policy.pop(&mut self.policy_context) else {
+                },
+            ) else {
                 break;
             };
+            self.policy.take_head(queued, &mut self.policy_context);
+            let source = FreshSource::Queued(queued);
             let Some(read) = kv_store.plan_tier_read(
                 PARTITION,
                 candidate.request_id,
@@ -345,6 +342,31 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         latest
     }
 
+    /// Whether serving the overdue misses oldest first would evict a queued
+    /// request's held context. Those requests compute `horizon` prefill tokens
+    /// ahead of everything else, and each computed context is written to the
+    /// tiers (write-through as it finishes, or into the victim tier as HBM
+    /// makes room for it), so `horizon` written tokens is the horizon. A
+    /// context is at risk if it evicts it from every tier holding it, its
+    /// session's queued request resumes from it, and HBM does not hold it for
+    /// a victim tier to take.
+    fn held_context_at_risk<K: TieredPrefixKv>(&self, kv_store: &K, horizon: u64) -> bool {
+        let victim_tier = kv_store.tiers_take_hbm_evictions(PARTITION);
+        kv_store
+            .tier_sessions_at_risk(PARTITION, horizon)
+            .into_iter()
+            .any(|session_id| {
+                let Some(candidate) = self.policy.queued_in_session(session_id) else {
+                    return false;
+                };
+                let (fresh, session_input) =
+                    (candidate.fresh_prompt_tokens, candidate.session_input);
+                let hbm = kv_store.resident_prefix_tokens(fresh, session_input);
+                !(hbm > 0 && victim_tier)
+                    && kv_store.reusable_prefix_tokens(fresh, session_input) > hbm
+            })
+    }
+
     /// Size each microbatch's prefill by `budget` over a `depth`-deep pipeline.
     pub(crate) fn with_microbatch_budget(mut self, budget: MicrobatchBudget, depth: u16) -> Self {
         assert!(depth > 0, "pipeline depth must be positive");
@@ -360,9 +382,10 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     }
 
     /// Serve a request that has waited `after` since arrival before every
-    /// other one, queued or started. Not vLLM.
-    pub(crate) fn with_force_schedule_after(mut self, after: Time) -> Self {
-        self.policy = self.policy.with_bound(after);
+    /// other one, queued or started, in the cost classes `schedule` names.
+    /// Not vLLM.
+    pub(crate) fn with_force_schedule(mut self, schedule: ForceSchedule) -> Self {
+        self.policy = self.policy.with_force_schedule(schedule);
         self
     }
 
@@ -409,6 +432,10 @@ where
         self.policy.is_overdue(arrival, now)
     }
 
+    fn splits_by_class(&self, _partition: u16) -> bool {
+        self.policy.splits_by_class()
+    }
+
     fn started_prefills_mut(&mut self, _partition: u16) -> &mut Vec<AdmissionCandidate> {
         &mut self.started_prefills
     }
@@ -426,11 +453,11 @@ where
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
         let staged = kv_store.stages_tier_reads();
-        if staged && gate != FreshGate::OverdueOnly {
+        if staged && gate.queues.takes_pending() {
             self.start_staged_reads(kv_store, now);
         }
         while remaining_budget > 0 {
-            let Some((source, candidate)) = self.peek_fresh(kv_store, gate) else {
+            let Some((source, candidate)) = self.peek_fresh(kv_store, gate.queues) else {
                 break;
             };
             if source == FreshSource::Landed && !self.landed[0].restored {
@@ -487,7 +514,7 @@ where
                 candidate.session_input,
             );
             if !gate.admits(
-                source != FreshSource::Pending,
+                source == FreshSource::Queued(Queued::Pending),
                 resolved_prefill.remaining_prefill_tokens(),
             ) {
                 break;
@@ -610,7 +637,14 @@ where
         now: Time,
     ) -> bool {
         self.land(kv_store, now);
-        self.policy.promote(now);
+        // A hit computes only its new tokens: its context is in HBM or a tier.
+        self.policy.promote(now, |candidate| {
+            kv_store.reusable_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+        });
+        if let Some(horizon) = self.policy.at_risk_horizon() {
+            let at_risk = horizon > 0 && self.held_context_at_risk(kv_store, horizon);
+            self.policy.set_hits_first(at_risk);
+        }
         let mut remaining_budget = self.max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
