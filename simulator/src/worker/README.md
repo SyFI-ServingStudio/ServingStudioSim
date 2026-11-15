@@ -327,8 +327,9 @@ chunk while the previous one is on a later stage. Token emission, decode KV
 advance, `Done`, and KV release wait for the exit, stamped with the exact exit
 time. A decode step needs the previous token, so a running request has at most
 one microbatch in flight; each microbatch takes the ready decodes first, then
-started and fresh prompts, under one token budget. Ready decodes all join by
-default (vLLM); `balance_decode_microbatches` caps them at
+started and fresh prompts, under one token budget whose prefill share follows
+the head's `MicrobatchBudget` (the round counts in-flight prefill too). Ready
+decodes all join by default (vLLM); `balance_decode_microbatches` caps them at
 `ceil(resident decodes / depth)` per microbatch. Admission writes the chosen
 decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
 outside it.
@@ -387,12 +388,23 @@ block; when its arch's drafter prunes the last matching prefix block
 therefore the stop no chunk may run past, sits one block earlier. Only that
 chunk-end stop reads the hook; prefix-hit lengths do not yet drop the block.
 
-With several attention partitions (an attention-DP arch), `dp_placement`
-chooses where a cold request lands. `round-robin` (default) rotates blindly;
-`vllm-least-loaded` ports vLLM's DP load balancer
-(`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
-waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+Both chunked lifecycles (`chunked_prefill` per attention DP rank, and the
+pipeline head) take the same scheduling options, all off by default (vLLM):
+
+- `pending_order` picks the fresh-request policy; `shortest-prefill-first`
+  (`ShortestJobFirst::by(JobSize::PrefillTokens)`) orders by the prefill a
+  request still needs, its fresh tokens plus any declared prefix not resident.
+- `srpt` sets `StartedOrder::ShortestRemaining` (`admission/started_order.rs`):
+  queued prompts no longer than a started one go before its next chunk.
+- `MicrobatchBudgetSpec` (`microbatch_split`, `min_microbatch_tokens`,
+  `long_prefill_token_threshold`, `load_budget_*`) resolves to one
+  `MicrobatchBudget` (`admission/microbatch_budget.rs`). The lifecycle counts
+  the backlog it follows (a DP rank's queued and started prompts; the head adds
+  its in-flight prefill); `even` is pipeline-only.
+- `ForceScheduleSpec` (`force_schedule_after_ms`) wraps the policy in
+  `Deadline<P>` (`policy/deadline.rs`), which serves a request that has waited
+  past the bound before the rest of its queue; `promote(now)` runs at the start
+  of each formation.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
