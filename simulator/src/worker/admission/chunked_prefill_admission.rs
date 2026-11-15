@@ -241,13 +241,19 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
 
     /// Decide this step's back pass: stash this step's tails or flush them
     /// with the stash. Returns whether a back pass runs.
+    /// `front_runs`: this step schedules front work. A front that cannot run
+    /// (e.g. every waiting prompt blocked on KV the stash's own requests hold)
+    /// counts as not pending, so the stash flushes instead of waiting for a
+    /// step that never comes.
     fn plan_back_pass<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
         batch_plan: &mut IterBatchPlan,
+        front_runs: bool,
     ) -> bool {
-        let front_pending = self.started_prefills.iter().any(|s| !s.is_empty())
-            || self.partition_policies.iter().any(|(p, _)| p.len() > 0);
+        let front_pending = front_runs
+            && (self.started_prefills.iter().any(|s| !s.is_empty())
+                || self.partition_policies.iter().any(|(p, _)| p.len() > 0));
         let Some(back) = self.back.as_mut() else {
             batch_plan.back_pass = None;
             return false;
@@ -1036,7 +1042,7 @@ where
             }
         }
         let has_batch = if self.back.is_some() {
-            let flushes = self.plan_back_pass(kv_store, batch_plan);
+            let flushes = self.plan_back_pass(kv_store, batch_plan, has_batch);
             let runs = has_batch || flushes;
             if runs {
                 self.back.as_mut().unwrap().step += 1;

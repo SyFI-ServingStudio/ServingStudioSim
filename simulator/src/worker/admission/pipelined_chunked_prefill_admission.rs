@@ -507,9 +507,13 @@ where
             now,
         );
         let has_front = kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty();
-        let front_pending = !self.started_prefills.is_empty()
-            || self.reads.len() > self.reads.reading()
-            || self.policy.len() > 0;
+        // A front that cannot run this formation (every waiting prompt blocked,
+        // e.g. on KV the stash's own requests hold) counts as not pending: the
+        // stash flushes rather than wait for a formation that never comes.
+        let front_pending = has_front
+            && (!self.started_prefills.is_empty()
+                || self.reads.len() > self.reads.reading()
+                || self.policy.len() > 0);
         let Some(back) = self.back.as_mut() else {
             return has_front;
         };
