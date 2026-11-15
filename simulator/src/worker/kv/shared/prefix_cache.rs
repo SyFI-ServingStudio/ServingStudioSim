@@ -32,6 +32,7 @@ use crate::worker::kv::shared::kv_accounting::{KvAccounting, ResumePositions, Sh
 use crate::worker::kv::shared::state_retention::{
     normalize, Carried, RoundState, StateRetention, StateTag,
 };
+use crate::worker::kv::shared::tier_chain::LeavingContext;
 
 /// Whether completed-session KV may be retained after a request finishes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -189,7 +190,7 @@ pub(crate) struct PrefixCacheReturnMetadata {
 /// Logging consumes these receipts instead of reconstructing mutations from
 /// sampled occupancy. That keeps `PrefixCache` as the only cache ledger while
 /// still exposing enough information for an exact operation replay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrefixCacheMutation {
     pub(crate) kind: PrefixCacheMutationKind,
     pub(crate) session_id: u32,
@@ -197,6 +198,8 @@ pub(crate) struct PrefixCacheMutation {
     pub(crate) entry_tokens_after: u64,
     pub(crate) cache_used_before: u64,
     pub(crate) cache_used_after: u64,
+    /// The entry a removal took out, for a host tier behind the cache.
+    pub(crate) removed: Option<LeavingContext>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +227,9 @@ pub(crate) struct PrefixCacheTakeResult {
 pub(crate) struct PrefixCacheInsertResult {
     pub(crate) mutations: Vec<PrefixCacheMutation>,
     pub(crate) retained_tokens: u64,
+    /// The whole context, when the cache kept less of it than it would with
+    /// room: it leaves HBM at once.
+    pub(crate) unkept: Option<LeavingContext>,
 }
 
 /// One attention partition's evictable retained-session tier.
@@ -388,11 +394,62 @@ impl PrefixCache {
         physical_limit: u64,
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
-        let mut mutations = Vec::new();
         let own = self
             .accounting
             .resume_positions(prompt_tokens, context_tokens);
-        let end = StateTag::after(incoming.resume);
+        self.insert_context(
+            session_id,
+            own,
+            context_tokens,
+            shared_tokens,
+            StateTag::after(incoming.resume),
+            incoming.states,
+            physical_limit,
+            return_metadata,
+        )
+    }
+
+    /// Put a context read back from a host tier into HBM: `positions`, with
+    /// the state `end` at its end and the `earlier` states the read moved.
+    /// It is a prefix of the session's latest context, as an entry the cache
+    /// holds for the session is, so the states of both within it stay as the
+    /// retention picks them.
+    pub(crate) fn restore(
+        &mut self,
+        session_id: u32,
+        positions: ResumePositions,
+        end: StateTag,
+        earlier: Vec<RoundState>,
+        physical_limit: u64,
+    ) -> PrefixCacheInsertResult {
+        self.insert_context(
+            session_id,
+            positions,
+            positions.end(),
+            positions.end(),
+            end,
+            earlier,
+            physical_limit,
+            None,
+        )
+    }
+
+    /// Insert a `context_tokens` context resumable at `own`, sharing
+    /// `shared_tokens` with the session's previous one, with the state `end`
+    /// at its end and the `incoming` states it brings.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_context(
+        &mut self,
+        session_id: u32,
+        own: ResumePositions,
+        context_tokens: u64,
+        shared_tokens: u64,
+        end: StateTag,
+        incoming: Vec<RoundState>,
+        physical_limit: u64,
+        return_metadata: Option<PrefixCacheReturnMetadata>,
+    ) -> PrefixCacheInsertResult {
+        let mut mutations = Vec::new();
         let earlier = if self.retention.keeps_earlier() {
             let limit = shared_tokens.min(context_tokens.saturating_sub(1));
             let mut states: Vec<RoundState> = self
@@ -400,7 +457,7 @@ impl PrefixCache {
                 .get(&session_id)
                 .into_iter()
                 .flat_map(PrefixEntry::states)
-                .chain(incoming.states)
+                .chain(incoming)
                 .filter(|state| state.at > 0 && state.at <= limit)
                 .collect();
             normalize(&mut states);
@@ -430,10 +487,17 @@ impl PrefixCache {
             .accounting
             .largest_fitting(&own, effective_capacity.saturating_sub(earlier_units));
         let retained_tokens = positions.end();
+        let unkept = (retained_tokens < own.end()).then(|| LeavingContext {
+            session_id,
+            positions: own,
+            end,
+            earlier: earlier.clone(),
+        });
         if retained_tokens == 0 {
             return PrefixCacheInsertResult {
                 mutations,
                 retained_tokens,
+                unkept,
             };
         }
         let charge = self.accounting.entry_charge(&positions) + earlier_units;
@@ -474,10 +538,12 @@ impl PrefixCache {
             entry_tokens_after: retained_tokens,
             cache_used_before,
             cache_used_after: self.used_tokens,
+            removed: None,
         });
         PrefixCacheInsertResult {
             mutations,
             retained_tokens,
+            unkept,
         }
     }
 
@@ -542,6 +608,12 @@ impl PrefixCache {
             entry_tokens_after: 0,
             cache_used_before,
             cache_used_after: self.used_tokens,
+            removed: Some(LeavingContext {
+                session_id,
+                positions: entry.positions,
+                end: entry.end,
+                earlier: entry.earlier,
+            }),
         })
     }
 

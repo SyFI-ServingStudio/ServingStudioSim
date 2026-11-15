@@ -455,7 +455,7 @@ impl KvAccounting {
         self.resume_points
     }
 
-    pub(super) fn state_retention(&self) -> StateRetention {
+    pub(crate) fn state_retention(&self) -> StateRetention {
         self.options.state_retention
     }
 

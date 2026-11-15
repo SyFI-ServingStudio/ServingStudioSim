@@ -35,12 +35,14 @@ use crate::log::{
 };
 use crate::worker::kv::shared::kv_accounting::SharedKvAccounting;
 use crate::worker::kv::shared::prefix_cache::{
-    PrefixCache, PrefixCacheBudget, PrefixCacheMutation, PrefixCacheReturnMetadata,
+    PrefixCache, PrefixCacheBudget, PrefixCacheMutation, PrefixCacheMutationKind,
+    PrefixCacheReturnMetadata,
 };
 use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::shared::state_retention::Carried;
+use crate::worker::kv::shared::tier_chain::{RoundContext, TierBytes, TierChain, TierSpec};
 use crate::worker::kv::{
     ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
     SlotPipelineKv,
@@ -72,6 +74,9 @@ pub struct KvCacheStore {
     ledger: RequestLedger,
     /// Evictable completed-session KV, local to each attention partition.
     prefix_caches: Vec<PrefixCache>,
+    /// Host DRAM/SSD tiers behind each partition's prefix cache; empty
+    /// without tiers.
+    tier_chains: Vec<TierChain>,
     journal: PrefixCacheJournal,
     sampler: Option<KvSampler>,
 }
@@ -276,16 +281,7 @@ impl ChunkedPrefillKv for KvCacheStore {
             .min(slack_after_step);
         let cache_limit = slack_after_step - live_checkpoints;
         let evictions = self.prefix_caches[partition as usize].shrink_to(cache_limit);
-        for eviction in evictions {
-            self.journal.record_mutation(
-                trigger,
-                partition,
-                now,
-                eviction,
-                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
-                0,
-            );
-        }
+        self.record_pressure_evictions(trigger, partition, now, evictions);
         let cache_units = self.prefix_caches[partition as usize].used_units();
         let available = capacity.saturating_sub(protected.saturating_add(cache_units));
         required.saturating_sub(available)
@@ -444,6 +440,15 @@ impl PrefixKv for KvCacheStore {
         }
         self.ledger.set_prefill_context(request, resolved_prefill);
         self.reserve(request, partition, footprint, now);
+        if let (Some(session_id), Some(chain)) = (
+            resolved_prefill.session_id(),
+            self.tier_chains.get_mut(partition as usize),
+        ) {
+            chain.cut(
+                session_id,
+                u64::from(resolved_prefill.declared_prefix_tokens()),
+            );
+        }
     }
 
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext {
@@ -515,10 +520,23 @@ impl KvCacheStore {
             prefix_caches: (0..num_partitions)
                 .map(|_| PrefixCache::new(accounting.clone(), prefix_cache))
                 .collect(),
+            tier_chains: Vec::new(),
             journal: PrefixCacheJournal::new(prefix_cache_logger),
             sampler,
             accounting,
         }
+    }
+
+    /// Put `specs`'s host tiers, fastest first, behind each partition's
+    /// prefix cache, storing `bytes` per context token and state on each GPU.
+    pub(crate) fn with_prefix_tiers(mut self, specs: &[TierSpec], bytes: TierBytes) -> Self {
+        if !specs.is_empty() {
+            let retention = self.accounting.state_retention();
+            self.tier_chains = (0..self.partitions.len())
+                .map(|_| TierChain::new(specs, bytes, retention))
+                .collect();
+        }
+        self
     }
 
     #[inline]
@@ -566,16 +584,7 @@ impl KvCacheStore {
             ReservationBasis::FullFootprint => self.trim_prefix_cache_to_physical_slack(partition),
             ReservationBasis::BoundedFuture => self.trim_prefix_cache_to_bounded_slack(partition),
         };
-        for eviction in evictions {
-            self.journal.record_mutation(
-                request,
-                partition,
-                now,
-                eviction,
-                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
-                0,
-            );
-        }
+        self.record_pressure_evictions(request, partition, now, evictions);
     }
 
     /// Local full-attention KV is immediately ready.
@@ -705,6 +714,17 @@ impl KvCacheStore {
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
             );
+            if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
+                chain.store_round(
+                    session_id,
+                    RoundContext {
+                        positions: self
+                            .accounting
+                            .resume_positions(prompt_tokens, retained_tokens),
+                        shared: shared_tokens,
+                    },
+                );
+            }
         }
     }
 
@@ -891,6 +911,58 @@ impl KvCacheStore {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    /// Journal evictions active KV forced on the prefix cache.
+    fn record_pressure_evictions(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+        evictions: Vec<PrefixCacheMutation>,
+    ) {
+        for eviction in evictions {
+            self.record_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+    }
+
+    /// Journal one mutation receipt, and hand an entry the cache evicted to
+    /// a victim tier behind it.
+    fn record_mutation(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+        mut mutation: PrefixCacheMutation,
+        event_kind: PrefixCacheEventKind,
+        retain_requested_tokens: u64,
+    ) {
+        let evicted = matches!(
+            mutation.kind,
+            PrefixCacheMutationKind::CapacityEviction
+                | PrefixCacheMutationKind::ReplacementPolicyEviction
+        );
+        let removed = mutation.removed.take();
+        self.journal.record_mutation(
+            request,
+            partition,
+            now,
+            mutation,
+            event_kind,
+            retain_requested_tokens,
+        );
+        if let (true, Some(removed), Some(chain)) =
+            (evicted, removed, self.tier_chains.get_mut(partition as usize))
+        {
+            chain.take_hbm_eviction(removed);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn retain_prefix(
         &mut self,
@@ -917,8 +989,12 @@ impl KvCacheStore {
         );
         for mutation in insert_result.mutations {
             let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
-            self.journal
-                .record_mutation(request, partition, now, mutation, event_kind, tokens);
+            self.record_mutation(request, partition, now, mutation, event_kind, tokens);
+        }
+        if let Some(unkept) = insert_result.unkept {
+            if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
+                chain.take_hbm_eviction(unkept);
+            }
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_tokens();
@@ -952,6 +1028,8 @@ mod tests {
     use crate::common::SessionInput;
 
     use crate::worker::kv::shared::kv_accounting::KvAccounting;
+    use crate::worker::kv::shared::state_retention::StateTag;
+    use crate::worker::kv::shared::tier_chain::{LeavingContext, TierWrites};
     use crate::worker::kv::PrefixCachePolicy;
 
     fn capped_prefix_cache(
@@ -962,6 +1040,113 @@ mod tests {
             max_retained_units,
             policy,
         }
+    }
+
+    /// A plain-token store of `capacity` with host tiers of 1000 B per token
+    /// behind it: `gb` holds `gb * 1e6` tokens, read at `gb_per_s * 1e3`
+    /// tokens per ms.
+    fn tiered_store(capacity: u64, tiers: &[(&'static str, f64, f64, TierWrites)]) -> KvCacheStore {
+        let specs: Vec<TierSpec> = tiers
+            .iter()
+            .map(|&(name, capacity_gb, read_gb_per_s, writes)| TierSpec {
+                name,
+                capacity_gb,
+                read_gb_per_s,
+                writes,
+            })
+            .collect();
+        KvCacheStore::new(
+            1,
+            KvAccounting::tokens_for_test(capacity),
+            capped_prefix_cache(capacity, PrefixCachePolicy::Lru),
+            None,
+            None,
+        )
+        .with_prefix_tiers(
+            &specs,
+            TierBytes {
+                per_token: 1000,
+                state: 0,
+            },
+        )
+    }
+
+    fn session(session_id: u32, declared_prefix_tokens: u32) -> SessionInput {
+        SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens,
+        }
+    }
+
+    /// Admit request `id` of `session_input` with `fresh` new tokens and one
+    /// output, as admission would.
+    fn admit(kv_store: &mut KvCacheStore, id: u32, session_input: SessionInput, fresh: u32) {
+        let resolved = kv_store.preview_prefill_context(0, fresh, session_input);
+        let footprint =
+            kv_store.footprint(RequestId(id), resolved.post_prefill_context_tokens(), 1);
+        kv_store.reserve_prefill_context(RequestId(id), 0, resolved, footprint, Time::ZERO);
+    }
+
+    fn tier_hit(kv_store: &KvCacheStore, session_id: u32, declared: u64) -> Option<(usize, u64)> {
+        kv_store.tier_chains[0]
+            .lookup(session_id, declared)
+            .map(|hit| (hit.tier, hit.tokens))
+    }
+
+    #[test]
+    fn a_victim_tier_receives_what_hbm_evicts_or_cannot_keep() {
+        let mut kv_store = tiered_store(100, &[("dram", 1.0, 1.0, TierWrites::Evictions)]);
+        let retain = |kv_store: &mut KvCacheStore, session_id: u32, tokens: u64| {
+            kv_store.retain_prefix(
+                RequestId(session_id),
+                0,
+                session_id,
+                tokens,
+                tokens,
+                0,
+                Carried::default(),
+                None,
+                Time::ZERO,
+                PrefixCacheRetentionReason::RequestComplete,
+            );
+        };
+        retain(&mut kv_store, 1, 80);
+        assert_eq!(tier_hit(&kv_store, 1, 80), None);
+        // Session 2's context pushes session 1 out. Session 3's is larger
+        // than HBM: it pushes 2 out, HBM keeps only its first 100 tokens, and
+        // the whole context leaves HBM.
+        retain(&mut kv_store, 2, 60);
+        retain(&mut kv_store, 3, 120);
+        assert_eq!(tier_hit(&kv_store, 1, 80), Some((0, 80)));
+        assert_eq!(tier_hit(&kv_store, 2, 60), Some((0, 60)));
+        assert_eq!(tier_hit(&kv_store, 3, 120), Some((0, 120)));
+        assert_eq!(kv_store.prefix_caches[0].peek(3, 120), 100);
+    }
+
+    #[test]
+    fn a_finished_context_is_written_through_and_a_victim_entry_cut_at_admission() {
+        let mut kv_store = tiered_store(
+            1_000,
+            &[
+                ("dram", 1.0, 1.0, TierWrites::Evictions),
+                ("ssd", 1.0, 1.0, TierWrites::EveryContext),
+            ],
+        );
+        admit(&mut kv_store, 1, session(7, 0), 300);
+        kv_store.release_retaining_prefix(RequestId(1), 0, Time::ZERO);
+        assert_eq!(tier_hit(&kv_store, 7, 300), Some((1, 300)), "SSD is written through");
+        kv_store.tier_chains[0].take_hbm_eviction(LeavingContext {
+            session_id: 7,
+            positions: kv_store.accounting.resume_positions(300, 300),
+            end: StateTag::default(),
+            earlier: Vec::new(),
+        });
+        assert_eq!(tier_hit(&kv_store, 7, 300), Some((0, 300)));
+        // The next request shares only 200 tokens: DRAM's entry is cut there.
+        admit(&mut kv_store, 2, session(7, 200), 50);
+        assert_eq!(tier_hit(&kv_store, 7, 300), Some((1, 300)));
+        assert_eq!(tier_hit(&kv_store, 7, 200), Some((0, 200)));
     }
 
     #[test]
