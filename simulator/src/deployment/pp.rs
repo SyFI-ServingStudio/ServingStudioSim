@@ -236,6 +236,7 @@ fn worker_config(
         log_output_token_times: cfg.io.log_output_token_times,
         log_stage_transitions: cfg.io.log_stage_transitions,
         kv_log_stride: cfg.io.kv_log_stride,
+        cost_log: cfg.io.cost_log_policy()?,
         gpu_time_multiplier: *gpu_time_multiplier,
         max_batch_tokens: Some(*max_batch_tokens),
         pending_order: PendingOrderKind::Fifo,

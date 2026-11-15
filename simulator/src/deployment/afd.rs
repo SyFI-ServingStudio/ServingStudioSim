@@ -99,6 +99,7 @@ impl Deployment for AfdDeployment {
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
+            cfg.io.cost_log_policy()?,
         );
         attn_wc.max_model_len = ag.arch.max_model_len().ok();
         let AttnWorkerSel::DisaggAttn { kv_accounting, .. } = &ag.worker;
@@ -110,6 +111,7 @@ impl Deployment for AfdDeployment {
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
+            cfg.io.cost_log_policy()?,
         );
 
         // attn↔ffn transfer cost: profiled p2p curve, keyed on the ffn GPU (the
@@ -343,12 +345,14 @@ fn worker_config(
     log_output_token_times: bool,
     log_stage_transitions: bool,
     kv_log_stride: u32,
+    cost_log: crate::log::CostLogPolicy,
 ) -> WorkerConfig {
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
         kv_log_stride,
+        cost_log,
         gpu_time_multiplier,
         prefix_cache,
         ..WorkerConfig::default()

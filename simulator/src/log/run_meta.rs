@@ -14,10 +14,13 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::common::StageVocab;
+use crate::log::CostLogPolicy;
 use crate::worker::gpu_cluster::KvPoolFacts;
 use crate::worker::GpuCluster;
 
-// v6 replaces each `kv_pools` entry's `capacity_tokens` with the pool's KV
+// v7 adds `cost_log` (`mode` + `stride_iterations`): which iterations the
+// run's `cost_log` holds, so the analyzer can weight a sampled log or report an
+// absent one instead of reading it as a complete run. v6 replaces each `kv_pools` entry's `capacity_tokens` with the pool's KV
 // units: `capacity_units`, `bytes_per_unit` and `kv_overhead`, the units the
 // `kv_snapshot` series counts in (a layout with one per-token part keeps one
 // unit per token). v5 adds `stage_vocab` (deployment + `code → "category:detail"`
@@ -26,7 +29,7 @@ use crate::worker::GpuCluster;
 // at `GpuCluster::allocate`), so non-KV workers (e.g. AFD ffn) no longer carry a null
 // tag that consumers had to reverse-recover through `comm_groups`. v3 added per-worker
 // `kv_pools`; v2 added the `comm_groups` array. The analyzer reads by field name.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Write `<log_dir>/raw/run_meta.json` from the run's [`GpuCluster`]'s GPU
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
@@ -35,7 +38,12 @@ const SCHEMA_VERSION: u32 = 6;
 /// (gid → base/count/gpu_ids, via [`GpuCluster::comm_groups`]). (The cluster's
 /// runtime state — `cost` / `logger` / `kv_caps` — is `#[serde(skip)]` and never
 /// reaches disk via the derived `Serialize`; only the reads above export it.)
-pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVocab) -> Result<()> {
+pub fn write_run_meta(
+    log_dir: &Path,
+    cluster: &GpuCluster,
+    stage_vocab: StageVocab,
+    cost_log: CostLogPolicy,
+) -> Result<()> {
     let raw = log_dir.join("raw");
     std::fs::create_dir_all(&raw)?;
 
@@ -129,6 +137,10 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
         "workers": workers,
         "comm_groups": comm_groups,
         "stage_vocab": stage_vocab,
+        "cost_log": {
+            "mode": cost_log.mode_name(),
+            "stride_iterations": cost_log.stride_iterations(),
+        },
     });
     std::fs::write(raw.join("run_meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     Ok(())

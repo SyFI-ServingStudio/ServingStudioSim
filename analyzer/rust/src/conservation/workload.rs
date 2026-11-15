@@ -243,10 +243,19 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
     };
     let speculative = params.as_ref().is_some_and(uses_speculative_worker);
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
+        ));
+    }
+    // Conservation compares every logged iteration with every request's work, so a
+    // sampled log would read as missing work.
+    if let Some(reason) = crate::io::read_cost_log_coverage(log_dir).needs_every_iteration_reason()
+    {
+        return Ok((
+            unavailable(log_dir, &reason),
+            unavailable_payload(log_dir, &reason),
         ));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
@@ -873,8 +882,13 @@ pub(crate) struct WorkerShapeSample {
 ///
 /// Each stratum's kept shapes are then reweighted so its weights sum to its exact
 /// iteration count, which leaves the caller nothing to anchor.
+///
+/// `logged_every` is the cost-log stride: the log holds iterations whose id is a
+/// multiple of it, and each one stands for that many, so the strata are counted
+/// and reweighted to the run's iteration total.
 pub(crate) async fn collect_workload_shapes_by_worker(
     ctx: &SessionContext,
+    logged_every: u64,
     target_sampled_decode_iterations: u64,
     target_sampled_prefill_iterations: u64,
 ) -> Result<HashMap<(String, u16), WorkerShapeSample>> {
@@ -934,14 +948,15 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         } else {
             &mut decode_iterations_by_worker
         };
-        *stratum.entry((*pool_index, *worker_id)).or_default() += 1;
+        *stratum.entry((*pool_index, *worker_id)).or_default() += logged_every;
     }
     // Keep a prefill iteration when its hash falls under this cutoff.
     let prefill_cutoff_by_worker: HashMap<(u16, u16), u64> = prefill_iterations_by_worker
         .iter()
         .map(|(worker_key, prefill_iterations)| {
+            // Sized from the logged iterations, which are what the hash draws from.
             let keep = target_sampled_prefill_iterations.max(1) as f64
-                / (*prefill_iterations).max(1) as f64;
+                / (*prefill_iterations / logged_every).max(1) as f64;
             let cutoff = if keep >= 1.0 {
                 u64::MAX
             } else {
@@ -954,7 +969,10 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         .iter()
         .map(|(worker_key, decode_iterations)| {
             let stride = (decode_iterations / target_sampled_decode_iterations.max(1)).max(1);
-            (*worker_key, stride)
+            (
+                *worker_key,
+                stride.div_ceil(logged_every).max(1) * logged_every,
+            )
         })
         .collect();
 
@@ -965,7 +983,7 @@ pub(crate) async fn collect_workload_shapes_by_worker(
     let mut sampled_prefill_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     for ((pool_index, worker_id, iteration_id), totals) in totals_by_iteration {
         let worker_key = (pool_index, worker_id);
-        *iterations_by_worker.entry(worker_key).or_default() += 1;
+        *iterations_by_worker.entry(worker_key).or_default() += logged_every;
         let prefill = carries_prefill(&totals);
         if prefill {
             let cutoff = prefill_cutoff_by_worker

@@ -13,6 +13,7 @@
 //! `cost_log/worker_<pool>_<id>.error`, which the run driver turns into a failed
 //! run once the workers are dropped ([`cost_log_failures`]).
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
@@ -27,6 +28,54 @@ use crate::log::rows::{cost_to_record_batches, CostLogChunk, CostLogEntry, Group
 use crate::log::schemas::cost_log_schema;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 use parquet::schema::types::ColumnPath;
+
+/// Which iterations a run writes to `cost_log` (`io.cost_log_mode`, validated
+/// by [`IoSpec::cost_log_policy`](crate::deployment::config::IoSpec::cost_log_policy)).
+/// The simulated timeline never depends on it; only the rows written do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CostLogPolicy {
+    /// Every iteration (and every AFD section of it) writes a row.
+    #[default]
+    Full,
+    /// Only iterations whose `iter_id` is a multiple of `iterations` write
+    /// rows, all of their sections included, so a logged iteration is whole.
+    Stride { iterations: NonZeroU32 },
+    /// No `cost_log` stream and no `cost_manifest` sidecar.
+    Off,
+}
+
+impl CostLogPolicy {
+    /// Whether this policy opens a cost-log writer at all.
+    pub fn writes(self) -> bool {
+        !matches!(self, CostLogPolicy::Off)
+    }
+
+    /// Whether iteration `iter_id` writes its rows.
+    pub fn logs_iteration(self, iter_id: u64) -> bool {
+        match self {
+            CostLogPolicy::Full => true,
+            CostLogPolicy::Stride { iterations } => iter_id % u64::from(iterations.get()) == 0,
+            CostLogPolicy::Off => false,
+        }
+    }
+
+    /// The `io.cost_log_mode` spelling, as recorded in `run_meta.json`.
+    pub fn mode_name(self) -> &'static str {
+        match self {
+            CostLogPolicy::Full => "full",
+            CostLogPolicy::Stride { .. } => "stride",
+            CostLogPolicy::Off => "off",
+        }
+    }
+
+    /// The stride width, `None` outside `stride`.
+    pub fn stride_iterations(self) -> Option<u32> {
+        match self {
+            CostLogPolicy::Stride { iterations } => Some(iterations.get()),
+            _ => None,
+        }
+    }
+}
 
 /// Most rows in one chunk handed to the writer thread.
 const STREAM_FLUSH_ROWS: usize = 8_192;
@@ -172,6 +221,36 @@ pub fn cost_log_failures(log_dir: &Path) -> Result<Vec<String>> {
     Ok(failures)
 }
 
+fn remove_files_if_present(paths: &[&PathBuf]) -> std::io::Result<()> {
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Remove one worker's cost-log parquet, failure marker and manifest sidecar
+/// left by an earlier run in `log_dir`. A run under [`CostLogPolicy::Off`] opens
+/// no writer, so without this the earlier run's rows (or its failure marker)
+/// would be read as this run's.
+pub fn remove_stale_cost_artifacts(
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: WorkerId,
+) -> std::io::Result<()> {
+    let raw = log_dir.join("raw");
+    let stem = cost_artifact_stem(pool_tag, worker_id);
+    remove_files_if_present(&[
+        &raw.join("cost_log").join(format!("{stem}.parquet")),
+        &raw.join("cost_log")
+            .join(format!("{stem}.{FAILURE_MARKER_EXTENSION}")),
+        &raw.join("cost_manifest").join(format!("{stem}.json")),
+    ])
+}
+
 /// Sim-thread handle: buffers `CostLogEntry` rows and offloads encode/write to a
 /// background thread. `flush_all` (also `Drop`) sends the tail and joins.
 pub struct CostLogger {
@@ -238,13 +317,7 @@ impl CostLogger {
         let failure_marker_path = cost_dir.join(format!("{stem}.{FAILURE_MARKER_EXTENSION}"));
         // The parquet is created on the first write, so a file left by an earlier
         // run in this log_dir would otherwise survive a run that fails before it.
-        for stale in [&parquet_path, &failure_marker_path] {
-            match std::fs::remove_file(stale) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        remove_files_if_present(&[&parquet_path, &failure_marker_path])?;
         let encode_threads = EncodeThreads::new(MAX_ENCODE_THREADS);
         let writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
             .with_column_dictionary_disabled(high_cardinality_slot_columns())

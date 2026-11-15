@@ -34,10 +34,16 @@ struct ResidentDecodeState {
 }
 
 impl ResidentDecodeState {
-    /// Grow by one token and return the added hard and soft units.
-    fn advance(&mut self, accounting: &KvAccounting) -> (u64, u64) {
-        self.current_kv += 1;
-        self.remaining_decode -= 1;
+    /// Grow by `steps` tokens, at most the remaining decode budget, and return
+    /// the added hard and soft units.
+    ///
+    /// Charge and passed checkpoints are functions of the final length alone,
+    /// so one jump adds exactly what `steps` one-token advances would: the
+    /// per-token differences telescope.
+    fn advance(&mut self, accounting: &KvAccounting, steps: u32) -> (u64, u64) {
+        let grown = steps.min(self.remaining_decode);
+        self.current_kv += u64::from(grown);
+        self.remaining_decode -= grown;
         let charge = accounting.held_while_running(self.current_kv, 1);
         let added = charge - self.charge;
         self.charge = charge;
@@ -227,27 +233,28 @@ impl ResidentPartitionState {
         self.prefill_admits.iter().copied()
     }
 
-    /// Advance every resident decode by one token.
-    pub(crate) fn advance_decodes(&mut self) {
+    /// Advance every live decode by `steps` tokens (each capped at its decode
+    /// budget).
+    pub(crate) fn advance_decodes(&mut self, steps: u32) {
         for (_, state) in &mut self.decodes {
             if state.remaining_decode > 0 {
-                let (added, added_checkpoint) = state.advance(&self.accounting);
+                let (added, added_checkpoint) = state.advance(&self.accounting, steps);
                 self.resident_units += added;
                 self.checkpoint_units += added_checkpoint;
             }
         }
     }
 
-    /// Advance only a named slot micro-batch.
+    /// Advance only a named slot micro-batch, each member by `steps` tokens.
     ///
     /// The by-id index preserves the original insertion order while avoiding
     /// the old O(decodes × requests) scan.
-    pub(crate) fn advance_subset(&mut self, requests: &[RequestId]) {
+    pub(crate) fn advance_subset(&mut self, requests: &[RequestId], steps: u32) {
         for &request in requests {
             if let Some(&position) = self.decode_index.get(&request) {
                 let state = &mut self.decodes[position].1;
                 if state.remaining_decode > 0 {
-                    let (added, added_checkpoint) = state.advance(&self.accounting);
+                    let (added, added_checkpoint) = state.advance(&self.accounting, steps);
                     self.resident_units += added;
                     self.checkpoint_units += added_checkpoint;
                 }
@@ -467,7 +474,7 @@ mod tests {
         assert_eq!(partition.resident_units(), 10);
         assert_eq!(partition.iter_decoding().count(), 1);
 
-        partition.advance_decodes();
+        partition.advance_decodes(1);
         let (_, state) = &partition.decodes[0];
         assert_eq!(state.current_kv, 11);
         assert_eq!(state.remaining_decode, 2);
@@ -484,7 +491,7 @@ mod tests {
         partition.begin_decode(request_id(1), 10, 3, 10);
         partition.begin_decode(request_id(2), 20, 3, 20);
 
-        partition.advance_subset(&[request_id(1)]);
+        partition.advance_subset(&[request_id(1)], 1);
         let state = |id| {
             &partition
                 .decodes
@@ -504,7 +511,7 @@ mod tests {
         partition.begin_decode(request_id(1), 10, 3, 10);
         assert_eq!(partition.resident_units(), 110, "context + one state");
 
-        partition.advance_decodes();
+        partition.advance_decodes(1);
         assert_eq!(
             partition.resident_units(),
             111,
@@ -603,11 +610,11 @@ mod tests {
         partition.begin_decode(request_id(2), 63, 10, 63);
         // Request 1 has passed 64 (128 is its current length, not passed).
         assert_eq!(partition.live_checkpoint_units(), 50);
-        partition.advance_decodes();
+        partition.advance_decodes(1);
         // 129 has passed 128. Request 2 now sits at 64: that is its running
         // state, not a checkpoint behind it.
         assert_eq!(partition.live_checkpoint_units(), 50 * 2);
-        partition.advance_decodes();
+        partition.advance_decodes(1);
         assert_eq!(partition.live_checkpoint_units(), 50 * 3);
         partition.release_decode(request_id(1));
         assert_eq!(partition.live_checkpoint_units(), 50);

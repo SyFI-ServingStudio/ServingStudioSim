@@ -176,6 +176,7 @@ impl Deployment for UnifiedDeployment {
             log_output_token_times: cfg.io.log_output_token_times,
             log_stage_transitions: cfg.io.log_stage_transitions,
             kv_log_stride: cfg.io.kv_log_stride,
+            cost_log: cfg.io.cost_log_policy()?,
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,

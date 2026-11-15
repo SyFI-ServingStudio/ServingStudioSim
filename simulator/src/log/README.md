@@ -91,12 +91,12 @@ kv_cache.rs       write_kv_cache — the kv_cache.json per-pool capacity sidecar
 |---|---|---|---|
 | `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request, or one sim-end partial row per incomplete arrived request; includes the request's nullable TTFT/TPOT/E2E SLOs, declared prefix tokens, and nullable admission-time cache-hit tokens |
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
-| `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
-| `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
+| `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per logged iteration (every iteration by default; see `io.cost_log_mode` below): envelope + per-group `input_section` + the CostTree per-slot breakdown |
+| `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open; absent under `io.cost_log_mode: off` |
 | `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition active/retained-prefix/projected/promised KV series, in the pool's KV units |
 | `prefix_cache_event/worker_<pool_tag>_<worker_id>.parquet` | `PrefixCacheLogger` | each prefix-capable KV-owning L5 worker | every session-cache ownership transition, with exact entry/cache before and after token counts |
 | `gpu_cluster.parquet` | `NetworkLogger` | shared `GpuCluster` for PD/AFD | one resolved cross-worker transfer with both endpoints and timing window |
-| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV pools (`capacity_units`, `bytes_per_unit`, `kv_overhead`), comm groups, and stage vocabulary |
+| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV pools (`capacity_units`, `bytes_per_unit`, `kv_overhead`), comm groups, stage vocabulary, and `cost_log` (`mode`, `stride_iterations`) |
 | `kv_cache.json` | `kv_cache` | L7 (pre-loop) | one entry per KV pool (`pool_tag`, `pool`, `worker_id`, `group_id`, `gpu_name`): the GPUs one partition spans (`attention_shards`; bytes are over the partition), the arch's declared layout (`parts`, `engine`; each part gives one entry's `bytes_per_entry` over the partition, `one_copy_bytes_per_entry` stored once and `per_gpu_bytes_per_entry` on one GPU), the resolved options, what each part is charged (`bytes_per_unit`, `capacity_units`, units and the copies a running request holds per part (`held_copies`), whether vLLM's estimate adds the align copy), and the result (units per request in vLLM's estimate and its per-part split `request_parts` at `max_model_len`, the units admission holds `admission_units_at_max_model_len`; each part's `bytes` over the partition, `per_gpu_bytes` and `one_copy_bytes` (the model's own bytes, stored once), and the request's `bytes_at_max_model_len`, `per_gpu_bytes_at_max_model_len`, `one_copy_bytes_at_max_model_len`, `replication_at_max_model_len` (copies from parts replicated across ranks) and `amplification_at_max_model_len` (partition bytes over one copy: replication times engine overhead); max concurrency under this and the other `kv_overhead`, `capacity_tokens` when every part grows per token). `simulator kv-cache <config>` prints it per GPU for reading, or the same JSON with `--json` |
 
 `network_event` remains a reserved schema with no writer; production transfer
@@ -164,6 +164,24 @@ mutation receipts that are written verbatim. `kv_snapshot` remains the compact
 occupancy view; `prefix_cache_event` is the exact diagnostic replay.
 
 ## cost_log & the manifest (INV-5)
+
+**Which iterations are logged** is `io.cost_log_mode` (`CostLogPolicy`):
+
+| Mode | Rows | When to use |
+|---|---|---|
+| `full` (default) | every iteration | any run whose kernel-level reports you read |
+| `stride` + `cost_log_stride_iterations: N` | iterations with `iter_id % N == 0`, all their sections | sweeps that read kernel shares / optimality as estimates |
+| `off` | none; no `cost_log/` or `cost_manifest/` (an earlier run's files for the same workers in a reused `log_dir` are removed) | sweeps that read request metrics only |
+
+On a long high-concurrency run the cost log is the largest output, and
+capturing and writing it can be a large share of the sim's wall time (measure
+it per deployment: compare a `full` run's wall with an `"off"` run's). The mode
+changes only which rows are written: the simulated
+timeline, `summary.json` and the request streams are identical in every mode.
+In a YAML preset write `cost_log_mode: "off"`: bare `off` is YAML 1.1 `false`,
+which the launcher rejects. `run_meta.json` records the mode so the analyzer weights a sampled log by `N`
+and labels its reports, and reports the `cost_log` subjects unavailable under
+`off` (see `analyzer/README.md`).
 
 The `cost_log` row carries the per-slot breakdown as **position-keyed parallel
 lists** — `slot_time_ms` (`List<f32>`), `slot_coverage` (`List<u8>` of

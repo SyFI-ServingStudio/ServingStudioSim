@@ -90,11 +90,15 @@ pub async fn run(
     max_iters: usize,
     color: bool,
 ) -> Result<()> {
-    let manifests = read_cost_manifests(log_dir)?;
-
-    if !register_cost_log(ctx, log_dir).await? {
-        bail!("cost_log/ dir not found under {}", log_dir.display());
+    let coverage = crate::io::read_cost_log_coverage(log_dir);
+    if let Some(note) = coverage.sampling_note() {
+        eprintln!("[analyze] {}", note["caveat"].as_str().unwrap_or_default());
     }
+    if !register_cost_log(ctx, log_dir).await? {
+        bail!("{} under {}", coverage.absent_reason(), log_dir.display());
+    }
+
+    let manifests = read_cost_manifests(log_dir)?;
     require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
     // Pick the render window in SQL *before* touching the heavy `groups` /

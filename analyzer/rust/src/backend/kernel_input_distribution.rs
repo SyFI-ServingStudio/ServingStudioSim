@@ -79,7 +79,7 @@ struct Point {
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
@@ -164,7 +164,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         ));
     }
 
-    let stride = choose_stride(ctx).await?;
+    let stride =
+        crate::io::read_cost_log_coverage(log_dir).align_run_stride(choose_stride(ctx).await?);
     let no_backend = slot_backend_none(&crate::io::resolve_artifact_path(log_dir, "cost_log"))?
         .context("cost_log has no slot_backend column")?;
     let scan = accumulate(

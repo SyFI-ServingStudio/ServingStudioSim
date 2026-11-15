@@ -72,6 +72,112 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
+/// Which iterations a run's `cost_log` holds, from `run_meta.json`'s `cost_log`
+/// (`io.cost_log_mode`, run_meta v7+). A run without the field logged every
+/// iteration, which is the only mode older simulators had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostLogCoverage {
+    /// Every iteration has its rows.
+    Every,
+    /// Only iterations whose `iter_id` is a multiple of `iterations` have rows,
+    /// each with all of its sections.
+    Stride { iterations: u64 },
+    /// The run wrote no `cost_log`.
+    Off,
+}
+
+impl CostLogCoverage {
+    /// Logged iterations between two logged iterations: what one logged row
+    /// stands for in a run-wide total.
+    pub fn every(self) -> u64 {
+        match self {
+            CostLogCoverage::Stride { iterations } => iterations,
+            CostLogCoverage::Every | CostLogCoverage::Off => 1,
+        }
+    }
+
+    /// [`every`](Self::every) as a multiplier for summed times and work.
+    pub fn weight(self) -> f64 {
+        self.every() as f64
+    }
+
+    /// A subject's own `iter_id % stride` sample, where `stride` was sized in
+    /// run iterations (from `MAX(iter_id)`): rounded up to a multiple of the
+    /// logged stride so the filter keeps logged iterations only, at about the
+    /// same count.
+    pub fn align_run_stride(self, stride: u64) -> u64 {
+        let every = self.every();
+        stride.max(1).div_ceil(every) * every
+    }
+
+    /// A subject's own sample sized in *logged* iterations (from a row count):
+    /// every `stride`-th logged iteration is `iter_id % (stride × every) = 0`.
+    pub fn logged_stride(self, stride: u64) -> u64 {
+        stride.max(1) * self.every()
+    }
+
+    /// The reason a `cost_log` subject gives when the log is missing.
+    pub fn absent_reason(self) -> &'static str {
+        match self {
+            CostLogCoverage::Off => "cost_log not written: the run set io.cost_log_mode: off",
+            _ => "cost_log/ dir not found",
+        }
+    }
+
+    /// The reason a subject that needs every iteration gives under `stride`.
+    pub fn needs_every_iteration_reason(self) -> Option<String> {
+        match self {
+            CostLogCoverage::Stride { iterations } => Some(format!(
+                "cost_log holds 1 in {iterations} iterations (io.cost_log_mode: stride); \
+                 this subject needs every iteration — rerun with io.cost_log_mode: full"
+            )),
+            _ => None,
+        }
+    }
+
+    /// The caveat a sampled-log report carries, `None` for a complete log.
+    pub fn sampling_note(self) -> Option<Value> {
+        match self {
+            CostLogCoverage::Stride { iterations } => Some(serde_json::json!({
+                "mode": "stride",
+                "stride_iterations": iterations,
+                "caveat": format!(
+                    "cost_log holds 1 in {iterations} iterations (io.cost_log_mode: stride); \
+                     run-wide times, work, and counts are the logged rows × {iterations}, \
+                     an estimate with sampling error; per-iteration views show logged \
+                     iterations only"
+                ),
+            })),
+            _ => None,
+        }
+    }
+}
+
+pub fn read_cost_log_coverage(log_dir: &Path) -> CostLogCoverage {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let Some(json) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return CostLogCoverage::Every;
+    };
+    cost_log_coverage_from_run_meta(&json)
+}
+
+fn cost_log_coverage_from_run_meta(json: &Value) -> CostLogCoverage {
+    let Some(cost_log) = json.get("cost_log") else {
+        return CostLogCoverage::Every;
+    };
+    match cost_log.get("mode").and_then(Value::as_str) {
+        Some("off") => CostLogCoverage::Off,
+        Some("stride") => match cost_log.get("stride_iterations").and_then(Value::as_u64) {
+            Some(iterations) if iterations > 1 => CostLogCoverage::Stride { iterations },
+            _ => CostLogCoverage::Every,
+        },
+        _ => CostLogCoverage::Every,
+    }
+}
+
 /// The GPU facts a *timing prediction* records: `(gpu_count, gpu_name)` from
 /// `prediction.meta.json`.
 ///
@@ -346,6 +452,35 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cost_log_coverage_reads_run_meta_and_aligns_strides() {
+        assert_eq!(
+            cost_log_coverage_from_run_meta(&json!({})),
+            CostLogCoverage::Every
+        );
+        assert_eq!(
+            cost_log_coverage_from_run_meta(&json!({"cost_log": {"mode": "full"}})),
+            CostLogCoverage::Every
+        );
+        assert_eq!(
+            cost_log_coverage_from_run_meta(&json!({"cost_log": {"mode": "off"}})),
+            CostLogCoverage::Off
+        );
+        let stride = cost_log_coverage_from_run_meta(
+            &json!({"cost_log": {"mode": "stride", "stride_iterations": 16}}),
+        );
+        assert_eq!(stride, CostLogCoverage::Stride { iterations: 16 });
+        assert_eq!(stride.weight(), 16.0);
+        assert_eq!(stride.align_run_stride(1), 16);
+        assert_eq!(stride.align_run_stride(50), 64);
+        assert_eq!(stride.logged_stride(3), 48);
+        assert!(stride.sampling_note().is_some());
+        assert!(stride.needs_every_iteration_reason().is_some());
+        assert_eq!(CostLogCoverage::Every.align_run_stride(50), 50);
+        assert_eq!(CostLogCoverage::Every.logged_stride(3), 3);
+        assert!(CostLogCoverage::Every.sampling_note().is_none());
+    }
 
     #[test]
     fn json_publication_atomically_replaces_the_previous_document() {

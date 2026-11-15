@@ -40,6 +40,7 @@ pub(crate) fn build_pipeline_stage_worker<M: IterwiseUnifiedModel>(
     // Followers cost the same whole-stage iteration as the head.
     let cost = CostBuffers::new(
         cost_log_dir,
+        config.cost_log,
         pool_tag,
         id,
         &CostManifestDoc::single("iter", stage_model.cost_log_manifest()),

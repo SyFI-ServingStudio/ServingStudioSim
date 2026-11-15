@@ -143,6 +143,7 @@ pub(super) fn prepare_iter_build_essentials(
     // the degenerate single-`iter` document.
     let cost = CostBuffers::new(
         cost_log_dir,
+        config.cost_log,
         pool_tag,
         id,
         &CostManifestDoc::single("iter", cost_manifest),
