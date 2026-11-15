@@ -397,6 +397,7 @@ mod tests {
         let layout = PipelineLayout {
             depth,
             activation_bytes_per_token: 0,
+            tier_bytes: crate::worker::kv::TierBytes::default(),
         };
         let kv_cache_layout = crate::arch::kv_layout::KvCacheLayout::new()
             .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1));

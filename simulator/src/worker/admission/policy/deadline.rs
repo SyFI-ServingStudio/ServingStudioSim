@@ -100,6 +100,14 @@ impl<P: PendingOrderPolicy> Deadline<P> {
         }
     }
 
+    /// Put an overdue request taken out this pass back at the front of the
+    /// overdue queue.
+    pub fn push_front_overdue(&mut self, candidate: AdmissionCandidate) {
+        self.overdue_kv_tokens += candidate.queued_kv_tokens();
+        self.overdue_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
+        self.overdue.push_front(candidate);
+    }
+
     fn take_overdue(&mut self, index: usize) -> AdmissionCandidate {
         let candidate = self.overdue.remove(index).expect("index is in range");
         self.overdue_kv_tokens -= candidate.queued_kv_tokens();

@@ -14,6 +14,7 @@ mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod read_wait;
 mod started_order;
 mod token_budget;
 
@@ -34,6 +35,7 @@ pub use policy::{
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub use read_wait::{ReadWait, ReadWaitPolicy};
 pub use started_order::StartedOrder;
 pub(crate) use token_budget::prefill_fits_budget;
 
@@ -95,6 +97,15 @@ pub trait MicrobatchAdmission<K: KvStore> {
         at: Time,
     );
     fn queued_requests(&self) -> u32;
+    /// Take in the host-tier reads landed by `now`; returns the latest
+    /// landing, if any landed.
+    fn land_reads(&mut self, _kv_store: &mut K, _now: Time) -> Option<Time> {
+        None
+    }
+    /// When the next host-tier read lands.
+    fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
+        None
+    }
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::arch::kv_layout::{KvCacheLayout, KvGrowth};
 use crate::common::Time;
 
 use super::kv_accounting::ResumePositions;
@@ -86,6 +87,20 @@ impl TierBytes {
         self.state.div_ceil(self.per_token.max(1))
     }
 
+    /// A one-GPU layout's bytes: its per-token parts, and the model's own
+    /// bytes (no padding) of its prefix-reusable per-request parts.
+    pub fn of_layout(layout: &KvCacheLayout) -> Self {
+        Self {
+            per_token: layout.per_token_bytes(),
+            state: layout
+                .parts
+                .iter()
+                .filter(|part| part.prefix_reusable && part.growth == KvGrowth::PerRequest)
+                .map(|part| part.bytes_per_entry)
+                .sum(),
+        }
+    }
+
     /// What one GPU of a pipeline reads, given each stage's bytes: the first
     /// stage with the most bytes per token, or with `balanced` the stages'
     /// means, each rounded up.
@@ -93,7 +108,11 @@ impl TierBytes {
         if balanced {
             let depth = stages.len().max(1) as u64;
             return Self {
-                per_token: stages.iter().map(|s| s.per_token).sum::<u64>().div_ceil(depth),
+                per_token: stages
+                    .iter()
+                    .map(|s| s.per_token)
+                    .sum::<u64>()
+                    .div_ceil(depth),
                 state: stages.iter().map(|s| s.state).sum::<u64>().div_ceil(depth),
             };
         }
@@ -223,10 +242,13 @@ impl TierEntry {
 
     /// Its states, the end's last.
     fn states(&self) -> impl Iterator<Item = RoundState> + '_ {
-        self.earlier.iter().copied().chain(std::iter::once(RoundState {
-            at: self.tokens(),
-            tag: self.end,
-        }))
+        self.earlier
+            .iter()
+            .copied()
+            .chain(std::iter::once(RoundState {
+                at: self.tokens(),
+                tag: self.end,
+            }))
     }
 
     /// The state a prompt sharing `declared` tokens resumes from: the largest
@@ -651,7 +673,13 @@ impl TierChain {
             let end = StateTag {
                 round: states.last().map_or(0, |state| state.tag.round + 1),
             };
-            let earlier = self.kept_below(states, RoundState { at: tokens, tag: end });
+            let earlier = self.kept_below(
+                states,
+                RoundState {
+                    at: tokens,
+                    tag: end,
+                },
+            );
             self.store_in(
                 tier,
                 TierEventKind::WriteThrough,
@@ -934,7 +962,11 @@ mod tests {
         chain.store_round(1, round(400, 0));
         assert_eq!(hit(&chain, 1, 400), Some((0, 400)));
         assert_eq!(hit(&chain, 1, 1_000), Some((0, 400)));
-        assert_eq!(hit(&chain, 1, 300), None, "a context-end entry resumes at its end only");
+        assert_eq!(
+            hit(&chain, 1, 300),
+            None,
+            "a context-end entry resumes at its end only"
+        );
         for tier in 0..2 {
             assert_eq!(chain.counters(tier).stored_entries, 1);
             assert_eq!(chain.counters(tier).written_tokens, 400);
@@ -946,7 +978,11 @@ mod tests {
         let mut chain = dram_ssd(TierWrites::EveryContext, TierWrites::EveryContext);
         chain.store_round(1, round(600, 0));
         chain.store_round(2, round(600, 0));
-        assert_eq!(hit(&chain, 1, 600), Some((1, 600)), "DRAM's 1000 tokens hold one");
+        assert_eq!(
+            hit(&chain, 1, 600),
+            Some((1, 600)),
+            "DRAM's 1000 tokens hold one"
+        );
         assert_eq!(hit(&chain, 2, 600), Some((0, 600)));
         assert_eq!(chain.counters(0).evicted_entries, 1);
         assert_eq!(chain.counters(0).evicted_tokens, 600);
@@ -983,12 +1019,24 @@ mod tests {
         let first = chain.read(1, chain.lookup(1, 600).unwrap(), 0, Time::ZERO);
         assert_eq!(first.ready, Time::from_ms(6.0));
         assert_eq!(chain.queue_wait(1, Time::from_ms(2.0)), Time::from_ms(4.0));
-        assert_eq!(hit(&chain, 1, 600), Some((0, 600)), "the read passed through DRAM");
-        assert_eq!(hit(&chain, 2, 600), Some((1, 600)), "and evicted session 2 there");
+        assert_eq!(
+            hit(&chain, 1, 600),
+            Some((0, 600)),
+            "the read passed through DRAM"
+        );
+        assert_eq!(
+            hit(&chain, 2, 600),
+            Some((1, 600)),
+            "and evicted session 2 there"
+        );
         chain.store_round(3, round(100, 0));
         let second = chain.read(2, chain.lookup(2, 600).unwrap(), 200, Time::from_ms(1.0));
         assert_eq!(second.started, Time::from_ms(1.0));
-        assert_eq!(second.ready, Time::from_ms(10.0), "queued behind the first, 400 tokens");
+        assert_eq!(
+            second.ready,
+            Time::from_ms(10.0),
+            "queued behind the first, 400 tokens"
+        );
         assert_eq!(chain.counters(1).loads, 2);
         assert_eq!(chain.counters(1).loaded_tokens, 1_000);
     }
@@ -1005,7 +1053,10 @@ mod tests {
         assert_eq!(chain.used_units(0), 450);
         let hit = chain.lookup(1, 400).unwrap();
         assert_eq!(chain.read_units(1, hit, 100), 300 + 50);
-        assert_eq!(chain.read(1, hit, 100, Time::ZERO).ready, Time::from_ms(0.35));
+        assert_eq!(
+            chain.read(1, hit, 100, Time::ZERO).ready,
+            Time::from_ms(0.35)
+        );
         assert_eq!(chain.counters(0).loaded_states, 1);
     }
 
@@ -1013,7 +1064,11 @@ mod tests {
     fn a_victim_tier_takes_only_what_hbm_evicts() {
         let mut chain = dram_ssd(TierWrites::Evictions, TierWrites::EveryContext);
         chain.store_round(1, round(400, 0));
-        assert_eq!(hit(&chain, 1, 400), Some((1, 400)), "only SSD is written through");
+        assert_eq!(
+            hit(&chain, 1, 400),
+            Some((1, 400)),
+            "only SSD is written through"
+        );
         chain.take_hbm_eviction(leaving(1, 400, &[]));
         assert_eq!(hit(&chain, 1, 400), Some((0, 400)));
         assert_eq!(chain.counters(0).written_tokens, 400);
@@ -1024,9 +1079,17 @@ mod tests {
         let mut chain = dram_ssd(TierWrites::Evictions, TierWrites::Evictions);
         chain.take_hbm_eviction(leaving(1, 400, &[]));
         chain.take_hbm_eviction(leaving(1, 400, &[]));
-        assert_eq!(chain.counters(0).stored_entries, 1, "an identical context only refreshes");
+        assert_eq!(
+            chain.counters(0).stored_entries,
+            1,
+            "an identical context only refreshes"
+        );
         chain.take_hbm_eviction(leaving(1, 300, &[]));
-        assert_eq!(hit(&chain, 1, 400), Some((0, 400)), "the longer context stays");
+        assert_eq!(
+            hit(&chain, 1, 400),
+            Some((0, 400)),
+            "the longer context stays"
+        );
         chain.take_hbm_eviction(leaving(1, 700, &[]));
         assert_eq!(chain.counters(0).written_tokens, 700);
     }
@@ -1159,7 +1222,11 @@ mod tests {
     #[test]
     fn a_full_tier_evicts_whole_entries_with_all_their_states() {
         // A state is 100 tier tokens; DRAM holds 1000.
-        let mut chain = chain(&[spec(DRAM, 1e-3, 1e-3, TierWrites::EveryContext)], 100_000, 2);
+        let mut chain = chain(
+            &[spec(DRAM, 1e-3, 1e-3, TierWrites::EveryContext)],
+            100_000,
+            2,
+        );
         chain.store_round(1, round(100, 0));
         chain.store_round(1, round(300, 100));
         assert_eq!(chain.used_units(0), 300 + 2 * 100);
@@ -1171,7 +1238,11 @@ mod tests {
 
     #[test]
     fn a_read_moves_only_the_states_that_survive_its_round() {
-        let mut chain = chain(&[spec(DRAM, 1e-2, 1e-3, TierWrites::EveryContext)], 10_000, 3);
+        let mut chain = chain(
+            &[spec(DRAM, 1e-2, 1e-3, TierWrites::EveryContext)],
+            10_000,
+            3,
+        );
         for (tokens, shared) in [(100, 0), (200, 100), (300, 200)] {
             chain.store_round(1, round(tokens, shared));
         }
@@ -1216,10 +1287,17 @@ mod tests {
 
     #[test]
     fn an_exclusive_tier_moves_an_entry_and_its_states_into_hbm() {
-        let mut chain = chain(&[spec(DRAM, 1e-2, 1e-3, TierWrites::EvictionsExclusive)], 10_000, 2);
+        let mut chain = chain(
+            &[spec(DRAM, 1e-2, 1e-3, TierWrites::EvictionsExclusive)],
+            10_000,
+            2,
+        );
         chain.take_hbm_eviction(leaving(1, 300, &[100, 200]));
         let read = chain.read(1, chain.lookup(1, 300).unwrap(), 0, Time::ZERO);
-        assert!(read.earlier.is_empty(), "k = 2 moves the resume state alone");
+        assert!(
+            read.earlier.is_empty(),
+            "k = 2 moves the resume state alone"
+        );
         assert_eq!(chain.used_units(0), 0);
         assert_eq!(chain.earlier_states(0), 0);
     }
@@ -1294,17 +1372,44 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_stores_its_per_token_parts_and_its_reusable_states_unpadded() {
+        use crate::arch::kv_layout::KvCachePart;
+        let layout = KvCacheLayout::new()
+            .with_part(KvCachePart::per_token("mla", 512))
+            .with_part(KvCachePart::compressed("indexer", 4, 132))
+            .with_part(KvCachePart::per_request("kda", 1_000).padded_to(4_096))
+            .with_part(KvCachePart::per_request("tail", 64).not_prefix_reusable());
+        assert_eq!(
+            TierBytes::of_layout(&layout),
+            TierBytes {
+                per_token: 545,
+                state: 1_000
+            }
+        );
+    }
+
+    #[test]
     fn tiers_read_one_state_per_context_on_the_same_gpu_as_the_kv() {
-        let stages = [(545, 30), (1_090, 20), (1_090, 50), (0, 7)].map(|(per_token, state)| {
-            TierBytes { per_token, state }
-        });
+        let stages = [(545, 30), (1_090, 20), (1_090, 50), (0, 7)]
+            .map(|(per_token, state)| TierBytes { per_token, state });
         assert_eq!(
             TierBytes::of_stages(&stages, false).state,
             20,
             "the first stage with the most KV bytes per token"
         );
-        assert_eq!(TierBytes::of_stages(&stages, true).state, 27, "107 B over 4 stages, rounded up");
+        assert_eq!(
+            TierBytes::of_stages(&stages, true).state,
+            27,
+            "107 B over 4 stages, rounded up"
+        );
         assert_eq!(TierBytes::of_stages(&[], false), TierBytes::default());
-        assert_eq!(TierBytes { per_token: 1_635, state: 39_081_984 }.state_tokens(), 23_904);
+        assert_eq!(
+            TierBytes {
+                per_token: 1_635,
+                state: 39_081_984
+            }
+            .state_tokens(),
+            23_904
+        );
     }
 }

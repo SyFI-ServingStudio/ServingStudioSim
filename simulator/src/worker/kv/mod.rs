@@ -19,6 +19,7 @@ pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResum
 pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::state_retention::StateRetention;
+pub use shared::tier_chain::{TierBytes, TierSpec, TierWrites};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

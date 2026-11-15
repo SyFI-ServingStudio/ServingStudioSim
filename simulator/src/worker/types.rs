@@ -601,6 +601,15 @@ pub struct WorkerConfig {
     /// Which round-end recurrent states a retained context keeps. Only the
     /// two chunked recipes set it.
     pub state_retention: crate::worker::kv::StateRetention,
+    /// Host tiers behind the prefix cache, fastest first. Only the pipeline
+    /// recipe reads them.
+    pub prefix_tiers: Vec<crate::worker::kv::TierSpec>,
+    /// Tiers hold the stages' mean bytes instead of the most loaded stage's.
+    pub prefix_tier_balanced_load: bool,
+    /// The bound on a tier read's wait for its channel; `None`: unbounded.
+    pub prefix_tier_read_wait: Option<crate::worker::admission::ReadWait>,
+    /// A session context older than the run is read from the slowest tier.
+    pub prefix_tier_warm_start: bool,
     /// Tokens one step may have in flight, which caps what admission charges a
     /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
     /// scheduling), or the whole prompt without a token budget.
@@ -653,6 +662,10 @@ impl Default for WorkerConfig {
             kv_part_padding: Vec::new(),
             kv_block_tokens: None,
             state_retention: crate::worker::kv::StateRetention::Latest { k: 1 },
+            prefix_tiers: Vec::new(),
+            prefix_tier_balanced_load: false,
+            prefix_tier_read_wait: None,
+            prefix_tier_warm_start: false,
             kv_max_in_flight_tokens: None,
             max_model_len: None,
             prefill_chunk_alignment: None,

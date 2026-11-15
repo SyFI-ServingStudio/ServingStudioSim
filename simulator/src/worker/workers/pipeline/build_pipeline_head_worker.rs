@@ -23,6 +23,8 @@ use super::PipelineHead;
 /// requests, so the stage with the most KV per token bounds the pipeline. With
 /// prefix caching on and a resumable recurrent state in the layout (vLLM's
 /// Mamba `align` mode), every non-final chunk ends on the layout's block.
+/// Host tiers, if the config has any, sit behind the prefix cache, each GPU
+/// storing and reading `layout.tier_bytes`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     id: WorkerId,
@@ -82,7 +84,13 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         &config,
         essentials.sampler,
         prefix_cache_logger,
-    );
+    )
+    .with_prefix_tiers(&config.prefix_tiers, layout.tier_bytes);
+    let kv_store = if config.prefix_tier_warm_start {
+        kv_store.with_tier_warm_start()
+    } else {
+        kv_store
+    };
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -99,6 +107,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if let Some(after) = config.force_schedule_after {
         admission = admission.with_force_schedule_after(after);
+    }
+    if let Some(read_wait) = config.prefix_tier_read_wait {
+        admission = admission.with_read_wait(read_wait);
     }
 
     PipelineHeadWorker::from_components(

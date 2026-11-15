@@ -16,6 +16,7 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
@@ -24,6 +25,7 @@ use crate::orchestrator::{
 };
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
+use crate::worker::kv::TierBytes;
 use crate::worker::{
     build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
     CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
@@ -92,6 +94,13 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stages()
+                            .iter()
+                            .map(|stage| stage.kv_cache_layout()),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -169,6 +178,13 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stages()
+                            .iter()
+                            .map(|stage| stage.kv_cache_layout()),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -222,6 +238,7 @@ fn worker_config(
         balance_decode_microbatches,
         prefill_chunk_alignment,
         pending_order,
+        prefix_tiers,
         ..
     } = worker
     else {
@@ -251,7 +268,16 @@ fn worker_config(
     };
     worker.kv_accounting().apply("pp", &mut config)?;
     worker.apply_chunked_scheduling("pp", &mut config)?;
+    prefix_tiers.apply("pp", &mut config)?;
     Ok(config)
+}
+
+/// What each GPU stores in and reads from a host tier, from every stage's
+/// layout: the first stage with the most KV bytes per token, or with
+/// `balanced` the stages' means.
+fn tier_bytes(stages: impl Iterator<Item = KvCacheLayout>, balanced: bool) -> TierBytes {
+    let stages: Vec<TierBytes> = stages.map(|layout| TierBytes::of_layout(&layout)).collect();
+    TierBytes::of_stages(&stages, balanced)
 }
 
 /// Stages of one pipeline share an NVLink domain, so activations move on the

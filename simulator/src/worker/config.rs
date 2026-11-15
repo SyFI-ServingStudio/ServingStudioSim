@@ -19,11 +19,12 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use crate::common::Time;
 
 use super::admission::{
-    LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit, StartedOrder,
+    LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit, ReadWait, ReadWaitPolicy,
+    StartedOrder,
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
-    PrefixResumePoints, StateRetention,
+    PrefixResumePoints, StateRetention, TierSpec, TierWrites,
 };
 use super::types::WorkerConfig;
 
@@ -351,6 +352,190 @@ impl StateRetentionSpec {
         })
     }
 }
+
+/// Host tiers behind a pipeline head's prefix cache: DRAM, then SSD, each per
+/// GPU. Flattened into `pipeline_chunked_prefill`; every key absent is no
+/// tier. A session request whose context is in a tier but not in HBM reads
+/// it back when admission reaches it, as vLLM's KV connector does; the rest
+/// is not vLLM.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, ParamStruct)]
+pub struct PrefixTierSpec {
+    /// Host DRAM per GPU (GB; `0`: none).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    dram_tier_gb: f64,
+    /// DRAM -> HBM read bandwidth per GPU (GB/s): a PCIe Gen5 x16 link.
+    #[serde(default = "default_dram_tier_gb_per_s")]
+    #[param(default = 50.0)]
+    dram_tier_gb_per_s: f64,
+    /// What DRAM is written: `every-context`, each finished context
+    /// (write-through); `hbm-evictions`, only what the HBM prefix cache evicts
+    /// or cannot keep, as what DRAM's entry for the session lacks (a victim
+    /// tier); `hbm-evictions-exclusive`, the same, and a read moves the
+    /// context back to HBM instead of copying it.
+    #[serde(default)]
+    #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
+    dram_tier_writes: DramTierWrites,
+    /// Local SSD behind DRAM per GPU (GB; `0`: none).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    ssd_tier_gb: f64,
+    /// SSD -> HBM read bandwidth per GPU (GB/s): one Gen5 NVMe drive.
+    #[serde(default = "default_ssd_tier_gb_per_s")]
+    #[param(default = 10.0)]
+    ssd_tier_gb_per_s: f64,
+    /// What SSD is written: `every-context` (write-through) or
+    /// `dram-evictions`, only what DRAM evicts or cannot hold (a victim tier;
+    /// needs both tiers).
+    #[serde(default)]
+    #[param(string, default = "every-context", choices = SSD_TIER_WRITES_CHOICES)]
+    ssd_tier_writes: SsdTierWrites,
+    /// Tiers store and read the stages' mean KV bytes, as if the stages held
+    /// equal shares, instead of the most loaded stage's. HBM is unchanged. A
+    /// what-if: vLLM's layer split leaves the stages unequal.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_balanced_load: bool,
+    /// Start a read only while its tier's channel would begin it within this
+    /// many ms; past that, `prefix_tier_read_wait_policy` decides. `0`: no
+    /// bound. Needs a tier.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    prefix_tier_max_read_wait_ms: f64,
+    /// With `prefix_tier_max_read_wait_ms`: `pass-over` leaves a request whose
+    /// read would wait past the bound queued, holding nothing, and admits the
+    /// ones behind it; `block` stops admission at it.
+    #[serde(default)]
+    #[param(string, default = "pass-over", choices = READ_WAIT_POLICY_CHOICES)]
+    prefix_tier_read_wait_policy: ReadWaitPolicy,
+    /// A session request whose declared prefix exceeds every context the run
+    /// stored for its session began before the run: its context is read from
+    /// the slowest tier, as a long-lived session's would be in steady state.
+    /// For closed-loop traces that start sessions mid-life.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_warm_start: bool,
+}
+
+const fn default_dram_tier_gb_per_s() -> f64 {
+    50.0
+}
+
+const fn default_ssd_tier_gb_per_s() -> f64 {
+    10.0
+}
+
+impl Default for PrefixTierSpec {
+    fn default() -> Self {
+        Self {
+            dram_tier_gb: 0.0,
+            dram_tier_gb_per_s: default_dram_tier_gb_per_s(),
+            dram_tier_writes: DramTierWrites::default(),
+            ssd_tier_gb: 0.0,
+            ssd_tier_gb_per_s: default_ssd_tier_gb_per_s(),
+            ssd_tier_writes: SsdTierWrites::default(),
+            prefix_tier_balanced_load: false,
+            prefix_tier_max_read_wait_ms: 0.0,
+            prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
+            prefix_tier_warm_start: false,
+        }
+    }
+}
+
+impl PrefixTierSpec {
+    /// Validate the tiers and set them on `config`.
+    pub(crate) fn apply(self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
+        let (dram_gb, ssd_gb) = (self.dram_tier_gb, self.ssd_tier_gb);
+        ensure!(
+            self.dram_tier_writes == DramTierWrites::EveryContext || dram_gb > 0.0,
+            "{owner}: dram_tier_writes: hbm-evictions(-exclusive) needs dram_tier_gb > 0"
+        );
+        ensure!(
+            self.ssd_tier_writes == SsdTierWrites::EveryContext || (dram_gb > 0.0 && ssd_gb > 0.0),
+            "{owner}: ssd_tier_writes: dram-evictions needs dram_tier_gb > 0 and ssd_tier_gb > 0"
+        );
+        let tier = |name: &'static str, gb: f64, gb_per_s: f64, writes| -> Result<_> {
+            ensure!(
+                gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
+                "{owner}: {name}_tier_gb must be >= 0 and its bandwidth positive"
+            );
+            Ok((gb > 0.0).then_some(TierSpec {
+                name,
+                capacity_gb: gb,
+                read_gb_per_s: gb_per_s,
+                writes,
+            }))
+        };
+        let dram_writes = match self.dram_tier_writes {
+            DramTierWrites::EveryContext => TierWrites::EveryContext,
+            DramTierWrites::HbmEvictions => TierWrites::Evictions,
+            DramTierWrites::HbmEvictionsExclusive => TierWrites::EvictionsExclusive,
+        };
+        let ssd_writes = match self.ssd_tier_writes {
+            SsdTierWrites::EveryContext => TierWrites::EveryContext,
+            SsdTierWrites::DramEvictions => TierWrites::Evictions,
+        };
+        config.prefix_tiers = [
+            tier("dram", dram_gb, self.dram_tier_gb_per_s, dram_writes)?,
+            tier("ssd", ssd_gb, self.ssd_tier_gb_per_s, ssd_writes)?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let ms = self.prefix_tier_max_read_wait_ms;
+        ensure!(
+            ms.is_finite() && ms >= 0.0,
+            "{owner}: prefix_tier_max_read_wait_ms ({ms}) must be a finite value >= 0"
+        );
+        ensure!(
+            self.prefix_tier_read_wait_policy == ReadWaitPolicy::PassOver || ms > 0.0,
+            "{owner}: prefix_tier_read_wait_policy: block needs prefix_tier_max_read_wait_ms > 0"
+        );
+        ensure!(
+            ms == 0.0 || !config.prefix_tiers.is_empty(),
+            "{owner}: prefix_tier_max_read_wait_ms needs dram_tier_gb or ssd_tier_gb > 0"
+        );
+        config.prefix_tier_read_wait = (ms > 0.0).then(|| ReadWait {
+            max: Time::from_ms(ms),
+            policy: self.prefix_tier_read_wait_policy,
+        });
+        config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
+        config.prefix_tier_warm_start = self.prefix_tier_warm_start;
+        Ok(())
+    }
+}
+
+/// What the DRAM tier is written (`dram_tier_writes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DramTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// What HBM evicts or cannot keep (HBM's victim tier).
+    HbmEvictions,
+    /// The same, and a read moves the context out of DRAM.
+    HbmEvictionsExclusive,
+}
+
+const DRAM_TIER_WRITES_CHOICES: [&str; 3] =
+    ["every-context", "hbm-evictions", "hbm-evictions-exclusive"];
+
+/// What the SSD tier is written (`ssd_tier_writes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsdTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// What DRAM evicts or cannot hold (DRAM's victim tier).
+    DramEvictions,
+}
+
+const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
+
+const READ_WAIT_POLICY_CHOICES: [&str; 2] = ["pass-over", "block"];
 
 /// How a pipeline head sizes each microbatch's prefill.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -823,6 +1008,9 @@ pub enum IterWorkerSel {
         /// [`StateRetentionSpec`].
         #[serde(flatten)]
         state_retention: StateRetentionSpec,
+        /// Host tiers behind the prefix cache; see [`PrefixTierSpec`].
+        #[serde(flatten)]
+        prefix_tiers: PrefixTierSpec,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -1346,5 +1534,96 @@ mod tests {
             StateRetention::Latest { k: 2 }
         );
         assert!(pipeline("recurrent_state_checkpoints: 0\n").is_err());
+    }
+
+    fn prefix_tiers(keys: &str) -> Result<WorkerConfig> {
+        let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{keys}"
+        ))
+        .expect("parse pipeline worker");
+        let IterWorkerSel::PipelineChunkedPrefill { prefix_tiers, .. } = worker else {
+            panic!("expected pipeline_chunked_prefill");
+        };
+        let mut config = WorkerConfig::default();
+        prefix_tiers.apply("t", &mut config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn tier_writes_build_the_victim_chain_and_need_their_tiers() {
+        let writes = |keys: &str| -> Vec<(&'static str, TierWrites)> {
+            prefix_tiers(keys)
+                .unwrap()
+                .prefix_tiers
+                .iter()
+                .map(|tier| (tier.name, tier.writes))
+                .collect()
+        };
+        assert!(prefix_tiers("").unwrap().prefix_tiers.is_empty());
+        let both = "dram_tier_gb: 50.0\nssd_tier_gb: 128.0\n";
+        assert_eq!(
+            writes(both),
+            [
+                ("dram", TierWrites::EveryContext),
+                ("ssd", TierWrites::EveryContext)
+            ]
+        );
+        assert_eq!(
+            writes(&format!(
+                "{both}dram_tier_writes: hbm-evictions\nssd_tier_writes: dram-evictions\n"
+            )),
+            [
+                ("dram", TierWrites::Evictions),
+                ("ssd", TierWrites::Evictions)
+            ]
+        );
+        assert_eq!(
+            writes("dram_tier_gb: 50.0\ndram_tier_writes: hbm-evictions-exclusive\n"),
+            [("dram", TierWrites::EvictionsExclusive)]
+        );
+        assert_eq!(
+            writes("ssd_tier_gb: 128.0\n"),
+            [("ssd", TierWrites::EveryContext)]
+        );
+        let config = prefix_tiers(both).unwrap();
+        assert_eq!(
+            (
+                config.prefix_tiers[0].read_gb_per_s,
+                config.prefix_tiers[1].read_gb_per_s
+            ),
+            (50.0, 10.0)
+        );
+        // A victim tier needs the tier above it.
+        assert!(prefix_tiers("dram_tier_writes: hbm-evictions\n").is_err());
+        assert!(prefix_tiers("ssd_tier_gb: 128.0\nssd_tier_writes: dram-evictions\n").is_err());
+        assert!(prefix_tiers("dram_tier_gb: -1.0\n").is_err());
+        assert!(prefix_tiers("dram_tier_gb: 50.0\ndram_tier_gb_per_s: 0.0\n").is_err());
+    }
+
+    #[test]
+    fn a_read_wait_bound_needs_a_tier_and_block_needs_a_bound() {
+        let dram = "dram_tier_gb: 50.0\n";
+        assert_eq!(prefix_tiers(dram).unwrap().prefix_tier_read_wait, None);
+        assert_eq!(
+            prefix_tiers(&format!("{dram}prefix_tier_max_read_wait_ms: 1000.0\n"))
+                .unwrap()
+                .prefix_tier_read_wait,
+            Some(ReadWait {
+                max: Time::from_ms(1000.0),
+                policy: ReadWaitPolicy::PassOver,
+            })
+        );
+        assert!(prefix_tiers("prefix_tier_max_read_wait_ms: 1000.0\n").is_err());
+        assert!(prefix_tiers(&format!("{dram}prefix_tier_max_read_wait_ms: -1.0\n")).is_err());
+        assert!(prefix_tiers(&format!("{dram}prefix_tier_read_wait_policy: block\n")).is_err());
+        assert_eq!(
+            prefix_tiers(&format!(
+                "{dram}prefix_tier_max_read_wait_ms: 5.0\nprefix_tier_read_wait_policy: block\n"
+            ))
+            .unwrap()
+            .prefix_tier_read_wait
+            .map(|wait| wait.policy),
+            Some(ReadWaitPolicy::Block)
+        );
     }
 }

@@ -38,7 +38,7 @@ use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::MicrobatchAdmission;
 use crate::worker::execution::IterModelExecution;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::IterWorkerKv;
+use crate::worker::kv::{IterWorkerKv, TierBytes};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     IterBatchPlan, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch, WorkerStatus,
@@ -51,6 +51,9 @@ pub struct PipelineLayout {
     pub depth: u16,
     /// Bytes one token's activations occupy between two stages.
     pub activation_bytes_per_token: u64,
+    /// What each GPU stores in and reads from a host tier
+    /// ([`TierBytes::of_stages`]).
+    pub tier_bytes: TierBytes,
 }
 
 struct ComputingMicrobatch {
@@ -190,6 +193,10 @@ where
         // Exits first: they release KV the next formation may need, and their
         // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
+        // A landed read can be admitted from its landing on.
+        if let Some(landed) = self.admission.land_reads(&mut self.kv_store, now) {
+            self.state_changed_at = self.state_changed_at.max(landed);
+        }
         loop {
             let mut progressed = false;
             if self
@@ -292,9 +299,15 @@ where
     }
 
     fn next_wakeup(&self) -> Option<Time> {
-        self.computing
+        let compute = self
+            .computing
             .as_ref()
-            .map(|computing| computing.compute_end)
+            .map(|computing| computing.compute_end);
+        let landing = self.admission.next_read_landing(&self.kv_store);
+        match (compute, landing) {
+            (Some(compute), Some(landing)) => Some(compute.min(landing)),
+            (compute, landing) => compute.or(landing),
+        }
     }
 }
 
@@ -308,10 +321,10 @@ mod tests {
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{
         FifoOrder, LoadBudget, MicrobatchBudget, PendingOrderKind,
-        PipelinedChunkedPrefillAdmission, PrefillSplit, StartedOrder,
+        PipelinedChunkedPrefillAdmission, PrefillSplit, ReadWait, ReadWaitPolicy, StartedOrder,
     };
     use crate::worker::execution::UnifiedIterExecution;
-    use crate::worker::kv::KvCacheStore;
+    use crate::worker::kv::{KvCacheStore, PrefixKv};
     use crate::worker::types::WorkerConfig;
     use crate::worker::workers::pipeline::{build_pipeline_head_worker, PipelineHead};
 
@@ -331,6 +344,10 @@ mod tests {
     const LAYOUT: PipelineLayout = PipelineLayout {
         depth: 2,
         activation_bytes_per_token: 4,
+        tier_bytes: TierBytes {
+            per_token: 2,
+            state: 0,
+        },
     };
 
     /// Two KV bytes per token on the most constrained stage.
@@ -1179,5 +1196,388 @@ mod tests {
         // three have left the pipeline by 12 ms.
         let progress = starved_prompt_progress(Some(Time::from_ms(5.0)));
         assert!(progress >= 3 * 2048, "progress {progress}");
+    }
+
+    // ── Prefix tiers ─────────────────────────────────────────────────────────
+
+    fn as_session(
+        store: &SharedRequests,
+        id: u32,
+        session_id: u32,
+        declared: u32,
+        arrival_ms: f64,
+    ) {
+        let mut store = store.borrow_mut();
+        let request = &mut store[RequestId(id)].request;
+        request.definition.session = SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: declared,
+        };
+        request.core.arrival_time = Time::from_ms(arrival_ms);
+    }
+
+    /// Tick at every wakeup and stage-1 exit (1 ms after stage 0) up to `until`.
+    fn run_until(
+        worker: &mut PipelineHead<FakeModel>,
+        from: Time,
+        until: Time,
+        events: &mut Vec<PipelineHeadEvent>,
+    ) {
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        let mut now = from;
+        while now <= until {
+            let mut fresh = Vec::new();
+            let wakeup = worker.tick(now, &mut fresh);
+            for (id, _, ready) in launched(&fresh) {
+                exits.push((id, ready + Time::from_ms(1.0)));
+            }
+            events.extend(fresh);
+            let next_exit = exits.iter().map(|&(_, at)| at).min();
+            let next = [wakeup, next_exit].into_iter().flatten().min();
+            let Some(next) = next else { break };
+            if let Some(index) = exits.iter().position(|&(_, at)| at == next) {
+                let (microbatch, at) = exits.remove(index);
+                worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+            }
+            now = next.max(now);
+        }
+    }
+
+    /// 2 B/token, 120 tokens of HBM, 64-token microbatches. DRAM: 500 tokens
+    /// read at 1e5 B/s, so 50 tokens take 1 ms.
+    fn tiered_config() -> WorkerConfig {
+        WorkerConfig {
+            max_batch_tokens: Some(64),
+            attn_kv_bytes: 240,
+            prefix_tiers: vec![crate::worker::kv::TierSpec {
+                name: "dram",
+                capacity_gb: 1e-6,
+                read_gb_per_s: 1e-4,
+                writes: crate::worker::kv::TierWrites::EveryContext,
+            }],
+            ..WorkerConfig::default()
+        }
+    }
+
+    fn hit_tokens(store: &SharedRequests, id: u32) -> Option<u32> {
+        store.borrow()[RequestId(id)]
+            .telemetry
+            .prefix_cache_hit_tokens
+    }
+
+    #[test]
+    fn a_session_evicted_from_hbm_reads_its_context_back_from_dram_first() {
+        // Session 7 round 0 (50 tokens), then a 100-token prompt that evicts it
+        // from HBM, then round 1 declaring the 51-token context, whose first 50
+        // have KV in DRAM (the output's KV is round 1's to compute).
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = head_with(Rc::clone(&store), tiered_config());
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(3.0),
+            Time::from_ms(9.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+
+        events.clear();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        // The read starts at 10 ms and lands 1 ms later; nothing launches
+        // before it.
+        assert_eq!(
+            worker.tick(Time::from_ms(10.0), &mut events),
+            Some(Time::from_ms(11.0))
+        );
+        assert_eq!(worker.status().queued_requests, 1);
+        assert!(events.is_empty());
+        run_until(
+            &mut worker,
+            Time::from_ms(11.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        let pairs: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => {
+                    Some(microbatch.input.groups[0].prefill_chunk_pairs.clone())
+                }
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(pairs, [(50, 5)]);
+        assert_eq!(hit_tokens(&store, 2), Some(50));
+        assert!(store.borrow()[RequestId(2)].lifecycle.completed);
+    }
+
+    #[test]
+    fn a_context_evicted_while_queued_is_read_when_admission_reaches_it() {
+        // Round 1 of session 7 arrives while HBM still holds round 0's 50
+        // tokens, behind a 100-token prompt of session 8 whose admission evicts
+        // them. The read starts when round 1 reaches the head, not at arrival,
+        // so it still finds its context; HBM alone recomputes it.
+        for (tiers, hit) in [(true, 50), (false, 0)] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 4.0);
+            as_session(&store, 2, 7, 51, 4.0);
+            let config = if tiers {
+                tiered_config()
+            } else {
+                WorkerConfig {
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    ..WorkerConfig::default()
+                }
+            };
+            let mut worker = head_with(Rc::clone(&store), config);
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+            let round1 = store.borrow()[RequestId(2)].request.definition.session;
+            assert_eq!(worker.kv_store.resident_prefix_tokens(4, round1), 50);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(4.0),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(0), RequestId(1), RequestId(2)]
+            );
+            assert_eq!(hit_tokens(&store, 2), Some(hit), "tiers={tiers}");
+        }
+    }
+
+    #[test]
+    fn a_read_waits_until_its_request_fits_in_hbm_and_holds_it() {
+        // HBM holds 120 tokens. A 60-token prompt runs while session 7 (70
+        // pre-run tokens in the tier, 4 fresh) reaches the head with budget
+        // left: its 74 tokens do not fit beside the prompt, so its read starts
+        // only once the prompt leaves, as vLLM allocates an async load's
+        // blocks before starting it.
+        let store = shared_with(&[(0, 60, 1), (1, 4, 1)]);
+        as_session(&store, 0, 8, 0, 0.0);
+        as_session(&store, 1, 7, 70, 0.0);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                prefix_tier_warm_start: true,
+                ..tiered_config()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(60.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        assert_eq!(hit_tokens(&store, 1), Some(70));
+        // The prompt's microbatch leaves 1 ms after launch; the 70-token read
+        // (1.4 ms) starts then, and session 7 launches once it lands.
+        let launches = launched(&events);
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert!(
+            launches[1].2 >= launches[0].2 + Time::from_ms(2.4),
+            "{launches:?}"
+        );
+    }
+
+    #[test]
+    fn a_landed_read_is_admitted_before_a_queue_head_that_cannot_start_its_read() {
+        // Shortest prefill first, 120 tokens of HBM. Session 7 (40 pre-run
+        // tokens, 4 fresh) starts its read and holds 45 tokens. Session 9 (80
+        // pre-run, 2 fresh) then ranks first but cannot start its read beside
+        // that hold. Session 7's landed read goes first, as vLLM schedules
+        // loaded requests before its waiting queue; otherwise neither moves.
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 80, 0.1);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                prefix_tier_warm_start: true,
+                ..tiered_config()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(0.1),
+            Time::from_ms(60.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        assert_eq!(hit_tokens(&store, 0), Some(40));
+        assert_eq!(hit_tokens(&store, 1), Some(80));
+    }
+
+    /// Session 7's 40-token pre-run read keeps the DRAM channel busy until
+    /// 0.8 ms; session 9 (20 pre-run tokens) reaches the head at 0.1 ms with
+    /// `behind` (a 8-token prompt needing no read) queued after it.
+    fn read_wait_head(
+        read_wait: Option<ReadWait>,
+        behind: bool,
+    ) -> (
+        SharedRequests,
+        PipelineHead<FakeModel>,
+        Vec<PipelineHeadEvent>,
+    ) {
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 20, 0.1);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                prefix_tier_warm_start: true,
+                prefix_tier_read_wait: read_wait,
+                ..tiered_config()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        if behind {
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        }
+        (store, worker, events)
+    }
+
+    fn bound(ms: f64, policy: ReadWaitPolicy) -> Option<ReadWait> {
+        (ms > 0.0).then(|| ReadWait {
+            max: Time::from_ms(ms),
+            policy,
+        })
+    }
+
+    #[test]
+    fn a_read_waits_in_its_queue_while_its_tier_is_past_the_read_wait_bound() {
+        // Unbounded, session 9's read queues behind session 7's (and holds
+        // HBM); with a 0.5 ms bound it waits in its queue until the channel
+        // drains. Both land the same: the channel is FIFO.
+        for (bound_ms, reading_at_0_2) in [(0.0, 2), (0.5, 1)] {
+            let (store, mut worker, mut events) =
+                read_wait_head(bound(bound_ms, ReadWaitPolicy::PassOver), false);
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(0.2),
+                &mut events,
+            );
+            assert_eq!(
+                worker.admission.reading_requests(),
+                reading_at_0_2,
+                "bound {bound_ms}"
+            );
+            run_until(
+                &mut worker,
+                Time::from_ms(0.2),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+            assert_eq!(hit_tokens(&store, 0), Some(40), "bound {bound_ms}");
+            assert_eq!(hit_tokens(&store, 1), Some(20), "bound {bound_ms}");
+        }
+    }
+
+    #[test]
+    fn a_request_past_the_read_wait_bound_is_passed_over_for_the_ones_behind() {
+        // Unbounded, session 9's read queues and request 2 follows it; with a
+        // 0.5 ms bound session 9 is passed over rather than stopping admission.
+        // Either way request 2 launches at 0.1 ms (1 ms stage), before the
+        // channel drains.
+        for bound_ms in [0.0, 0.5] {
+            let (store, mut worker, mut events) =
+                read_wait_head(bound(bound_ms, ReadWaitPolicy::PassOver), true);
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                launched(&events)[0],
+                (1, 8, Time::from_ms(1.1)),
+                "bound {bound_ms}"
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(2), RequestId(0), RequestId(1)],
+                "bound {bound_ms}"
+            );
+            assert_eq!(hit_tokens(&store, 1), Some(20), "bound {bound_ms}");
+        }
+    }
+
+    #[test]
+    fn the_block_policy_stops_admission_at_a_request_past_the_read_wait_bound() {
+        // With a 0.5 ms bound: passed over, request 2 runs at 0.1 ms; blocked,
+        // it waits behind session 9 until the channel drains and session 7's
+        // read lands at 0.8 ms.
+        let first_token_of_request_2 = |policy| {
+            let (store, mut worker, mut events) = read_wait_head(bound(0.5, policy), true);
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events).len(), 3, "{policy:?}");
+            assert_eq!(hit_tokens(&store, 1), Some(20), "{policy:?}");
+            let first_token = store.borrow()[RequestId(2)].telemetry.first_output_time;
+            first_token.expect("request 2 finishes")
+        };
+        assert_eq!(
+            first_token_of_request_2(ReadWaitPolicy::PassOver),
+            Time::from_ms(2.1)
+        );
+        assert_eq!(
+            first_token_of_request_2(ReadWaitPolicy::Block),
+            Time::from_ms(2.8)
+        );
+    }
+
+    #[test]
+    fn warm_start_reads_a_pre_run_context_from_the_slowest_tier() {
+        // A session's first request in the run declares 40 tokens: with warm
+        // start they come from the tier (0.8 ms), without it they are computed.
+        for (warm_start, hit, read_ms) in [(true, 40, 0.8), (false, 0, 0.0)] {
+            let store = shared_with(&[(0, 4, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: warm_start,
+                    ..tiered_config()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(20.0), &mut events);
+            assert_eq!(completed(&events), vec![RequestId(0)]);
+            assert_eq!(hit_tokens(&store, 0), Some(hit));
+            // Stage 0 starts once the read lands.
+            let launches = launched(&events);
+            assert!(
+                launches[0].2 > Time::from_ms(read_ms),
+                "warm_start={warm_start}: {launches:?}"
+            );
+        }
     }
 }

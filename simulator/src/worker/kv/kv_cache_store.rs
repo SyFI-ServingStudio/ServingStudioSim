@@ -464,7 +464,10 @@ impl TieredPrefixKv for KvCacheStore {
         let reads = self.tier_reads.as_mut().expect("a read implies tiers");
         let chain = &mut self.tier_chains[partition as usize];
         if seeded {
-            chain.seed(session_id, self.accounting.resume_positions(hit.tokens, hit.tokens));
+            chain.seed(
+                session_id,
+                self.accounting.resume_positions(hit.tokens, hit.tokens),
+            );
             reads.note_stored(partition, session_id, hit.tokens);
             reads.note_warm_start(partition, hit.tokens);
         }
@@ -734,7 +737,12 @@ impl KvCacheStore {
 
     /// Where a read of the session's `declared` prefix on `partition` would
     /// come from, and whether it is a pre-run context.
-    fn tier_lookup(&self, partition: PartitionId, session_id: u32, declared: u64) -> Option<(TierHit, bool)> {
+    fn tier_lookup(
+        &self,
+        partition: PartitionId,
+        session_id: u32,
+        declared: u64,
+    ) -> Option<(TierHit, bool)> {
         let chain = self.tier_chains.get(partition as usize)?;
         let reads = self.tier_reads.as_ref()?;
         if self.tier_warm_start && declared > reads.stored(partition, session_id) + 1 {
@@ -1164,7 +1172,9 @@ impl KvCacheStore {
             event_kind,
             retain_requested_tokens,
         );
-        if let (Some(evicted), Some(chain)) = (evicted, self.tier_chains.get_mut(partition as usize)) {
+        if let (Some(evicted), Some(chain)) =
+            (evicted, self.tier_chains.get_mut(partition as usize))
+        {
             chain.take_hbm_eviction(evicted);
         }
     }
@@ -1392,7 +1402,11 @@ mod tests {
         );
         admit(&mut kv_store, 1, session(7, 0), 300);
         kv_store.release_retaining_prefix(RequestId(1), 0, Time::ZERO);
-        assert_eq!(tier_hit(&kv_store, 7, 300), Some((1, 300)), "SSD is written through");
+        assert_eq!(
+            tier_hit(&kv_store, 7, 300),
+            Some((1, 300)),
+            "SSD is written through"
+        );
         kv_store.tier_chains[0].take_hbm_eviction(LeavingContext {
             session_id: 7,
             positions: kv_store.accounting.resume_positions(300, 300),
@@ -1428,7 +1442,10 @@ mod tests {
         complete(&mut kv_store, 1, session(1, 0), 6_000);
         kv_store.prefix_caches[0].shrink_to(0);
         let read = plan(&kv_store, 2, session(1, 6_000), 10, Time::ZERO).expect("DRAM holds more");
-        assert_eq!((read.tier, read.hit_tokens, read.resident_tokens), (0, 6_000, 0));
+        assert_eq!(
+            (read.tier, read.hit_tokens, read.resident_tokens),
+            (0, 6_000, 0)
+        );
         assert_eq!(read.hold.reserved_units(), 6_010 + 1);
         kv_store.start_tier_read(0, RequestId(2), session(1, 6_000), read, Time::ZERO);
         assert_eq!(kv_store.ledger.partition_held(0), 6_011);
@@ -1445,7 +1462,10 @@ mod tests {
         assert!(plan(&kv_store, 2, session(1, 6_000), 10, Time::from_ms(7.0)).is_none());
         admit(&mut kv_store, 2, session(1, 6_000), 10);
         let stats = kv_store.tier_reads.as_ref().unwrap().stats(0);
-        assert_eq!((stats.tier_hit_requests[0], stats.tier_hit_tokens[0]), (1, 6_000));
+        assert_eq!(
+            (stats.tier_hit_requests[0], stats.tier_hit_tokens[0]),
+            (1, 6_000)
+        );
         assert_eq!(stats.rereads, 0);
     }
 

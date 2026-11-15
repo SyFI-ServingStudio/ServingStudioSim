@@ -164,7 +164,9 @@ impl TierReads {
     }
 
     pub(crate) fn note_stored(&mut self, partition: PartitionId, session_id: u32, tokens: u64) {
-        let stored = self.stored[partition as usize].entry(session_id).or_insert(0);
+        let stored = self.stored[partition as usize]
+            .entry(session_id)
+            .or_insert(0);
         *stored = (*stored).max(tokens);
     }
 

@@ -33,7 +33,7 @@ use crate::schema::ParamDef;
 use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
 use crate::worker::config::{
     AttnWorkerSel, FfnWorkerSel, ForceScheduleSpec, IterWorkerSel, KvAccountingSpec,
-    KvAdmissionSpec, MicrobatchBudgetSpec, StateRetentionSpec,
+    KvAdmissionSpec, MicrobatchBudgetSpec, PrefixTierSpec, StateRetentionSpec,
 };
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -98,6 +98,7 @@ pub fn list_params() -> Value {
                         ("pipeline_chunked_prefill", MicrobatchBudgetSpec::PARAMS),
                         ("pipeline_chunked_prefill", ForceScheduleSpec::PARAMS),
                         ("pipeline_chunked_prefill", StateRetentionSpec::PARAMS),
+                        ("pipeline_chunked_prefill", PrefixTierSpec::PARAMS),
                         ("pd_prefill", KvAccountingSpec::PARAMS),
                         ("pd_decode", KvAccountingSpec::PARAMS),
                     ],
