@@ -957,6 +957,97 @@ pub(crate) fn resolve_prefix_cache_config(
 mod tests {
     use super::*;
 
+    /// Parse a chunked selector of `kind` with `max_batch_tokens` 8192 plus
+    /// `keys`, and resolve its scheduling options.
+    fn chunked_scheduling(kind: &str, keys: &str) -> Result<WorkerConfig> {
+        let batch_policy = if kind == "chunked_prefill" {
+            "batch_policy: mix\n"
+        } else {
+            ""
+        };
+        let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+            "type: {kind}\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{batch_policy}{keys}"
+        ))
+        .expect("parse chunked worker");
+        let mut config = WorkerConfig::default();
+        worker.apply_chunked_scheduling("t", &mut config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn min_microbatch_tokens_requires_the_even_split() {
+        let pipeline = |keys: &str| chunked_scheduling("pipeline_chunked_prefill", keys);
+        let config = pipeline("").unwrap();
+        assert_eq!(
+            config.microbatch_budget,
+            MicrobatchBudget::default(),
+            "the default is vLLM's greedy fill"
+        );
+        assert_eq!(config.started_order, StartedOrder::StartOrder);
+        assert_eq!(config.force_schedule_after, None);
+
+        let error = pipeline("min_microbatch_tokens: 1024\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only applies with microbatch_split: even"),
+            "{error}"
+        );
+        assert!(pipeline("microbatch_split: even\nmin_microbatch_tokens: 8193\n").is_err());
+        assert_eq!(
+            pipeline("microbatch_split: even\nmin_microbatch_tokens: 1024\n")
+                .unwrap()
+                .microbatch_budget
+                .split,
+            PrefillSplit::Even { min_tokens: 1024 }
+        );
+        // An even split sizes pipeline microbatches; a whole iteration has none.
+        assert!(chunked_scheduling("chunked_prefill", "microbatch_split: even\n").is_err());
+    }
+
+    #[test]
+    fn chunked_prefill_scheduler_options_default_to_vllm_and_validate() {
+        let chunked = |keys: &str| chunked_scheduling("chunked_prefill", keys);
+        let config = chunked("").unwrap();
+        assert_eq!(config.microbatch_budget, MicrobatchBudget::default());
+        assert_eq!(config.started_order, StartedOrder::StartOrder);
+        assert_eq!(config.force_schedule_after, None);
+
+        // The floor needs ordered bounds, the bounds need the floor, and the
+        // floor cannot exceed the cap.
+        let load = |low: u32, lo: u64, hi: u64| {
+            chunked(&format!(
+                "load_budget_low_tokens: {low}\nload_budget_backlog_lo_tokens: {lo}\n\
+                 load_budget_backlog_hi_tokens: {hi}\n"
+            ))
+        };
+        assert!(load(4096, 0, 0).is_err());
+        assert!(load(4096, 3_000_000, 1_000_000).is_err());
+        assert!(load(0, 1_000_000, 3_000_000).is_err());
+        assert!(load(16384, 1_000_000, 3_000_000).is_err());
+        assert_eq!(
+            load(4096, 1_000_000, 3_000_000)
+                .unwrap()
+                .microbatch_budget
+                .load
+                .map(|budget| budget.target(2_000_000, 8192)),
+            Some(6144)
+        );
+
+        let config = chunked(
+            "pending_order: shortest-prefill-first\nsrpt: true\n\
+             long_prefill_token_threshold: 4096\nforce_schedule_after_ms: 2500\n",
+        )
+        .unwrap();
+        assert_eq!(config.started_order, StartedOrder::ShortestRemaining);
+        assert_eq!(
+            config.microbatch_budget.long_prefill_token_threshold,
+            Some(4096)
+        );
+        assert_eq!(config.force_schedule_after, Some(Time::from_ms(2500.0)));
+        assert!(chunked("force_schedule_after_ms: -1.0\n").is_err());
+    }
+
     #[test]
     fn selector_defaults_to_uncapped_opportunistic_prefix_reuse() {
         let worker: IterWorkerSel = serde_yaml::from_str(

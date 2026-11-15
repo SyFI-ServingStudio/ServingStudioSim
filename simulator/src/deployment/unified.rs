@@ -1505,6 +1505,16 @@ mod tests {
     }
 
     #[test]
+    fn least_work_ahead_placement_is_rejected_outside_pp() {
+        let error = placement_into(PlacementPolicy::LeastWorkAhead).unwrap_err();
+        assert!(
+            error.to_string().contains("only for the pp deployment"),
+            "{error}"
+        );
+        assert!(placement_into(PlacementPolicy::RoundRobin).is_ok());
+    }
+
+    #[test]
     fn glm52_unified_config_preserves_ep8_hp_pairing() {
         let yaml = r#"
 deployment: unified

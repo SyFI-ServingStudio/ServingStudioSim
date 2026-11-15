@@ -306,7 +306,10 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
-    use crate::worker::admission::{FifoOrder, PipelinedChunkedPrefillAdmission};
+    use crate::worker::admission::{
+        FifoOrder, LoadBudget, MicrobatchBudget, PendingOrderKind,
+        PipelinedChunkedPrefillAdmission, PrefillSplit, StartedOrder,
+    };
     use crate::worker::execution::UnifiedIterExecution;
     use crate::worker::kv::KvCacheStore;
     use crate::worker::types::WorkerConfig;
@@ -860,5 +863,284 @@ mod tests {
         assert_eq!(balanced.iter().sum::<usize>(), greedy.iter().sum::<usize>());
         assert_eq!(greedy_done.len(), 4);
         assert_eq!(balanced_done.len(), 4);
+    }
+
+    // ── Microbatch budget, srpt and force-schedule ───────────────────────────
+
+    /// A four-stage head with `max_batch_tokens` 2048 over `config`.
+    fn depth4_head(store: SharedRequests, config: WorkerConfig) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                ..config
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    fn with_budget(budget: MicrobatchBudget) -> WorkerConfig {
+        WorkerConfig {
+            microbatch_budget: budget,
+            ..WorkerConfig::default()
+        }
+    }
+
+    const EVEN: MicrobatchBudget = MicrobatchBudget {
+        split: PrefillSplit::Even { min_tokens: 0 },
+        long_prefill_token_threshold: None,
+        load: None,
+    };
+
+    /// Prefill tokens of each launched microbatch, in order.
+    fn launched_tokens(events: &[PipelineHeadEvent]) -> Vec<u64> {
+        launched(events)
+            .into_iter()
+            .map(|(_, tokens, _)| tokens)
+            .collect()
+    }
+
+    /// Each launched microbatch's prefill chunk lengths, sorted.
+    fn launched_chunk_lengths(events: &[PipelineHeadEvent]) -> Vec<Vec<u32>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => {
+                    let mut lengths: Vec<u32> = microbatch.input.groups[0]
+                        .prefill_chunk_pairs
+                        .iter()
+                        .map(|&(_, length)| length)
+                        .collect();
+                    lengths.sort_unstable();
+                    Some(lengths)
+                }
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .collect()
+    }
+
+    fn run_one_prompt(prompt_tokens: u32, config: WorkerConfig, steps: u32) -> Vec<u64> {
+        let store = shared_with(&[(0, prompt_tokens, 1)]);
+        let mut worker = depth4_head(store, config);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..steps {
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
+        }
+        launched_tokens(&events)
+    }
+
+    #[test]
+    fn greedy_sizing_fills_each_microbatch_to_the_cap() {
+        assert_eq!(
+            run_one_prompt(3000, WorkerConfig::default(), 6),
+            vec![2048, 952]
+        );
+    }
+
+    #[test]
+    fn even_sizing_slices_one_prompt_into_depth_equal_pieces() {
+        // In-flight tokens count toward the round, so each slice stays P / 4
+        // instead of shrinking as P/4, 3P/16, ...
+        assert_eq!(
+            run_one_prompt(3000, with_budget(EVEN), 6),
+            vec![750, 750, 750, 750]
+        );
+    }
+
+    #[test]
+    fn even_sizing_counts_in_flight_tokens_when_new_work_arrives() {
+        let store = shared_with(&[(0, 400, 1), (1, 1200, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), with_budget(EVEN));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        // Two slices of 100 are in flight and 200 tokens pending when 1200 more
+        // arrive: the round is 1600, so every later slice is 400.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        for step in 2..8 {
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
+        }
+        assert_eq!(launched_tokens(&events), vec![100, 100, 400, 400]);
+        assert_eq!(worker.in_flight.len(), 4);
+    }
+
+    #[test]
+    fn even_sizing_floor_takes_a_short_prompt_whole_and_never_waits() {
+        let store = shared_with(&[(0, 100, 1), (1, 10, 1)]);
+        let mut worker = depth4_head(
+            Rc::clone(&store),
+            with_budget(MicrobatchBudget {
+                split: PrefillSplit::Even { min_tokens: 1024 },
+                ..MicrobatchBudget::default()
+            }),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        // A later 10-token prompt starts as soon as stage 0 is free, below the
+        // floor and with work in flight: the floor sizes, it never holds.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        worker.tick(Time::from_ms(0.5), &mut events);
+        worker.tick(Time::from_ms(2.0), &mut events);
+        assert_eq!(
+            launched(&events),
+            vec![(1, 100, Time::from_ms(1.0)), (2, 10, Time::from_ms(2.0))]
+        );
+    }
+
+    #[test]
+    fn long_prefill_threshold_leaves_budget_for_a_short_prompt_behind_a_long_one() {
+        let store = shared_with(&[(0, 3000, 1), (1, 100, 1)]);
+        let mut worker = depth4_head(
+            Rc::clone(&store),
+            with_budget(MicrobatchBudget {
+                long_prefill_token_threshold: Some(512),
+                ..MicrobatchBudget::default()
+            }),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
+        }
+        // Without the cap the long prompt takes all 2048 and the short one waits
+        // for the next microbatch; with it both start in the first.
+        assert_eq!(launched_tokens(&events), vec![612, 512, 512, 512]);
+    }
+
+    #[test]
+    fn long_prefill_threshold_caps_the_even_target_per_request() {
+        // The even target is 2000 (8000 / 4); one request may take only 1000.
+        let budget = MicrobatchBudget {
+            long_prefill_token_threshold: Some(1000),
+            ..EVEN
+        };
+        assert_eq!(
+            run_one_prompt(8000, with_budget(budget), 6),
+            vec![1000, 1000, 1000, 1000]
+        );
+    }
+
+    #[test]
+    fn a_load_budget_follows_queued_and_in_flight_tokens() {
+        let budget = MicrobatchBudget {
+            load: Some(LoadBudget {
+                low_tokens: 512,
+                backlog_lo_tokens: 1000,
+                backlog_hi_tokens: 5000,
+            }),
+            ..MicrobatchBudget::default()
+        };
+        // Backlog 3000 tokens (queued, then started plus in flight) is halfway
+        // from 1000 to 5000: the budget sits halfway from 512 to 2048.
+        assert_eq!(
+            run_one_prompt(3000, with_budget(budget), 5),
+            vec![1280, 1280, 440]
+        );
+    }
+
+    fn srpt_config() -> WorkerConfig {
+        WorkerConfig {
+            pending_order: PendingOrderKind::ShortestPrefillFirst,
+            started_order: StartedOrder::ShortestRemaining,
+            ..WorkerConfig::default()
+        }
+    }
+
+    #[test]
+    fn srpt_orders_started_and_queued_prompts_by_remaining_tokens() {
+        let store = shared_with(&[(0, 2156, 1), (1, 10_000, 1), (2, 500, 1)]);
+        let mut worker = depth4_head(store, srpt_config());
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        for step in 1..4 {
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
+        }
+        // Prompt 0's 108-token tail beats the queued 500, which beats the
+        // queued 10000; that one takes the rest and then runs alone.
+        assert_eq!(
+            launched_chunk_lengths(&events),
+            vec![vec![2048], vec![108, 500, 1440], vec![2048]]
+        );
+    }
+
+    /// A 10k-token prompt queued at 0 ms behind one 2048-token prompt arriving
+    /// every ms, each filling a microbatch under shortest-prefill-first and
+    /// srpt; returns the long prompt's prefill tokens processed by 12 ms.
+    fn starved_prompt_progress(force_schedule_after: Option<Time>) -> u32 {
+        let mut requests = vec![(0, 10_000, 1)];
+        requests.extend((1..=12).map(|id| (id, 2048, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=12 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = depth4_head(
+            Rc::clone(&store),
+            WorkerConfig {
+                force_schedule_after,
+                ..srpt_config()
+            },
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        for step in 0..12_u32 {
+            let start = Time::from_ms(f64::from(step));
+            let end = Time::from_ms(f64::from(step + 1));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(step + 1)));
+            let mut now = start;
+            loop {
+                exits.retain(|&(microbatch, at)| {
+                    let due = at <= now;
+                    if due {
+                        worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+                    }
+                    !due
+                });
+                let mut events = Vec::new();
+                let wakeup = worker.tick(now, &mut events);
+                for (id, _, ready) in launched(&events) {
+                    exits.push((id, ready + Time::from_ms(1.0)));
+                }
+                let next = [wakeup, exits.iter().map(|&(_, at)| at).min()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                match next {
+                    Some(next) if next > now && next < end => now = next,
+                    _ => break,
+                }
+            }
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_runs_before_shorter_ones() {
+        // Shortest-prefill-first and srpt alone: every microbatch goes to a
+        // newer, shorter prompt.
+        assert_eq!(starved_prompt_progress(None), 0);
+        // Overdue at 5 ms, it takes whole microbatches from then on: at least
+        // three have left the pipeline by 12 ms.
+        let progress = starved_prompt_progress(Some(Time::from_ms(5.0)));
+        assert!(progress >= 3 * 2048, "progress {progress}");
     }
 }

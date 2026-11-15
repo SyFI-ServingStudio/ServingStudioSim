@@ -246,7 +246,9 @@ mod tests {
     use crate::arch::contract::IterwiseUnifiedModel;
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
-    use crate::worker::admission::{FifoOrder, ShortestJobFirst};
+    use crate::worker::admission::{
+        FifoOrder, LoadBudget, MicrobatchBudget, PendingOrderKind, ShortestJobFirst, StartedOrder,
+    };
     use crate::worker::config::{BoundedFutureKvAdmissionConfig, DpPlacement};
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
@@ -638,6 +640,189 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    fn chunked_worker_with(
+        store: SharedRequests,
+        model: FakeModel,
+        config: WorkerConfig,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(model),
+            store,
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Form one iteration at `now`, then complete it 1 ms later.
+    fn run_iteration(worker: &mut ChunkedPrefillWorker<FakeModel>, now: Time) {
+        assert!(worker.form_batch(now));
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            now + Time::from_ms(1.0),
+        );
+    }
+
+    /// Form one iteration at `now`; returns each DP group's prefill chunks.
+    fn formed_chunk_pairs(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        now: Time,
+    ) -> Vec<Vec<(u32, u32)>> {
+        assert!(worker.form_batch(now));
+        let mut input: crate::arch::UnifiedArchInput = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        input
+            .groups
+            .into_iter()
+            .map(|group| group.prefill_chunk_pairs)
+            .collect()
+    }
+
+    /// A 5000-token prompt queued at 0 ms behind one 1000-token prompt arriving
+    /// every ms, each filling an iteration under shortest-prefill-first;
+    /// returns the long prompt's prefill tokens processed after 8 iterations.
+    fn starved_spf_progress(force_schedule_after: Option<Time>) -> u32 {
+        let mut requests = vec![(0, 5_000, 1)];
+        requests.extend((1..=8).map(|id| (id, 1_000, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=8 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(1_000),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                force_schedule_after,
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for step in 0..8_u32 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(step + 1)));
+            run_iteration(&mut worker, Time::from_ms(f64::from(step)));
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_leaves_the_spf_queue_first() {
+        assert_eq!(starved_spf_progress(None), 0, "SPF alone starves it");
+        // Overdue at 3 ms: it starts then and, started, keeps its place.
+        assert_eq!(starved_spf_progress(Some(Time::from_ms(3.0))), 5_000);
+    }
+
+    /// A 5000-token prompt starts alone under a 2048-token budget; a 500-token
+    /// prompt then queues. Returns the next iteration's prefill chunks.
+    fn chunks_after_a_short_prompt_queues_behind_a_long_one(
+        started_order: StartedOrder,
+    ) -> Vec<(u32, u32)> {
+        let store = shared_with(&[(0, 5_000, 1), (1, 500, 1)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                started_order,
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        run_iteration(&mut worker, Time::ZERO);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let mut chunks = formed_chunk_pairs(&mut worker, Time::from_ms(1.0)).remove(0);
+        chunks.sort_unstable();
+        chunks
+    }
+
+    #[test]
+    fn srpt_runs_a_queued_prompt_shorter_than_the_started_one_first() {
+        // vLLM order: the started prompt's 2952 tokens left fill the budget.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(StartedOrder::StartOrder),
+            [(2_048, 2_048)]
+        );
+        // srpt: the queued 500 go first; the started prompt takes the rest.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(StartedOrder::ShortestRemaining),
+            [(0, 500), (2_048, 1_548)]
+        );
+    }
+
+    #[test]
+    fn a_load_budget_follows_each_dp_rank_own_backlog() {
+        // Round-robin: rank 0 queues 3000 tokens, rank 1 800.
+        let store = shared_with(&[(0, 3_000, 1), (1, 800, 1)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::with_dp_groups(1.0, 2),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                dp_placement: DpPlacement::RoundRobin,
+                microbatch_budget: MicrobatchBudget {
+                    load: Some(LoadBudget {
+                        low_tokens: 512,
+                        backlog_lo_tokens: 1_000,
+                        backlog_hi_tokens: 5_000,
+                    }),
+                    ..MicrobatchBudget::default()
+                },
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        // Rank 0's backlog is halfway from 1000 to 5000: halfway from 512 to
+        // 2048. Rank 1's is below 1000: the floor. One shared backlog (3800)
+        // would give both ranks 1459.
+        assert_eq!(
+            formed_chunk_pairs(&mut worker, Time::ZERO),
+            [vec![(0, 1_280)], vec![(0, 512)]]
+        );
+    }
+
+    #[test]
+    fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
+        let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                microbatch_budget: MicrobatchBudget {
+                    long_prefill_token_threshold: Some(4_096),
+                    ..MicrobatchBudget::default()
+                },
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        // Uncapped, the long prompt would take all 8192 and the short one wait.
+        assert_eq!(
+            formed_chunk_pairs(&mut worker, Time::ZERO),
+            [vec![(0, 4_096), (0, 100)]]
+        );
     }
 
     #[test]
