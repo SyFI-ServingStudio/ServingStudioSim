@@ -42,7 +42,8 @@ pub(super) fn read_pipeline_stages(log_dir: &Path) -> Result<PipelineStages> {
 }
 
 /// Every pipelined worker's stage, after checking that each pipelined pool is
-/// exactly stages `0..N` whose layer ranges tile one contiguous range from layer 0.
+/// `R >= 1` whole pipelines (replicas): every stage `0..N` appears `R` times with
+/// one layer range, and those ranges tile one contiguous range from layer 0.
 /// A pool is pipelined when any of its workers is a stage; then all must be.
 pub(super) fn pipeline_stages(
     manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
@@ -71,25 +72,33 @@ pub(super) fn pipeline_stages(
         if let Some(plain) = plain_workers_by_pool.get(pool_tag) {
             bail!("pool {pool_tag:?} mixes pipeline stages with {plain} non-stage worker(s)");
         }
-        pool_stages.sort_by_key(|stage| stage.index);
+        pool_stages.sort_by_key(|stage| (stage.index, stage.layers));
         let num_stages = pool_stages[0].num_stages;
+        let replicas = pool_stages.len() / usize::from(num_stages).max(1);
+        if replicas == 0 || pool_stages.len() != replicas * usize::from(num_stages) {
+            bail!(
+                "pool {pool_tag:?} has {} pipeline stage workers, not a whole number of \
+                 {num_stages}-stage pipelines",
+                pool_stages.len()
+            );
+        }
         let mut next_layer = 0;
-        for (position, stage) in pool_stages.iter().enumerate() {
-            if usize::from(stage.index) != position || stage.num_stages != num_stages {
+        for (index, replica_stages) in pool_stages.chunks(replicas).enumerate() {
+            let stage = replica_stages[0];
+            if replica_stages.iter().any(|other| {
+                usize::from(other.index) != index
+                    || other.num_stages != num_stages
+                    || other.layers != stage.layers
+            }) {
                 bail!(
-                    "pool {pool_tag:?} pipeline stages are not exactly 0..{num_stages}: {pool_stages:?}"
+                    "pool {pool_tag:?} pipeline stages are not {replicas} x exactly \
+                     0..{num_stages}: {pool_stages:?}"
                 );
             }
             if stage.layers.0 != next_layer || stage.layers.1 <= stage.layers.0 {
                 bail!("pool {pool_tag:?} stage layer ranges do not tile: {pool_stages:?}");
             }
             next_layer = stage.layers.1;
-        }
-        if pool_stages.len() != usize::from(num_stages) {
-            bail!(
-                "pool {pool_tag:?} has {} of its {num_stages} pipeline stages",
-                pool_stages.len()
-            );
         }
     }
     Ok(stages)
@@ -216,6 +225,35 @@ mod tests {
 
         assert!(pipeline_stages(&pool(&[(0, 5), (6, 10)])).is_err());
         assert!(pipeline_stages(&pool(&[(1, 5), (5, 10)])).is_err());
+
+        // Replicated pipelines: every stage index once per replica, one range each.
+        let replicated =
+            |ranges: &[(u16, u32, u32)], num_stages: u16| -> BTreeMap<(String, u16), ManifestDoc> {
+                ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(worker_id, &(index, start, end))| {
+                        (
+                            ("stage".to_string(), worker_id as u16),
+                            manifest(&stage_label(index, num_stages, start, end)),
+                        )
+                    })
+                    .collect()
+            };
+        let two_by_two = pipeline_stages(&replicated(
+            &[(0, 0, 5), (1, 5, 10), (0, 0, 5), (1, 5, 10)],
+            2,
+        ))
+        .unwrap();
+        assert_eq!(two_by_two[&("stage".to_string(), 3)].layers, (5, 10));
+        let eight_by_one = pipeline_stages(&replicated(&[(0, 0, 45); 8], 1)).unwrap();
+        assert_eq!(eight_by_one.len(), 8);
+        assert!(pipeline_stages(&replicated(&[(0, 0, 5), (1, 5, 10), (0, 0, 5)], 2)).is_err());
+        assert!(pipeline_stages(&replicated(
+            &[(0, 0, 5), (1, 5, 10), (0, 0, 6), (1, 6, 10)],
+            2
+        ))
+        .is_err());
 
         let mut mixed = pool(&[(0, 5), (5, 10)]);
         mixed.insert(("stage".to_string(), 2), manifest("plain worker"));
