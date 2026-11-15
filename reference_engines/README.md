@@ -32,7 +32,8 @@ against BASE.yaml, applies the patches (any path: the whole tree is built),
 builds the vendor wheels and the engine as `build.sh` does, and adds the guard,
 the Sim code and the manifest. It has no capture interpreter or req-frontend
 and serves no profile env yet; it runs DeepInfer's own `examples/benchmark.py`
-(its patch adds `--profiler nsys`). `materialize` checks the pins but does
+(patches: `--profiler nsys` for nsys captures; CPU binding within the
+cores a Slurm job grants). `materialize` checks the pins but does
 not fetch the submodules. Only the amd64 image has been built.
 
 Both vLLM and SGLang bases are main/nightly builds, not releases: vLLM is on main because

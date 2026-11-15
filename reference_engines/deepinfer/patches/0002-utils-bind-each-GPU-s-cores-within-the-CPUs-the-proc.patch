@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Sat, 14 Nov 2026 23:19:52 -0800
+Subject: [PATCH] utils: bind each GPU's cores within the CPUs the process may
+ use
+
+bind_cpu took range(local_rank * n, (local_rank + 1) * n) with
+n = physical cores // GPUs on the host, which assumes the process owns the
+whole host. Under a Slurm job's cpuset (cayenne 4-GPU job: CPUs
+0-27,56-83 + siblings) ranks 2 and 3 asked for CPUs 28-55 and
+sched_setaffinity failed with EINVAL. Take the same n cores in order from
+the physical cores the process may run on at import: identical on a whole
+host, the job's own cores under a scheduler. get_idle_cpus follows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ deepinfer/utils.py | 37 +++++++++++++++++++++++++++++--------
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/deepinfer/utils.py b/deepinfer/utils.py
+index 10810c7710edfe3a1935bd358262d0ff1b5357db..fcccf4cd54ff40be12a93b9a89354557bf025366 100644
+--- a/deepinfer/utils.py
++++ b/deepinfer/utils.py
+@@ -140,11 +140,33 @@ def allow_cuda_sync() -> AbstractContextManager[None]:
+     return _sync_debug_arbiter.scope("allow")
+ 
+ 
+-def bind_cpu(local_rank: int) -> None:
++# The CPUs this process may run on, before bind_cpu narrows them to one GPU's share (get_idle_cpus
++# runs after it).
++_ALLOWED_CPUS = frozenset(os.sched_getaffinity(0))
++
++
++def _gpu_cpus(local_rank: int) -> list[int]:
++    """This GPU's share of the host's physical cores: phy_cpus // (GPUs on the host) of them.
++
++    Taken in order from the physical cores (CPU ids below phy_cpus, as before) this process could
++    run on at import, so on a whole host it is range(local_rank * n, (local_rank + 1) * n) as before, and
++    under a scheduler that grants a subset (a Slurm job's cpuset) it is the same number of cores
++    from that subset rather than ids the process is not allowed to use.
++    """
+     phy_cpus = psutil.cpu_count(logical=False)
+-    ngpus = get_actual_num_gpus()
+-    num_cpus_per_gpu = phy_cpus // ngpus
+-    bind_cpus = list(range(local_rank * num_cpus_per_gpu, (local_rank + 1) * num_cpus_per_gpu))
++    num_cpus_per_gpu = phy_cpus // get_actual_num_gpus()
++    allowed = sorted(cpu for cpu in _ALLOWED_CPUS if cpu < phy_cpus)
++    cpus = allowed[local_rank * num_cpus_per_gpu : (local_rank + 1) * num_cpus_per_gpu]
++    if len(cpus) < num_cpus_per_gpu:
++        raise RuntimeError(
++            f"GPU {local_rank} needs {num_cpus_per_gpu} physical cores, "
++            f"but this process may run on only {len(allowed)} ({allowed})"
++        )
++    return cpus
++
++
++def bind_cpu(local_rank: int) -> None:
++    bind_cpus = _gpu_cpus(local_rank)
+     logger.info(f"bind_cpu gpu_id: {local_rank}, cpus: {bind_cpus}.")
+     import deep_cluster.topology
+ 
+@@ -152,13 +174,12 @@ def bind_cpu(local_rank: int) -> None:
+ 
+ 
+ def get_idle_cpus(local_rank: int) -> list[int]:
+-    phy_cpus = psutil.cpu_count(logical=False)
+-    num_cpus_per_gpu = phy_cpus // get_actual_num_gpus()
++    gpu_cpus = _gpu_cpus(local_rank)
++    num_cpus_per_gpu = len(gpu_cpus)
+     so_builder_cpus = envs.DEEPINFER_SO_BUILDER_CPUS
+     if so_builder_cpus > num_cpus_per_gpu:
+         raise RuntimeError(f"num_cpus_per_gpu={num_cpus_per_gpu} 不足以容纳 SO builder 绑核 (so_builder_cpus={so_builder_cpus})")
+-    start = local_rank * num_cpus_per_gpu
+-    return list(range(start, start + so_builder_cpus))
++    return gpu_cpus[:so_builder_cpus]
+ 
+ 
+ @cpu_timer.record("try_concat")
