@@ -354,13 +354,14 @@ impl KvAccounting {
         if options.state_retention.keeps_earlier() {
             ensure!(
                 resume_points == PrefixResumePoints::ContextEnd && resume_interval.is_none(),
-                "recurrent_state_checkpoints > 1 keeps the states left at earlier context ends: \
-                 it needs prefix_resume_points: context_end and no prefix_resume_interval"
+                "recurrent_state_checkpoints > 1 or recurrent_state_anchors keep states left at \
+                 earlier context ends: they need prefix_resume_points: context_end and no \
+                 prefix_resume_interval"
             );
             ensure!(
                 windows.iter().all(|part| !part.prefix_reusable),
-                "recurrent_state_checkpoints > 1 does not charge a reusable sliding window's tail \
-                 at an earlier state"
+                "recurrent_state_checkpoints > 1 or recurrent_state_anchors do not charge a \
+                 reusable sliding window's tail at an earlier state"
             );
         }
 

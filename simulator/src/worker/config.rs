@@ -326,9 +326,27 @@ pub struct StateRetentionSpec {
     #[serde(default = "one_state")]
     #[param(default = 1)]
     recurrent_state_checkpoints: u32,
+    /// When > 0, a retained context keeps instead the latest handed-back
+    /// decode's end, the latest pass's end, and this many anchors: the latest
+    /// earlier pass ends of rounds (counted along the session's lineage) that
+    /// are a multiple of `recurrent_state_anchor_stride`. Stride 2 records an
+    /// anchor every other round, so the kept anchor is one to two rounds back
+    /// at a constant state count. Needs `recurrent_state_checkpoints: 1`. Not
+    /// vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    recurrent_state_anchors: u32,
+    /// Round stride of `recurrent_state_anchors` (>= 1). Not vLLM.
+    #[serde(default = "one_round")]
+    #[param(default = 1)]
+    recurrent_state_anchor_stride: u32,
 }
 
 const fn one_state() -> u32 {
+    1
+}
+
+const fn one_round() -> u32 {
     1
 }
 
@@ -336,6 +354,8 @@ impl Default for StateRetentionSpec {
     fn default() -> Self {
         Self {
             recurrent_state_checkpoints: one_state(),
+            recurrent_state_anchors: 0,
+            recurrent_state_anchor_stride: one_round(),
         }
     }
 }
@@ -347,8 +367,19 @@ impl StateRetentionSpec {
             self.recurrent_state_checkpoints >= 1,
             "{owner}: recurrent_state_checkpoints must be >= 1 (a context keeps its end state)"
         );
-        Ok(StateRetention::Latest {
-            k: self.recurrent_state_checkpoints,
+        if self.recurrent_state_anchors == 0 {
+            return Ok(StateRetention::Latest {
+                k: self.recurrent_state_checkpoints,
+            });
+        }
+        ensure!(
+            self.recurrent_state_checkpoints == 1 && self.recurrent_state_anchor_stride >= 1,
+            "{owner}: recurrent_state_anchors needs recurrent_state_checkpoints: 1 and \
+             recurrent_state_anchor_stride >= 1"
+        );
+        Ok(StateRetention::Anchors {
+            count: self.recurrent_state_anchors,
+            stride: self.recurrent_state_anchor_stride,
         })
     }
 }
@@ -1586,6 +1617,19 @@ mod tests {
             StateRetention::Latest { k: 2 }
         );
         assert!(pipeline("recurrent_state_checkpoints: 0\n").is_err());
+        assert_eq!(
+            pipeline("recurrent_state_anchors: 2\nrecurrent_state_anchor_stride: 2\n")
+                .unwrap()
+                .state_retention,
+            StateRetention::Anchors {
+                count: 2,
+                stride: 2
+            }
+        );
+        assert!(pipeline("recurrent_state_anchors: 1\nrecurrent_state_checkpoints: 2\n").is_err());
+        assert!(
+            pipeline("recurrent_state_anchors: 1\nrecurrent_state_anchor_stride: 0\n").is_err()
+        );
     }
 
     fn prefix_tiers(keys: &str) -> Result<WorkerConfig> {

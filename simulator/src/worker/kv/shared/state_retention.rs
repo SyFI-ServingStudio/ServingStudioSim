@@ -14,6 +14,9 @@
 //! A round whose decode runs elsewhere leaves two states: its pass's end at
 //! the prompt's end, and the handed-back decode's end at the context's end
 //! ([`StateTag::handback`]).
+//!
+//! The rules take no tuned parameter: [`StateRetention::Latest`] keeps a count,
+//! [`StateRetention::Anchors`] a count and a round stride, both the user's.
 
 /// What a round-end state is, beside where it sits: the round that computed
 /// it, counted along the session's lineage (one past the round of the state
@@ -67,6 +70,14 @@ pub enum StateRetention {
     /// The latest `k` round-end states, the end's included
     /// (`recurrent_state_checkpoints`). `k = 1` keeps only the end.
     Latest { k: u32 },
+    /// The latest handed-back decode's end, the latest pass's end, and
+    /// `count` anchors: walking back from that pass, the earlier passes' ends
+    /// of rounds before it that are a multiple of `stride`
+    /// (`recurrent_state_anchors`, `recurrent_state_anchor_stride`). Stride 2
+    /// records an anchor every other round, so the kept anchor is one to two
+    /// rounds back at a constant state count; stride 1 keeps the latest
+    /// earlier pass ends.
+    Anchors { count: u32, stride: u32 },
 }
 
 impl Default for StateRetention {
@@ -80,6 +91,7 @@ impl StateRetention {
     pub(crate) fn keeps_earlier(self) -> bool {
         match self {
             Self::Latest { k } => k > 1,
+            Self::Anchors { .. } => true,
         }
     }
 
@@ -89,6 +101,30 @@ impl StateRetention {
         match self {
             Self::Latest { k } => {
                 states.drain(..states.len().saturating_sub(k as usize));
+                states
+            }
+            Self::Anchors { count, stride } => {
+                let handback = states.iter().rposition(|state| state.tag.handback);
+                let pass = states.iter().rposition(|state| !state.tag.handback);
+                let mut keep = vec![false; states.len()];
+                for index in handback.into_iter().chain(pass) {
+                    keep[index] = true;
+                }
+                if let Some(pass) = pass {
+                    let current = states[pass].tag.round;
+                    let anchors = (0..pass)
+                        .rev()
+                        .filter(|&index| {
+                            let tag = states[index].tag;
+                            !tag.handback && tag.round < current && tag.round % stride.max(1) == 0
+                        })
+                        .take(count as usize);
+                    for index in anchors.collect::<Vec<_>>() {
+                        keep[index] = true;
+                    }
+                }
+                let mut kept = keep.into_iter();
+                states.retain(|_| kept.next().unwrap_or(false));
                 states
             }
         }
@@ -162,6 +198,58 @@ mod tests {
             latest.survivors(&at(&[1, 2, 3]), StateTag::default(), 2),
             at(&[3])
         );
+    }
+
+    fn tagged(at: u64, round: u32, handback: bool) -> RoundState {
+        RoundState {
+            at,
+            tag: StateTag { round, handback },
+        }
+    }
+
+    #[test]
+    fn anchors_keep_the_latest_hand_back_and_pass_and_strided_earlier_passes() {
+        let anchors = StateRetention::Anchors {
+            count: 1,
+            stride: 2,
+        };
+        // Rounds 0..=3, each a pass end then a hand-back.
+        let states: Vec<RoundState> = (0..4)
+            .flat_map(|round| {
+                let at = 100 * u64::from(round + 1);
+                [tagged(at, round, false), tagged(at + 50, round, true)]
+            })
+            .collect();
+        assert_eq!(
+            anchors.keep(states.clone()),
+            [
+                tagged(300, 2, false),
+                tagged(400, 3, false),
+                tagged(450, 3, true)
+            ],
+            "round 2 is the latest even round before round 3"
+        );
+        let stride_one = StateRetention::Anchors {
+            count: 2,
+            stride: 1,
+        };
+        assert_eq!(
+            stride_one.keep(states.clone()),
+            [
+                tagged(200, 1, false),
+                tagged(300, 2, false),
+                tagged(400, 3, false),
+                tagged(450, 3, true)
+            ]
+        );
+        // A round resuming from round 3's hand-back adds a round-4 pass end
+        // and hand-back: of the states up to the resume point, only round
+        // 2's pass end stays, as the anchor.
+        assert_eq!(
+            anchors.survivors(&states, StateTag::handed_back(Some(states[6])), 2),
+            [tagged(300, 2, false)]
+        );
+        assert!(anchors.keeps_earlier());
     }
 
     #[test]

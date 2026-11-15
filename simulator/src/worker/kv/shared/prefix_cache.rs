@@ -693,6 +693,11 @@ mod tests {
 
     /// [`end_state_cache`] keeping up to `states` round-end states per entry.
     fn round_end_cache(capacity: u64, states: u32) -> PrefixCache {
+        retention_cache(capacity, StateRetention::Latest { k: states })
+    }
+
+    /// [`end_state_cache`] keeping the round-end states `retention` picks.
+    fn retention_cache(capacity: u64, retention: StateRetention) -> PrefixCache {
         let layout = KvCacheLayout::new()
             .with_part(KvCachePart::per_token("kv", 1))
             .with_part(KvCachePart::per_request("state", 500));
@@ -700,7 +705,7 @@ mod tests {
             &layout,
             KvAccountingOptions {
                 resume_points: Some(PrefixResumePoints::ContextEnd),
-                state_retention: StateRetention::Latest { k: states },
+                state_retention: retention,
                 ..KvAccountingOptions::default()
             },
             capacity,
@@ -971,6 +976,110 @@ mod tests {
         assert_eq!(cache.peek(1, 1_350), 1_300);
         assert_eq!(cache.peek(1, 1_100), 1_000);
         assert_eq!(cache.used_units(), 1_600 + 3 * 500);
+    }
+
+    fn anchor_cache(count: u32, stride: u32) -> PrefixCache {
+        retention_cache(1_000_000, StateRetention::Anchors { count, stride })
+    }
+
+    /// One pipeline round whose decode runs elsewhere: the request takes the
+    /// entry (sharing `declared`), retains its prompt's context to
+    /// `prompt_end`, and the decode hands back 10 more tokens.
+    fn hand_back_round(cache: &mut PrefixCache, declared: u64, prompt_end: u64) {
+        cache.take(1, declared as u32);
+        let carried = cache.take_carried(1);
+        cache.share(1, prompt_end, declared, carried, 1_000_000);
+        let positions = cache
+            .accounting
+            .resume_positions(prompt_end, prompt_end + 10);
+        cache.hand_back(1, positions, prompt_end, 1_000_000);
+    }
+
+    /// Rounds `0..rounds`: round r's prompt ends at 1_000 (r + 1), and the
+    /// next round extends its handed-back context.
+    fn hand_back_rounds(cache: &mut PrefixCache, rounds: u64) -> Vec<Vec<(u64, u32, bool)>> {
+        (0..rounds)
+            .map(|round| {
+                let declared = if round == 0 { 0 } else { 1_000 * round + 11 };
+                hand_back_round(cache, declared, 1_000 * (round + 1));
+                entry_states(cache)
+            })
+            .collect()
+    }
+
+    /// The session's entry's states: (position, round, hand-back).
+    fn entry_states(cache: &PrefixCache) -> Vec<(u64, u32, bool)> {
+        cache.entries[&1]
+            .states()
+            .map(|state| (state.at, state.tag.round, state.tag.handback))
+            .collect()
+    }
+
+    #[test]
+    fn stride_two_anchors_keep_a_prefill_end_one_to_two_rounds_back() {
+        let mut cache = anchor_cache(1, 2);
+        assert_eq!(
+            hand_back_rounds(&mut cache, 6),
+            [
+                vec![(1_000, 0, false), (1_010, 0, true)],
+                // The current prefill end and round 0's.
+                vec![(1_000, 0, false), (2_000, 1, false), (2_010, 1, true)],
+                vec![(1_000, 0, false), (3_000, 2, false), (3_010, 2, true)],
+                // Round 2 is an anchor once round 3 runs: one round back.
+                vec![(3_000, 2, false), (4_000, 3, false), (4_010, 3, true)],
+                vec![(3_000, 2, false), (5_000, 4, false), (5_010, 4, true)],
+                vec![(5_000, 4, false), (6_000, 5, false), (6_010, 5, true)],
+            ]
+        );
+        // Two anchors at stride 2 keep rounds 2 and 4; stride 1 the latest
+        // earlier prefill ends.
+        for (count, stride, anchors) in [(2, 2, [3_000, 5_000]), (2, 1, [4_000, 5_000])] {
+            let mut cache = anchor_cache(count, stride);
+            hand_back_rounds(&mut cache, 6);
+            let at: Vec<u64> = entry_states(&cache).iter().map(|state| state.0).collect();
+            assert_eq!(
+                at,
+                [anchors[0], anchors[1], 6_000, 6_010],
+                "m{count}s{stride}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inside_round_resumes_from_the_deepest_anchor_at_or_before_its_prefix() {
+        let mut cache = anchor_cache(1, 2);
+        hand_back_rounds(&mut cache, 6);
+        // States at 5_000 (round 4), 6_000 and 6_010.
+        assert_eq!(cache.peek(1, 6_011), 6_010);
+        assert_eq!(cache.peek(1, 6_005), 6_000);
+        assert_eq!(cache.peek(1, 5_500), 5_000);
+        assert_eq!(cache.peek(1, 4_999), 0, "older states were not kept");
+        // The inside round resumes at round 4's state, so it is round 5 of
+        // its lineage: the states past its prefix go, round 4 stays its anchor.
+        hand_back_round(&mut cache, 5_500, 5_800);
+        assert_eq!(
+            entry_states(&cache),
+            [(5_000, 4, false), (5_800, 5, false), (5_810, 5, true)]
+        );
+    }
+
+    #[test]
+    fn every_kept_anchor_state_is_charged_and_carried_states_stay_charged() {
+        let mut cache = anchor_cache(1, 2);
+        hand_back_rounds(&mut cache, 3);
+        // 3_010 tokens and states at 1_000, 3_000 and 3_010.
+        assert_eq!(cache.used_units(), 3_010 + 3 * 500);
+        // Round 3 takes the entry: it carries the states that survive its
+        // pass, still charged, while its own state is live. HBM leaves room
+        // for one added state only, so the hand-back end at 3_010 survives
+        // beside the round-2 anchor at 3_000.
+        cache.take(1, 3_011);
+        assert_eq!(cache.used_units(), 2 * 500);
+        let carried = cache.take_carried(1);
+        assert_eq!(positions(&carried), [3_000, 3_010]);
+        assert_eq!(carried.resume.map(|tag| tag.round), Some(2));
+        cache.share(1, 4_000, 3_011, carried, 1_000_000);
+        assert_eq!(cache.used_units(), 4_000 + 3 * 500);
     }
 
     #[test]

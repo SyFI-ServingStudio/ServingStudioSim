@@ -1663,6 +1663,70 @@ mod tests {
         assert_eq!(positions_of(&chain.read_states(1, hit)), [100, 120]);
     }
 
+    fn tag(round: u32, handback: bool) -> StateTag {
+        StateTag { round, handback }
+    }
+
+    /// m1s2 anchors with a hand-back per round, over victim tiers of 1000 B
+    /// per token read at 1 GB/s, a state 50k tier tokens; HBM evicts session
+    /// 1's context ending at round 4's decode (5_010k), with round 4's
+    /// prefill end and round 2's anchor.
+    fn anchor_chain(specs: &[TierSpec]) -> TierChain {
+        let mut chain = TierChain::new(
+            specs,
+            TierBytes {
+                per_token: 1000,
+                state: 50_000_000,
+            },
+            StateRetention::Anchors {
+                count: 1,
+                stride: 2,
+            },
+            TierStateOptions {
+                added_per_round: 2,
+                ..TierStateOptions::default()
+            },
+        );
+        chain.take_hbm_eviction(LeavingContext {
+            session_id: 1,
+            positions: at(5_010_000),
+            end: tag(4, true),
+            earlier: vec![
+                RoundState {
+                    at: 3_000_000,
+                    tag: tag(2, false),
+                },
+                RoundState {
+                    at: 5_000_000,
+                    tag: tag(4, false),
+                },
+            ],
+        });
+        chain
+    }
+
+    #[test]
+    fn a_read_moves_the_anchors_that_survive_its_round_and_charges_every_state() {
+        let mut chain = anchor_chain(&[spec(DRAM, 10.0, 1.0, TierWrites::Evictions)]);
+        assert_eq!(chain.used_units(0), 5_010_000 + 3 * 50_000);
+        assert_eq!(chain.earlier_states(0), 2);
+        // An extending round resumes at the decode end: of the earlier states
+        // only round 4's prefill end survives it (the next anchor).
+        let hit = chain.lookup(1, 5_010_001).unwrap();
+        assert_eq!(hit.tokens, 5_010_000);
+        assert_eq!(positions_of(&chain.read_states(1, hit)), [5_000_000]);
+        assert_eq!(chain.read_units(1, hit, 0), 5_010_000 + 2 * 50_000);
+        // An inside round resumes at the round-2 anchor and moves it alone.
+        let hit = chain.lookup(1, 4_000_000).unwrap();
+        assert_eq!(hit.tokens, 3_000_000);
+        assert!(chain.read_states(1, hit).is_empty());
+        assert_eq!(chain.read_units(1, hit, 0), 3_000_000 + 50_000);
+        let read = chain.read(1, hit, 0, Time::ZERO);
+        assert!(read.earlier.is_empty());
+        assert_eq!(read.end, tag(2, false));
+        assert_eq!(chain.counters(0).loaded_states, 1);
+    }
+
     #[test]
     fn a_victim_merge_keeps_the_longer_context_and_the_latest_k_states() {
         let mut chain = chain(&[spec(DRAM, 1e-2, 1e-3, TierWrites::Evictions)], 0, 2);
