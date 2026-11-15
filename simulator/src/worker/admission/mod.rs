@@ -9,10 +9,12 @@ mod chunked_prefill_admission;
 mod decode_completion;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
+mod microbatch_budget;
 mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod started_order;
 mod token_budget;
 
 pub(crate) use chunked_prefill_admission::ChunkEndAlignment;
@@ -22,15 +24,17 @@ pub use decode_completion::{
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
+pub use microbatch_budget::{LoadBudget, MicrobatchBudget, PrefillSplit};
 pub use pipelined_chunked_prefill_admission::PipelinedChunkedPrefillAdmission;
 pub use placement::LoadBalance;
 pub(crate) use placement::PartitionLoad;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
-    AdmissionCandidate, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,
+    AdmissionCandidate, Deadline, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub use started_order::StartedOrder;
 pub(crate) use token_budget::prefill_fits_budget;
 
 pub trait IterAdmission<K: KvStore> {

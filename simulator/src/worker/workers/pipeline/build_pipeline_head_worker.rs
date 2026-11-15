@@ -91,9 +91,14 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let mut admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
-    };
+    }
+    .with_microbatch_budget(config.microbatch_budget, layout.depth)
+    .with_started_order(config.started_order);
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
+    }
+    if let Some(after) = config.force_schedule_after {
+        admission = admission.with_force_schedule_after(after);
     }
 
     PipelineHeadWorker::from_components(

@@ -574,6 +574,15 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// How much prefill a pipeline microbatch, or a chunked-prefill DP rank's
+    /// share of an iteration, takes. Only the two chunked recipes read it.
+    pub microbatch_budget: crate::worker::admission::MicrobatchBudget,
+    /// Order of started prompts against queued ones (the selector's `srpt`).
+    /// Only the two chunked recipes read it.
+    pub started_order: crate::worker::admission::StartedOrder,
+    /// Wait after which a queued request is served before the rest; `None`:
+    /// no bound. Only the two chunked recipes read it.
+    pub force_schedule_after: Option<crate::common::Time>,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -627,6 +636,9 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            microbatch_budget: crate::worker::admission::MicrobatchBudget::default(),
+            started_order: crate::worker::admission::StartedOrder::StartOrder,
+            force_schedule_after: None,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,
