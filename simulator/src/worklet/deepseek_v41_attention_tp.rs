@@ -55,6 +55,17 @@
 //!   entry mHC, the input projections, the q/kv norm, the SWA KV insert, the
 //!   compressor and the index-K store run; `wq_b`, the indexer Q path and
 //!   scoring, attention, `wo_a`, `wo_b` and the all-reduce do not.
+//!
+//! [`DeepseekV41AttentionDeepInfer`] swaps in DeepInfer's launches where its
+//! kernels have their own kinds (DeepInfer a679bb8): the entry mHC (DeepGEMM
+//! `mega_mhc` with its FP8 cast; TileKernels' shifted pre at layer 0), the
+//! prefill indexer scoring ([`DeepseekV41DeepInferIndexerOp`]) and the prefill
+//! core attention (FlashMLA `fused_norm_rope_attn_rope_cast.prefill`). DeepInfer
+//! has no mHC overlap path, so those blocks have no overlap boundary. Decode
+//! rows keep the vLLM fork's indexer and mega-attention decode leaves; the
+//! other launches keep their vLLM leaves. DeepInfer's separate launches around
+//! the prefill attention (paged KV gathers, `_kv_index_cat`, SWA stores, the
+//! kv cast-back) have no kind and no leaf.
 
 use std::sync::Arc;
 
@@ -64,7 +75,8 @@ use super::deepseek_v41_common::{
 };
 use crate::common::Fabric;
 use crate::op::attention::{
-    DeepseekV41CandidateRole, DeepseekV41IndexerOp, DeepseekV41IndexerOpConfig,
+    DeepseekV41CandidateRole, DeepseekV41DeepInferIndexerOp, DeepseekV41DeepInferIndexerOpConfig,
+    DeepseekV41DeepInferIndexerOpInput, DeepseekV41IndexerOp, DeepseekV41IndexerOpConfig,
     DeepseekV41IndexerOpInput, DeepseekV41MegaAttnOp, DeepseekV41MegaAttnOpConfig,
     DeepseekV41MegaAttnOpInput,
 };
@@ -76,9 +88,13 @@ use crate::timing::kernels::{
     QPadKvRopeMxfp8InsertKernel, QPadKvRopeMxfp8InsertKernelConfig,
     QPadKvRopeMxfp8InsertKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
-    GemmFp32OutputKernelInput, MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    GemmFp32OutputKernelInput, MegaMhcKernel, MegaMhcKernelConfig, MegaMhcKernelInput,
+    MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
+    MhcShiftedPreKernel, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    SparseMlaNormRopeCastPrefillKernel, SparseMlaNormRopeCastPrefillKernelConfig,
+    SparseMlaNormRopeCastPrefillKernelInput,
 };
+use crate::timing::kernels::mega_mhc::SF_LAYOUT_GEMM;
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Layers whose attention entry is the Engram worklet's non-fused pre.
@@ -212,6 +228,30 @@ pub struct DeepseekV41AttentionTpWorkletConfig {
     pub index_logits_prefill_backends: Vec<&'static str>,
     pub index_logits_decode_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// `Some`: DeepInfer's kernels (see the module doc).
+    pub deepinfer: Option<DeepseekV41AttentionDeepInfer>,
+}
+
+/// DeepInfer's backends and the deployment bounds its kinds' grids take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepseekV41AttentionDeepInfer {
+    /// DeepGEMM `mega_mhc` (FusedPostPre entries).
+    pub mega_mhc_backends: Vec<&'static str>,
+    /// TileKernels' unfused shifted pre (the layer-0 entry).
+    pub mhc_unfused_backends: Vec<&'static str>,
+    /// FlashMLA `fused_norm_rope_attn_rope_cast.prefill`.
+    pub prefill_attn_backends: Vec<&'static str>,
+    /// DeepGEMM FP4 MQA logits (dense, sparse and the sparse schedule).
+    pub index_logits_backends: Vec<&'static str>,
+    pub candidate_block_max_backends: Vec<&'static str>,
+    /// DeepSelect top-k.
+    pub topk_backends: Vec<&'static str>,
+    /// Most rows one rank runs (the prefill attention's row axis).
+    pub max_tokens_per_rank: u32,
+    pub candidate_topk_blocks: u32,
+    pub candidate_block_size: u32,
+    /// This layer builds the step's sparse candidate schedule.
+    pub candidate_metadata: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +265,10 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub entry_fused: Option<MhcRmsNormKernelConfig>,
     /// `Some` exactly when `entry_fused` is.
     pub mhc_overlap: Option<MhcOverlapBoundaryResolved>,
+    /// DeepInfer layer 0: the shifted pre in place of hc_prenorm + pre_fuse.
+    pub entry_shifted_pre: Option<MhcRmsNormKernelConfig>,
+    /// DeepInfer FusedPostPre: `mega_mhc` in place of `entry_fused`.
+    pub entry_mega_mhc: Option<MegaMhcKernelConfig>,
     pub fused_wqa_wkv: SingleGemmKernelConfig,
     pub compressor_proj: Option<GemmFp32OutputKernelConfig>,
     pub indexer_weights_proj: Option<ElementwiseKernelConfig>,
@@ -239,6 +283,10 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub compressor_insert: Option<ElementwiseKernelConfig>,
     pub global_topk_remap: Option<ElementwiseKernelConfig>,
     pub indexer: Option<DeepseekV41IndexerOpConfig>,
+    /// DeepInfer index sources: the prefill scoring.
+    pub deepinfer_indexer: Option<DeepseekV41DeepInferIndexerOpConfig>,
+    /// DeepInfer: the prefill core attention.
+    pub prefill_attn: Option<SparseMlaNormRopeCastPrefillKernelConfig>,
     pub mega_attn: DeepseekV41MegaAttnOpConfig,
     pub wo_a: BatchedGemmKernelConfig,
     pub wo_b: SingleGemmKernelConfig,
@@ -272,6 +320,8 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub entry_pre_fuse: Option<Op<ElementwiseKernel>>,
     pub entry_fused: Option<Op<MhcFusedPostPreRmsNormKernel>>,
     pub mhc_overlap: Option<MhcOverlapBoundary>,
+    pub entry_shifted_pre: Option<Op<MhcShiftedPreKernel>>,
+    pub entry_mega_mhc: Option<Op<MegaMhcKernel>>,
     pub fused_wqa_wkv: Op<SingleGemmKernel>,
     pub compressor_proj: Option<Op<GemmFp32OutputKernel>>,
     pub indexer_weights_proj: Option<Op<ElementwiseKernel>>,
@@ -286,6 +336,8 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub compressor_insert: Option<Op<ElementwiseKernel>>,
     pub global_topk_remap: Option<Op<ElementwiseKernel>>,
     pub indexer: Option<DeepseekV41IndexerOp>,
+    pub deepinfer_indexer: Option<DeepseekV41DeepInferIndexerOp>,
+    pub prefill_attn: Option<Op<SparseMlaNormRopeCastPrefillKernel>>,
     pub mega_attn: DeepseekV41MegaAttnOp,
     pub wo_a: Op<BatchedGemmKernel>,
     pub wo_b: Op<SingleGemmKernel>,
@@ -362,6 +414,16 @@ impl DeepseekV41AttentionTpWorklet {
         let layer0 = layer.entry == DeepseekV41AttentionEntry::Layer0Pre;
         let index_source = layer.index != DeepseekV41IndexRole::None;
         let owner = layer.index == DeepseekV41IndexRole::Owner;
+        let fused_entry = layer.entry == DeepseekV41AttentionEntry::FusedPostPre;
+        let deepinfer = cfg.deepinfer.as_ref();
+        let vllm = deepinfer.is_none();
+        let mhc = |backends: &Vec<&'static str>| MhcRmsNormKernelConfig {
+            backends: backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            hidden_size: cfg.hidden_size.clone(),
+            hc_mult: cfg.hc_mult,
+            hidden_dtype: DType::Bf16,
+        };
 
         DeepseekV41AttentionTpWorkletResolved {
             heads_per_rank,
@@ -370,11 +432,25 @@ impl DeepseekV41AttentionTpWorklet {
             entry_expand: layer0.then(|| ew(hidden * 2, hc_hidden_bytes)),
             // nvidia/model.py:435 -> deep_gemm `tf32_hc_prenorm_gemm`: the hc
             // streams in, the fp32 mix logits out.
-            entry_hc_prenorm: layer0.then(|| ew(hc_hidden_bytes, mix_bytes)),
+            entry_hc_prenorm: (layer0 && vllm).then(|| ew(hc_hidden_bytes, mix_bytes)),
             // nvidia/model.py:435 -> `mhc_pre_big_fuse_with_norm`: streams and
             // mixes in, the normalized attention input out.
-            entry_pre_fuse: layer0.then(|| ew(hc_hidden_bytes + mix_bytes, hidden * 2)),
-            mhc_overlap: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
+            entry_pre_fuse: (layer0 && vllm)
+                .then(|| ew(hc_hidden_bytes + mix_bytes, hidden * 2)),
+            entry_shifted_pre: deepinfer
+                .filter(|_| layer0)
+                .map(|di| mhc(&di.mhc_unfused_backends)),
+            // DeepInfer `_mega_mhc` before attention: the FP8 output and its
+            // scales go to the MXFP8 input projections.
+            entry_mega_mhc: deepinfer.filter(|_| fused_entry).map(|di| MegaMhcKernelConfig {
+                backends: di.mega_mhc_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden_size.clone(),
+                hc_mult: cfg.hc_mult,
+                hidden_dtype: DType::Bf16,
+                sf_layout: SF_LAYOUT_GEMM.to_string(),
+            }),
+            mhc_overlap: (fused_entry && vllm).then(|| {
                 MhcOverlapBoundary::resolve(&MhcOverlapBoundaryConfig {
                     hidden_size: cfg.hidden_size.clone(),
                     hc_mult: cfg.hc_mult,
@@ -383,15 +459,7 @@ impl DeepseekV41AttentionTpWorklet {
                     elementwise_backends: cfg.elementwise_backends.clone(),
                 })
             }),
-            entry_fused: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
-                MhcRmsNormKernelConfig {
-                    backends: cfg.mhc_backends.clone(),
-                    gpu_name: cfg.gpu_name.clone(),
-                    hidden_size: cfg.hidden_size.clone(),
-                    hc_mult: cfg.hc_mult,
-                    hidden_dtype: DType::Bf16,
-                }
-            }),
+            entry_fused: (fused_entry && vllm).then(|| mhc(&cfg.mhc_backends)),
             fused_wqa_wkv: mxfp8(
                 cfg.q_lora_rank.clone() + cfg.head_dim.clone(),
                 cfg.hidden_size.clone(),
@@ -492,6 +560,40 @@ impl DeepseekV41AttentionTpWorklet {
                 logits_decode_backends: cfg.index_logits_decode_backends.clone(),
                 elementwise_backends: cfg.elementwise_backends.clone(),
             }),
+            deepinfer_indexer: deepinfer.filter(|_| index_source).map(|di| {
+                DeepseekV41DeepInferIndexerOpConfig {
+                    gpu_name: cfg.gpu_name.clone(),
+                    compress_ratio: ratio,
+                    num_heads: cfg.index_num_heads.clone(),
+                    head_dim: cfg.index_head_dim.clone(),
+                    index_topk: cfg.index_topk,
+                    candidate: layer.candidate,
+                    candidate_metadata: di.candidate_metadata,
+                    candidate_topk_blocks: di.candidate_topk_blocks,
+                    candidate_block_size: di.candidate_block_size,
+                    max_model_len: cfg.max_model_len,
+                    logits_backends: di.index_logits_backends.clone(),
+                    candidate_block_max_backends: di.candidate_block_max_backends.clone(),
+                    topk_backends: di.topk_backends.clone(),
+                }
+            }),
+            prefill_attn: deepinfer.map(|di| SparseMlaNormRopeCastPrefillKernelConfig {
+                backends: di.prefill_attn_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                window_size: cfg.window_size,
+                compress_ratio: ratio,
+                index_topk: if ratio == 0 { 0 } else { cfg.index_topk },
+                num_heads: heads_per_rank.into(),
+                head_dim: cfg.head_dim.clone(),
+                rope_dim: cfg.rope_dim.clone(),
+                n_wv_group: o_groups_per_rank,
+                enable_q_norm: true,
+                q_dtype: DType::Bf16,
+                kv_dtype: DType::Bf16,
+                output_dtype: DType::Fp8E4m3,
+                max_tokens_per_rank: di.max_tokens_per_rank,
+                max_context: cfg.max_model_len,
+            }),
             mega_attn: DeepseekV41MegaAttnOpConfig {
                 backends: cfg.mega_attn_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -569,6 +671,12 @@ impl DeepseekV41AttentionTpWorklet {
                 r.entry_fused,
                 "entry.mega_mhc_post_pre"
             ),
+            entry_shifted_pre: maybe!(
+                MhcShiftedPreKernel,
+                r.entry_shifted_pre,
+                "entry.mhc_shifted_pre"
+            ),
+            entry_mega_mhc: maybe!(MegaMhcKernel, r.entry_mega_mhc, "entry.mega_mhc"),
             mhc_overlap: match r.mhc_overlap {
                 Some(config) => Some(MhcOverlapBoundary::build(
                     &format!("{name}.entry"),
@@ -618,6 +726,19 @@ impl DeepseekV41AttentionTpWorklet {
                 )?),
                 None => None,
             },
+            deepinfer_indexer: match r.deepinfer_indexer {
+                Some(config) => Some(DeepseekV41DeepInferIndexerOp::build(
+                    format!("{name}.indexer.prefill"),
+                    DeepseekV41DeepInferIndexerOp::resolve(&config),
+                    bridge,
+                )?),
+                None => None,
+            },
+            prefill_attn: maybe!(
+                SparseMlaNormRopeCastPrefillKernel,
+                r.prefill_attn,
+                "attention.prefill_attn"
+            ),
             mega_attn: DeepseekV41MegaAttnOp::build(
                 format!("{name}.attention.mega_attn"),
                 r.mega_attn,
@@ -639,7 +760,13 @@ impl DeepseekV41AttentionTpWorklet {
         {
             children.push(entry.compile(b));
         }
+        if let Some(entry) = &self.entry_shifted_pre {
+            children.push(entry.compile(b));
+        }
         if let Some(entry) = &self.entry_fused {
+            children.push(entry.compile(b));
+        }
+        if let Some(entry) = &self.entry_mega_mhc {
             children.push(entry.compile(b));
         }
         if let Some(overlap) = &self.mhc_overlap {
@@ -697,7 +824,13 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(indexer) = &self.indexer {
             children.push(indexer.compile(b));
         }
+        if let Some(indexer) = &self.deepinfer_indexer {
+            children.push(indexer.compile(b));
+        }
         if let Some(op) = &self.global_topk_remap {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.prefill_attn {
             children.push(op.compile(b));
         }
         children.push(self.mega_attn.compile(b));
@@ -747,8 +880,14 @@ impl DeepseekV41AttentionTpWorklet {
         {
             eval_or_zero(entry, ew.clone(), zero, ev);
         }
+        if let Some(entry) = &self.entry_shifted_pre {
+            eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero, ev);
+        }
         if let Some(entry) = &self.entry_fused {
             eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero || overlap, ev);
+        }
+        if let Some(entry) = &self.entry_mega_mhc {
+            eval_or_zero(entry, MegaMhcKernelInput { num_tokens: rows }, zero, ev);
         }
         if let Some(boundary) = &self.mhc_overlap {
             boundary.eval_entry(rows, overlap, ev);
@@ -802,11 +941,26 @@ impl DeepseekV41AttentionTpWorklet {
                 input.decode_kv_lens.clone(),
             )
         };
+        // DeepInfer runs the prefill rows through its own scoring and
+        // attention; the vLLM ops keep the decode rows.
+        let (deepinfer_prefill, prefill_pairs) = if self.resolved.raw_cfg.deepinfer.is_some() {
+            (prefill_pairs, Vec::new())
+        } else {
+            (Vec::new(), prefill_pairs)
+        };
         if let Some(indexer) = &self.indexer {
             indexer.eval(
                 &DeepseekV41IndexerOpInput {
                     prefill_query_context_pairs: prefill_pairs.clone(),
                     decode_kv_lens: decode_kv_lens.clone(),
+                },
+                ev,
+            );
+        }
+        if let Some(indexer) = &self.deepinfer_indexer {
+            indexer.eval(
+                &DeepseekV41DeepInferIndexerOpInput {
+                    prefill_query_context_pairs: deepinfer_prefill.clone(),
                 },
                 ev,
             );
@@ -820,6 +974,16 @@ impl DeepseekV41AttentionTpWorklet {
                 op,
                 ElementwiseKernelInput { num_tokens: launched },
                 decode_kv_lens.is_empty(),
+                ev,
+            );
+        }
+        if let Some(op) = &self.prefill_attn {
+            eval_or_zero(
+                op,
+                SparseMlaNormRopeCastPrefillKernelInput {
+                    query_context_pairs: deepinfer_prefill.clone(),
+                },
+                deepinfer_prefill.is_empty(),
                 ev,
             );
         }
@@ -936,6 +1100,7 @@ pub(crate) mod tests {
             index_logits_prefill_backends: vec!["deepgemm_fp8"],
             index_logits_decode_backends: vec!["deepgemm_fp8"],
             elementwise_backends: vec!["triton"],
+            deepinfer: None,
         }
     }
 

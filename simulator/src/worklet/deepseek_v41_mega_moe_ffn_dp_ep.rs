@@ -3,9 +3,10 @@
 //! `mega_moe_forward`, 528-559), one layer over every DP rank.
 //!
 //! ```text
-//! per rank   entry mHC (its FP8 output is written straight into the
-//!            DeepGEMM symmetric buffer) -> DeepGEMM mega gate (router GEMM,
-//!            scoring, top-k, EPLB slot map in one launch)
+//! per rank   entry mHC (DeepGEMM `mega_mhc`, `sf_layout = mega_moe`: its FP8
+//!            output and scales go straight into the DeepGEMM symmetric
+//!            buffer) -> DeepGEMM mega gate (router GEMM, scoring, top-k,
+//!            EPLB slot map in one launch)
 //! group      DeepGEMM fp8_fp4_mega_moe: dispatch, routed experts, the fused
 //!            shared expert and the combine in one kernel over the EP group
 //! ```
@@ -17,12 +18,12 @@
 //! the busiest rank's token count, with every slot's rows drawn from the
 //! routed demand under DeepInfer's EPLB placement.
 //!
+//! DeepInfer's `hc.py` has no mHC side stream, so there is no overlap
+//! boundary: the entry is always the one `mega_mhc` launch.
 
 use std::sync::Arc;
 
-use super::deepseek_v41_common::{
-    eval_or_zero, MhcOverlapBoundary, MhcOverlapBoundaryConfig, MhcOverlapBoundaryResolved,
-};
+use super::deepseek_v41_common::eval_or_zero;
 use super::deepseek_v41_moe_ffn_dp_ep::{
     DeepseekV41MoeFfnDpEpWorkletInput, DeepseekV41MoeFfnDpRankInput,
 };
@@ -32,10 +33,10 @@ use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::{
-    MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaMoeKernelConfig,
-    MegaMoeKernelInput, MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput,
+    MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaMhcKernel,
+    MegaMhcKernelConfig, MegaMhcKernelInput, MegaMoeKernelConfig, MegaMoeKernelInput,
 };
+use crate::timing::kernels::mega_mhc::SF_LAYOUT_MEGA_MOE;
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 #[derive(Clone, Debug)]
@@ -56,11 +57,10 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletConfig {
     /// One rank's token budget: the mega MoE symmetric buffer's capacity.
     pub max_rank_tokens: u32,
     pub gpu_name: String,
+    /// DeepGEMM `mega_mhc`.
     pub mhc_backends: Vec<&'static str>,
-    pub mhc_tilelang_backends: Vec<&'static str>,
     pub mega_gate_backends: Vec<&'static str>,
     pub mega_moe_backends: Vec<&'static str>,
-    pub elementwise_backends: Vec<&'static str>,
     /// Each layer this body stands for, its routed demand over the logical
     /// experts; with the placement it sets every rank's rows in that layer.
     pub layer_demands: Vec<ExpertDemand>,
@@ -70,8 +70,7 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct DeepseekV41MegaMoeFfnDpEpWorkletResolved {
     pub raw_cfg: DeepseekV41MegaMoeFfnDpEpWorkletConfig,
-    pub entry: MhcRmsNormKernelConfig,
-    pub mhc_overlap: MhcOverlapBoundaryResolved,
+    pub entry: MegaMhcKernelConfig,
     pub gate: MegaGateKernelConfig,
     /// One config per layer the body stands for.
     pub mega_moe: Vec<MegaMoeKernelConfig>,
@@ -79,8 +78,7 @@ pub struct DeepseekV41MegaMoeFfnDpEpWorkletResolved {
 
 pub struct DeepseekV41MegaMoeFfnDpEpWorklet {
     pub name: String,
-    pub entry: Op<MhcFusedPostPreRmsNormKernel>,
-    pub mhc_overlap: MhcOverlapBoundary,
+    pub entry: Op<MegaMhcKernel>,
     pub gate: Op<MegaGateKernel>,
     pub mega_moe: MegaMoeLayersOp,
     resolved: DeepseekV41MegaMoeFfnDpEpWorkletResolved,
@@ -101,20 +99,14 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             "every logical expert needs a physical slot"
         );
         DeepseekV41MegaMoeFfnDpEpWorkletResolved {
-            entry: MhcRmsNormKernelConfig {
+            entry: MegaMhcKernelConfig {
                 backends: cfg.mhc_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 hidden_size: cfg.hidden_size.clone(),
                 hc_mult: cfg.hc_mult,
                 hidden_dtype: DType::Bf16,
+                sf_layout: SF_LAYOUT_MEGA_MOE.to_string(),
             },
-            mhc_overlap: MhcOverlapBoundary::resolve(&MhcOverlapBoundaryConfig {
-                hidden_size: cfg.hidden_size.clone(),
-                hc_mult: cfg.hc_mult,
-                gpu_name: cfg.gpu_name.clone(),
-                mhc_tilelang_backends: cfg.mhc_tilelang_backends.clone(),
-                elementwise_backends: cfg.elementwise_backends.clone(),
-            }),
             gate: MegaGateKernelConfig {
                 backends: cfg.mega_gate_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -166,16 +158,7 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
         }
         let r = resolved.clone();
         Ok(Self {
-            entry: op!(
-                MhcFusedPostPreRmsNormKernel,
-                r.entry,
-                "entry.mega_mhc_post_pre"
-            ),
-            mhc_overlap: MhcOverlapBoundary::build(
-                &format!("{name}.entry"),
-                r.mhc_overlap,
-                bridge,
-            )?,
+            entry: op!(MegaMhcKernel, r.entry, "entry.mega_mhc"),
             gate: op!(MegaGateKernel, r.gate, "routed.mega_gate"),
             mega_moe: MegaMoeLayersOp::build(format!("{name}.routed.mega_moe"), &r.mega_moe, bridge)?,
             name,
@@ -185,23 +168,11 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
 
     /// One rank's launches before the group kernel.
     pub fn compile_local(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
-        let mut leaves = vec![self.entry.compile(b)];
-        leaves.extend(self.mhc_overlap.compile_entry(b));
-        leaves.push(self.gate.compile(b));
-        leaves
+        vec![self.entry.compile(b), self.gate.compile(b)]
     }
 
-    /// The group kernel, with every rank's mHC coefficient branch beside it.
-    pub fn compile_exchange(&self, ranks: usize, b: &mut CostTreeBuilder) -> CostNode {
-        // Slots are assigned in compile order and filled in `eval_exchange`
-        // order: the group kernel first.
-        let mega_moe = self.mega_moe.compile(b);
-        let coefficients = CostNode::Max {
-            overlap: 1.0,
-            children: (0..ranks)
-                .map(|_| self.mhc_overlap.compile_beside(Vec::new(), b))
-                .collect(),
-        };
+    /// The group kernel.
+    pub fn compile_exchange(&self, b: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: format!(
                 "{} exchange [DeepGEMM mega MoE over EP{}: dispatch, {} physical expert slots, \
@@ -210,24 +181,14 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
                 self.resolved.raw_cfg.ep_size,
                 self.resolved.raw_cfg.num_physical_experts
             ),
-            child: Box::new(CostNode::Parallel {
-                overlap: 1.0,
-                children: vec![mega_moe, coefficients],
-            }),
+            child: Box::new(self.mega_moe.compile(b)),
         }
     }
 
     pub fn eval_local(&self, input: &DeepseekV41MoeFfnDpRankInput, ev: &mut Evaluator) {
         let rows = input.num_tokens;
         let zero = rows == 0;
-        let mhc_overlap = !zero && input.mhc_overlap;
-        eval_or_zero(
-            &self.entry,
-            MhcRmsNormKernelInput { num_tokens: rows },
-            zero || mhc_overlap,
-            ev,
-        );
-        self.mhc_overlap.eval_entry(rows, mhc_overlap, ev);
+        eval_or_zero(&self.entry, MegaMhcKernelInput { num_tokens: rows }, zero, ev);
         eval_or_zero(
             &self.gate,
             MegaGateKernelInput { num_tokens: rows },
@@ -252,10 +213,6 @@ impl DeepseekV41MegaMoeFfnDpEpWorklet {
             self.mega_moe.eval_zero(&group, ev);
         } else {
             self.mega_moe.eval(&group, ev);
-        }
-        for rank in &input.ranks {
-            let live = rank.num_tokens > 0 && rank.mhc_overlap;
-            self.mhc_overlap.eval_side(rank.num_tokens, live, false, ev);
         }
     }
 }

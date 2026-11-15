@@ -15,6 +15,9 @@
 //! No mHC-head or RMSNorm L1 rows exist on B200 at hidden 5120 (profile.db
 //! `rms_norm` has flashinfer B200 rows at 128/512/2048/6144 only), so both are
 //! byte placeholders.
+//!
+//! With `mhc_post_backends` (DeepInfer) the last FFN's hc post is TileKernels'
+//! `mhc_post_fwd` (kind `mhc_post`) in place of its placeholder.
 
 use std::sync::Arc;
 
@@ -25,8 +28,8 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernelConfig, ElementwiseKernelInput, MhcPostKernel, MhcRmsNormKernelConfig,
+    MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -40,13 +43,17 @@ pub struct DeepseekV41HeadTpWorkletConfig {
     pub lm_head_backends: Vec<&'static str>,
     pub all_gather_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// `Some`: the hc post is TileKernels' `mhc_post_fwd` (DeepInfer).
+    pub mhc_post_backends: Option<Vec<&'static str>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DeepseekV41HeadTpWorkletResolved {
     pub raw_cfg: DeepseekV41HeadTpWorkletConfig,
     pub vocab_per_rank: u32,
-    pub mhc_post: ElementwiseKernelConfig,
+    /// The placeholder; `None` with `mhc_post_backends`.
+    pub mhc_post: Option<ElementwiseKernelConfig>,
+    pub tile_mhc_post: Option<MhcRmsNormKernelConfig>,
     pub hc_collapse: ElementwiseKernelConfig,
     pub final_norm: ElementwiseKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
@@ -67,7 +74,8 @@ pub struct DeepseekV41HeadTpWorkletInput {
 
 pub struct DeepseekV41HeadTpWorklet {
     pub name: String,
-    pub mhc_post: Op<ElementwiseKernel>,
+    pub mhc_post: Option<Op<ElementwiseKernel>>,
+    pub tile_mhc_post: Option<Op<MhcPostKernel>>,
     pub hc_collapse: Op<ElementwiseKernel>,
     pub final_norm: Op<ElementwiseKernel>,
     pub lm_head: Op<SingleGemmKernel>,
@@ -87,7 +95,17 @@ impl DeepseekV41HeadTpWorklet {
         DeepseekV41HeadTpWorkletResolved {
             vocab_per_rank,
             // nvidia/model.py:858 last FFN's `mhc_post`.
-            mhc_post: ew(hc_bytes + hidden_bytes, hc_bytes),
+            mhc_post: cfg
+                .mhc_post_backends
+                .is_none()
+                .then(|| ew(hc_bytes + hidden_bytes, hc_bytes)),
+            tile_mhc_post: cfg.mhc_post_backends.as_ref().map(|backends| MhcRmsNormKernelConfig {
+                backends: backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden_size.clone(),
+                hc_mult: cfg.hc_mult,
+                hidden_dtype: DType::Bf16,
+            }),
             // nvidia/model.py:890 `_hc_head_reduce_store`: hc streams and the
             // fp32 head mix in, one bf16 row out.
             hc_collapse: ew(hc_bytes + cfg.hc_mult * 4, hidden_bytes),
@@ -124,7 +142,14 @@ impl DeepseekV41HeadTpWorklet {
         }
         let r = resolved.clone();
         Ok(Self {
-            mhc_post: op!(ElementwiseKernel, r.mhc_post, "mhc_post"),
+            mhc_post: match r.mhc_post {
+                Some(config) => Some(op!(ElementwiseKernel, config, "mhc_post")),
+                None => None,
+            },
+            tile_mhc_post: match r.tile_mhc_post {
+                Some(config) => Some(op!(MhcPostKernel, config, "mhc_post")),
+                None => None,
+            },
             hc_collapse: op!(ElementwiseKernel, r.hc_collapse, "hc_head_collapse"),
             final_norm: op!(ElementwiseKernel, r.final_norm, "final_rms_norm"),
             lm_head: op!(SingleGemmKernel, r.lm_head, "lm_head"),
@@ -138,12 +163,18 @@ impl DeepseekV41HeadTpWorklet {
     }
 
     pub fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
-        let mut children = vec![
-            self.mhc_post.compile(b),
+        let mut children = Vec::new();
+        if let Some(op) = &self.mhc_post {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            children.push(op.compile(b));
+        }
+        children.extend([
             self.hc_collapse.compile(b),
             self.final_norm.compile(b),
             self.lm_head.compile(b),
-        ];
+        ]);
         if let Some(all_gather) = &self.logits_all_gather {
             children.push(all_gather.compile(b));
         }
@@ -167,14 +198,26 @@ impl DeepseekV41HeadTpWorklet {
         let logits = input.logits_rows;
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let post_rows = input.mhc_post_rows;
-        eval_or_zero(
-            &self.mhc_post,
-            ElementwiseKernelInput {
-                num_tokens: post_rows,
-            },
-            post_rows == 0,
-            ev,
-        );
+        if let Some(op) = &self.mhc_post {
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput {
+                    num_tokens: post_rows,
+                },
+                post_rows == 0,
+                ev,
+            );
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            eval_or_zero(
+                op,
+                MhcRmsNormKernelInput {
+                    num_tokens: post_rows,
+                },
+                post_rows == 0,
+                ev,
+            );
+        }
         eval_or_zero(&self.hc_collapse, ew.clone(), rows == 0, ev);
         eval_or_zero(&self.final_norm, ew, rows == 0, ev);
         eval_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, logits == 0, ev);
@@ -206,6 +249,7 @@ pub(crate) mod tests {
             lm_head_backends: vec!["torch_linear"],
             all_gather_backends: vec!["nccl"],
             elementwise_backends: vec!["triton"],
+            mhc_post_backends: None,
         }
     }
 

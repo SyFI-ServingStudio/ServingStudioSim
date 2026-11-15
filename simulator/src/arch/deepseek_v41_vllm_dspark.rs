@@ -229,6 +229,7 @@ pub(crate) fn draft_kind(entry: DeepseekV41AttentionEntry) -> LayerKind {
             candidate: DeepseekV41CandidateRole::None,
         },
         engram: false,
+        candidate_metadata: false,
     }
 }
 

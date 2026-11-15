@@ -71,6 +71,8 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::deepseek_v41_common::eval_or_zero;
+use crate::op::attention::DeepseekV41CandidateRole;
+use crate::worklet::deepseek_v41_attention_tp::DeepseekV41AttentionDeepInfer;
 use crate::worklet::{
     DeepseekV41AttentionEntry, DeepseekV41AttentionTpWorklet, DeepseekV41AttentionTpWorkletConfig,
     DeepseekV41AttentionTpWorkletInput, DeepseekV41AttentionTpWorkletResolved,
@@ -126,9 +128,14 @@ pub struct DeepseekV41VllmDpParallel {
 /// slots, the dense linears are DeepGEMM's MXFP8 GEMM, and YoCo prefill
 /// truncation is the bounded-replay cut keeping `yoco_keep_tokens` rows per
 /// request (DeepInfer `DEEPINFER_YOCO_PREFILL_KEEP_TOKENS`, its benchmark's
-/// `--yoco_clip` 140 = window 128 + 12 backtracking tokens). The other kernels
-/// (FlashMLA attention, mHC, indexer logits and top-k, norms) are the vLLM
-/// fork's own, which vendors the same FlashMLA/DeepGEMM kernels.
+/// `--yoco_clip` 140 = window 128 + 12 backtracking tokens). DeepInfer's own
+/// kinds price the mHC boundaries (DeepGEMM `mega_mhc` at every attention and
+/// FFN entry, TileKernels' shifted pre and post at layer 0, the Engram layers
+/// and the head; no mHC overlap path), the prefill indexer scoring (FP4 MQA
+/// logits, the layer-20 candidate scheme, DeepSelect top-k) and the prefill
+/// core attention (FlashMLA `fused_norm_rope_attn_rope_cast`). Decode
+/// attention and indexer, norms and the remaining small launches keep the
+/// vLLM fork's leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeepInferEngine {
     /// EPLB redundant expert slots over the EP group (`num_extra_experts`).
@@ -161,6 +168,16 @@ const DEEPINFER_MEGA_MOE_BACKENDS: &[&str] = &["deepgemm_sm100"];
 const DEEPINFER_MEGA_GATE_BACKENDS: &[&str] = &["deepgemm_sm100"];
 /// TileKernels `engram_gate_fwd` (DeepInfer `v4_modules/engram.py`).
 const DEEPINFER_ENGRAM_GATE_BACKENDS: &[&str] = &["tile_kernels"];
+/// DeepGEMM `mega_mhc` with the FP8 cast (DeepInfer `hc.py` `_mega_mhc`).
+const DEEPINFER_MEGA_MHC_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// TileKernels' unfused `mhc_post_fwd` and shifted pre (DeepInfer `hc.py`).
+const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
+/// FlashMLA `fused_norm_rope_attn_rope_cast.prefill`.
+const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
+/// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
+const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
+const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
+const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -263,7 +280,7 @@ pub fn build_configs(
     let dp_layer = |kind: LayerKind, layers: Vec<u32>| {
         let mut tp1 = layer_config(model, &local, demand, kind, layers);
         if parallel.deepinfer.is_some() {
-            deepinfer_backends(&mut tp1);
+            deepinfer_backends(&mut tp1, model, &kind, max_rank_tokens);
         }
         let mut layer = dp_layer_config(tp1, max_rank_tokens);
         if let Some(engine) = &parallel.deepinfer {
@@ -274,9 +291,19 @@ pub fn build_configs(
         }
         layer
     };
-    let tail: Vec<(u32, LayerKind)> = (1..model.num_layers)
+    let mut tail: Vec<(u32, LayerKind)> = (1..model.num_layers)
         .map(|layer| (layer, model.layer_kind(layer)))
         .collect();
+    if parallel.deepinfer.is_some() {
+        // DeepInfer's first candidate consumer builds the step's sparse
+        // schedule; the later ones reuse it (`_get_sparse_prefill_metadata`).
+        if let Some((_, kind)) = tail
+            .iter_mut()
+            .find(|(_, kind)| kind.attention.candidate == DeepseekV41CandidateRole::Consumer)
+        {
+            kind.candidate_metadata = true;
+        }
+    }
     let mut bodies = Vec::new();
     let plan = index_plan(&fold_layers(&tail), &mut |kind, layers| {
         bodies.push(dp_layer(kind, layers.to_vec()));
@@ -360,6 +387,9 @@ pub fn build_configs(
             lm_head_backends: tp_arch::LM_HEAD_BACKENDS.to_vec(),
             all_gather_backends: tp_arch::ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: tp_arch::ELEMENTWISE_BACKENDS.to_vec(),
+            mhc_post_backends: parallel
+                .deepinfer
+                .map(|_| DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
         },
         kv_cache_layout: tp_arch::kv_cache_layout(model, 1, 0),
         replay,
@@ -387,15 +417,34 @@ pub(crate) fn dp_layer_config(
     }
 }
 
-/// DeepInfer's dense linears: DeepGEMM MXFP8 for every MXFP8 projection the
-/// vLLM fork runs through FlashInfer.
-fn deepinfer_backends(tp1: &mut DeepseekV41LayerConfig) {
+/// DeepInfer's kernels on a body layer: DeepGEMM MXFP8 for every MXFP8
+/// projection the vLLM fork runs through FlashInfer, and DeepInfer's own
+/// mHC, prefill indexer and prefill attention kinds.
+fn deepinfer_backends(
+    tp1: &mut DeepseekV41LayerConfig,
+    model: &DeepseekV41ModelCfg,
+    kind: &LayerKind,
+    max_rank_tokens: u32,
+) {
     tp1.attention.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.prequantized_gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.wo_a_backends = DEEPINFER_WO_A_BACKENDS.to_vec();
+    tp1.attention.deepinfer = Some(DeepseekV41AttentionDeepInfer {
+        mega_mhc_backends: DEEPINFER_MEGA_MHC_BACKENDS.to_vec(),
+        mhc_unfused_backends: DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec(),
+        prefill_attn_backends: DEEPINFER_PREFILL_ATTN_BACKENDS.to_vec(),
+        index_logits_backends: DEEPINFER_INDEX_LOGITS_BACKENDS.to_vec(),
+        candidate_block_max_backends: DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS.to_vec(),
+        topk_backends: DEEPINFER_TOPK_BACKENDS.to_vec(),
+        max_tokens_per_rank: max_rank_tokens,
+        candidate_topk_blocks: model.candidate_topk_blocks,
+        candidate_block_size: model.candidate_block_size,
+        candidate_metadata: kind.candidate_metadata,
+    });
     if let Some(engram) = &mut tp1.engram {
         engram.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
         engram.engram_gate_backends = Some(DEEPINFER_ENGRAM_GATE_BACKENDS.to_vec());
+        engram.mhc_unfused_backends = Some(DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec());
     }
 }
 
@@ -427,11 +476,9 @@ fn mega_ffn_config(
         moe_intermediate_size: f.moe_intermediate_size.clone(),
         max_rank_tokens,
         gpu_name: f.gpu_name.clone(),
-        mhc_backends: f.mhc_backends.clone(),
-        mhc_tilelang_backends: f.mhc_tilelang_backends.clone(),
+        mhc_backends: DEEPINFER_MEGA_MHC_BACKENDS.to_vec(),
         mega_gate_backends: DEEPINFER_MEGA_GATE_BACKENDS.to_vec(),
         mega_moe_backends: DEEPINFER_MEGA_MOE_BACKENDS.to_vec(),
-        elementwise_backends: f.elementwise_backends.clone(),
         // Every layer routes and is placed from its own history.
         layer_demands: layers
             .iter()
@@ -619,7 +666,7 @@ impl DpLayerBody {
                 ),
             ],
             // The mega MoE writes routed + shared; the next mHC takes the residual.
-            DpFfn::Mega(ffn) => vec![ffn.compile_exchange(ranks, b)],
+            DpFfn::Mega(ffn) => vec![ffn.compile_exchange(b)],
         }
     }
 
@@ -1560,6 +1607,47 @@ mod tests {
             prefill_chunk_tokens: None,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
+    }
+
+    /// Catches the sparse candidate schedule priced on every consumer (they
+    /// share one folded body unless the first one is its own kind), DeepInfer
+    /// slots leaking into the vLLM engine, or an overlap boundary under
+    /// DeepInfer.
+    #[test]
+    fn deepinfer_builds_the_candidate_schedule_on_the_first_consumer_only() {
+        let mut p = parallel();
+        let vllm = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
+        for body in vllm.bodies.iter().chain([&vllm.layer0]) {
+            assert!(body.attention.deepinfer.is_none());
+            assert!(body.engram.as_ref().map_or(true, |e| e.mhc_unfused_backends.is_none()));
+        }
+        assert!(vllm.head.mhc_post_backends.is_none());
+        p.deepinfer = Some(DeepInferEngine {
+            num_redundant_experts: 32,
+            yoco_keep_tokens: Some(140),
+            engram_fetch: false,
+            force_load_balance: true,
+            prefill_chunk_tokens: None,
+        });
+        let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
+        let metadata: Vec<Vec<u32>> = configs
+            .bodies
+            .iter()
+            .filter(|body| body.attention.deepinfer.as_ref().unwrap().candidate_metadata)
+            .map(|body| body.layers.clone())
+            .collect();
+        assert_eq!(metadata, [vec![24]]);
+        let consumers: Vec<u32> = configs
+            .bodies
+            .iter()
+            .filter(|body| body.attention.layer.candidate == DeepseekV41CandidateRole::Consumer)
+            .flat_map(|body| body.layers.clone())
+            .collect();
+        assert_eq!(consumers, [24, 28, 32, 36]);
+        let layer2 = configs.bodies.iter().find(|body| body.layers[0] == 2).unwrap();
+        let resolved = resolve_layer(layer2);
+        assert!(resolved.attention.mhc_overlap.is_none() && resolved.attention.entry_fused.is_none());
+        assert!(resolved.attention.entry_mega_mhc.is_some());
     }
 
     fn configs_vllm_mega_attn() -> Vec<&'static str> {

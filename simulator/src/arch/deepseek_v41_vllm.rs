@@ -185,6 +185,10 @@ pub struct DeepseekV41ModelCfg {
     pub kv_source_layer_ids: Vec<u32>,
     pub index_source_layer_ids: Vec<u32>,
     pub candidate_source_layer_id: u32,
+    /// Candidate blocks the source layer keeps per query row.
+    pub candidate_topk_blocks: u32,
+    /// Tokens per candidate block before compression.
+    pub candidate_block_size: u32,
     pub engram_layer_ids: Vec<u32>,
     /// Hash columns = `(engram_max_ngram_size - 1) * engram_n_heads` (24).
     pub engram_hash_heads: u32,
@@ -375,6 +379,8 @@ impl DeepseekV41ModelCfg {
             kv_source_layer_ids: raw.kv_source_layer_ids,
             index_source_layer_ids: raw.index_source_layer_ids,
             candidate_source_layer_id: raw.candidate_source_layer_id,
+            candidate_topk_blocks: raw.candidate_topk_blocks,
+            candidate_block_size: raw.candidate_block_size,
             engram_layer_ids: raw.engram_layer_ids,
             engram_hash_heads: (raw.engram_max_ngram_size - 1) * raw.engram_n_heads,
             engram_lookback_depth: raw.engram_max_ngram_size - 1,
@@ -412,6 +418,7 @@ impl DeepseekV41ModelCfg {
                 },
             },
             engram,
+            candidate_metadata: false,
         }
     }
 }
@@ -422,6 +429,10 @@ pub struct LayerKind {
     pub attention: DeepseekV41AttentionLayer,
     /// An Engram block runs before this layer's attention.
     pub engram: bool,
+    /// The layer builds the step's sparse candidate-logits schedule. Only
+    /// DeepInfer has one (its first candidate consumer builds it, the later
+    /// consumers reuse it); always false under vLLM.
+    pub candidate_metadata: bool,
 }
 
 /// The layer fold: `Body` is one built body layer standing for `layers`;
@@ -866,6 +877,7 @@ pub fn build_configs(
             lm_head_backends: LM_HEAD_BACKENDS.to_vec(),
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            mhc_post_backends: None,
         },
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
         replay,
@@ -1103,6 +1115,7 @@ pub(crate) fn layer_config(
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             engram_gate_backends: None,
             max_rank_tokens: parallel.max_num_batched_tokens,
+            mhc_unfused_backends: None,
         }),
         attention: DeepseekV41AttentionTpWorkletConfig {
             layer: kind.attention,
@@ -1145,6 +1158,7 @@ pub(crate) fn layer_config(
             index_logits_prefill_backends: INDEX_LOGITS_BACKENDS.to_vec(),
             index_logits_decode_backends: INDEX_LOGITS_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            deepinfer: None,
         },
         ffn: DeepseekV41MoeFfnEpWorkletConfig {
             tp_size: parallel.tp_size,
