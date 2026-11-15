@@ -7,6 +7,7 @@ use crate::worker::types::IterBatchPlan;
 
 mod chunked_prefill_admission;
 mod decode_completion;
+mod external_decode;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
 mod microbatch_budget;

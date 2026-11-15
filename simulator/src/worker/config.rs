@@ -1030,6 +1030,13 @@ pub enum IterWorkerSel {
         /// [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Decode runs elsewhere: a request completes at its first token, and
+        /// its decode hands the context back, every output but the last
+        /// extending the prompt's context in HBM and in the tiers (a round
+        /// then adds two round-end states). Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
         /// Round-end states a retained context keeps; see
         /// [`StateRetentionSpec`].
         #[serde(flatten)]

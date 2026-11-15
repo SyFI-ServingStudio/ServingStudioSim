@@ -22,7 +22,9 @@
 //! context resumes from the latest of them at or before it. The entry is one
 //! unit with them. A request that takes it carries the states that survive
 //! its round, charged here but not evictable, until its context returns
-//! ([`PrefixCache::take_carried`], [`PrefixCache::insert_sharing`]).
+//! ([`PrefixCache::take_carried`], [`PrefixCache::insert_sharing`]). A context
+//! that a decode run elsewhere hands back extends the prompt's entry, its
+//! prompt-end state kept as the retention picks it ([`PrefixCache::hand_back`]).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -321,8 +323,10 @@ impl PrefixCache {
                 .states()
                 .filter(|state| state.at <= u64::from(hit_tokens))
                 .collect();
+            // HBM leaves room for one state the round adds, also when its
+            // decode runs elsewhere; a tier read leaves room for both.
             let carried = Carried {
-                states: self.retention.survivors(&below, resume.tag),
+                states: self.retention.survivors(&below, resume.tag, 1),
                 resume: Some(resume.tag),
             };
             self.used_units += self.state_units(carried.states.len());
@@ -429,6 +433,37 @@ impl PrefixCache {
             positions.end(),
             end,
             earlier,
+            physical_limit,
+            None,
+        )
+    }
+
+    /// Put back a session's context that a decode run elsewhere extended past
+    /// the prompt's end, `shared` (the end of the entry the prompt left):
+    /// `positions`, with the handed-back decode's end at its end, a state of
+    /// the round of the entry's latest state at or before `shared`.
+    pub(crate) fn hand_back(
+        &mut self,
+        session_id: u32,
+        positions: ResumePositions,
+        shared: u64,
+        physical_limit: u64,
+    ) -> PrefixCacheInsertResult {
+        let limit = shared.min(positions.end().saturating_sub(1));
+        let latest = self
+            .entries
+            .get(&session_id)
+            .into_iter()
+            .flat_map(PrefixEntry::states)
+            .filter(|state| state.at > 0 && state.at <= limit)
+            .max();
+        self.insert_context(
+            session_id,
+            positions,
+            positions.end(),
+            shared,
+            StateTag::handed_back(latest),
+            Vec::new(),
             physical_limit,
             None,
         )

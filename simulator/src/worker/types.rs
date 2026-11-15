@@ -601,6 +601,9 @@ pub struct WorkerConfig {
     /// Which round-end recurrent states a retained context keeps. Only the
     /// two chunked recipes set it.
     pub state_retention: crate::worker::kv::StateRetention,
+    /// Decode runs elsewhere: the pipeline head completes a request at its
+    /// first token and takes its context back from the decode.
+    pub external_decode: bool,
     /// Host tiers behind the prefix cache, fastest first. Only the pipeline
     /// recipe reads them.
     pub prefix_tiers: Vec<crate::worker::kv::TierSpec>,
@@ -665,6 +668,7 @@ impl Default for WorkerConfig {
             kv_part_padding: Vec::new(),
             kv_block_tokens: None,
             state_retention: crate::worker::kv::StateRetention::Latest { k: 1 },
+            external_decode: false,
             prefix_tiers: Vec::new(),
             prefix_tier_balanced_load: false,
             prefix_tier_read_wait: None,

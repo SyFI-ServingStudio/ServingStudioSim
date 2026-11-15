@@ -35,7 +35,13 @@
 //! the KV HBM lacks and, of the entry's states at or before the hit, only those
 //! that survive the round it serves ([`StateRetention::survivors`]): the state
 //! it resumes from and the latest earlier ones still kept once the round adds
-//! its own. Writes are free: only counted.
+//! its own ([`TierStateOptions::added_per_round`]: its pass's end, and with a
+//! decode run elsewhere the handed-back decode's end). Writes are free: only
+//! counted.
+//!
+//! A finished round whose context goes past its prompt (outputs decoded, here
+//! or elsewhere) is written with a state at the prompt's end beside the one at
+//! the context's end, a handed-back decode's ([`TierChain::store_round`]).
 //!
 //! Staged loading ([`TierChain::set_loading_area`]) puts reads through loading
 //! areas, each a fraction of its tier: HBM's, in tier tokens, which every read
@@ -83,6 +89,21 @@ pub struct TierSpec {
     pub capacity_gb: f64,
     pub read_gb_per_s: f64,
     pub writes: TierWrites,
+}
+
+/// How tiers move recurrent states, beside the retention that picks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierStateOptions {
+    /// Round-end states a round adds to its context: its pass's end, and with
+    /// a decode run elsewhere the handed-back decode's end. A read moves only
+    /// the states that survive that many more.
+    pub added_per_round: u32,
+}
+
+impl Default for TierStateOptions {
+    fn default() -> Self {
+        Self { added_per_round: 1 }
+    }
 }
 
 /// One GPU's bytes a tier stores per context token and per recurrent state.
@@ -201,6 +222,9 @@ pub struct LoadingReport {
 pub(crate) struct RoundContext {
     /// Where the context can be resumed; its end is the context.
     pub(crate) positions: ResumePositions,
+    /// Where its prompt ended: the context's end, or before it when outputs
+    /// were decoded past it.
+    pub(crate) prompt_end: u64,
     /// Tokens it shares with the session's previous context.
     pub(crate) shared: u64,
 }
@@ -429,6 +453,7 @@ pub(crate) struct TierChain {
     /// One state in tier tokens.
     state_tokens: u64,
     retention: StateRetention,
+    options: TierStateOptions,
     /// Staged loading; `None`: reads land straight in HBM.
     loading: Option<LoadingAreas>,
     /// Entry changes since the last [`Self::take_events`], when recorded.
@@ -436,7 +461,16 @@ pub(crate) struct TierChain {
 }
 
 impl TierChain {
-    pub(crate) fn new(specs: &[TierSpec], bytes: TierBytes, retention: StateRetention) -> Self {
+    pub(crate) fn new(
+        specs: &[TierSpec],
+        bytes: TierBytes,
+        retention: StateRetention,
+        options: TierStateOptions,
+    ) -> Self {
+        assert!(
+            options.added_per_round >= 1,
+            "a round leaves at least its pass's end state"
+        );
         let per_token = bytes.per_token.max(1) as f64;
         let tiers = specs
             .iter()
@@ -465,6 +499,7 @@ impl TierChain {
             bytes,
             state_tokens: bytes.state_tokens(),
             retention,
+            options,
             loading: None,
             events: None,
         }
@@ -891,15 +926,17 @@ impl TierChain {
     /// Write a finished context through to every write-through tier; what
     /// that pushes out of a tier goes to a victim tier behind it. An entry
     /// keeping earlier round-end states keeps the old entry's within what the
-    /// round shares with it.
+    /// round shares with it, and the round's prompt end when the context goes
+    /// past it, the context's end then being a handed-back decode's.
     pub(crate) fn store_round(&mut self, session_id: u32, round: RoundContext) {
         let tokens = round.positions.end();
+        let prompt_end = (round.prompt_end < tokens).then_some(round.prompt_end);
         for tier in 0..self.tiers.len() {
             if self.tiers[tier].spec.writes != TierWrites::EveryContext {
                 continue;
             }
             let limit = round.shared.min(tokens.saturating_sub(1));
-            let states: Vec<RoundState> = self.tiers[tier]
+            let mut states: Vec<RoundState> = self.tiers[tier]
                 .entries
                 .get(&session_id)
                 .into_iter()
@@ -907,9 +944,15 @@ impl TierChain {
                 .filter(|state| state.at > 0 && state.at <= limit)
                 .collect();
             // The round is one past the latest state it shares.
-            let end = StateTag {
+            let pass = StateTag {
                 round: states.last().map_or(0, |state| state.tag.round + 1),
+                handback: false,
             };
+            let end = StateTag {
+                handback: prompt_end.is_some(),
+                ..pass
+            };
+            states.extend(prompt_end.map(|at| RoundState { at, tag: pass }));
             let earlier = self.kept_below(
                 states,
                 RoundState {
@@ -973,7 +1016,9 @@ impl TierChain {
             .states()
             .filter(|state| state.at <= hit.tokens)
             .collect();
-        let mut moved = self.retention.survivors(&below, resume.tag);
+        let mut moved = self
+            .retention
+            .survivors(&below, resume.tag, self.options.added_per_round);
         moved.retain(|state| state.at < hit.tokens);
         moved
     }
@@ -1148,6 +1193,7 @@ mod tests {
                 state: state_bytes,
             },
             StateRetention::Latest { k: states },
+            TierStateOptions::default(),
         )
     }
 
@@ -1164,9 +1210,11 @@ mod tests {
         ResumePositions::at_state(tokens)
     }
 
+    /// A round ending at its prompt's end: no output past it.
     fn round(tokens: u64, shared: u64) -> RoundContext {
         RoundContext {
             positions: at(tokens),
+            prompt_end: tokens,
             shared,
         }
     }
@@ -1436,10 +1484,18 @@ mod tests {
         assert_eq!(hit(&chain, 1, 600), Some((0, 600)));
     }
 
+    /// The tag of round `round`'s pass end.
+    fn pass(round: u32) -> StateTag {
+        StateTag {
+            round,
+            handback: false,
+        }
+    }
+
     fn tagged(at: u64, round: u32) -> RoundState {
         RoundState {
             at,
-            tag: StateTag { round },
+            tag: pass(round),
         }
     }
 
@@ -1454,7 +1510,7 @@ mod tests {
         // A round sharing only 250 tokens keeps the states at or below them.
         chain.store_round(1, round(500, 250));
         assert_eq!(entry_states(&chain, 0, 1), [200, 500]);
-        assert_eq!(chain.tiers[0].entries[&1].end, StateTag { round: 2 });
+        assert_eq!(chain.tiers[0].entries[&1].end, pass(2));
         assert_eq!(chain.earlier_states(0), 1);
     }
 
@@ -1485,26 +1541,80 @@ mod tests {
     }
 
     #[test]
-    fn a_read_moves_only_the_states_that_survive_its_round() {
+    fn a_handed_back_round_keeps_its_prompt_end_state() {
+        // A state is 50 tier tokens.
         let mut chain = chain(
             &[spec(DRAM, 1e-2, 1e-3, TierWrites::EveryContext)],
-            10_000,
-            3,
+            50_000,
+            2,
         );
-        for (tokens, shared) in [(100, 0), (200, 100), (300, 200)] {
-            chain.store_round(1, round(tokens, shared));
+        // The prompt ends at 1_000; the decode hands back 10 more.
+        chain.store_round(
+            1,
+            RoundContext {
+                positions: at(1_010),
+                prompt_end: 1_000,
+                shared: 0,
+            },
+        );
+        assert_eq!(chain.used_units(0), 1_010 + 2 * 50);
+        assert_eq!(chain.counters(0).written_states, 2);
+        assert_eq!(
+            chain.tiers[0].entries[&1].end,
+            StateTag {
+                round: 0,
+                handback: true
+            }
+        );
+        // The next prompt keeps only part of the output.
+        assert_eq!(hit(&chain, 1, 1_005), Some((0, 1_000)));
+        assert_eq!(hit(&chain, 1, 1_011), Some((0, 1_010)));
+        assert_eq!(hit(&chain, 1, 999), None);
+    }
+
+    #[test]
+    fn a_read_moves_only_the_states_that_survive_its_round() {
+        // Four rounds leave states at 100, 120, 150 and 180; a state is 10
+        // tier tokens, read at one tier token per ms.
+        let entry = |k, added_per_round| {
+            let mut chain = TierChain::new(
+                &[spec(DRAM, 1e-2, 1e-3, TierWrites::EveryContext)],
+                TierBytes {
+                    per_token: 1000,
+                    state: 10_000,
+                },
+                StateRetention::Latest { k },
+                TierStateOptions { added_per_round },
+            );
+            for (tokens, shared) in [(100, 0), (120, 100), (150, 120), (180, 150)] {
+                chain.store_round(1, round(tokens, shared));
+            }
+            chain
+        };
+        // (k, states a round adds) -> the earlier states a hit at the end moves.
+        for (k, added, earlier) in [
+            (1, 2, vec![]),
+            (2, 2, vec![]),
+            (4, 2, vec![150]),
+            (2, 1, vec![]),
+            (4, 1, vec![120, 150]),
+        ] {
+            let mut chain = entry(k, added);
+            let hit = chain.lookup(1, 181).unwrap();
+            assert_eq!(hit.tokens, 180);
+            let moved = 1 + earlier.len() as u64;
+            assert_eq!(chain.read_units(1, hit, 0), 180 + moved * 10);
+            let read = chain.read(1, hit, 0, Time::ZERO);
+            assert_eq!(positions_of(&read.earlier), earlier, "k {k} added {added}");
+            assert_eq!(read.end, pass(3));
+            assert_eq!(read.ready, Time::from_ms((180 + moved * 10) as f64));
+            assert_eq!(chain.counters(0).loaded_states, moved);
         }
-        // k = 3, one state added per round: the read moves two.
-        let hit = chain.lookup(1, 300).unwrap();
-        let read = chain.read(1, hit, 0, Time::ZERO);
-        assert_eq!(positions_of(&read.earlier), [200]);
-        assert_eq!(read.end, StateTag { round: 2 });
-        assert_eq!(chain.counters(0).loaded_states, 2);
-        // A hit on an earlier state moves the states up to it.
-        let hit = chain.lookup(1, 250).unwrap();
-        assert_eq!(hit.tokens, 200);
-        assert_eq!(positions_of(&chain.read_states(1, hit)), [100]);
-        assert_eq!(chain.read_units(1, hit, 0), 200 + 2 * 10);
+        // A hit at an earlier state moves the survivors below it.
+        let chain = entry(4, 1);
+        let hit = chain.lookup(1, 160).unwrap();
+        assert_eq!(hit.tokens, 150);
+        assert_eq!(positions_of(&chain.read_states(1, hit)), [100, 120]);
     }
 
     #[test]
@@ -1524,11 +1634,11 @@ mod tests {
         let mut chain = chain(&[spec(DRAM, 1e-2, 1e-3, TierWrites::Evictions)], 10_000, 3);
         let mut entry = leaving(1, 300, &[]);
         entry.earlier = vec![tagged(100, 0), tagged(200, 1)];
-        entry.end = StateTag { round: 2 };
+        entry.end = pass(2);
         chain.take_hbm_eviction(entry);
         chain.cut(1, 250);
         assert_eq!(entry_states(&chain, 0, 1), [100, 200]);
-        assert_eq!(chain.tiers[0].entries[&1].end, StateTag { round: 1 });
+        assert_eq!(chain.tiers[0].entries[&1].end, pass(1));
         assert_eq!(chain.used_units(0), 200 + 2 * 10);
         assert_eq!(hit(&chain, 1, 250), Some((0, 200)));
     }

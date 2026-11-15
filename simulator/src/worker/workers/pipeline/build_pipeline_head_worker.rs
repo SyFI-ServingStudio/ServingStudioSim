@@ -10,6 +10,7 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::kv::TierStateOptions;
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
     kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
@@ -25,7 +26,8 @@ use super::PipelineHead;
 /// Mamba `align` mode), every non-final chunk ends on the layout's block.
 /// Host tiers, if the config has any, sit behind the prefix cache, each GPU
 /// storing and reading `layout.tier_bytes`, with reads staged through loading
-/// areas when the config has one.
+/// areas when the config has one. With `external_decode` a request completes
+/// at its first token and its decode elsewhere hands the context back.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     id: WorkerId,
@@ -86,7 +88,13 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     )
-    .with_prefix_tiers(&config.prefix_tiers, layout.tier_bytes);
+    .with_prefix_tiers(
+        &config.prefix_tiers,
+        layout.tier_bytes,
+        TierStateOptions {
+            added_per_round: 1 + u32::from(config.external_decode),
+        },
+    );
     let kv_store = if config.prefix_tier_loading_area > 0.0 {
         kv_store.with_loading_area(config.prefix_tier_loading_area)
     } else {
@@ -117,6 +125,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if let Some(read_wait) = config.prefix_tier_read_wait {
         admission = admission.with_read_wait(read_wait);
+    }
+    if config.external_decode {
+        admission = admission.with_external_decode();
     }
 
     PipelineHeadWorker::from_components(

@@ -49,6 +49,8 @@ pub enum PrefixCacheRetentionReason {
     NoCacheCapacity,
     /// A context read back from a host tier, put into HBM at admission.
     TierRead,
+    /// A context a decode run elsewhere handed back, extending the prompt's.
+    HandBack,
     /// A finished context written through to a host tier.
     TierWriteThrough,
     /// What the tier above evicted or could not keep, in its victim tier.
@@ -96,6 +98,7 @@ impl PrefixCacheEventKind {
             Self::Retain(PrefixCacheRetentionReason::HandoffComplete) => "handoff-complete",
             Self::Retain(PrefixCacheRetentionReason::NoCacheCapacity) => "no-cache-capacity",
             Self::Retain(PrefixCacheRetentionReason::TierRead) => "tier-read",
+            Self::Retain(PrefixCacheRetentionReason::HandBack) => "hand-back",
             Self::Retain(PrefixCacheRetentionReason::TierWriteThrough) => "write-through",
             Self::Retain(PrefixCacheRetentionReason::TierVictim) => "victim",
             Self::Retain(PrefixCacheRetentionReason::TierReadCopy) => "read-copy",

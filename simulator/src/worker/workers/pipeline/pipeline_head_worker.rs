@@ -1267,6 +1267,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_elsewhere_completes_at_the_first_token_and_retains_the_outputs() {
+        // Round 0 has 5 target outputs; round 1 declares all 55 tokens and
+        // finds the 54 with KV in HBM (the last output's KV is round 1's to
+        // compute).
+        let store = shared_with(&[(0, 50, 5), (1, 4, 5)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 1, 7, 55, 10.0);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                external_decode: true,
+                ..tiered_config()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(9.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0)]);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(10.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            1
+        );
+        assert_eq!(hit_tokens(&store, 1), Some(54));
+    }
+
+    #[test]
     fn a_session_evicted_from_hbm_reads_its_context_back_from_dram_first() {
         // Session 7 round 0 (50 tokens), then a 100-token prompt that evicts it
         // from HBM, then round 1 declaring the 51-token context, whose first 50

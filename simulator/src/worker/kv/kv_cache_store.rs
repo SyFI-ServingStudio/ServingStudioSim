@@ -44,12 +44,13 @@ use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::shared::state_retention::Carried;
 use crate::worker::kv::shared::tier_chain::{
     LeavingContext, LoadingQueue, RoundContext, TierBytes, TierChain, TierHit, TierSpec,
+    TierStateOptions,
 };
 use crate::worker::kv::shared::tier_reads::{
     ReadPhase, ReadRecord, SharedTiersReports, TierReads, TiersReport,
 };
 use crate::worker::kv::{
-    ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
+    ChunkedPrefillKv, HandBack, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
     SlotPipelineKv, TierReadPlan, TieredPrefixKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
@@ -688,6 +689,76 @@ impl PrefixKv for KvCacheStore {
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
         KvCacheStore::release_retaining_prefix(self, request, partition, now);
     }
+
+    fn release_handing_back(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+    ) -> Option<HandBack> {
+        let round = self.release_retaining_round(request, partition, now)?;
+        Some(HandBack {
+            request,
+            session_id: round.session_id,
+            prompt_end: round.prompt_end,
+            shared: round.shared,
+        })
+    }
+
+    fn hand_back_context(
+        &mut self,
+        partition: PartitionId,
+        hand_back: HandBack,
+        output_tokens: u32,
+        now: Time,
+    ) {
+        let HandBack {
+            request,
+            session_id,
+            prompt_end,
+            shared,
+        } = hand_back;
+        let tokens = prompt_end + u64::from(output_tokens.saturating_sub(1));
+        if tokens > prompt_end {
+            let physical_limit = self.prefix_cache_physical_limit(partition);
+            let insert_result = self.prefix_caches[partition as usize].hand_back(
+                session_id,
+                self.accounting.resume_positions(prompt_end, tokens),
+                prompt_end,
+                physical_limit,
+            );
+            self.record_retention(
+                request,
+                partition,
+                session_id,
+                tokens,
+                insert_result,
+                now,
+                PrefixCacheRetentionReason::HandBack,
+            );
+        }
+        self.store_round(
+            partition,
+            request,
+            FinishedRound {
+                session_id,
+                prompt_end,
+                tokens,
+                shared,
+            },
+            now,
+        );
+    }
+}
+
+/// A session request's round as it left HBM: where its prompt ended, the
+/// context it left, and what it shared with the session's previous context.
+#[derive(Clone, Copy, Debug)]
+struct FinishedRound {
+    session_id: u32,
+    prompt_end: u64,
+    tokens: u64,
+    shared: u64,
 }
 
 impl SlotPipelineKv for KvCacheStore {
@@ -760,13 +831,18 @@ impl KvCacheStore {
 
     /// Put `specs`'s host tiers, fastest first, behind each partition's
     /// prefix cache, storing `bytes` per context token and state on each GPU.
-    pub(crate) fn with_prefix_tiers(mut self, specs: &[TierSpec], bytes: TierBytes) -> Self {
+    pub(crate) fn with_prefix_tiers(
+        mut self,
+        specs: &[TierSpec],
+        bytes: TierBytes,
+        options: TierStateOptions,
+    ) -> Self {
         if !specs.is_empty() {
             let retention = self.accounting.state_retention();
             let logging = self.journal.is_logging();
             self.tier_chains = (0..self.partitions.len())
                 .map(|_| {
-                    let mut chain = TierChain::new(specs, bytes, retention);
+                    let mut chain = TierChain::new(specs, bytes, retention, options);
                     if logging {
                         chain.record_events();
                     }
@@ -1075,6 +1151,19 @@ impl KvCacheStore {
         partition: PartitionId,
         now: Time,
     ) {
+        if let Some(round) = self.release_retaining_round(request, partition, now) {
+            self.store_round(partition, request, round, now);
+        }
+    }
+
+    /// Release `request`, retaining a session request's context in HBM;
+    /// returns its round for the host tiers.
+    fn release_retaining_round(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+    ) -> Option<FinishedRound> {
         let resolved_prefill = self.ledger.prefill_context(request);
         let prompt_tokens =
             resolved_prefill.map_or(0, |value| u64::from(value.post_prefill_context_tokens()));
@@ -1090,34 +1179,50 @@ impl KvCacheStore {
             .map(|session_id| self.prefix_caches[partition as usize].take_carried(session_id))
             .unwrap_or_default();
         self.release(request, partition);
-        if let Some(session_id) = session_id {
-            self.retain_prefix(
-                request,
-                partition,
-                session_id,
-                prompt_tokens,
-                retained_tokens,
-                shared_tokens,
-                carried,
-                cache_return_metadata,
-                now,
-                PrefixCacheRetentionReason::RequestComplete,
+        let session_id = session_id?;
+        self.retain_prefix(
+            request,
+            partition,
+            session_id,
+            prompt_tokens,
+            retained_tokens,
+            shared_tokens,
+            carried,
+            cache_return_metadata,
+            now,
+            PrefixCacheRetentionReason::RequestComplete,
+        );
+        Some(FinishedRound {
+            session_id,
+            prompt_end: prompt_tokens,
+            tokens: retained_tokens,
+            shared: shared_tokens,
+        })
+    }
+
+    /// Write `request`'s finished round through to the host tiers.
+    fn store_round(
+        &mut self,
+        partition: PartitionId,
+        request: RequestId,
+        round: FinishedRound,
+        now: Time,
+    ) {
+        if let Some(reads) = self.tier_reads.as_mut() {
+            reads.note_stored(partition, round.session_id, round.tokens);
+        }
+        if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
+            chain.store_round(
+                round.session_id,
+                RoundContext {
+                    positions: self
+                        .accounting
+                        .resume_positions(round.prompt_end, round.tokens),
+                    prompt_end: round.prompt_end,
+                    shared: round.shared,
+                },
             );
-            if let Some(reads) = self.tier_reads.as_mut() {
-                reads.note_stored(partition, session_id, retained_tokens);
-            }
-            if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
-                chain.store_round(
-                    session_id,
-                    RoundContext {
-                        positions: self
-                            .accounting
-                            .resume_positions(prompt_tokens, retained_tokens),
-                        shared: shared_tokens,
-                    },
-                );
-                self.log_tier_events(partition, request, now);
-            }
+            self.log_tier_events(partition, request, now);
         }
     }
 
@@ -1533,6 +1638,7 @@ mod tests {
                 per_token: 1000,
                 state: 0,
             },
+            TierStateOptions::default(),
         )
     }
 
@@ -1707,6 +1813,7 @@ mod tests {
                 per_token: 1,
                 state: 0,
             },
+            TierStateOptions::default(),
         )
         .with_loading_area(0.1);
         for (i, &tokens) in contexts.iter().enumerate() {
@@ -1865,6 +1972,7 @@ mod tests {
                 per_token: 1000,
                 state: 0,
             },
+            TierStateOptions::default(),
         )
         .with_tiers_reports(Rc::clone(&reports));
         complete(&mut kv_store, 1, session(1, 0), 6_000);
@@ -2662,6 +2770,61 @@ mod tests {
         // the state it carried goes with it.
         round(&mut kv_store, 2, 2_000, false);
         assert_eq!(kv_store.prefix_caches[0].used_units(), 0);
+    }
+
+    /// A decode run elsewhere hands back every output but the last on top of
+    /// the prompt's context: with two states kept, the prompt's end stays a
+    /// resume point inside the extended context.
+    #[test]
+    fn a_handed_back_context_keeps_its_prompt_end_state_when_asked() {
+        for (k, inside_hit) in [(1, 0), (2, 5_000)] {
+            let mut kv_store = KvCacheStore::new(
+                1,
+                Arc::new(
+                    KvAccounting::resolve(
+                        &KvCacheLayout::new()
+                            .with_part(KvCachePart::per_token("gqa", 1))
+                            .with_part(KvCachePart::per_request("gdn", STATE_TOKENS)),
+                        KvAccountingOptions {
+                            resume_points: Some(PrefixResumePoints::ContextEnd),
+                            state_retention: StateRetention::Latest { k },
+                            ..KvAccountingOptions::default()
+                        },
+                        10_000_000,
+                    )
+                    .unwrap(),
+                ),
+                capped_prefix_cache(10_000_000, PrefixCachePolicy::Lru),
+                None,
+                None,
+            );
+            let session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: 0,
+            };
+            let resolved = kv_store.preview_prefill_context(0, 5_000, session);
+            let footprint = kv_store.footprint(RequestId(0), 5_000, 0);
+            kv_store.reserve_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+            kv_store.drain_ready();
+            kv_store.commit_resident(RequestId(0), 0, 5_000, 0);
+            let hand_back = kv_store
+                .release_handing_back(RequestId(0), 0, Time::ZERO)
+                .expect("a session request hands its context back");
+            assert_eq!(
+                kv_store.prefix_caches[0].used_units(),
+                5_000 + STATE_TOKENS,
+                "the prompt's context waits for its decode"
+            );
+            kv_store.hand_back_context(0, hand_back, 401, Time::from_ms(1.0));
+            assert_eq!(
+                kv_store.prefix_caches[0].used_units(),
+                5_400 + u64::from(k) * STATE_TOKENS
+            );
+            assert_eq!(kv_store.prefix_caches[0].peek(7, 5_401), 5_400);
+            // A next prompt keeping only part of the output.
+            assert_eq!(kv_store.prefix_caches[0].peek(7, 5_200), inside_hit);
+        }
     }
 
     /// The reusable length is bounded by the attention KV **and** by the last

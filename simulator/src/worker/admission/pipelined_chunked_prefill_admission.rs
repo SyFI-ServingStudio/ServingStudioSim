@@ -76,6 +76,7 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::ChunkEndAlignment;
+use super::external_decode::ExternalDecode;
 use super::microbatch_budget::MicrobatchBudget;
 use super::read_wait::{ReadWait, ReadWaitPolicy};
 use super::started_order::{FreshGate, PrefillFill, StartedOrder};
@@ -119,6 +120,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     landed: VecDeque<Landed>,
     /// When a read may start; `None`: whenever it fits (vLLM).
     read_wait: Option<ReadWait>,
+    /// The decode runs elsewhere: a request completes at its first token.
+    external_decode: Option<ExternalDecode>,
 }
 
 /// A request whose read has landed.
@@ -186,12 +189,20 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             reading: HashMap::new(),
             landed: VecDeque::new(),
             read_wait: None,
+            external_decode: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn reading_requests(&self) -> usize {
         self.reading.len()
+    }
+
+    /// Run each request to its first token and take its context back from a
+    /// decode elsewhere. Not vLLM.
+    pub(crate) fn with_external_decode(mut self) -> Self {
+        self.external_decode = Some(ExternalDecode::default());
+        self
     }
 
     /// Start a host-tier read only within `read_wait` of its tier's channel.
@@ -563,6 +574,9 @@ where
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
+            if let Some(external_decode) = &mut self.external_decode {
+                external_decode.accept(request, &mut record.request.definition);
+            }
             (
                 arrival_time,
                 record.request.definition.prompt_tokens,
@@ -739,11 +753,19 @@ where
             };
             kv_store.finish_chunked_prefill(chunk.request, PARTITION, remaining_output_tokens);
             if remaining_output_tokens == 0 {
-                kv_store.release_retaining_prefix(chunk.request, PARTITION, at);
+                match &mut self.external_decode {
+                    Some(external_decode) => {
+                        external_decode.release(kv_store, chunk.request, PARTITION, at);
+                    }
+                    None => kv_store.release_retaining_prefix(chunk.request, PARTITION, at),
+                }
                 completed.push(chunk.request);
             }
         }
         kv_store.sample_submit(PARTITION, at);
+        if let Some(external_decode) = &mut self.external_decode {
+            external_decode.hand_back(kv_store, PARTITION, at);
+        }
     }
 
     fn queued_requests(&self) -> u32 {

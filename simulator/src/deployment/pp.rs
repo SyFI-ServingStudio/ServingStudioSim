@@ -238,6 +238,7 @@ fn worker_config(
         balance_decode_microbatches,
         prefill_chunk_alignment,
         pending_order,
+        external_decode,
         prefix_tiers,
         ..
     } = worker
@@ -263,6 +264,7 @@ fn worker_config(
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
         prefill_chunk_alignment: *prefill_chunk_alignment,
+        external_decode: *external_decode,
         max_model_len,
         ..WorkerConfig::default()
     };

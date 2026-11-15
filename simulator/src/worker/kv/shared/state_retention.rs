@@ -10,20 +10,37 @@
 //! one reusable state each), kept or evicted whole. A request that takes the
 //! context carries the states that survive its round, still charged, until its
 //! context returns with them below its new end.
+//!
+//! A round whose decode runs elsewhere leaves two states: its pass's end at
+//! the prompt's end, and the handed-back decode's end at the context's end
+//! ([`StateTag::handback`]).
 
 /// What a round-end state is, beside where it sits: the round that computed
 /// it, counted along the session's lineage (one past the round of the state
-/// it resumed from, 0 when it resumed from none).
+/// it resumed from, 0 when it resumed from none), and whether it is a
+/// handed-back decode's end rather than the end of a pass this engine ran.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StateTag {
     pub(crate) round: u32,
+    pub(crate) handback: bool,
 }
 
 impl StateTag {
-    /// The tag of the state a round resuming from `resume` leaves at its end.
+    /// The tag of the state a pass resuming from `resume` leaves at its end.
     pub(crate) fn after(resume: Option<StateTag>) -> Self {
         Self {
             round: resume.map_or(0, |tag| tag.round + 1),
+            handback: false,
+        }
+    }
+
+    /// The tag of a handed-back decode's end, given `latest`, the latest
+    /// state of the context at or before the prompt's end: the decode
+    /// belongs to that state's round (0 without one).
+    pub(crate) fn handed_back(latest: Option<RoundState>) -> Self {
+        Self {
+            round: latest.map_or(0, |state| state.tag.round),
+            handback: true,
         }
     }
 }
@@ -79,15 +96,31 @@ impl StateRetention {
 
     /// Of `states` (ascending, at or before the resume point of a round that
     /// resumed from a `resume` state), those still kept once that round adds
-    /// the state at its own end.
-    pub(crate) fn survivors(self, states: &[RoundState], resume: StateTag) -> Vec<RoundState> {
+    /// its `added` states: its pass's end, and with 2 a handed-back decode's
+    /// end.
+    pub(crate) fn survivors(
+        self,
+        states: &[RoundState],
+        resume: StateTag,
+        added: u32,
+    ) -> Vec<RoundState> {
+        let pass = StateTag::after(Some(resume));
         let mut all = states.to_vec();
         all.push(RoundState {
-            at: u64::MAX,
-            tag: StateTag::after(Some(resume)),
+            at: u64::MAX - 1,
+            tag: pass,
         });
+        if added >= 2 {
+            all.push(RoundState {
+                at: u64::MAX,
+                tag: StateTag {
+                    handback: true,
+                    ..pass
+                },
+            });
+        }
         let mut kept = self.keep(all);
-        kept.pop();
+        kept.retain(|state| state.at < u64::MAX - 1);
         kept
     }
 }
@@ -118,19 +151,27 @@ mod tests {
         assert_eq!(latest.keep(at(&[1, 2, 3, 4])), at(&[2, 3, 4]));
         assert_eq!(latest.keep(at(&[4])), at(&[4]));
         assert_eq!(
-            latest.survivors(&at(&[1, 2, 3]), StateTag::default()),
+            latest.survivors(&at(&[1, 2, 3]), StateTag::default(), 1),
             at(&[2, 3])
         );
         assert!(StateRetention::default()
-            .survivors(&at(&[1, 2]), StateTag::default())
+            .survivors(&at(&[1, 2]), StateTag::default(), 1)
             .is_empty());
+        // A round that also hands a decode back leaves room for both.
+        assert_eq!(
+            latest.survivors(&at(&[1, 2, 3]), StateTag::default(), 2),
+            at(&[3])
+        );
     }
 
     #[test]
     fn normalize_keeps_the_latest_round_at_each_position() {
         let tagged = |at, round| RoundState {
             at,
-            tag: StateTag { round },
+            tag: StateTag {
+                round,
+                handback: false,
+            },
         };
         let mut states = vec![tagged(20, 1), tagged(10, 0), tagged(20, 3)];
         normalize(&mut states);

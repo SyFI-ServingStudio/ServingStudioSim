@@ -19,7 +19,9 @@ pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResum
 pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::state_retention::StateRetention;
-pub use shared::tier_chain::{LoadingQueue, StagedCharge, TierBytes, TierSpec, TierWrites};
+pub use shared::tier_chain::{
+    LoadingQueue, StagedCharge, TierBytes, TierSpec, TierStateOptions, TierWrites,
+};
 pub use shared::tier_reads::{SharedTiersReports, TiersReport};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
@@ -167,6 +169,18 @@ pub trait KvStore {
     fn sample_submit(&mut self, partition: PartitionId, now: Time);
 }
 
+/// A session request whose decode runs elsewhere, from its release until its
+/// context comes back ([`PrefixKv::hand_back_context`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandBack {
+    request: RequestId,
+    session_id: u32,
+    /// Where its prompt ended.
+    prompt_end: u64,
+    /// Tokens it shared with the session's previous context.
+    shared: u64,
+}
+
 /// Prefix-aware refinement of the same KV owner.
 ///
 /// Admission first obtains a pure plan, applies its token/KV gates, then reserves
@@ -193,6 +207,26 @@ pub trait PrefixKv: KvStore {
     );
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
+    /// [`Self::release_retaining_prefix`] of a request whose decode runs
+    /// elsewhere: HBM retains its prompt's context, and what comes back is
+    /// for [`Self::hand_back_context`]; `None` for a standalone request.
+    fn release_handing_back(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+    ) -> Option<HandBack>;
+    /// The decode run elsewhere hands the context back after `output_tokens`
+    /// outputs: every output but the last, whose KV the next round computes,
+    /// extends the prompt's context in HBM, and host tiers are written the
+    /// whole round.
+    fn hand_back_context(
+        &mut self,
+        partition: PartitionId,
+        hand_back: HandBack,
+        output_tokens: u32,
+        now: Time,
+    );
 
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
