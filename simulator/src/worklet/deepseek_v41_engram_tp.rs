@@ -19,9 +19,10 @@
 //!
 //! With `mhc_unfused_backends` (DeepInfer `hc.py`), the hc post is
 //! TileKernels' `mhc_post_fwd` and the attention pre its five-launch shifted
-//! pre (`mhc_shifted_pre`), in place of the two placeholders. The RMSNorm
-//! DeepInfer runs after the shifted pre (`_norm_kernel`) has no kind and no
-//! leaf.
+//! pre (`mhc_shifted_pre`), in place of the two placeholders. With
+//! `attn_norm_backends`, the RMSNorm + MXFP8 DeepInfer runs after the shifted
+//! pre (`hc.py` `layer_norm(..., return_bf16=True)`, one `_norm_kernel`) is its
+//! own leaf.
 
 use std::sync::Arc;
 
@@ -34,7 +35,8 @@ use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
     ElementwiseKernelConfig, ElementwiseKernelInput, EngramGateKernel, EngramGateKernelConfig,
     EngramGateKernelInput, MhcPostKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
-    MhcShiftedPreKernel, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    MhcShiftedPreKernel, RmsNormMxfp8Kernel, RmsNormMxfp8KernelConfig, RmsNormMxfp8KernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -62,6 +64,9 @@ pub struct DeepseekV41EngramTpWorkletConfig {
     /// `Some` when the engine runs the hc post and the shifted pre as
     /// TileKernels' unfused mHC kernels (DeepInfer), not as placeholders.
     pub mhc_unfused_backends: Option<Vec<&'static str>>,
+    /// `Some` when the engine runs the attention RMSNorm + MXFP8 after the
+    /// shifted pre as its own launch (DeepInfer `_norm_kernel`).
+    pub attn_norm_backends: Option<Vec<&'static str>>,
 }
 
 /// The launch that folds the `wkv` output into the hc streams.
@@ -117,6 +122,7 @@ pub struct DeepseekV41EngramTpWorkletResolved {
     pub pre_big_fuse: Option<ElementwiseKernelConfig>,
     /// TileKernels' shifted pre in place of `hc_prenorm` + `pre_big_fuse`.
     pub shifted_pre: Option<MhcRmsNormKernelConfig>,
+    pub attn_norm: Option<RmsNormMxfp8KernelConfig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -135,6 +141,7 @@ pub struct DeepseekV41EngramTpWorklet {
     pub hc_prenorm: Option<Op<ElementwiseKernel>>,
     pub pre_big_fuse: Option<Op<ElementwiseKernel>>,
     pub shifted_pre: Option<Op<MhcShiftedPreKernel>>,
+    pub attn_norm: Option<Op<RmsNormMxfp8Kernel>>,
     resolved: DeepseekV41EngramTpWorkletResolved,
 }
 
@@ -202,6 +209,14 @@ impl DeepseekV41EngramTpWorklet {
             hc_prenorm: placeholders.then(|| ew(hc_bytes, mix_bytes)),
             pre_big_fuse: placeholders.then(|| ew(hc_bytes + mix_bytes, hidden_bytes)),
             shifted_pre: cfg.mhc_unfused_backends.as_ref().map(tile),
+            attn_norm: cfg.attn_norm_backends.as_ref().map(|backends| RmsNormMxfp8KernelConfig {
+                backends: backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden: cfg.hidden_size.get(),
+                return_bf16: true,
+                dtype: DType::Bf16,
+                max_tokens_per_rank: cfg.max_rank_tokens,
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -252,6 +267,7 @@ impl DeepseekV41EngramTpWorklet {
             hc_prenorm: maybe!(ElementwiseKernel, r.hc_prenorm, "mhc_hc_prenorm"),
             pre_big_fuse: maybe!(ElementwiseKernel, r.pre_big_fuse, "mhc_pre_big_fuse"),
             shifted_pre: maybe!(MhcShiftedPreKernel, r.shifted_pre, "mhc_shifted_pre"),
+            attn_norm: maybe!(RmsNormMxfp8Kernel, r.attn_norm, "attn_norm"),
             name,
             resolved,
         })
@@ -277,6 +293,9 @@ impl DeepseekV41EngramTpWorklet {
             children.push(op.compile(b));
         }
         if let Some(op) = &self.shifted_pre {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.attn_norm {
             children.push(op.compile(b));
         }
         CostNode::Labeled {
@@ -325,6 +344,9 @@ impl DeepseekV41EngramTpWorklet {
         if let Some(op) = &self.shifted_pre {
             eval_or_zero(op, mhc, zero, ev);
         }
+        if let Some(op) = &self.attn_norm {
+            eval_or_zero(op, RmsNormMxfp8KernelInput { num_tokens: rows }, zero, ev);
+        }
     }
 }
 
@@ -347,6 +369,7 @@ pub(crate) mod tests {
             engram_gate_backends: None,
             max_rank_tokens: 8192,
             mhc_unfused_backends: None,
+            attn_norm_backends: None,
         }
     }
 

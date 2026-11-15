@@ -557,6 +557,7 @@ fn normalize_dp_dspark_input(
                         // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
                         mhc_overlap: false,
                         write_kv_only: false,
+                        kv_written: false,
                     },
                 },
             }

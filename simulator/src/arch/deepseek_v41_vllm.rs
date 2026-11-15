@@ -1116,6 +1116,7 @@ pub(crate) fn layer_config(
             engram_gate_backends: None,
             max_rank_tokens: parallel.max_num_batched_tokens,
             mhc_unfused_backends: None,
+            attn_norm_backends: None,
         }),
         attention: DeepseekV41AttentionTpWorkletConfig {
             layer: kind.attention,
@@ -1479,6 +1480,7 @@ impl DeepseekV41VllmModel {
                                 full_graph: false,
                                 mhc_overlap: false,
                                 write_kv_only: true,
+                                kv_written: false,
                             }
                         };
                         replay.write_kv.eval(&write_kv, evaluator);
@@ -1918,6 +1920,7 @@ pub(crate) fn layer_input(
             full_graph,
             mhc_overlap: mhc_overlap_live(full_graph, rows),
             write_kv_only: false,
+            kv_written: false,
         },
     }
 }

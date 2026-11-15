@@ -19,6 +19,7 @@ pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
 pub mod deepseek_v41_attention_tp;
 pub mod deepseek_v41_common;
+pub mod deepseek_v41_deepinfer_kv;
 pub mod deepseek_v41_dspark_context_kv_local;
 pub mod deepseek_v41_engram_prefetch_local;
 pub mod deepseek_v41_engram_tp;

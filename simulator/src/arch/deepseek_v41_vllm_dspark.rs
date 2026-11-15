@@ -910,6 +910,7 @@ fn normalize_dspark_input(
             // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
             mhc_overlap: false,
             write_kv_only: false,
+            kv_written: false,
         },
     };
     Ok((target, step.decode.len() as u32, draft, plumbing))

@@ -178,6 +178,17 @@ const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
 const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
 const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
+/// DeepInfer's TileLang KV launches around the prefill attention (paged loads
+/// and stores, fused norm/RoPE/cast, compressor, index assembly, `_norm_kernel`).
+const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
+/// The `kv_swa_cur.copy_` DtoD memcpy.
+const DEEPINFER_MEMCPY_BACKENDS: &[&str] = &["torch_memcpy_deepinfer"];
+/// DeepInfer's KV page (`ModelMetadata.resolved_tokens_per_block`).
+const DEEPINFER_BLOCK_SIZE: u32 = 128;
+/// `DEEPINFER_MAX_BACKTRACKING_TOKENS`' default, `max(v, nextn + 1)` with
+/// `nextn` 5 (`environ.py`): each request's SWA ring holds this many tokens
+/// past the window.
+const DEEPINFER_BACKTRACKING_TOKENS: u32 = 6;
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -342,6 +353,10 @@ pub fn build_configs(
                 ))
             })?;
         let write_kv = bodies[cut_body].attention.clone();
+        // DeepInfer rebuilds `kv_swa_full_index` for the compact rows at the cut.
+        if let Some(di) = bodies[cut_body].attention.deepinfer.as_mut() {
+            di.builds_swa_index = true;
+        }
         (
             Some(DeepseekV41ReplayConfig::new(
                 rule, cut_body, write_kv, model, &gpu,
@@ -440,11 +455,18 @@ fn deepinfer_backends(
         candidate_topk_blocks: model.candidate_topk_blocks,
         candidate_block_size: model.candidate_block_size,
         candidate_metadata: kind.candidate_metadata,
+        kv_backends: DEEPINFER_KV_BACKENDS.to_vec(),
+        memcpy_backends: DEEPINFER_MEMCPY_BACKENDS.to_vec(),
+        block_size: DEEPINFER_BLOCK_SIZE,
+        swa_ring_tokens: model.sliding_window + DEEPINFER_BACKTRACKING_TOKENS,
+        // The first layer builds the step's `kv_swa_full_index`.
+        builds_swa_index: tp1.layers == [0],
     });
     if let Some(engram) = &mut tp1.engram {
         engram.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
         engram.engram_gate_backends = Some(DEEPINFER_ENGRAM_GATE_BACKENDS.to_vec());
         engram.mhc_unfused_backends = Some(DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec());
+        engram.attn_norm_backends = Some(DEEPINFER_KV_BACKENDS.to_vec());
     }
 }
 
@@ -746,6 +768,13 @@ impl DpLayerBody {
         for (rank, layer) in input.ranks.iter().enumerate() {
             if let Some((boundary, step)) = boundary {
                 boundary.eval_rank(step, rank, ev);
+                if step.replay.is_some() {
+                    // The cut's `write_kv` stored this layer's main and index KV.
+                    let mut layer = layer.clone();
+                    layer.attention.kv_written = true;
+                    self.eval_rank(&layer, ev);
+                    continue;
+                }
             }
             self.eval_rank(layer, ev);
         }
@@ -796,6 +825,7 @@ impl DpReplayBoundary {
                 full_graph: false,
                 mhc_overlap: false,
                 write_kv_only: true,
+                kv_written: false,
             },
         };
         self.write_kv.eval(&write_kv, ev);
@@ -1637,6 +1667,16 @@ mod tests {
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(metadata, [vec![24]]);
+        // `kv_swa_full_index` is built by layer 0 and again at the YOCO cut.
+        let swa_index: Vec<Vec<u32>> = configs
+            .bodies
+            .iter()
+            .chain([&configs.layer0])
+            .filter(|body| body.attention.deepinfer.as_ref().unwrap().builds_swa_index)
+            .map(|body| body.layers.clone())
+            .collect();
+        assert_eq!(swa_index, [vec![20], vec![0]]);
+        assert_eq!(configs.layer0.attention.deepinfer.as_ref().unwrap().swa_ring_tokens, 134);
         let consumers: Vec<u32> = configs
             .bodies
             .iter()
