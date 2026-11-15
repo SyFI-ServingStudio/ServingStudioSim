@@ -566,19 +566,36 @@ mod tests {
         assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(100));
     }
 
-    /// A hybrid head over 2-byte tokens on 4-token blocks, with an 8-unit
-    /// recurrent state per request and one null block.
+    /// A hybrid head over 2-byte tokens on 4-token blocks, with a 6-byte
+    /// recurrent state per request padded to 8 units and one null block.
     fn hybrid_head(
         store: SharedRequests,
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
         block_aligned_chunks: bool,
     ) -> PipelineHead<FakeModel> {
+        hybrid_head_charging(
+            store,
+            max_batch_tokens,
+            attn_kv_bytes,
+            block_aligned_chunks,
+            Vec::new(),
+        )
+    }
+
+    /// [`hybrid_head`] with `kv_part_padding`.
+    fn hybrid_head_charging(
+        store: SharedRequests,
+        max_batch_tokens: u32,
+        attn_kv_bytes: u64,
+        block_aligned_chunks: bool,
+        kv_part_padding: Vec<crate::worker::kv::PartPadding>,
+    ) -> PipelineHead<FakeModel> {
         use crate::arch::kv_layout::{EngineOverhead, KvCachePart};
         use crate::worker::config::PrefillChunkAlignment;
         use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
         let kv_cache_layout = kv_layout()
-            .with_part(KvCachePart::per_request("state", 16))
+            .with_part(KvCachePart::per_request("state", 6).padded_to(16))
             .with_engine(EngineOverhead {
                 block_tokens: Some(4),
                 fixed_device_bytes: 8,
@@ -602,6 +619,7 @@ mod tests {
                 } else {
                     PrefillChunkAlignment::Plain
                 }),
+                kv_part_padding,
                 ..WorkerConfig::default()
             },
             None,
@@ -626,6 +644,25 @@ mod tests {
         }
         assert_eq!(launched(&events), vec![(1, 12, Time::from_ms(1.0))]);
         assert_eq!(worker.status().queued_requests, 1);
+    }
+
+    #[test]
+    fn a_hybrid_head_can_charge_state_by_its_real_bytes() {
+        // (84 - 8) / 2 = 38 units. Padded, a 12-token prompt reserves at
+        // least 12 + 8 and only one fits; unpadded, the state is its 6 bytes,
+        // 3 units, and both fit.
+        for (charge, launches) in [("state=padded", 1), ("state=unpadded", 2)] {
+            let store = shared_with(&[(0, 12, 1), (1, 12, 1)]);
+            let padding = vec![charge.parse().unwrap()];
+            let mut worker = hybrid_head_charging(Rc::clone(&store), 16, 84, true, padding);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            let mut events = Vec::new();
+            for step in 0..3 {
+                worker.tick(Time::from_ms(step as f64), &mut events);
+            }
+            assert_eq!(launched(&events).len(), launches, "{charge}");
+        }
     }
 
     #[test]

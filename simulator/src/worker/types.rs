@@ -521,7 +521,7 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
@@ -594,6 +594,8 @@ pub struct WorkerConfig {
     pub prefix_resume_points: Option<crate::worker::kv::PrefixResumePoints>,
     /// Also keep them at every multiple of this many tokens.
     pub prefix_resume_interval: Option<u32>,
+    /// Layout parts charged other entry bytes than `kv_overhead` gives them.
+    pub kv_part_padding: Vec<crate::worker::kv::PartPadding>,
     /// Tokens one step may have in flight, which caps what admission charges a
     /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
     /// scheduling), or the whole prompt without a token budget.
@@ -643,6 +645,7 @@ impl Default for WorkerConfig {
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,
             prefix_resume_interval: None,
+            kv_part_padding: Vec::new(),
             kv_max_in_flight_tokens: None,
             max_model_len: None,
             prefill_chunk_alignment: None,

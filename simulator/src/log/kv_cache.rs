@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::arch::kv_layout::{KvGrowth, RankPlacement};
-use crate::worker::kv::{KvCacheReport, KvOverhead};
+use crate::worker::kv::{KvCacheReport, KvOverhead, PartCharge};
 use crate::worker::GpuCluster;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -181,6 +181,18 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             }
             None => line.push_str(" · whole prompt in flight"),
         }
+    }
+    if !options.part_padding.is_empty() {
+        let parts: Vec<String> = options
+            .part_padding
+            .iter()
+            .map(|padding| match padding.charge {
+                PartCharge::Padded => format!("{} padded", padding.part),
+                PartCharge::Unpadded => format!("{} unpadded", padding.part),
+                PartCharge::Bytes(bytes) => format!("{} {bytes} B", padding.part),
+            })
+            .collect();
+        let _ = write!(line, " · charges {}", parts.join(", "));
     }
     let _ = writeln!(out, "{line}");
 

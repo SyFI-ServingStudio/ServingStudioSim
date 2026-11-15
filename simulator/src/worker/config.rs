@@ -22,7 +22,8 @@ use super::admission::{
     LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit, StartedOrder,
 };
 use super::kv::{
-    KvOverhead, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy, PrefixResumePoints,
+    KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
+    PrefixResumePoints,
 };
 use super::types::WorkerConfig;
 
@@ -232,7 +233,7 @@ const PREFIX_RESUME_POINTS_CHOICES: [&str; 5] = [
 /// serving engine's own allocation counts, and where a finished request keeps
 /// the state a later request resumes from. Flattened into every selector that
 /// owns KV.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ParamStruct)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, ParamStruct)]
 pub struct KvAccountingSpec {
     /// `vllm` charges what vLLM allocates (padding, state copies, engine
     /// blocks, a sliding window's in-flight tokens) and resumes prefixes where
@@ -258,11 +259,17 @@ pub struct KvAccountingSpec {
     /// async scheduling), or the whole prompt without a token budget.
     #[serde(default)]
     kv_max_in_flight_tokens: Option<u32>,
+    /// Entry bytes of named layout parts, overriding `kv_overhead` for those
+    /// parts only: `<part>=padded`, `<part>=unpadded`, or `<part>=<bytes per
+    /// entry>` (an engine that packs a state differently). Every other
+    /// `kv_overhead` rule stays. A name the arch's layout lacks is an error.
+    #[serde(default)]
+    kv_part_padding: Vec<String>,
 }
 
 impl KvAccountingSpec {
     /// Validate the knobs and set them on `config`.
-    pub(crate) fn apply(self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
+    pub(crate) fn apply(&self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
         ensure!(
             self.prefix_resume_interval != Some(0),
             "{owner}: prefix_resume_interval must be positive"
@@ -275,6 +282,21 @@ impl KvAccountingSpec {
         config.prefix_resume_points = self.prefix_resume_points;
         config.prefix_resume_interval = self.prefix_resume_interval;
         config.kv_max_in_flight_tokens = self.kv_max_in_flight_tokens;
+        config.kv_part_padding = Vec::with_capacity(self.kv_part_padding.len());
+        for value in &self.kv_part_padding {
+            let padding: PartPadding = value
+                .parse()
+                .map_err(|error| anyhow::anyhow!("{owner}: kv_part_padding: {error:#}"))?;
+            ensure!(
+                config
+                    .kv_part_padding
+                    .iter()
+                    .all(|named| named.part != padding.part),
+                "{owner}: kv_part_padding names part `{}` twice",
+                padding.part
+            );
+            config.kv_part_padding.push(padding);
+        }
         Ok(())
     }
 }
@@ -795,7 +817,7 @@ impl IterWorkerSel {
             | Self::Speculative { kv_accounting, .. }
             | Self::PipelineChunkedPrefill { kv_accounting, .. }
             | Self::PdPrefill { kv_accounting, .. }
-            | Self::PdDecode { kv_accounting, .. } => *kv_accounting,
+            | Self::PdDecode { kv_accounting, .. } => kv_accounting.clone(),
         }
     }
 
@@ -1212,5 +1234,30 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn kv_part_padding_parses_each_part_once() {
+        let apply = |keys: &str| {
+            let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+                "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\n\
+                 max_batch_tokens: 8192\n{keys}"
+            ))
+            .expect("parse pipeline worker");
+            let mut config = WorkerConfig::default();
+            worker
+                .kv_accounting()
+                .apply("t", &mut config)
+                .map(|()| config)
+        };
+        assert!(apply("").unwrap().kv_part_padding.is_empty());
+        let config = apply("kv_part_padding: [kda=unpadded, kpool_tail=0]\n").unwrap();
+        assert_eq!(
+            config.kv_part_padding,
+            ["kda=unpadded", "kpool_tail=0"].map(|value| value.parse().unwrap())
+        );
+        let twice = apply("kv_part_padding: [kda=unpadded, kda=padded]\n").unwrap_err();
+        assert!(twice.to_string().contains("twice"), "{twice}");
+        assert!(apply("kv_part_padding: [kda]\n").is_err());
     }
 }

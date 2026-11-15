@@ -127,8 +127,10 @@ waiting one needs free (`needed_to_admit`), and what a retained prefix entry
 keeps (`entry_charge`). `current_kv` stays context tokens for the arch input;
 charge never replaces it. The worker's flattened `KvAccountingSpec` picks
 `kv_overhead` (`vllm` default: padding, state copies, engine blocks, in-flight
-window tokens; `none`: model state only), `prefix_resume_points`,
-`prefix_resume_interval`, and `kv_max_in_flight_tokens`. Rules and rationale:
+window tokens; `none`: model state only), `kv_part_padding` (one part's entry
+bytes: `padded`, `unpadded` or a byte count, other rules unchanged),
+`prefix_resume_points`, `prefix_resume_interval`, and
+`kv_max_in_flight_tokens`. Rules and rationale:
 `doc/detailed_design/L5.md` §3.1–3.2.
 
 `SessionInput` remains one closed immutable request declaration: `Standalone`;

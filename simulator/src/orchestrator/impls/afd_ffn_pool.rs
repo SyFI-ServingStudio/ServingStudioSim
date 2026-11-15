@@ -61,7 +61,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<DisaggFfnWorker<M>> {
                     crate::common::WorkerId(i),
                     std::sync::Arc::clone(&model),
                     std::rc::Rc::clone(&requests),
-                    config,
+                    config.clone(),
                     pool,
                     gpu_name,
                     std::rc::Rc::clone(cluster),

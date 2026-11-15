@@ -19,7 +19,8 @@
 //! `kv_overhead` picks the byte counts. `vllm` charges what vLLM allocates:
 //! padded entries, extra state copies, whole engine blocks, and a sliding window
 //! that holds `W - 1` tokens plus the tokens in flight. `none` charges only what
-//! the model itself must keep.
+//! the model itself must keep. `part_padding` overrides one part's entry bytes
+//! and leaves every other rule of the mode in place.
 //!
 //! [`KvAccounting::report`] restates one resolved pool as a
 //! [`KvCacheReport`](super::kv_cache_report::KvCacheReport), built once per
@@ -108,10 +109,57 @@ impl PrefixResumePoints {
     }
 }
 
+/// The entry bytes one part is charged instead of what `kv_overhead` gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartCharge {
+    /// The engine's padded entry, where the layout declares one.
+    Padded,
+    /// The model's own entry.
+    Unpadded,
+    /// This many bytes per entry, such as an engine that packs a state more
+    /// tightly than either.
+    Bytes(u64),
+}
+
+/// `<part>=<charge>`: one part's [`PartCharge`], `<charge>` being `padded`,
+/// `unpadded` or a byte count per entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PartPadding {
+    pub part: String,
+    pub charge: PartCharge,
+}
+
+impl std::str::FromStr for PartPadding {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        let Some((part, charge)) = value.split_once('=') else {
+            anyhow::bail!("`{value}` is not `<part>=<padded|unpadded|bytes per entry>`");
+        };
+        let charge = match charge.trim() {
+            "padded" => PartCharge::Padded,
+            "unpadded" => PartCharge::Unpadded,
+            bytes => PartCharge::Bytes(bytes.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "`{value}`: the charge is `padded`, `unpadded` or a byte count per entry"
+                )
+            })?),
+        };
+        Ok(Self {
+            part: part.trim().to_string(),
+            charge,
+        })
+    }
+}
+
 /// Worker options that shape the charges.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KvAccountingOptions {
     pub overhead: KvOverhead,
+    /// Parts charged other entry bytes than `overhead` gives them; each names
+    /// a part of the layout at most once.
+    pub part_padding: Vec<PartPadding>,
     /// `None` follows the overhead mode: `prompt_end` under `vllm`,
     /// `response_end` under `none`.
     pub resume_points: Option<PrefixResumePoints>,
@@ -207,12 +255,29 @@ impl KvAccounting {
         budget_bytes: u64,
     ) -> anyhow::Result<Self> {
         layout.validate()?;
+        for padding in &options.part_padding {
+            ensure!(
+                layout.parts.iter().any(|part| part.name == padding.part),
+                "kv_part_padding names part `{}`, which the layout does not have (its parts: {})",
+                padding.part,
+                layout
+                    .parts
+                    .iter()
+                    .map(|part| part.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let with_overhead = options.overhead == KvOverhead::Vllm;
         let bytes_per_unit = layout
             .parts
             .iter()
-            .map(|part| charged_bytes_per_entry(part, options.overhead))
+            .map(|part| charged_bytes_per_entry(part, &options))
             .fold(0, gcd);
+        ensure!(
+            bytes_per_unit > 0,
+            "kv_part_padding charges every part zero bytes"
+        );
 
         let mut per_token = Vec::new();
         let mut windows = Vec::new();
@@ -220,7 +285,7 @@ impl KvAccounting {
         let mut align_estimate_units = 0;
         let mut reusable_state_units = 0;
         for part in &layout.parts {
-            let units = charged_bytes_per_entry(part, options.overhead) / bytes_per_unit;
+            let units = charged_bytes_per_entry(part, &options) / bytes_per_unit;
             match part.growth {
                 KvGrowth::PerToken { tokens_per_entry } => per_token.push(PerTokenCharge {
                     units_per_entry: units,
@@ -232,7 +297,7 @@ impl KvAccounting {
                     prefix_reusable: part.prefix_reusable,
                 }),
                 KvGrowth::PerRequest => {
-                    let (copies, aligns) = state_copies(part, layout, options);
+                    let (copies, aligns) = state_copies(part, layout, &options);
                     state_units += units * u64::from(copies);
                     align_estimate_units += units * u64::from(aligns);
                     if part.prefix_reusable {
@@ -272,11 +337,13 @@ impl KvAccounting {
 
         Ok(Self {
             layout: layout.clone(),
+            overhead: options.overhead,
+            checkpoint_block_tokens: layout.engine.block_tokens,
+            max_in_flight_tokens: options.max_in_flight_tokens.map(u64::from),
             options,
             budget_bytes,
             attention_shards: 1,
             reserved_units: 0,
-            overhead: options.overhead,
             bytes_per_unit,
             capacity_units,
             per_token,
@@ -285,8 +352,6 @@ impl KvAccounting {
             align_estimate_units,
             reusable_state_units,
             block_tokens,
-            checkpoint_block_tokens: layout.engine.block_tokens,
-            max_in_flight_tokens: options.max_in_flight_tokens.map(u64::from),
             linear_units_per_token,
             resume_points,
             resume_interval,
@@ -340,8 +405,8 @@ impl KvAccounting {
         &self.layout
     }
 
-    pub(super) fn options(&self) -> KvAccountingOptions {
-        self.options
+    pub(super) fn options(&self) -> &KvAccountingOptions {
+        &self.options
     }
 
     pub(super) fn budget_bytes(&self) -> u64 {
@@ -459,7 +524,7 @@ impl KvAccounting {
             .iter()
             .map(|part| {
                 let units_per_entry =
-                    charged_bytes_per_entry(part, self.overhead) / self.bytes_per_unit;
+                    charged_bytes_per_entry(part, &self.options) / self.bytes_per_unit;
                 let (tokens_held, entries) = match part.growth {
                     KvGrowth::PerToken { tokens_per_entry } => {
                         let tokens = if prompt_tokens == 0 { 0 } else { allocated };
@@ -475,7 +540,7 @@ impl KvAccounting {
                         (Some(tokens), tokens)
                     }
                     KvGrowth::PerRequest => {
-                        let (copies, aligns) = state_copies(part, &self.layout, self.options);
+                        let (copies, aligns) = state_copies(part, &self.layout, &self.options);
                         (None, u64::from(copies + u32::from(aligns)))
                     }
                 };
@@ -726,15 +791,23 @@ impl ResumePositions {
     }
 }
 
-/// Bytes one entry of `part` is charged: the engine's padded entry under
-/// `vllm`, the model's own under `none`.
-pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) -> u64 {
-    match overhead {
-        KvOverhead::Vllm => part
-            .overhead
-            .padded_bytes_per_entry
-            .unwrap_or(part.bytes_per_entry),
-        KvOverhead::None => part.bytes_per_entry,
+/// Bytes one entry of `part` is charged: its `part_padding` when the options
+/// name it, else the engine's padded entry under `vllm` and the model's own
+/// under `none`.
+pub(super) fn charged_bytes_per_entry(part: &KvCachePart, options: &KvAccountingOptions) -> u64 {
+    let padded = part
+        .overhead
+        .padded_bytes_per_entry
+        .unwrap_or(part.bytes_per_entry);
+    let charge = options
+        .part_padding
+        .iter()
+        .find(|padding| padding.part == part.name)
+        .map(|padding| padding.charge);
+    match (charge, options.overhead) {
+        (Some(PartCharge::Padded), _) | (None, KvOverhead::Vllm) => padded,
+        (Some(PartCharge::Unpadded), _) | (None, KvOverhead::None) => part.bytes_per_entry,
+        (Some(PartCharge::Bytes(bytes)), _) => bytes,
     }
 }
 
@@ -752,7 +825,7 @@ pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) 
 pub(super) fn state_copies(
     part: &KvCachePart,
     layout: &KvCacheLayout,
-    options: KvAccountingOptions,
+    options: &KvAccountingOptions,
 ) -> (u32, bool) {
     if options.overhead == KvOverhead::None {
         return (1, false);
@@ -1071,5 +1144,52 @@ mod tests {
             1 << 40,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn part_padding_overrides_one_parts_entry_bytes_only() {
+        let resolve = |overhead, padding: &[&str]| {
+            KvAccounting::resolve(
+                &gdn_layout(),
+                KvAccountingOptions {
+                    part_padding: padding.iter().map(|value| value.parse().unwrap()).collect(),
+                    ..options(overhead)
+                },
+                1 << 40,
+            )
+        };
+        // The 300_000-byte state unpadded under vllm: blocks still round the
+        // 2000 tokens up to 2112.
+        let unpadded = resolve(KvOverhead::Vllm, &["gdn=unpadded"]).unwrap();
+        assert_eq!(unpadded.held_while_running(2_000, 1), 2_112 + 3_000);
+        let bytes = resolve(KvOverhead::Vllm, &["gdn=250000"]).unwrap();
+        assert_eq!(bytes.held_while_running(2_000, 1), 2_112 + 2_500);
+        // Padded under none: the padding only, no block rounding.
+        let padded = resolve(KvOverhead::None, &["gdn=padded"]).unwrap();
+        assert_eq!(padded.held_while_running(2_000, 1), 2_000 + 3_168);
+
+        let unknown = resolve(KvOverhead::Vllm, &["mamba=unpadded"]).unwrap_err();
+        assert!(format!("{unknown:#}").contains("gqa, gdn"), "{unknown:#}");
+        assert!(resolve(KvOverhead::Vllm, &["gqa=0", "gdn=0"]).is_err());
+    }
+
+    #[test]
+    fn part_padding_parses_a_name_and_a_charge() {
+        let parse = |value: &str| value.parse::<PartPadding>();
+        assert_eq!(
+            parse("kda=unpadded").unwrap(),
+            PartPadding {
+                part: "kda".to_string(),
+                charge: PartCharge::Unpadded
+            }
+        );
+        assert_eq!(parse("kda=padded").unwrap().charge, PartCharge::Padded);
+        assert_eq!(
+            parse("kda=66969600").unwrap().charge,
+            PartCharge::Bytes(66_969_600)
+        );
+        for malformed in ["kda", "kda=compact", "kda=-1"] {
+            assert!(parse(malformed).is_err(), "{malformed}");
+        }
     }
 }

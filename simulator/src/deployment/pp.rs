@@ -98,6 +98,7 @@ impl Deployment for PpDeployment {
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
                 let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
                     store,
@@ -118,7 +119,7 @@ impl Deployment for PpDeployment {
                             layout,
                             &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
-                            worker_config,
+                            head_config.clone(),
                             head_log_dir.clone(),
                             PP_STAGE_POOL,
                             &head_gpu,
@@ -174,6 +175,7 @@ impl Deployment for PpDeployment {
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
                 let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
                     store,
@@ -194,7 +196,7 @@ impl Deployment for PpDeployment {
                             layout,
                             &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
-                            worker_config,
+                            head_config.clone(),
                             head_log_dir.clone(),
                             PP_STAGE_POOL,
                             &head_gpu,
@@ -297,7 +299,7 @@ where
                 STAGE_POOL_TAG,
                 Arc::clone(&stages[usize::from(stage)]),
                 std::rc::Rc::clone(&store),
-                worker_config,
+                worker_config.clone(),
                 log_dir.clone(),
                 PP_STAGE_POOL,
                 &gpu_name,

@@ -15,7 +15,7 @@ mod shared;
 
 pub use kv_cache_store::KvCacheStore;
 pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
-pub use shared::kv_accounting::{KvOverhead, PrefixResumePoints};
+pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResumePoints};
 pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 

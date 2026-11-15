@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::arch::kv_layout::{KvCacheLayout, KvGrowth};
 use crate::worker::kv::shared::kv_accounting::{
     charged_bytes_per_entry, state_copies, KvAccounting, KvAccountingOptions, KvOverhead,
-    PrefixResumePoints,
+    PartPadding, PrefixResumePoints,
 };
 
 /// One KV pool's report. Bytes are over one KV partition, as in the layout;
@@ -29,9 +29,11 @@ pub struct KvCacheReport {
 }
 
 /// The worker options, as resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct KvOptionsReport {
     pub kv_overhead: KvOverhead,
+    /// Parts charged other entry bytes than `kv_overhead` gives them.
+    pub part_padding: Vec<PartPadding>,
     pub prefix_caching: bool,
     pub prefix_resume_points: PrefixResumePoints,
     pub prefix_resume_interval_tokens: Option<u32>,
@@ -59,7 +61,8 @@ pub struct KvAccountingReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct KvPartChargeReport {
     pub name: &'static str,
-    /// The padded entry under `vllm`, the model's own under `none`.
+    /// The padded entry under `vllm`, the model's own under `none`, unless
+    /// `part_padding` names the part.
     pub charged_bytes_per_entry: u64,
     pub units_per_entry: u64,
     /// Copies a running request holds; 1 for a part that grows with context.
@@ -143,7 +146,7 @@ impl KvAccounting {
             .parts
             .iter()
             .map(|part| {
-                let charged_bytes_per_entry = charged_bytes_per_entry(part, overhead);
+                let charged_bytes_per_entry = charged_bytes_per_entry(part, options);
                 let (held_copies, align_copy) = match part.growth {
                     KvGrowth::PerRequest => {
                         let (copies, aligns) = state_copies(part, layout, options);
@@ -170,7 +173,7 @@ impl KvAccounting {
             layout,
             KvAccountingOptions {
                 overhead: other_kv_overhead,
-                ..options
+                ..options.clone()
             },
             self.budget_bytes(),
         )
@@ -229,6 +232,7 @@ impl KvAccounting {
             layout: layout.clone(),
             options: KvOptionsReport {
                 kv_overhead: overhead,
+                part_padding: options.part_padding.clone(),
                 prefix_caching: options.prefix_caching,
                 prefix_resume_points: self.resume_points(),
                 prefix_resume_interval_tokens: options.resume_interval,

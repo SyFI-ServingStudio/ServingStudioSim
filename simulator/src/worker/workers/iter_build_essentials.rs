@@ -47,6 +47,7 @@ pub(crate) fn resolve_kv_accounting(
         .saturating_mul(u64::from(num_attn_shards.max(1)));
     let options = KvAccountingOptions {
         overhead: config.kv_overhead,
+        part_padding: config.kv_part_padding.clone(),
         resume_points: config.prefix_resume_points,
         resume_interval: config.prefix_resume_interval,
         max_in_flight_tokens: config.kv_max_in_flight_tokens.or_else(|| {
