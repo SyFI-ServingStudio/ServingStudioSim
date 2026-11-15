@@ -4,41 +4,56 @@
 //!   per Engram layer reads the pinned host table over UVA on the GPU's SMs
 //!   (the profiled `engram_lookup` at `residency = host_uva`).
 //! - `off`: the fetch is priced out (the Engram blocks' compute stays).
-//! - `cpu_gather`: host threads gather the step's rows into a pinned staging
-//!   buffer, one copy-engine H2D per layer moves it, and a device kernel
-//!   unpacks (dequantizes) it. The gather and the copy use no SM time; the
-//!   GPU waits only for what they have not finished by the time the consumer
-//!   layer needs its rows:
+//! - `cpu_threads`: `engram_cpu_threads` host threads per rank, started at
+//!   the step's start, gather the step's rows into a pinned staging buffer,
+//!   one copy-engine H2D per layer moves it, and a device kernel unpacks
+//!   (dequantizes) it. The gather and the copy use no SM time; the GPU waits
+//!   only for what they have not finished by the time the consumer layer
+//!   needs its rows:
 //!   `exposed_k = max(0, ready_k - (available_k + exposed_<k))`, with layer
 //!   `k`'s rows ready at `(k + 1) * gather + h2d` (one gather after another
 //!   on the rank's threads, each copy overlapping the next gather) and
 //!   `available_k` the step's GPU time before the consumer layer, taken as the
 //!   step's mean per-layer time times the layers ahead of it on this GPU.
-//! - `cpu_gather_prefetch`: `cpu_gather` started one step early. The Engram
-//!   hashes depend only on token ids, and the scheduler knows step `k`'s
-//!   tokens while step `k-1` runs, so the host gather and the H2D copies of
-//!   step `k`'s rows start at step `k-1`'s start. They share nothing with step
-//!   `k-1` but the host threads and the copy engine (each step's threads
-//!   gather one step's rows, the next step's), so in the same formula the
-//!   rows are ready `T_prev` earlier: `ready_k = (k + 1) * gather + h2d -
-//!   T_prev`. `T_prev`, the previous step's GPU time, is taken as this step's
-//!   own GPU time before the wait (the arch evaluates one step without its
-//!   history; a chunked-prefill engine's consecutive steps carry the same
-//!   token budget). The unpack stays on the GPU, as under `cpu_gather`.
+//!   `cpu_gather` (the earlier name) is `cpu_threads` at its default 8.
+//! - `prefetch` (earlier `cpu_gather_prefetch`): `cpu_threads` started one
+//!   step early. The Engram hashes depend only on token ids, and the
+//!   scheduler knows step `k`'s tokens while step `k-1` runs, so the host
+//!   gather and the H2D copies of step `k`'s rows start at step `k-1`'s
+//!   start. They share nothing with step `k-1` but the host threads and the
+//!   copy engine, so in the same formula the rows are ready `T_prev` earlier:
+//!   `ready_k = (k + 1) * gather + h2d - T_prev`. `T_prev`, the previous
+//!   step's GPU time, is taken as this step's own GPU time before the wait
+//!   (the arch evaluates one step without its history; a chunked-prefill
+//!   engine's consecutive steps carry the same token budget). The unpack
+//!   stays on the GPU, as under `cpu_threads`.
+//! - `gpu`: the table resident in HBM, read by the device `engram_lookup`
+//!   (`residency = device`) over this GPU's hash columns (24 per rank). A
+//!   theoretical bound only: the two layers' tables (101.4 GB each) do not
+//!   fit beside the weights, and DeepInfer with
+//!   `DEEPINFER_ENGRAM_FORCE_GPU_STORAGE=1` OOMs at load on B200 (Slurm job
+//!   22879, wt-dsv41-deepinfer logs/20261114_2_deepinfer_prefill).
 //!
 //! Measured inputs (experiments/20261114_engram_cpu_gather, B200 host):
 //! - gather: 393,216 rows per rank (8192 tokens x 2 layers x 24 hash columns)
-//!   in 6.645 ms median, 4 ranks x 8 threads at once, THP on, threads on the
-//!   table's NUMA node (`logs/cpu_gather2.log`);
+//!   with 4 ranks gathering at once (the 4 GPUs of every deployment here), THP
+//!   on, split layout, threads on the table's NUMA node, no software prefetch;
+//!   median step time over the repeats ([`GATHER_STEP_MS`]). Thread counts
+//!   between measured points take the nearest measured point (ties to the
+//!   fewer threads); none is extrapolated past 14 per rank, the most measured
+//!   with 4 ranks (16 and 32 were measured with one rank only).
 //! - H2D: one layer's 51,904,512 B in 1.150 ms (45.1 GB/s) with 4 GPUs
 //!   copying at once while a GEMM and the CPU gather run
 //!   (`results/h2d_table.md`, `all4gpu_with_cpu_gather_52thr`); the GEMM ran
 //!   at most 0.9% slower beside it, so the copy is charged no SM time.
 //!
-//! The unpack has no measured kernel of its own: it is priced as the profiled
-//! device-resident `engram_lookup` over the same row count (its 6-column
-//! geometry), a random gather from HBM, which bounds a sequential read of the
-//! packed buffer from above.
+//! The unpack (`cpu_threads`, `prefetch`) and the `gpu` lookup are both the
+//! profiled device-resident `engram_lookup`. Its profiled geometry is 6 hash
+//! columns per token over a quarter table (a full 24-column, 384M-row device
+//! table does not fit one B200), so a GPU's `rows_per_token` columns are priced
+//! as `rows_per_token / 6` times the tokens at 6 columns: the same row count,
+//! a random gather from HBM either way (for the unpack, an upper bound on a
+//! sequential read of the packed buffer).
 
 use crate::arch::deepseek_v41_vllm::ENGRAM_TABLE_ROWS_RANK0;
 use crate::worklet::DeepseekV41EngramPrefetchLocalWorkletConfig;
@@ -47,16 +62,20 @@ use crate::worklet::DeepseekV41EngramPrefetchLocalWorkletConfig;
 pub enum EngramFetch {
     #[default]
     Uva,
-    CpuGather,
-    /// `cpu_gather` with the next step's rows gathered during this step.
-    CpuGatherPrefetch,
+    /// Host threads gather at the step's start (`engram_cpu_threads`).
+    CpuThreads,
+    /// `cpu_threads` with the next step's rows gathered during this step.
+    Prefetch,
+    /// The table in HBM, read by the device lookup (a bound; OOMs on B200).
+    Gpu,
     /// The fetch priced out (the Engram blocks' compute stays): the engine's
     /// own fetch path cannot be measured here.
     Off,
 }
 
-/// `uva` / `cpu_gather` / `off`, or a bool (`true` = uva, `false` = off) as
-/// the DeepInfer engine option spells it.
+/// The `engram_fetch` spellings: `uva`, `cpu_threads` (or `cpu_gather`),
+/// `prefetch` (or `cpu_gather_prefetch`), `gpu`, `off`, or a bool (`true` =
+/// uva, `false` = off) as the DeepInfer engine option spells it.
 impl<'de> serde::Deserialize<'de> for EngramFetch {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
@@ -70,25 +89,62 @@ impl<'de> serde::Deserialize<'de> for EngramFetch {
             Raw::Bool(false) => Ok(Self::Off),
             Raw::Name(name) => match name.as_str() {
                 "uva" | "true" => Ok(Self::Uva),
-                "cpu_gather" => Ok(Self::CpuGather),
-                "cpu_gather_prefetch" => Ok(Self::CpuGatherPrefetch),
+                "cpu_threads" | "cpu_gather" => Ok(Self::CpuThreads),
+                "prefetch" | "cpu_gather_prefetch" => Ok(Self::Prefetch),
+                "gpu" => Ok(Self::Gpu),
                 "off" | "false" => Ok(Self::Off),
                 other => Err(serde::de::Error::custom(format!(
-                    "engram_fetch: expected uva, cpu_gather, cpu_gather_prefetch or off, got {other}"
+                    "engram_fetch: expected uva, cpu_threads, prefetch, gpu or off, got {other}"
                 ))),
             },
         }
     }
 }
 
-/// Rows one rank gathers per ms with four ranks gathering at once.
-const GATHER_ROWS_PER_MS: f64 = 393_216.0 / 6.645;
+/// The `engram_fetch` choices the launcher offers.
+pub const ENGRAM_FETCH_CHOICES: [&str; 7] = [
+    "uva",
+    "cpu_threads",
+    "prefetch",
+    "gpu",
+    "off",
+    "cpu_gather",
+    "cpu_gather_prefetch",
+];
+
+/// Rows per rank in one measured gather step (8192 tokens x 2 layers x 24).
+const GATHER_STEP_ROWS: f64 = 393_216.0;
+/// Measured gather step (ms) per threads-per-rank, 4 ranks at once
+/// (median over the repeats; experiments/20261114_engram_cpu_gather/logs):
+/// 1 and 2 from `cpu_gather3_threads.log` (26.837/26.119/42.967,
+/// 13.897/15.975/15.911; a 76M-row table, still far past the LLC), 4, 8 and
+/// 14 from `cpu_gather2.log` (8.212/6.932/7.801, 6.645/5.437/6.875,
+/// 5.741/5.060/5.774; the full 384M-row table).
+const GATHER_STEP_MS: [(u32, f64); 5] = [
+    (1, 26.837),
+    (2, 15.911),
+    (4, 7.801),
+    (8, 6.645),
+    (14, 5.741),
+];
+
+/// The measured gather step (ms) nearest `threads` per rank (ties to the
+/// fewer threads; past the last point, the last point).
+pub fn gather_step_ms(threads: u32) -> f64 {
+    GATHER_STEP_MS
+        .iter()
+        .min_by_key(|(t, _)| (t.abs_diff(threads), *t))
+        .map(|&(_, ms)| ms)
+        .expect("non-empty table")
+}
+
 /// H2D bytes per ms per GPU with four GPUs copying at once.
 const H2D_BYTES_PER_MS: f64 = 51_904_512.0 / 1.150;
 /// Hash columns of the profiled device-resident lookup geometry.
 const UNPACK_PROFILED_HEADS: u32 = 6;
 
-/// The `cpu_gather` fetch of one GPU: its row geometry and the per-row unpack.
+/// The host-gathered fetch of one GPU (`cpu_threads` / `prefetch`): its row
+/// geometry, gather rate and start.
 #[derive(Clone, Copy, Debug)]
 pub struct EngramHostGather {
     /// Rows per token on this GPU (its hash columns).
@@ -97,19 +153,22 @@ pub struct EngramHostGather {
     pub row_bytes: u32,
     /// Tokens of the profiled unpack per scheduled token (same row count).
     pub unpack_token_scale: u32,
-    /// `cpu_gather_prefetch`: the rows are fetched during the previous step.
+    /// `prefetch`: the rows are fetched during the previous step.
     pub prefetch: bool,
+    /// Host gather rate of one rank (rows per ms) at its thread count.
+    pub gather_rows_per_ms: f64,
 }
 
 impl EngramHostGather {
-    /// Turn the UVA prefetch config into the unpack's (the device-resident
-    /// lookup over the same rows) and describe the host side.
+    /// Turn the UVA prefetch config into the device-resident lookup over the
+    /// same rows (the `gpu` fetch, and the unpack of a host gather) and
+    /// describe the host side at the measured 8 threads per rank.
     pub fn from_prefetch(prefetch: &mut DeepseekV41EngramPrefetchLocalWorkletConfig) -> Self {
         let local_heads = prefetch.engram_num_heads / prefetch.tp_size;
         assert_eq!(
             local_heads % UNPACK_PROFILED_HEADS,
             0,
-            "cpu_gather unpack: {local_heads} hash columns per GPU is not a multiple of the profiled {UNPACK_PROFILED_HEADS}"
+            "device lookup: {local_heads} hash columns per GPU is not a multiple of the profiled {UNPACK_PROFILED_HEADS}"
         );
         let gather = Self {
             rows_per_token: local_heads,
@@ -117,26 +176,35 @@ impl EngramHostGather {
                 + prefetch.engram_head_dim / prefetch.quant_block_size,
             unpack_token_scale: local_heads / UNPACK_PROFILED_HEADS,
             prefetch: false,
+            gather_rows_per_ms: GATHER_STEP_ROWS / gather_step_ms(8),
         };
         prefetch.tp_size = prefetch.engram_num_heads / UNPACK_PROFILED_HEADS;
         prefetch.table_rows = ENGRAM_TABLE_ROWS_RANK0;
         prefetch.residency = "device".into();
+        prefetch.token_scale = gather.unpack_token_scale;
         gather
     }
 
-    /// [`Self::from_prefetch`] for `fetch` (`cpu_gather` or
-    /// `cpu_gather_prefetch`; `None` for the others).
+    /// Apply `fetch` to the prefetch config: `cpu_threads` / `prefetch` (at
+    /// `threads` per rank) return the host side, `gpu` turns the lookup
+    /// device-resident and returns `None`, `uva` / `off` leave it.
     pub fn for_fetch(
         fetch: EngramFetch,
+        threads: u32,
         prefetch: &mut DeepseekV41EngramPrefetchLocalWorkletConfig,
     ) -> Option<Self> {
         let early = match fetch {
-            EngramFetch::CpuGather => false,
-            EngramFetch::CpuGatherPrefetch => true,
+            EngramFetch::CpuThreads => false,
+            EngramFetch::Prefetch => true,
+            EngramFetch::Gpu => {
+                Self::from_prefetch(prefetch);
+                return None;
+            }
             EngramFetch::Uva | EngramFetch::Off => return None,
         };
         Some(Self {
             prefetch: early,
+            gather_rows_per_ms: GATHER_STEP_ROWS / gather_step_ms(threads),
             ..Self::from_prefetch(prefetch)
         })
     }
@@ -150,7 +218,7 @@ impl EngramHostGather {
             return 0.0;
         }
         let rows = f64::from(tokens) * f64::from(self.rows_per_token);
-        let gather = rows / GATHER_ROWS_PER_MS;
+        let gather = rows / self.gather_rows_per_ms;
         let h2d = rows * f64::from(self.row_bytes) / H2D_BYTES_PER_MS;
         let head_start = if self.prefetch { step_ms } else { 0.0 };
         let mut exposed = 0.0;
@@ -172,6 +240,7 @@ mod tests {
             row_bytes: 264,
             unpack_token_scale: 4,
             prefetch: false,
+            gather_rows_per_ms: GATHER_STEP_ROWS / 6.645,
         }
     }
 
@@ -224,8 +293,28 @@ mod tests {
             (24, 264, 4)
         );
         assert_eq!(
-            (cfg.tp_size, cfg.table_rows, cfg.residency.as_str()),
-            (4, 96_000_564, "device")
+            (cfg.tp_size, cfg.table_rows, cfg.residency.as_str(), cfg.token_scale),
+            (4, 96_000_564, "device", 4)
         );
+    }
+
+    #[test]
+    fn threads_take_the_nearest_measured_point_without_extrapolating() {
+        assert_eq!(gather_step_ms(1), 26.837);
+        assert_eq!(gather_step_ms(3), 15.911); // tie 2/4 -> fewer threads
+        assert_eq!(gather_step_ms(8), 6.645); // the former cpu_gather
+        assert_eq!(gather_step_ms(16), 5.741);
+        assert_eq!(gather_step_ms(32), 5.741);
+        let mut cfg = crate::worklet::deepseek_v41_engram_prefetch_local::tests::config();
+        cfg.tp_size = 1;
+        cfg.table_rows = 384_006_168;
+        let one = EngramHostGather::for_fetch(EngramFetch::CpuThreads, 1, &mut cfg.clone()).unwrap();
+        let eight = EngramHostGather::for_fetch(EngramFetch::CpuThreads, 8, &mut cfg.clone()).unwrap();
+        let ratio = one.exposed_ms(8192, &[0.0], 0.0) - 1.150;
+        assert!((ratio - 26.837 / 2.0).abs() < 1e-9, "{ratio}");
+        assert!(eight.exposed_ms(8192, &[0.0], 0.0) < one.exposed_ms(8192, &[0.0], 0.0));
+        let mut gpu = cfg.clone();
+        assert!(EngramHostGather::for_fetch(EngramFetch::Gpu, 8, &mut gpu).is_none());
+        assert_eq!((gpu.residency.as_str(), gpu.token_scale), ("device", 4));
     }
 }

@@ -1143,6 +1143,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     cudagraph_capture_sizes: &[u32],
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     engram_fetch: EngramFetch,
+    engram_cpu_threads: u32,
     dp_size: u32,
     gpu: &str,
     name: &str,
@@ -1180,7 +1181,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         configs.engram_prefetch = None;
     }
     let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
-        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, prefetch),
+        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),
         _ => None,
     };
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
@@ -2815,6 +2816,7 @@ pub fn build_iter_model(
             num_redundant_experts,
             yoco_keep_tokens,
             engram_fetch,
+            engram_cpu_threads,
             dp_size,
             force_load_balance,
             prefill_chunk_tokens,
@@ -2837,6 +2839,7 @@ pub fn build_iter_model(
                 *prefill_chunk_tokens,
             )?,
             *engram_fetch,
+            *engram_cpu_threads,
             *dp_size,
             gpu,
             name,
