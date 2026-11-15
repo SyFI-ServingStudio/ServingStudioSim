@@ -17,6 +17,8 @@
 //! - [`prefix_cache_journal`] — turning cache mutations into logged events.
 //! - [`state_retention`] — which round-end recurrent states a retained
 //!   context keeps.
+//! - [`tier_chain`] — the host DRAM/SSD tiers behind one partition's prefix
+//!   cache: writes, victim merges, cuts and read channels.
 
 pub(crate) mod kv_accounting;
 pub(crate) mod kv_cache_report;
@@ -25,3 +27,4 @@ pub(crate) mod prefix_cache_journal;
 pub(crate) mod request_ledger;
 pub(crate) mod resident_partition;
 pub(crate) mod state_retention;
+pub(crate) mod tier_chain;

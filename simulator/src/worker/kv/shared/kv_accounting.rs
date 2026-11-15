@@ -744,6 +744,11 @@ impl ResumePositions {
         }
     }
 
+    /// An entry resumable only at `at`, where a kept state sits.
+    pub(crate) fn at_state(at: u64) -> Self {
+        Self::new([Some(at), None], None, at)
+    }
+
     /// Context tokens the entry keeps; also its last position.
     pub(crate) fn end(&self) -> u64 {
         self.end
