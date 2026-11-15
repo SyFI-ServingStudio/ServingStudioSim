@@ -361,7 +361,12 @@ impl ChunkedPrefillKv for KvCacheStore {
 }
 
 impl TieredPrefixKv for KvCacheStore {
-    fn reusable_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
+    fn reusable_prefix_tokens(
+        &self,
+        partition: PartitionId,
+        fresh_prompt_tokens: u32,
+        session_input: SessionInput,
+    ) -> u32 {
         let resident = self.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let SessionInput::Session {
             session_id,
@@ -371,8 +376,6 @@ impl TieredPrefixKv for KvCacheStore {
         else {
             return resident;
         };
-        // One pipeline head or one rank's tiers: the partition HBM would use.
-        let partition = self.retained_prefix_partition(session_input).unwrap_or(0);
         self.tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
             .map_or(resident, |(hit, _)| resident.max(hit.tokens as u32))
     }
@@ -2091,7 +2094,7 @@ mod tests {
         // A pre-run context: nothing stored, so it reads from the slowest tier.
         let read = plan(&kv_store, 1, session(7, 500), 10, Time::ZERO).unwrap();
         assert_eq!((read.tier, read.hit_tokens), (1, 500));
-        assert_eq!(kv_store.reusable_prefix_tokens(10, session(7, 500)), 500);
+        assert_eq!(kv_store.reusable_prefix_tokens(0, 10, session(7, 500)), 500);
         kv_store.start_tier_read(0, RequestId(1), session(7, 500), read, Time::ZERO);
         let stats = kv_store.tier_reads.as_ref().unwrap().stats(0);
         assert_eq!((stats.warm_start_reads, stats.warm_start_tokens), (1, 500));

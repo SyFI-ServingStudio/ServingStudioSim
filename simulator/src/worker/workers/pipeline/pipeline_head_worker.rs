@@ -1792,7 +1792,7 @@ mod tests {
             assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
             let round1 = store.borrow()[RequestId(3)].request.definition.session;
             assert_eq!(worker.kv_store.resident_prefix_tokens(4, round1), 0);
-            assert_eq!(worker.kv_store.reusable_prefix_tokens(4, round1), 50);
+            assert_eq!(worker.kv_store.reusable_prefix_tokens(0, 4, round1), 50);
             worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
             worker.enqueue(PipelineHeadMsg::Request(RequestId(3)));
             run_until(

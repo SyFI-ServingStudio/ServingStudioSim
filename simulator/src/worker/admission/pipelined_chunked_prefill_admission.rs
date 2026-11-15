@@ -42,27 +42,11 @@
 //! decode membership when that chunk exits, and a decode step's request is in
 //! `in_flight_decodes` until its microbatch exits.
 //!
-//! With host tiers behind HBM (`TieredPrefixKv`), a fresh request goes pending
-//! -> reading -> landed -> started, as under vLLM's KV connector: when
-//! admission reaches a request whose context a tier holds beyond HBM, its read
-//! starts if the whole request fits in HBM, holding that footprint, and the
-//! request leaves its queue (`WAITING_FOR_REMOTE_KVS`) while other requests go
-//! ahead; one that does not fit stops admission. Once the read lands the
-//! request is offered before every queue, in landing order, and its context
-//! goes back into HBM just before admission resolves its prefix; one evicted
-//! again before admission is read again. A `ReadWait` bound passes over or
-//! stops at a request whose tier would begin its read too late
-//! (`read_wait.rs`).
-//!
-//! Under staged loading (a loading area, not vLLM) reads start in a loading
-//! pass before each fresh-admission pass instead: it walks the overdue
-//! requests, then the pending order, and starts each read the KV store's
-//! loading area has room for. A read that does not fit stops its landing
-//! queue (HBM's, or DRAM's for an SSD read that hops on) for the rest of the
-//! pass, so no later read jumps it; requests that start no read keep their
-//! places. Admission passes over a request still needing a read, holding
-//! nothing, and a landed one whose context HBM evicted again goes back to
-//! the pending order to be read again.
+//! With host tiers behind HBM (`TieredPrefixKv`), a fresh request whose
+//! context a tier holds beyond HBM is read back before admission, as under
+//! vLLM's KV connector, or through loading areas under staged loading; the
+//! reading -> landed lifecycle is shared with the whole-iteration chunked
+//! prefill (`fresh_reads.rs`).
 //!
 //! KV reserves the full request footprint once at admission and releases it at
 //! completion. A hybrid recurrent model with prefix caching ends every non-final
@@ -70,19 +54,20 @@
 //! which does not change under PP), via the same rule as unified chunked
 //! prefill. One attention partition only.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::{ChunkedPrefillKv, LoadingQueue, TieredPrefixKv};
+use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::ChunkEndAlignment;
 use super::external_decode::ExternalDecode;
+use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::MicrobatchBudget;
-use super::policy::{ForceSchedule, QueueAccess, Queued};
-use super::read_wait::{ReadWait, ReadWaitPolicy};
+use super::policy::{ForceSchedule, Queued};
+use super::read_wait::ReadWait;
 use super::started_order::{FreshGate, PrefillFill, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy,
@@ -117,30 +102,10 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     balanced_depth: Option<u16>,
     /// Prefill tokens of the committed microbatches that have not exited.
     in_flight_prefill_tokens: u64,
-    /// Fresh requests out of their queue while their host-tier read runs.
-    reading: HashMap<RequestId, AdmissionCandidate>,
-    /// Requests whose read has landed, in landing order, offered before every
-    /// queue.
-    landed: VecDeque<Landed>,
-    /// When a read may start; `None`: whenever it fits (vLLM).
-    read_wait: Option<ReadWait>,
+    /// Fresh requests out of their queue for a host-tier read.
+    reads: FreshReads,
     /// The decode runs elsewhere: a request completes at its first token.
     external_decode: Option<ExternalDecode>,
-}
-
-/// A request whose read has landed.
-#[derive(Clone, Copy, Debug)]
-struct Landed {
-    candidate: AdmissionCandidate,
-    /// Its context is back in HBM.
-    restored: bool,
-}
-
-/// Where a fresh-admission pass found its candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FreshSource {
-    Landed,
-    Queued(Queued),
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -189,16 +154,14 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             scheduled_decodes: Vec::new(),
             balanced_depth: None,
             in_flight_prefill_tokens: 0,
-            reading: HashMap::new(),
-            landed: VecDeque::new(),
-            read_wait: None,
+            reads: FreshReads::new(1),
             external_decode: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn reading_requests(&self) -> usize {
-        self.reading.len()
+        self.reads.reading()
     }
 
     /// Run each request to its first token and take its context back from a
@@ -211,160 +174,8 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     /// Start a host-tier read only within `read_wait` of its tier's channel.
     /// Not vLLM.
     pub(crate) fn with_read_wait(mut self, read_wait: ReadWait) -> Self {
-        assert!(
-            read_wait.max > Time::ZERO,
-            "a read-wait bound must be positive"
-        );
-        self.read_wait = Some(read_wait);
+        self.reads.set_read_wait(read_wait);
         self
-    }
-
-    /// The next fresh candidate: a landed read, then what `queues` offers of
-    /// the overdue requests and the pending order, whose head is re-ranked by
-    /// what HBM or a tier now holds. Landed reads come only with the pending
-    /// order.
-    fn peek_fresh<K: TieredPrefixKv>(
-        &mut self,
-        kv_store: &K,
-        queues: QueueAccess,
-    ) -> Option<(FreshSource, AdmissionCandidate)> {
-        if queues.takes_pending() {
-            if let Some(landed) = self.landed.front() {
-                return Some((FreshSource::Landed, landed.candidate));
-            }
-        }
-        self.policy
-            .peek_head(queues, &mut self.policy_context, &mut |candidate| {
-                kv_store
-                    .reusable_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
-            })
-            .map(|(candidate, queued)| (FreshSource::Queued(queued), candidate))
-    }
-
-    /// Take the candidate [`Self::peek_fresh`] returned out of its source.
-    fn take_fresh(&mut self, source: FreshSource, candidate: AdmissionCandidate) {
-        match source {
-            FreshSource::Landed => {
-                let landed = self.landed.pop_front();
-                debug_assert_eq!(landed.map(|landed| landed.candidate), Some(candidate));
-            }
-            FreshSource::Queued(queued) => {
-                let taken = self.policy.take_head(queued, &mut self.policy_context);
-                debug_assert_eq!(taken, candidate);
-            }
-        }
-    }
-
-    /// Put the candidates passed over this pass back at the front of the
-    /// queues they came from, in their order, after the pending requests a
-    /// hits-only pass went past. A landed one, whose context HBM evicted
-    /// again, goes back to the pending order.
-    fn return_passed_over(&mut self, passed_over: Vec<(FreshSource, AdmissionCandidate)>) {
-        self.policy.restore_set_aside(&mut self.policy_context);
-        for (source, candidate) in passed_over.into_iter().rev() {
-            let queued = match source {
-                FreshSource::Landed => Queued::Pending,
-                FreshSource::Queued(queued) => queued,
-            };
-            self.policy
-                .return_head(candidate, queued, &mut self.policy_context);
-        }
-    }
-
-    /// Staged loading: start the reads of the overdue requests, then of the
-    /// pending order, in order, while the loading area each lands in has room
-    /// (module docs). The pass ends once both landing queues have stopped.
-    fn start_staged_reads<K: TieredPrefixKv>(&mut self, kv_store: &mut K, now: Time) {
-        let (mut hbm_stopped, mut dram_stopped) = (false, false);
-        let mut kept = Vec::new();
-        while !(hbm_stopped && dram_stopped) {
-            let Some((candidate, queued)) = self.policy.peek_head(
-                QueueAccess::All,
-                &mut self.policy_context,
-                &mut |candidate| {
-                    kv_store.reusable_prefix_tokens(
-                        candidate.fresh_prompt_tokens,
-                        candidate.session_input,
-                    )
-                },
-            ) else {
-                break;
-            };
-            self.policy.take_head(queued, &mut self.policy_context);
-            let source = FreshSource::Queued(queued);
-            let Some(read) = kv_store.plan_tier_read(
-                PARTITION,
-                candidate.request_id,
-                candidate.fresh_prompt_tokens,
-                candidate.remaining_output_tokens,
-                candidate.session_input,
-                now,
-            ) else {
-                kept.push((source, candidate));
-                continue;
-            };
-            let stopped = match read.staged.expect("a staged read").queue {
-                LoadingQueue::Hbm => &mut hbm_stopped,
-                LoadingQueue::Dram => &mut dram_stopped,
-            };
-            if *stopped || !kv_store.has_loading_room(PARTITION, &read) {
-                *stopped = true;
-                kept.push((source, candidate));
-                continue;
-            }
-            kv_store.start_tier_read(
-                PARTITION,
-                candidate.request_id,
-                candidate.session_input,
-                read,
-                now,
-            );
-            self.reading.insert(candidate.request_id, candidate);
-        }
-        self.return_passed_over(kept);
-    }
-
-    /// Move the reads landed by `now` from reading to landed; returns the
-    /// latest landing.
-    fn land<K: TieredPrefixKv>(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
-        let mut latest = None;
-        for (request, ready) in kv_store.take_landed_reads(now) {
-            let candidate = self
-                .reading
-                .remove(&request)
-                .expect("a landed read belongs to a reading request");
-            self.landed.push_back(Landed {
-                candidate,
-                restored: false,
-            });
-            latest = Some(ready);
-        }
-        latest
-    }
-
-    /// Whether serving the overdue misses oldest first would evict a queued
-    /// request's held context. Those requests compute `horizon` prefill tokens
-    /// ahead of everything else, and each computed context is written to the
-    /// tiers (write-through as it finishes, or into the victim tier as HBM
-    /// makes room for it), so `horizon` written tokens is the horizon. A
-    /// context is at risk if it evicts it from every tier holding it, its
-    /// session's queued request resumes from it, and HBM does not hold it for
-    /// a victim tier to take.
-    fn held_context_at_risk<K: TieredPrefixKv>(&self, kv_store: &K, horizon: u64) -> bool {
-        let victim_tier = kv_store.tiers_take_hbm_evictions(PARTITION);
-        kv_store
-            .tier_sessions_at_risk(PARTITION, horizon)
-            .into_iter()
-            .any(|session_id| {
-                let Some(candidate) = self.policy.queued_in_session(session_id) else {
-                    return false;
-                };
-                let (fresh, session_input) =
-                    (candidate.fresh_prompt_tokens, candidate.session_input);
-                let hbm = kv_store.resident_prefix_tokens(fresh, session_input);
-                !(hbm > 0 && victim_tier)
-                    && kv_store.reusable_prefix_tokens(fresh, session_input) > hbm
-            })
     }
 
     /// Size each microbatch's prefill by `budget` over a `depth`-deep pipeline.
@@ -452,61 +263,31 @@ where
     ) -> u32 {
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
-        let staged = kv_store.stages_tier_reads();
-        if staged && gate.queues.takes_pending() {
-            self.start_staged_reads(kv_store, now);
+        let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
+        if kv_store.stages_tier_reads() && gate.queues.takes_pending() {
+            self.reads
+                .start_staged_reads(PARTITION, policy, policy_context, kv_store, now);
         }
         while remaining_budget > 0 {
-            let Some((source, candidate)) = self.peek_fresh(kv_store, gate.queues) else {
+            let Some((source, candidate)) =
+                self.reads
+                    .peek(PARTITION, policy, policy_context, kv_store, gate.queues)
+            else {
                 break;
             };
-            if source == FreshSource::Landed && !self.landed[0].restored {
-                // Its blocks were held since the read started: the context
-                // fills them and the admission that follows takes them over.
-                kv_store.restore_landed_read(PARTITION, candidate.request_id, now);
-                self.landed[0].restored = true;
-            } else if let Some(read) = kv_store.plan_tier_read(
+            match self.reads.at_head(
                 PARTITION,
-                candidate.request_id,
-                candidate.fresh_prompt_tokens,
-                candidate.remaining_output_tokens,
-                candidate.session_input,
+                policy,
+                policy_context,
+                kv_store,
+                source,
+                candidate,
+                &mut passed_over,
                 now,
             ) {
-                if staged {
-                    // Not landed: a loading pass starts its read.
-                    self.take_fresh(source, candidate);
-                    passed_over.push((source, candidate));
-                    continue;
-                }
-                if let Some(read_wait) = self
-                    .read_wait
-                    .filter(|read_wait| read_wait.exceeded(read.queue_wait))
-                {
-                    match read_wait.policy {
-                        ReadWaitPolicy::PassOver => {
-                            self.take_fresh(source, candidate);
-                            passed_over.push((source, candidate));
-                            continue;
-                        }
-                        ReadWaitPolicy::Block => break,
-                    }
-                }
-                // The whole request must fit before its read starts (vLLM's
-                // waiting loop stops at an async load that cannot allocate).
-                if !kv_store.fits(PARTITION, &read.hold) {
-                    break;
-                }
-                kv_store.start_tier_read(
-                    PARTITION,
-                    candidate.request_id,
-                    candidate.session_input,
-                    read,
-                    now,
-                );
-                self.take_fresh(source, candidate);
-                self.reading.insert(candidate.request_id, candidate);
-                continue;
+                AtHead::Admit => {}
+                AtHead::Moved => continue,
+                AtHead::Stop => break,
             }
             let resolved_prefill = kv_store.preview_prefill_context(
                 PARTITION,
@@ -536,7 +317,8 @@ where
             if !kv_store.fits(PARTITION, &footprint) {
                 break;
             }
-            self.take_fresh(source, candidate);
+            self.reads
+                .take(PARTITION, policy, policy_context, source, candidate);
             kv_store.reserve_chunked_prefill_context(
                 candidate.request_id,
                 PARTITION,
@@ -557,7 +339,7 @@ where
                 self.started_prefills.push(candidate);
             }
         }
-        self.return_passed_over(passed_over);
+        FreshReads::return_passed_over(policy, policy_context, passed_over);
         budget - remaining_budget
     }
 
@@ -622,7 +404,7 @@ where
             target_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.reusable_prefix_tokens(fresh_prompt_tokens, session_input),
+            kv_store.reusable_prefix_tokens(PARTITION, fresh_prompt_tokens, session_input),
         );
         debug_assert!(!self.policy.contains(request));
         self.policy
@@ -636,13 +418,18 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
-        self.land(kv_store, now);
+        self.reads.land(kv_store, now);
         // A hit computes only its new tokens: its context is in HBM or a tier.
         self.policy.promote(now, |candidate| {
-            kv_store.reusable_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+            kv_store.reusable_prefix_tokens(
+                PARTITION,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            )
         });
         if let Some(horizon) = self.policy.at_risk_horizon() {
-            let at_risk = horizon > 0 && self.held_context_at_risk(kv_store, horizon);
+            let at_risk = horizon > 0
+                && FreshReads::held_context_at_risk(PARTITION, &self.policy, kv_store, horizon);
             self.policy.set_hits_first(at_risk);
         }
         let mut remaining_budget = self.max_batch_tokens;
@@ -803,11 +590,11 @@ where
     }
 
     fn queued_requests(&self) -> u32 {
-        (self.policy.len() + self.reading.len() + self.landed.len()) as u32
+        (self.policy.len() + self.reads.len()) as u32
     }
 
     fn land_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
-        self.land(kv_store, now)
+        self.reads.land(kv_store, now)
     }
 
     fn next_read_landing(&self, kv_store: &K) -> Option<Time> {

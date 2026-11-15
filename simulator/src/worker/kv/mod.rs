@@ -378,9 +378,15 @@ pub struct TierReadPlan<F> {
 /// go through loading areas the store keeps free, each landing queue in
 /// order: admission starts a read only while its area has room.
 pub trait TieredPrefixKv: ChunkedPrefillKv {
-    /// The longer of HBM's resident prefix and what a tier would read back:
-    /// what a cache-aware order ranks a request by.
-    fn reusable_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32;
+    /// The longer of HBM's resident prefix and what `partition`'s tiers would
+    /// read back: what a cache-aware order of that partition ranks a request
+    /// by.
+    fn reusable_prefix_tokens(
+        &self,
+        partition: PartitionId,
+        fresh_prompt_tokens: u32,
+        session_input: SessionInput,
+    ) -> u32;
     /// The read the request needs before admission: a tier holds more of its
     /// declared prefix than `partition`'s HBM. `None`: admit it from HBM.
     #[allow(clippy::too_many_arguments)]
