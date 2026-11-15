@@ -125,8 +125,8 @@ COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu
 COPY reference_engines/autotune_guard.py /opt/vibesim/reference_engines/autotune_guard.py
 
-# The envs images.py assigns this image (`selfcheck` loads their runners). None yet: the
-# image runs DeepInfer's own benchmark until DeepInfer L1 kernels are registered.
+# The envs images.py assigns this image (deepinfer_env: the L1 runners that time DeepInfer's
+# vendored kernels); `selfcheck` loads their runners.
 ARG VIBESIM_PROFILE_ENVS
 RUN if [ -n "${VIBESIM_PROFILE_ENVS}" ]; then \
         cd /opt/vibesim && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}; \

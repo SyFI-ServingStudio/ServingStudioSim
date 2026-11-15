@@ -88,6 +88,10 @@ keeping them. The host setups follow.
 site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's
 own build.
 
+`deepinfer_env` has no host setup: DeepInfer publishes no image and nothing installs it on
+a host, so it runs only in its reference-engine image (`just ref build-image deepinfer`),
+under the default container runtime or `VIBESIM_PROFILE_RUNTIME=in-image`.
+
 `flashinfer_kda_env` on the host is a venv at `~/profile_envs/flashinfer_kda` (or a
 symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
 Blackwell KDA prefill kernels are only on its main branch, and they need Torch

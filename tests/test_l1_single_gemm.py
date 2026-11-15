@@ -1586,6 +1586,7 @@ def test_run_profile_batch_rejects_invalid_gpu_count():
 def test_documented_profile_env_registry_complete():
     expected_envs = {
         "causal_conv1d_env",
+        "deepinfer_env",
         "default_env",
         "flashinfer_pip_env",
         "flashinfer_kda_env",

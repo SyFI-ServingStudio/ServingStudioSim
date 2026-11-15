@@ -188,7 +188,7 @@ IMAGES = {
         Image(
             "deepinfer",
             "reference_engines/deepinfer/Dockerfile",
-            (),
+            ("deepinfer_env",),
             python="/opt/deepinfer-venv/bin/python",
             inputs=(
                 "reference_engines/deepinfer/BASE.yaml",
