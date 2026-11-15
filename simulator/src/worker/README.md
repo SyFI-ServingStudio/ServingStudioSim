@@ -37,7 +37,7 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 |---|---|---|---|---|
 | `barebone` | `KvCacheStore` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `hp_unified` | `KvCacheStore` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
-| `chunked_prefill` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `chunked_prefill` | `KvCacheStore` with N partitions, optional host DRAM/SSD tiers per partition | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `speculative` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>` | `SpeculativeIterExecution` | `IterBatchWorker` |
 | `pd_prefill` | `KvCacheStore` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_decode` | `KvCacheStore` less the reserved pull budget, no prefix tier | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
@@ -190,7 +190,9 @@ hit the entry would give if every position were resumable. The logger is an
 observer of the same `KvCacheStore`; it does not infer operations from `kv_snapshot` or maintain shadow
 residency.
 
-The pipeline head may put host tiers behind its prefix cache
+The pipeline head may put host tiers behind its prefix cache, and
+`chunked_prefill` behind each attention DP rank's (any arch; per-rank bytes are
+the rank's layout over its attention shards, `TierBytes::per_gpu`)
 (`PrefixTierSpec`: `dram_tier_*`, `ssd_tier_*`, `prefix_tier_*`). Each
 partition's `TierChain` (`kv/shared/tier_chain.rs`) keeps one entry per session
 per tier in tier tokens (one GPU's per-token bytes, `TierBytes`, which the
@@ -440,21 +442,25 @@ pipeline head) take the same scheduling options, all off by default (vLLM):
   `srpt`) splits the overdue requests by cost class (`HitsFirst`): those whose
   context HBM or a tier holds go first, and the srpt fill runs once per class
   (`PrefillFill::fill_prefill_by_class`). `force_schedule_hits_first_when_at_risk`
-  splits only while the pipeline head finds a queued request's tier context at
-  risk from the overdue misses' compute tokens
+  splits only while the pipeline head (or a `chunked_prefill` rank) finds a
+  queued request's tier context at risk from the overdue misses' compute tokens
   (`TieredPrefixKv::tier_sessions_at_risk`); without tiers it never splits.
 
-On the pipeline head with host tiers, a fresh request whose context a tier
+On the pipeline head and on each `chunked_prefill` rank with host tiers (one
+shared lifecycle, `FreshReads` in `admission/fresh_reads.rs`), a fresh request whose context a tier
 holds beyond HBM goes pending -> reading -> landed -> started; landed requests
 are offered first. `prefix_tier_max_read_wait_ms` with
 `prefix_tier_read_wait_policy` (`ReadWait`, `admission/read_wait.rs`) passes
 over or stops at a request whose read would wait too long for its channel. The
-shell wakes at each landing (`MicrobatchAdmission::next_read_landing`). With
+shell wakes at each landing (`MicrobatchAdmission::next_read_landing`;
+`IterAdmission::next_read_landing` when every queued request is reading). A
+`chunked_prefill` rank with tiers or `external_decode` keeps sessions sticky:
+the rank retaining the session in HBM, else the session's last rank, else load. With
 staged loading, `start_staged_reads` runs at the start of each fresh pass
 (overdue requests, then the pending order) and starts reads in order until
 both loading areas are out of room; admission passes over a request until its
 read lands. The areas and their arithmetic stay in the KV store. With
-`external_decode` the lifecycle owns an `ExternalDecode` completion rule
+`external_decode` either lifecycle owns an `ExternalDecode` completion rule
 (`admission/external_decode.rs`): a request runs to its first token, and its
 context is handed back after every release of the microbatch.
 
