@@ -560,8 +560,8 @@ pub struct WorkerConfig {
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
     /// Queue discipline the admission lifecycle uses to pick the head it gates
-    /// (from the worker selector). Only the iter-wise local-prefill/decode and
-    /// prefill-handoff lifecycles read it today.
+    /// (from the worker selector). The iter-wise lifecycles and the pipeline
+    /// head read it.
     pub pending_order: crate::worker::admission::PendingOrderKind,
     /// Whether chunked prefill may share an iteration with resident decode.
     /// Only `ChunkedPrefillAdmission` reads this; other lifecycles state their
