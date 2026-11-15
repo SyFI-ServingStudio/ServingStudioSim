@@ -198,7 +198,11 @@ tier of the one above, LRU-evicted, and cut at admission when a victim entry
 outgrows what the request shares. `TieredPrefixKv` plans, starts, lands and
 restores reads (`kv/shared/tier_reads.rs`): a read holds its request's whole
 footprint on HBM until its landed context is put back just before admission.
-Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
+With `prefix_tier_loading_area` > 0 reads are staged: a loading area of
+`floor(capacity x fraction)` units stays held on HBM (and a DRAM area carved
+from DRAM when SSD is behind it); a staged read holds only what it lands, starts
+when it fits its area or the area is empty, and an SSD read lands in DRAM before
+it hops on to HBM on DRAM's channel. Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
 counters become the pool's `tiers` in `raw/kv_cache.json`, written when the
 store is dropped and rewritten after the run. Rules:
 `doc/detailed_design/L5.md` §3.3.
@@ -431,7 +435,11 @@ holds beyond HBM goes pending -> reading -> landed -> started; landed requests
 are offered first. `prefix_tier_max_read_wait_ms` with
 `prefix_tier_read_wait_policy` (`ReadWait`, `admission/read_wait.rs`) passes
 over or stops at a request whose read would wait too long for its channel. The
-shell wakes at each landing (`MicrobatchAdmission::next_read_landing`).
+shell wakes at each landing (`MicrobatchAdmission::next_read_landing`). With
+staged loading, `start_staged_reads` runs at the start of each fresh pass
+(overdue requests, then the pending order) and starts reads in order until
+both loading areas are out of room; admission passes over a request until its
+read lands. The areas and their arithmetic stay in the KV store.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
