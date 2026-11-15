@@ -435,8 +435,14 @@ pipeline head) take the same scheduling options, all off by default (vLLM):
   its in-flight prefill); `even` is pipeline-only.
 - `ForceScheduleSpec` (`force_schedule_after_ms`) wraps the policy in
   `Deadline<P>` (`policy/deadline.rs`), which serves a request that has waited
-  past the bound before the rest of its queue; `promote(now)` runs at the start
-  of each formation.
+  past the bound before the rest of its queue; `promote(now, held)` runs at the
+  start of each formation. `force_schedule_hits_first` (with the bound and
+  `srpt`) splits the overdue requests by cost class (`HitsFirst`): those whose
+  context HBM or a tier holds go first, and the srpt fill runs once per class
+  (`PrefillFill::fill_prefill_by_class`). `force_schedule_hits_first_when_at_risk`
+  splits only while the pipeline head finds a queued request's tier context at
+  risk from the overdue misses' compute tokens
+  (`TieredPrefixKv::tier_sessions_at_risk`); without tiers it never splits.
 
 On the pipeline head with host tiers, a fresh request whose context a tier
 holds beyond HBM goes pending -> reading -> landed -> started; landed requests
