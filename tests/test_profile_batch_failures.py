@@ -209,3 +209,37 @@ def test_worker_failure_tails_a_long_stream_because_the_exception_is_last() -> N
 
     assert "RuntimeError: last" in message
     assert "truncated" in message
+
+
+def test_chunk_timeout_is_a_floor_plus_a_per_spec_bound(monkeypatch) -> None:
+    from profiling.exec.local import CHUNK_TIMEOUT_FLOOR_ENV, SPEC_TIMEOUT_ENV, chunk_timeout_s
+
+    monkeypatch.setenv(CHUNK_TIMEOUT_FLOOR_ENV, "100")
+    monkeypatch.setenv(SPEC_TIMEOUT_ENV, "2")
+    assert chunk_timeout_s(0) == 100
+    assert chunk_timeout_s(50) == 200
+
+
+def test_a_worker_past_its_limit_fails_its_chunk_and_names_it(monkeypatch) -> None:
+    """A hung worker (22916: a rank blocked on the result pipe) used to hold
+    its chunk forever; now it is killed and every spec of the chunk fails."""
+    from profiling.exec.local import CHUNK_TIMEOUT_FLOOR_ENV, SPEC_TIMEOUT_ENV, LocalGpuChunk
+
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
+    monkeypatch.setenv(CHUNK_TIMEOUT_FLOOR_ENV, "5")
+    monkeypatch.setenv(SPEC_TIMEOUT_ENV, "1")
+    limits = []
+
+    def hung_worker(cmd, **kwargs):
+        limits.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr("profiling.exec.local.subprocess.run", hung_worker)
+    results = LocalGpuChunk([0]).run("single_gemm", [_spec(8), _spec(16)])
+
+    assert limits == [7.0]
+    assert len(results) == 2
+    assert all(result.metrics is None for result in results)
+    assert "timed out" in results[0].error
+    assert "specs 1..2" in results[0].error
+    assert '"m": 16' in results[0].error

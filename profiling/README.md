@@ -275,6 +275,15 @@ historical results and record the selected database with the experiment.
    shape-dependent ones.
    Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
    spec, and writes JSON results back.
+   Each worker gets `floor + specs × per_spec` seconds of wall clock
+   (`VIBESIM_PROFILE_CHUNK_TIMEOUT_FLOOR_S`, default 900, covers container start,
+   rank init and JIT; `VIBESIM_PROFILE_SPEC_TIMEOUT_S`, default 30, is far above
+   any measured spec). Past it the worker is killed (a container by its name),
+   every spec of the chunk fails with an error naming the chunk's first and last
+   spec and the elapsed time, and the batch goes on with the other chunks.
+   Multi-GPU runners hand rank 0's result back over a pipe; the launcher reads it
+   while the ranks run (`runners/comm/_launcher.py` `_spawn_and_collect`), so a
+   result of any size cannot block the join.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
    rows through `Table.insert`. Failed specs retain their worker error in one

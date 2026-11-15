@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -48,6 +49,25 @@ from reference_engines.autotune_guard import (
 )
 
 CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
+
+# A chunk's worker gets ``floor + specs x per_spec`` seconds before it is
+# killed and the chunk is failed. The floor covers what every chunk pays once
+# (container start, rank init, JIT compiles: about 20 s of a 33 s 68-spec
+# mega MoE chunk); the per-spec bound is far above any measured spec (that
+# chunk spent about 0.2 s on each), so the limit only ends a worker that has
+# stopped making progress, never a slow but healthy one.
+CHUNK_TIMEOUT_FLOOR_ENV = "VIBESIM_PROFILE_CHUNK_TIMEOUT_FLOOR_S"
+SPEC_TIMEOUT_ENV = "VIBESIM_PROFILE_SPEC_TIMEOUT_S"
+_DEFAULT_CHUNK_TIMEOUT_FLOOR_S = 900.0
+_DEFAULT_SPEC_TIMEOUT_S = 30.0
+
+
+def chunk_timeout_s(num_specs: int) -> float:
+    """Wall-clock limit for one chunk's worker of ``num_specs`` specs."""
+    floor = float(os.environ.get(CHUNK_TIMEOUT_FLOOR_ENV, _DEFAULT_CHUNK_TIMEOUT_FLOOR_S))
+    per_spec = float(os.environ.get(SPEC_TIMEOUT_ENV, _DEFAULT_SPEC_TIMEOUT_S))
+    return floor + num_specs * per_spec
+
 
 # CDI name of IMEX channel 0, which fabric-handle cuMemCreate needs. Docker's
 # --device passes a CDI name as a device request; the host registers the device
@@ -180,7 +200,11 @@ class LocalGpuChunk(GpuChunk):
                 ),
                 encoding="utf-8",
             )
+            container_name = None
             if isinstance(profiler_env, ContainerProfileEnv):
+                # Named, so a worker that outlives its limit can be stopped:
+                # killing the `docker run` client leaves the container running.
+                container_name = f"vibesim-profile-{uuid.uuid4().hex[:16]}"
                 cmd, env = _container_worker_command(
                     profiler_env,
                     self.gpus,
@@ -189,6 +213,7 @@ class LocalGpuChunk(GpuChunk):
                     imex_channel=profiler_spec.imex_channel,
                     cache_dir=cache_dir,
                     gpu_uuids=gpu_uuids,
+                    container_name=container_name,
                 )
             else:
                 cmd, env = _host_worker_command(
@@ -196,10 +221,29 @@ class LocalGpuChunk(GpuChunk):
                 )
             # The gap between this span and the worker.boot span inside it is
             # process/container start: fork, image, CUDA context.
-            with span("worker.subprocess", kind=kernel_kind, specs=len(chunk_specs)):
-                completed = subprocess.run(
-                    cmd, env=env, capture_output=True, text=True, check=False
+            limit_s = chunk_timeout_s(len(chunk_specs))
+            started = time.monotonic()
+            try:
+                with span("worker.subprocess", kind=kernel_kind, specs=len(chunk_specs)):
+                    completed = subprocess.run(
+                        cmd, env=env, capture_output=True, text=True, check=False, timeout=limit_s
+                    )
+            except subprocess.TimeoutExpired:
+                # subprocess.run has SIGKILLed the worker (a host worker's torch
+                # ranks follow it: torch.multiprocessing sets their parent-death
+                # signal); a container has to be killed by name.
+                if container_name is not None:
+                    subprocess.run(
+                        ["docker", "kill", container_name],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=120,
+                    )
+                error = _worker_timeout_message(
+                    kernel_kind, backend, chunk_specs, time.monotonic() - started, limit_s
                 )
+                return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
             if completed.returncode != 0:
                 forbidden = forbidden_line(completed.stderr)
                 if forbidden is not None:
@@ -349,6 +393,27 @@ def _log_tuning(kernel_kind: KernelKind, backend: str, tuned: list[dict] | None)
 
 
 _WORKER_STREAM_TAIL_CHARS = 2000
+
+
+def _worker_timeout_message(
+    kernel_kind: KernelKind,
+    backend: str,
+    specs: list[dict],
+    elapsed_s: float,
+    limit_s: float,
+) -> str:
+    """Name the chunk a timed-out worker was running, so it can be rerun."""
+
+    def brief(spec: dict) -> str:
+        text = json.dumps(spec, sort_keys=True)
+        return text if len(text) <= 300 else text[:300] + "..."
+
+    return (
+        f"worker timed out after {elapsed_s:.0f} s (limit {limit_s:.0f} s for "
+        f"{len(specs)} specs; {CHUNK_TIMEOUT_FLOOR_ENV} + specs x {SPEC_TIMEOUT_ENV}) "
+        f"on {kernel_kind} {backend}: specs 1..{len(specs)} of this chunk, "
+        f"first {brief(specs[0])}, last {brief(specs[-1])}"
+    )
 
 
 def _worker_failure_message(completed: subprocess.CompletedProcess[str]) -> str:
@@ -535,6 +600,7 @@ def _container_worker_command(
     imex_channel: bool = False,
     cache_dir: Path | None = None,
     gpu_uuids: Sequence[str] | None = None,
+    container_name: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     # Address the cards by UUID, never by index, and twice: in the runtime's
     # device request and in CUDA_VISIBLE_DEVICES. See gpu_uuids_for_indices.
@@ -600,6 +666,7 @@ def _container_worker_command(
             "docker",
             "run",
             "--rm",
+            *(["--name", container_name] if container_name else []),
             "--network",
             "none",
             "--ipc",
