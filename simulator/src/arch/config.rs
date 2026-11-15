@@ -758,6 +758,20 @@ pub enum IterArchSel {
         /// Omitted: vLLM's default list up to 2048. Empty: eager.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+        /// Per stage, its layer ranges as `start-end` (end exclusive), stages
+        /// separated by `;` (a folded split: `0-10,20-30;10-20,30-40`).
+        /// Overrides `layer_partition`; a fold needs a worker back pass
+        /// (`back_flush`). Empty: `layer_partition`.
+        #[serde(default)]
+        #[param(string, cache_key)]
+        stage_layers: String,
+        /// How the replay cut layer's input reaches it: `v1` all rows' state,
+        /// `v2` continuing rows' state + collapsed hidden, `v3` continuing
+        /// rows' state + the cut source's KV entries (`write_kv` before the
+        /// hop).
+        #[serde(default)]
+        #[param(string, default = "v1", choices = ["v1", "v2", "v3"], cache_key)]
+        cut_handoff: crate::arch::deepseek_v41_vllm_pp::CutHandoff,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

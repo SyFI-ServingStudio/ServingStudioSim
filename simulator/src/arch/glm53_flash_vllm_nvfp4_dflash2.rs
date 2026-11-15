@@ -330,6 +330,7 @@ fn verify_batch(input: &SpeculativeArchInput) -> UnifiedArchInput {
             })
             .collect(),
         tokens_per_source_rank: input.tokens_per_source_rank.clone(),
+        back_pass: None,
     }
 }
 

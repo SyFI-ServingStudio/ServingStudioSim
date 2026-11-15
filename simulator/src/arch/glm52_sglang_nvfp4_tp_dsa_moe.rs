@@ -1779,6 +1779,7 @@ mod tests {
         let input = UnifiedArchInput {
             groups: vec![group(5, vec![64, 91], vec![(3, 2), (0, 3)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let normalized = normalize_input(&input, 8_192).unwrap();
         assert_eq!(normalized.total_tokens, 7);
@@ -1880,11 +1881,13 @@ mod tests {
         let wrong_group_count = UnifiedArchInput {
             groups: vec![ArchGroupInput::default(); 2],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&wrong_group_count, 8_192).is_err());
         let over_context = UnifiedArchInput {
             groups: vec![group(0, vec![8_193], vec![])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&over_context, 8_192).is_err());
     }

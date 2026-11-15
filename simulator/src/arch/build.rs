@@ -1221,6 +1221,8 @@ pub fn deepseek_v41_vllm_pp(
     decoder_swa_bounded_replay: bool,
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
+    stage_layers: &str,
+    cut_handoff: deepseek_v41_vllm_pp::CutHandoff,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1238,6 +1240,8 @@ pub fn deepseek_v41_vllm_pp(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        stage_layers: deepseek_v41_vllm_pp::parse_stage_layers(stage_layers)?,
+        cut_handoff,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -2878,6 +2882,8 @@ pub fn build_iter_model(
             decoder_swa_bounded_replay,
             max_num_batched_tokens,
             cudagraph_capture_sizes,
+            stage_layers,
+            cut_handoff,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
             *pp_size,
@@ -2890,6 +2896,8 @@ pub fn build_iter_model(
             *decoder_swa_bounded_replay,
             *max_num_batched_tokens,
             cudagraph_capture_sizes,
+            stage_layers,
+            *cut_handoff,
             gpu,
             name,
             bridge,

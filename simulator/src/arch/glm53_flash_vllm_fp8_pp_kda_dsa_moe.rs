@@ -1124,12 +1124,14 @@ mod tests {
         let one = UnifiedArchInput {
             groups: vec![group(vec![(0, 4_096)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(model.check_input(&one).is_ok());
         assert!(model.stages()[2].check_input(&one).is_ok());
         let too_long = UnifiedArchInput {
             groups: vec![group(vec![(131_000, 4_096)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(model.check_input(&too_long).is_err());
     }

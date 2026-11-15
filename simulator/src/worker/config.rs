@@ -51,6 +51,55 @@ pub enum DpPlacement {
 
 const DP_PLACEMENT_CHOICES: [&str; 2] = ["round-robin", "vllm-least-loaded"];
 
+/// Back-pass batching on a bounded-replay arch; see
+/// [`crate::worker::shared::back_stash`]. `off` is the ordinary forward.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackFlushKind {
+    #[default]
+    Off,
+    EveryStep,
+    Knee,
+    Fixed,
+}
+
+const BACK_FLUSH_CHOICES: [&str; 4] = ["off", "every-step", "knee", "fixed"];
+
+/// Which rows a prefill chunk leaves for the back pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackRowsKind {
+    #[default]
+    VllmChunk,
+    PromptTail,
+}
+
+const BACK_ROWS_CHOICES: [&str; 2] = ["vllm-chunk", "prompt-tail"];
+
+fn default_back_flush_k() -> u32 {
+    16
+}
+
+/// The selector's back-batching fields as the worker's spec.
+pub(crate) fn back_batching_spec(
+    flush: BackFlushKind,
+    k: u32,
+    rows: BackRowsKind,
+) -> Option<crate::worker::shared::back_stash::BackBatchingSpec> {
+    use crate::worker::shared::back_stash::{BackBatchingSpec, BackFlush, BackRows};
+    let flush = match flush {
+        BackFlushKind::Off => return None,
+        BackFlushKind::EveryStep => BackFlush::EveryStep,
+        BackFlushKind::Knee => BackFlush::Knee,
+        BackFlushKind::Fixed => BackFlush::Fixed(k),
+    };
+    let rows = match rows {
+        BackRowsKind::VllmChunk => BackRows::VllmChunk,
+        BackRowsKind::PromptTail => BackRows::PromptTail,
+    };
+    Some(BackBatchingSpec { flush, rows })
+}
+
 /// Where the chunked-prefill worker may end a non-final prefill chunk of an
 /// arch whose KV layout keeps a resumable recurrent state. A layout without
 /// one has no checkpoint and always chunks plainly.
@@ -990,6 +1039,20 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,
+        /// Back-pass batching (bounded-replay archs only): `off`, `every-step`,
+        /// `knee` (derived flush size), `fixed` (`back_flush_k` entries).
+        #[serde(default)]
+        #[param(string, default = "off", choices = BACK_FLUSH_CHOICES)]
+        back_flush: BackFlushKind,
+        /// Entries per back pass under `back_flush: fixed`.
+        #[serde(default = "default_back_flush_k")]
+        #[param(default = 16)]
+        back_flush_k: u32,
+        /// Rows a chunk leaves for the back pass: `vllm-chunk` (every chunk's
+        /// last `min(q, 128)`) or `prompt-tail` (the prompt's last 128 only).
+        #[serde(default)]
+        #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
+        back_rows: BackRowsKind,
         /// Archs whose KV layout keeps a resumable recurrent state only:
         /// `checkpoint` ends non-final prefill chunks on the layout's engine
         /// block (vLLM's Mamba `align` mode); `plain` chunks as
@@ -1168,6 +1231,16 @@ pub enum IterWorkerSel {
         /// Host tiers behind the prefix cache; see [`PrefixTierSpec`].
         #[serde(flatten)]
         prefix_tiers: PrefixTierSpec,
+        /// Back-pass batching, as for `chunked_prefill`.
+        #[serde(default)]
+        #[param(string, default = "off", choices = BACK_FLUSH_CHOICES)]
+        back_flush: BackFlushKind,
+        #[serde(default = "default_back_flush_k")]
+        #[param(default = 16)]
+        back_flush_k: u32,
+        #[serde(default)]
+        #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
+        back_rows: BackRowsKind,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

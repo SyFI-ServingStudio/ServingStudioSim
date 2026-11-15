@@ -195,6 +195,19 @@ impl Deployment for UnifiedDeployment {
                 | IterWorkerSel::Speculative { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            back_batching: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    back_flush,
+                    back_flush_k,
+                    back_rows,
+                    ..
+                } => crate::worker::config::back_batching_spec(
+                    *back_flush,
+                    *back_flush_k,
+                    *back_rows,
+                ),
+                _ => None,
+            },
             ..WorkerConfig::default()
         };
         g.worker
@@ -1475,6 +1488,9 @@ mod tests {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
+            back_flush: Default::default(),
+            back_flush_k: 16,
+            back_rows: Default::default(),
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
             pending_order: crate::worker::PendingOrderKind::Fifo,

@@ -959,6 +959,7 @@ mod tests {
         UnifiedArchInput {
             tokens_per_source_rank: groups.iter().map(|group| group.batch_tokens).collect(),
             groups,
+            back_pass: None,
         }
     }
 

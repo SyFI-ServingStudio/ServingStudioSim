@@ -860,7 +860,7 @@ fn normalize_dspark_input(
     // Every prefill chunk yields one logits row; every verify row one more.
     let logits_rows = prefill.len() as u32 + decode_tokens;
     let step = DeepseekV41Step { prefill, decode };
-    let target = normalize_step(graphs, &step, draft_tokens + 1, logits_rows, replay);
+    let target = normalize_step(graphs, &step, draft_tokens + 1, logits_rows, replay, None);
 
     // Every scheduled request drafts a block. The draft forward is one FULL
     // graph keyed by the request count (the verify width's capture sizes);

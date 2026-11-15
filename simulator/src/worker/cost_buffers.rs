@@ -789,6 +789,7 @@ mod tests {
         let decode = UnifiedArchInput {
             groups: vec![grp(&[100, 200])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let mut mixed = decode.clone();
         mixed.groups[0].prefill_tokens = 512;

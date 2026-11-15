@@ -56,6 +56,8 @@
 
 use std::collections::HashSet;
 
+use crate::worker::shared::back_stash::{BackEntry, BackStash};
+
 use crate::common::{RequestId, Time, UnifiedStage};
 use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
@@ -106,6 +108,19 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     reads: FreshReads,
     /// The decode runs elsewhere: a request completes at its first token.
     external_decode: Option<ExternalDecode>,
+    /// Back-pass batching (see [`crate::worker::shared::back_stash`]): a
+    /// microbatch's tails enter the stash when it exits, and a later
+    /// microbatch's back pass carries them; the request's first token is
+    /// emitted when that microbatch exits.
+    back: Option<PipelineBack>,
+}
+
+struct PipelineBack {
+    stash: BackStash,
+    /// Microbatches formed so far.
+    step: u64,
+    /// The requests the microbatch being formed flushes.
+    flushing: Vec<RequestId>,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -122,6 +137,12 @@ pub struct PrefillChunk {
 pub struct MicrobatchTicket {
     chunks: Vec<PrefillChunk>,
     decodes: Vec<RequestId>,
+    /// Back batching: the entries this microbatch's chunks leave, stashed
+    /// when it exits.
+    back_entries: Vec<BackEntry>,
+    /// Back batching: the requests whose tails this microbatch's back pass
+    /// carries, completed when it exits.
+    back_requests: Vec<RequestId>,
 }
 
 impl MicrobatchTicket {
@@ -156,6 +177,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             in_flight_prefill_tokens: 0,
             reads: FreshReads::new(1),
             external_decode: None,
+            back: None,
         }
     }
 
@@ -197,6 +219,16 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     /// Not vLLM.
     pub(crate) fn with_force_schedule(mut self, schedule: ForceSchedule) -> Self {
         self.policy = self.policy.with_force_schedule(schedule);
+        self
+    }
+
+    /// Batch the back pass of a bounded-replay arch through `stash`.
+    pub(crate) fn with_back_stash(mut self, stash: BackStash) -> Self {
+        self.back = Some(PipelineBack {
+            stash,
+            step: 0,
+            flushing: Vec::new(),
+        });
         self
     }
 
@@ -474,7 +506,24 @@ where
             remaining_budget,
             now,
         );
-        kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
+        let has_front = kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty();
+        let front_pending = !self.started_prefills.is_empty()
+            || self.reads.len() > self.reads.reading()
+            || self.policy.len() > 0;
+        let Some(back) = self.back.as_mut() else {
+            return has_front;
+        };
+        // Only exited microbatches' tails are in the stash.
+        let flushes = back.stash.should_flush(&[], front_pending, back.step + 1);
+        back.flushing.clear();
+        if flushes {
+            let batch = back.stash.take(&[]);
+            back.flushing = batch.requests;
+            batch_plan.back_pass = Some(batch.groups);
+        } else {
+            batch_plan.back_pass = Some(back.stash.empty_pass());
+        }
+        has_front || flushes
     }
 
     fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> MicrobatchTicket {
@@ -482,6 +531,27 @@ where
             decodes: std::mem::take(&mut self.scheduled_decodes),
             ..MicrobatchTicket::default()
         };
+        if let Some(back) = self.back.as_mut() {
+            back.step += 1;
+            ticket.back_requests = std::mem::take(&mut back.flushing);
+            let (stash, step) = (&back.stash, back.step);
+            kv_store.visit_prefill_admits(PARTITION, |request| {
+                let resolved = kv_store.resolved_prefill_context(request);
+                let (prefix, chunk) = resolved.active_chunk();
+                let finishes = chunk == resolved.remaining_prefill_tokens();
+                if let Some((prefix, rows)) =
+                    stash.chunk_entry(prefix, chunk, resolved.resident_prefix_tokens(), finishes)
+                {
+                    ticket.back_entries.push(BackEntry {
+                        group: 0,
+                        prefix,
+                        rows,
+                        request: finishes.then_some(request),
+                        step,
+                    });
+                }
+            });
+        }
         self.in_flight_decodes
             .extend(ticket.decodes.iter().copied());
         kv_store.visit_prefill_admits(PARTITION, |request| {
@@ -517,7 +587,13 @@ where
         at: Time,
     ) {
         self.in_flight_prefill_tokens -= ticket.tokens();
-        let MicrobatchTicket { chunks, decodes } = ticket;
+        let MicrobatchTicket {
+            chunks,
+            decodes,
+            back_entries,
+            back_requests,
+        } = ticket;
+        let deferred = self.back.is_some();
         let mut finished_decodes = Vec::new();
         {
             let mut store = context.requests.borrow_mut();
@@ -556,7 +632,7 @@ where
                     .prefill_tokens_processed
                     .checked_add(chunk.chunk_tokens)
                     .expect("prefill progress overflows u32");
-                if !chunk.finishes_prefill {
+                if !chunk.finishes_prefill || deferred {
                     continue;
                 }
                 record.record_first_token(at, context.log_tokens());
@@ -581,6 +657,35 @@ where
                     None => kv_store.release_retaining_prefix(chunk.request, PARTITION, at),
                 }
                 completed.push(chunk.request);
+            }
+        }
+        if let Some(back) = self.back.as_mut() {
+            for entry in back_entries {
+                back.stash.push(entry);
+            }
+        }
+        // The requests whose back pass this microbatch carried.
+        for request in back_requests {
+            let remaining_output_tokens = {
+                let mut store = context.requests.borrow_mut();
+                let record = &mut store[request];
+                record.record_first_token(at, context.log_tokens());
+                let stage = if record.is_complete() {
+                    UnifiedStage::Done
+                } else {
+                    UnifiedStage::Decode
+                };
+                context.stamp_stage(record, at, stage as u16);
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted)
+            };
+            kv_store.finish_chunked_prefill(request, PARTITION, remaining_output_tokens);
+            if remaining_output_tokens == 0 {
+                kv_store.release_retaining_prefix(request, PARTITION, at);
+                completed.push(request);
             }
         }
         kv_store.sample_submit(PARTITION, at);

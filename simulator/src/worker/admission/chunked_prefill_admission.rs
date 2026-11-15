@@ -36,13 +36,14 @@
 //! elsewhere hands the context back (`external_decode.rs`). Not vLLM.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
 use crate::worker::config::{
     BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
 };
 use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext, TieredPrefixKv};
+use crate::worker::shared::back_stash::{BackEntry, BackStash};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
@@ -120,6 +121,8 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     session_partitions: Option<HashMap<u32, usize>>,
     /// The decode runs elsewhere: a request completes at its first token.
     external_decode: Option<ExternalDecode>,
+    /// Back-pass batching; `None` runs every step's rows through every layer.
+    back: Option<BackBatching>,
 }
 
 /// What gates one partition's fresh-prompt admission in the iteration being
@@ -129,6 +132,21 @@ pub(super) struct FreshAdmissionStep {
     admits: bool,
     /// Future verify-window slots left (speculative decode only).
     future_decode_slots: Option<u32>,
+}
+
+/// A chunked-prefill lifecycle's back-pass batching state (see
+/// [`crate::worker::shared::back_stash`]). A request whose final chunk has
+/// run waits here, out of the prefill and decode sets, until the step whose
+/// back pass carries its tail completes; that step emits its first token.
+struct BackBatching {
+    stash: BackStash,
+    /// Front steps formed so far.
+    step: u64,
+    /// Requests whose tail this step's back pass carries.
+    flushing: HashSet<RequestId>,
+    /// Finished prompts waiting for their back pass: partition and whether
+    /// the episode reprocessed a retracted request.
+    waiting: HashMap<RequestId, (u16, bool)>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -206,6 +224,115 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             reads,
             session_partitions: None,
             external_decode: None,
+            back: None,
+        }
+    }
+
+    /// Batch the back pass of a bounded-replay arch through `stash`.
+    pub(crate) fn with_back_stash(mut self, stash: BackStash) -> Self {
+        self.back = Some(BackBatching {
+            stash,
+            step: 0,
+            flushing: HashSet::new(),
+            waiting: HashMap::new(),
+        });
+        self
+    }
+
+    /// Decide this step's back pass: stash this step's tails or flush them
+    /// with the stash. Returns whether a back pass runs.
+    fn plan_back_pass<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        batch_plan: &mut IterBatchPlan,
+    ) -> bool {
+        let front_pending = self.started_prefills.iter().any(|s| !s.is_empty())
+            || self.partition_policies.iter().any(|(p, _)| p.len() > 0);
+        let Some(back) = self.back.as_mut() else {
+            batch_plan.back_pass = None;
+            return false;
+        };
+        let step = back.step + 1;
+        let mut current = Vec::new();
+        for partition in 0..kv_store.num_partitions() as u16 {
+            kv_store.visit_prefill_admits(partition, |request| {
+                let resolved = kv_store.resolved_prefill_context(request);
+                let (prefix, chunk) = resolved.active_chunk();
+                let finishes = chunk == resolved.remaining_prefill_tokens();
+                if let Some((prefix, rows)) = back.stash.chunk_entry(
+                    prefix,
+                    chunk,
+                    resolved.resident_prefix_tokens(),
+                    finishes,
+                ) {
+                    current.push(BackEntry {
+                        group: usize::from(partition),
+                        prefix,
+                        rows,
+                        request: finishes.then_some(request),
+                        step,
+                    });
+                }
+            });
+        }
+        back.flushing.clear();
+        if back.stash.should_flush(&current, front_pending, step) {
+            let batch = back.stash.take(&current);
+            back.flushing.extend(batch.requests);
+            batch_plan.back_pass = Some(batch.groups);
+            true
+        } else {
+            for entry in current {
+                back.stash.push(entry);
+            }
+            batch_plan.back_pass = Some(back.stash.empty_pass());
+            false
+        }
+    }
+
+    /// Emit a finished prompt's first token and hand it to decode (or
+    /// complete it).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_prefill<K: ChunkedPrefillKv>(
+        kv_store: &mut K,
+        context: &WorkerContext,
+        request: RequestId,
+        partition: u16,
+        reprocessed: bool,
+        completed: &mut Vec<RequestId>,
+        now: Time,
+    ) {
+        {
+            let mut store = context.requests.borrow_mut();
+            let record = &mut store[request];
+            if reprocessed {
+                record.complete_reprocessed_prefill();
+                record.record_token(now, context.log_tokens());
+            } else {
+                record.record_first_token(now, context.log_tokens());
+            }
+            context.stamp_stage(
+                record,
+                now,
+                if record.is_complete() {
+                    UnifiedStage::Done
+                } else {
+                    UnifiedStage::Decode
+                } as u16,
+            );
+        }
+        let remaining_output_tokens = {
+            let store = context.requests.borrow();
+            let record = &store[request];
+            record
+                .request
+                .definition
+                .target_output_tokens
+                .saturating_sub(record.progress.output_tokens_emitted)
+        };
+        kv_store.finish_chunked_prefill(request, partition, remaining_output_tokens);
+        if context.requests.borrow()[request].is_complete() {
+            completed.push(request);
         }
     }
 
@@ -908,6 +1035,16 @@ where
                 self.current_new_token_ratio = config.initial_new_token_ratio;
             }
         }
+        let has_batch = if self.back.is_some() {
+            let flushes = self.plan_back_pass(kv_store, batch_plan);
+            let runs = has_batch || flushes;
+            if runs {
+                self.back.as_mut().unwrap().step += 1;
+            }
+            runs
+        } else {
+            has_batch
+        };
         if has_batch && query_width > 1 {
             let decode_completion = &self.decode_completion;
             let mut store = context.requests.borrow_mut();
@@ -957,6 +1094,26 @@ where
                 );
             }
 
+            if let Some(back) = self.back.as_mut() {
+                let ready: Vec<(RequestId, bool)> = back
+                    .waiting
+                    .iter()
+                    .filter(|(request, &(p, _))| p == partition && back.flushing.contains(request))
+                    .map(|(&request, &(_, reprocessed))| (request, reprocessed))
+                    .collect();
+                for (request, reprocessed) in ready {
+                    back.waiting.remove(&request);
+                    Self::finish_prefill(
+                        kv_store,
+                        context,
+                        request,
+                        partition,
+                        reprocessed,
+                        &mut completed,
+                        now,
+                    );
+                }
+            }
             let mut prefills = Vec::new();
             kv_store.visit_prefill_admits(partition, |request| prefills.push(request));
             for request in prefills {
@@ -992,38 +1149,22 @@ where
                         observation.prefill_chunks += 1;
                         observation.pending_prefill = None;
                     }
-                    if finished {
-                        if reprocessed {
-                            record.complete_reprocessed_prefill();
-                            record.record_token(now, context.log_tokens());
-                        } else {
-                            record.record_first_token(now, context.log_tokens());
-                        }
-                        context.stamp_stage(
-                            record,
-                            now,
-                            if record.is_complete() {
-                                UnifiedStage::Done
-                            } else {
-                                UnifiedStage::Decode
-                            } as u16,
-                        );
-                    }
                 }
                 if finished {
                     self.prefill_episodes.remove(&request);
-                    let remaining_output_tokens = {
-                        let store = context.requests.borrow();
-                        let record = &store[request];
-                        record
-                            .request
-                            .definition
-                            .target_output_tokens
-                            .saturating_sub(record.progress.output_tokens_emitted)
-                    };
-                    kv_store.finish_chunked_prefill(request, partition, remaining_output_tokens);
-                    if context.requests.borrow()[request].is_complete() {
-                        completed.push(request);
+                    match self.back.as_mut() {
+                        Some(back) if !back.flushing.contains(&request) => {
+                            back.waiting.insert(request, (partition, reprocessed));
+                        }
+                        _ => Self::finish_prefill(
+                            kv_store,
+                            context,
+                            request,
+                            partition,
+                            reprocessed,
+                            &mut completed,
+                            now,
+                        ),
                     }
                 }
             }

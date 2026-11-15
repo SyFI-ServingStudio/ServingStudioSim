@@ -404,8 +404,8 @@ impl DeepseekV41VllmDpDsparkModel {
                 ev,
             );
         }
-        self.draft_first.eval(&draft, None, ev);
-        self.draft_rest.eval(&draft, None, ev);
+        self.draft_first.eval(&draft, None, false, ev);
+        self.draft_rest.eval(&draft, None, false, ev);
         for (edges, rank) in self.ranks.iter().zip(&ranks) {
             let rows = rank.layer.rows;
             edges.head.eval(

@@ -50,5 +50,7 @@ pub use workers::iter::{
 };
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;
-pub(crate) use workers::pipeline::{build_pipeline_head_worker, build_pipeline_stage_worker};
+pub(crate) use workers::pipeline::{
+    build_pipeline_head_worker, build_pipeline_head_worker_with_back, build_pipeline_stage_worker,
+};
 pub use workers::pipeline::{PipelineHead, PipelineLayout, PipelineStage};

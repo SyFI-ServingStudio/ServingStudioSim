@@ -25,6 +25,7 @@ use crate::worker::admission::{
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::TierBytes;
+use crate::worker::shared::back_stash::{back_window, model_probe, BackStash};
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
@@ -121,6 +122,15 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     if config.external_decode {
         admission = admission.with_external_decode();
     }
+    let admission = match config.back_batching {
+        Some(spec) => admission.with_back_stash(BackStash::new(
+            spec,
+            back_window(&model.kv_cache_layout()),
+            num_partitions,
+            model_probe(Arc::clone(&model), num_partitions),
+        )),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

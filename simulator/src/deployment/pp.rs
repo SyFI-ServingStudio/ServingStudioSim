@@ -31,7 +31,7 @@ use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::kv::TierBytes;
 use crate::worker::{
-    build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
+    build_pipeline_head_worker, build_pipeline_head_worker_with_back, build_pipeline_stage_worker, resolve_prefix_cache_config,
     CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
     PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
@@ -230,6 +230,8 @@ impl Deployment for PpDeployment {
                 decoder_swa_bounded_replay,
                 max_num_batched_tokens,
                 cudagraph_capture_sizes,
+            stage_layers,
+            cut_handoff,
                 ..
             } => {
                 let pipeline = arch_build::deepseek_v41_vllm_pp(
@@ -244,10 +246,13 @@ impl Deployment for PpDeployment {
                     *decoder_swa_bounded_replay,
                     *max_num_batched_tokens,
                     cudagraph_capture_sizes,
+            stage_layers,
+            *cut_handoff,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
                 )?;
+                let pipeline = Arc::new(pipeline);
                 // Each stage sizes what it sends (`pipeline_send_bytes`); the
                 // per-token size is the hidden-state fallback.
                 let layout = PipelineLayout {
@@ -255,6 +260,9 @@ impl Deployment for PpDeployment {
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let back_probe = worker_config.back_batching.map(|_| {
+                    crate::worker::shared::back_stash::model_probe(Arc::clone(&pipeline), 1)
+                });
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -272,7 +280,7 @@ impl Deployment for PpDeployment {
                     },
                     build_activation_cost(&gpu_name, bridge)?,
                     move |id, cluster| {
-                        build_pipeline_head_worker(
+                        build_pipeline_head_worker_with_back(
                             id,
                             STAGE_POOL_TAG,
                             Arc::clone(&head_model),
@@ -284,6 +292,7 @@ impl Deployment for PpDeployment {
                             PP_STAGE_POOL,
                             &head_gpu,
                             std::rc::Rc::clone(cluster),
+                            back_probe.clone(),
                         )
                     },
                 ))
@@ -307,6 +316,9 @@ fn worker_config(
         pending_order,
         external_decode,
         prefix_tiers,
+        back_flush,
+        back_flush_k,
+        back_rows,
         ..
     } = worker
     else {
@@ -331,6 +343,11 @@ fn worker_config(
         pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
+        back_batching: crate::worker::config::back_batching_spec(
+            *back_flush,
+            *back_flush_k,
+            *back_rows,
+        ),
         prefill_chunk_alignment: *prefill_chunk_alignment,
         external_decode: *external_decode,
         max_model_len,

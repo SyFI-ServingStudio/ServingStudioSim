@@ -274,6 +274,13 @@ impl<'a> Evaluator<'a> {
     pub fn filled(&self) -> usize {
         self.cursor
     }
+
+    /// Zero every slot written since `start` (a [`Self::filled`] mark): a
+    /// section that runs no rows this step was walked with a placeholder
+    /// input to keep the slot order, and costs nothing.
+    pub fn zero_from(&mut self, start: usize) {
+        self.buf[start..self.cursor].fill(LeafMetrics::ZERO);
+    }
 }
 
 impl CostTree {

@@ -1047,32 +1047,29 @@ pub(crate) fn kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> D
 /// rows sit in 32-token pages with no stride padding.
 pub(crate) fn stage_kv_cache_layout(
     model: &DeepseekV41ModelCfg,
-    layers: (u32, u32),
+    layers: &[u32],
     copies: &[(u32, bool)],
 ) -> KvCacheLayout {
-    let (start, end) = layers;
     assert!(
-        start < end && end <= model.num_layers,
-        "stage layers {start}..{end}"
+        !layers.is_empty()
+            && layers.windows(2).all(|w| w[0] < w[1])
+            && *layers.last().unwrap() < model.num_layers,
+        "stage layers {layers:?}"
     );
     // A synthetic layer list: the copied sources first, then the stage's
-    // layers, so the packing helpers index ratios by position.
+    // layers in order, so the packing helpers index ratios by position.
     let copied = copies.len() as u32;
     let rebase = |ids: &[u32]| -> Vec<u32> {
         ids.iter()
-            .filter(|&&id| (start..end).contains(&id))
-            .map(|&id| id - start + copied)
+            .filter_map(|id| layers.iter().position(|l| l == id))
+            .map(|position| position as u32 + copied)
             .collect()
     };
     let mut stage = model.clone();
     stage.compress_ratios = copies
         .iter()
         .map(|&(source, _)| model.compress_ratios[source as usize])
-        .chain(
-            model.compress_ratios[start as usize..end as usize]
-                .iter()
-                .copied(),
-        )
+        .chain(layers.iter().map(|&l| model.compress_ratios[l as usize]))
         .collect();
     stage.kv_source_layer_ids = (0..copied)
         .chain(rebase(&model.kv_source_layer_ids))
@@ -1084,7 +1081,7 @@ pub(crate) fn stage_kv_cache_layout(
         .map(|(position, _)| position as u32)
         .chain(rebase(&model.index_source_layer_ids))
         .collect();
-    let swa_layers = u64::from(end - start);
+    let swa_layers = layers.len() as u64;
     if !stage.kv_source_layer_ids.is_empty() {
         let mut own = stage.clone();
         own.kv_source_layer_ids.retain(|&id| id >= copied);
@@ -1372,7 +1369,21 @@ impl DeepseekV41LayerBody {
         }
     }
 
+    /// A layer group that runs no rows this step (the late layers of a
+    /// deferred back pass with an empty stash, or a back-only step's front
+    /// layers) costs nothing; it is walked with a one-row placeholder to keep
+    /// the slot order.
     pub(crate) fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
+        if input.rows == 0 {
+            let start = evaluator.filled();
+            self.eval_rows(&placeholder_layer_input(), evaluator);
+            evaluator.zero_from(start);
+            return;
+        }
+        self.eval_rows(input, evaluator);
+    }
+
+    fn eval_rows(&self, input: &LayerInput, evaluator: &mut Evaluator) {
         if let Some(engram) = &self.engram {
             engram.eval(
                 &DeepseekV41EngramTpWorkletInput {
@@ -1607,7 +1618,7 @@ impl DeepseekV41VllmModel {
         );
         self.eval_plan(&self.plan, input, evaluator);
         if let Some(replay) = &self.replay {
-            let scattered = if input.replay.is_some() { rows } else { 0 };
+            let scattered = input.scatter_rows();
             eval_or_zero(
                 &replay.scatter,
                 ElementwiseKernelInput {
@@ -1619,7 +1630,7 @@ impl DeepseekV41VllmModel {
         }
         self.head.eval(
             &DeepseekV41HeadTpWorkletInput {
-                num_tokens: rows,
+                num_tokens: input.head_rows(),
                 mhc_post_rows: input.replay.as_ref().map_or(rows, |late| late.rows),
                 logits_rows: input.logits_rows,
             },
@@ -1631,12 +1642,14 @@ impl DeepseekV41VllmModel {
     pub(crate) fn normalize(&self, batch: &UnifiedArchInput) -> Result<NormalizedInput, String> {
         let step = DeepseekV41Step::from_unified(batch, self.max_model_len)?;
         let logits_rows = step.request_count();
+        let back = group_back_pairs(batch, self.max_model_len)?;
         Ok(normalize_step(
             &self.graphs,
             &step,
             1,
             logits_rows,
             self.replay_rule.as_ref(),
+            back.as_deref(),
         ))
     }
 
@@ -1970,6 +1983,62 @@ pub struct NormalizedInput {
     /// `Some` when the step runs the layers from the cut on the replay batch.
     pub replay: Option<LayerInput>,
     pub logits_rows: u32,
+    /// The replay batch is a deferred back pass
+    /// ([`UnifiedArchInput::back_pass`]): it carries stashed rows, not this
+    /// step's, so nothing scatters back and the head runs on its rows.
+    pub deferred: bool,
+}
+
+impl NormalizedInput {
+    /// Rows the head's hc collapse and final norm run: the batch after the
+    /// scatter, or the back pass's rows.
+    pub fn head_rows(&self) -> u32 {
+        match &self.replay {
+            Some(late) if self.deferred => late.rows,
+            _ => self.full.rows,
+        }
+    }
+
+    /// Rows the replay scatter writes back: the whole batch on an inline
+    /// replay step, none otherwise.
+    pub fn scatter_rows(&self) -> u32 {
+        match &self.replay {
+            Some(_) if !self.deferred => self.full.rows,
+            _ => 0,
+        }
+    }
+}
+
+/// A one-row prefill, the input a zero-row layer group is walked with.
+pub(crate) fn placeholder_layer_input() -> LayerInput {
+    layer_input(GraphMode::Eager, 1, vec![(1, 1)], &[])
+}
+
+/// A deferred back pass's `(prefix, rows)` entries as `(query, context)`
+/// pairs, validated as prefill chunks are.
+pub(crate) fn back_pairs(
+    entries: &[(u32, u32)],
+    max_model_len: u32,
+) -> Result<Vec<(u32, u32)>, String> {
+    prefill_pairs(entries, max_model_len).map_err(|reason| format!("back pass: {reason}"))
+}
+
+/// The deferred back pass of a one-group input, as `(query, context)` pairs.
+pub(crate) fn group_back_pairs(
+    input: &UnifiedArchInput,
+    max_model_len: u32,
+) -> Result<Option<Vec<(u32, u32)>>, String> {
+    match &input.back_pass {
+        None => Ok(None),
+        Some(groups) if groups.len() == input.groups.len() => {
+            back_pairs(&groups[0], max_model_len).map(Some)
+        }
+        Some(groups) => Err(format!(
+            "back pass has {} groups, the batch {}",
+            groups.len(),
+            input.groups.len()
+        )),
+    }
 }
 
 /// Decode requests as one-token attention rows: a request of `q` rows ending
@@ -2016,13 +2085,24 @@ pub(crate) fn layer_input(
 /// Normalize a step: graph mode and padded rows, the replay batch
 /// ([`BoundedReplay`]), and the attention batches. `uniform_query_len` is 1
 /// without speculation and the verify width with it.
+///
+/// With a deferred back pass (`back`, `(query, context)` pairs) every step
+/// that prefills or carries stashed rows splits at the cut: the step's own
+/// rows (and decodes) run up to it, the cut layer's `write_kv` runs on them,
+/// and the later layers run on the stashed rows plus the decodes, padded as a
+/// replay batch. A step with neither is an ordinary decode step.
 pub(crate) fn normalize_step(
     graphs: &DeepseekV41CudaGraphs,
     step: &DeepseekV41Step,
     uniform_query_len: u32,
     logits_rows: u32,
     replay: Option<&BoundedReplay>,
+    back: Option<&[(u32, u32)]>,
 ) -> NormalizedInput {
+    if let Some(back) = back.filter(|back| !back.is_empty() || !step.prefill.is_empty()) {
+        let rule = replay.expect("a deferred back pass needs the bounded-replay cut");
+        return normalize_deferred(graphs, step, uniform_query_len, rule, back);
+    }
     let query_lens: Vec<u32> = step
         .prefill
         .iter()
@@ -2041,6 +2121,46 @@ pub(crate) fn normalize_step(
         full,
         replay,
         logits_rows,
+        deferred: false,
+    }
+}
+
+/// [`normalize_step`] with a deferred back pass: the front batch is the
+/// step's own rows (none on a back-only step), the late batch the stashed
+/// rows plus the decodes (none when the stash is held), and each back entry
+/// and decode row owns one logits row.
+fn normalize_deferred(
+    graphs: &DeepseekV41CudaGraphs,
+    step: &DeepseekV41Step,
+    uniform_query_len: u32,
+    rule: &BoundedReplay,
+    back: &[(u32, u32)],
+) -> NormalizedInput {
+    let query_lens: Vec<u32> = step
+        .prefill
+        .iter()
+        .chain(&step.decode)
+        .map(|&(q, _)| q)
+        .collect();
+    let (mode, rows) = if query_lens.is_empty() {
+        (GraphMode::Eager, 0)
+    } else {
+        graphs.step_graph(&query_lens, uniform_query_len)
+    };
+    let full = layer_input(mode, rows, step.prefill.clone(), &step.decode);
+    let kept = back.iter().map(|&(q, _)| q).sum::<u32>()
+        + step.decode.iter().map(|&(q, _)| q.min(rule.window)).sum::<u32>();
+    let late_rows = match kept {
+        0 => 0,
+        kept => graphs.replay_rows(kept, rule.window),
+    };
+    let late = layer_input(GraphMode::Piecewise, late_rows, back.to_vec(), &step.decode);
+    NormalizedInput {
+        mode,
+        full,
+        replay: Some(late),
+        logits_rows: back.len() as u32 + step.decode.iter().map(|&(q, _)| q).sum::<u32>(),
+        deferred: true,
     }
 }
 
@@ -2546,6 +2666,7 @@ mod tests {
             &UnifiedArchInput {
                 groups: vec![ArchGroupInput::default(), ArchGroupInput::default()],
                 tokens_per_source_rank: vec![],
+                back_pass: None,
             },
             None,
         )
@@ -2622,7 +2743,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 106), (6, 10)],
         };
-        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None);
+        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None, None);
         assert_eq!((input.mode, input.full.rows), (GraphMode::Full, 12));
         assert_eq!(
             input.full.attention.decode_kv_lens,
@@ -2634,7 +2755,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 50); 3],
         };
-        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None);
+        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None, None);
         assert_eq!(input.full.rows, 18);
         assert!(!input.full.attention.mhc_overlap);
         // PIECEWISE steps never take it.
@@ -2697,6 +2818,7 @@ mod tests {
         UnifiedArchInput {
             groups: vec![group(prefill, decode)],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         }
     }
 
@@ -2711,6 +2833,7 @@ mod tests {
             1,
             step.request_count(),
             replay,
+            None,
         ))
     }
 

@@ -10,6 +10,7 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::shared::back_stash::{back_window, BackProbe, BackStash};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
     kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
@@ -41,6 +42,40 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     pool: PoolId,
     gpu_name: &str,
     cluster: SharedGpuCluster,
+) -> PipelineHead<M> {
+    build_pipeline_head_worker_with_back(
+        id,
+        pool_tag,
+        stage_model,
+        layout,
+        kv_cache_layout,
+        requests,
+        config,
+        cost_log_dir,
+        pool,
+        gpu_name,
+        cluster,
+        None,
+    )
+}
+
+/// [`build_pipeline_head_worker`] with the whole pipeline's back-pass probe,
+/// used when `config.back_batching` is set (see
+/// [`crate::worker::shared::back_stash`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
+    id: WorkerId,
+    pool_tag: &'static str,
+    stage_model: Arc<M>,
+    layout: PipelineLayout,
+    kv_cache_layout: &KvCacheLayout,
+    requests: SharedRequests,
+    config: WorkerConfig,
+    cost_log_dir: Option<PathBuf>,
+    pool: PoolId,
+    gpu_name: &str,
+    cluster: SharedGpuCluster,
+    back_probe: Option<BackProbe>,
 ) -> PipelineHead<M> {
     let max_batch_tokens = config
         .max_batch_tokens
@@ -118,6 +153,11 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if config.external_decode {
         admission = admission.with_external_decode();
+    }
+    if let Some(spec) = config.back_batching {
+        let probe = back_probe.expect("back batching on a pipeline needs the pipeline's probe");
+        admission =
+            admission.with_back_stash(BackStash::new(spec, back_window(kv_cache_layout), 1, probe));
     }
 
     PipelineHeadWorker::from_components(

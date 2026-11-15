@@ -1030,6 +1030,7 @@ mod tests {
             &UnifiedArchInput {
                 groups,
                 tokens_per_source_rank: vec![4, 2, 0, 3],
+                back_pass: None,
             },
             4,
         )

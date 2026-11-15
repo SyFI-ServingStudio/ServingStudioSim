@@ -898,10 +898,16 @@ impl DpLayerBody {
 
     /// `input` is the batch this body runs (the replay batch for a late
     /// body); `boundary` is set on the cut body.
+    ///
+    /// `idle`: no rank runs a row of this body (a deferred back pass with an
+    /// empty stash); `input` is then a placeholder walked to keep the slot
+    /// order and the body costs nothing, while the cut boundary's `write_kv`
+    /// still runs.
     pub(crate) fn eval(
         &self,
         input: &DpLayerInput,
         boundary: Option<(&DpReplayBoundary, &DpStep)>,
+        idle: bool,
         ev: &mut Evaluator,
     ) {
         for (rank, layer) in input.ranks.iter().enumerate() {
@@ -915,9 +921,17 @@ impl DpLayerBody {
                     continue;
                 }
             }
+            let start = ev.filled();
             self.eval_rank(layer, ev);
+            if idle {
+                ev.zero_from(start);
+            }
         }
+        let start = ev.filled();
         self.eval_tail(input, ev);
+        if idle {
+            ev.zero_from(start);
+        }
     }
 }
 
@@ -1275,12 +1289,15 @@ impl DeepseekV41VllmDpModel {
         for node in plan {
             match node {
                 PlanNode::Body(index) => {
-                    let input = match &step.replay {
-                        Some(late) if self.late_bodies[*index] => late,
-                        _ => &step.full,
+                    let (input, idle) = match &step.replay {
+                        Some(late) if self.late_bodies[*index] => match late.idle() {
+                            true => (&step.full, true),
+                            false => (late, false),
+                        },
+                        _ => (&step.full, false),
                     };
                     let boundary = self.boundary_at(*index).map(|boundary| (boundary, step));
-                    self.bodies[*index].eval(input, boundary, ev)
+                    self.bodies[*index].eval(input, boundary, idle, ev)
                 }
                 PlanNode::Repeat { body, .. } => self.eval_plan(body, step, ev),
             }
@@ -1307,7 +1324,10 @@ impl DeepseekV41VllmDpModel {
         for (index, rank) in step.full.ranks.iter().enumerate() {
             let late_rows = step.replay.as_ref().map(|late| late.ranks[index].rows);
             if let Some(replay) = &self.replay {
-                let scattered = if late_rows.is_some() { rank.rows } else { 0 };
+                let scattered = match late_rows {
+                    Some(_) if !step.deferred => rank.rows,
+                    _ => 0,
+                };
                 eval_or_zero(
                     &replay.scatter,
                     ElementwiseKernelInput {
@@ -1319,7 +1339,10 @@ impl DeepseekV41VllmDpModel {
             }
             self.head.eval(
                 &DeepseekV41HeadTpWorkletInput {
-                    num_tokens: rank.rows,
+                    num_tokens: match late_rows {
+                        Some(late) if step.deferred => late,
+                        _ => rank.rows,
+                    },
                     mhc_post_rows: late_rows.unwrap_or(rank.rows),
                     logits_rows: step.logits_rows[index],
                 },
@@ -1494,6 +1517,11 @@ impl DpLayerInput {
             ranks,
         }
     }
+
+    /// No rank runs a row (an empty deferred back pass).
+    pub(crate) fn idle(&self) -> bool {
+        self.ranks.iter().all(|rank| rank.rows == 0)
+    }
 }
 
 /// A DP step, normalized: the graph mode every rank agreed on, the batch
@@ -1507,6 +1535,9 @@ pub(crate) struct DpStep {
     pub full: DpLayerInput,
     pub replay: Option<DpLayerInput>,
     pub logits_rows: Vec<u32>,
+    /// The replay batch is a deferred back pass (see
+    /// [`tp_arch::NormalizedInput::deferred`]).
+    pub deferred: bool,
 }
 
 /// One rank's no-spec step: each decode request is one row after its
@@ -1695,7 +1726,54 @@ pub(crate) fn normalize_dp_steps(
         full,
         replay,
         logits_rows,
+        deferred: false,
     }
+}
+
+/// [`normalize_dp_steps`] with a deferred back pass (`back`, one list of
+/// `(query, context)` pairs per rank): every rank's front batch is its own
+/// step (idle ranks run the dummy), the late batch each rank's stashed rows
+/// plus its decodes, padded to the busiest rank's replay graph (no rows on
+/// any rank when nothing is flushed).
+fn normalize_dp_deferred(
+    graphs: &DeepseekV41CudaGraphs,
+    steps: &[DeepseekV41Step],
+    rule: &BoundedReplay,
+    back: &[Vec<(u32, u32)>],
+) -> DpStep {
+    let logits_rows: Vec<u32> = steps
+        .iter()
+        .zip(back)
+        .map(|(step, back)| back.len() as u32 + step.decode.len() as u32)
+        .collect();
+    let mut step = normalize_dp_steps(graphs, steps, 1, logits_rows, None);
+    let kept: Vec<u32> = steps
+        .iter()
+        .zip(back)
+        .map(|(step, back)| {
+            back.iter().map(|&(q, _)| q).sum::<u32>()
+                + step.decode.iter().map(|&(q, _)| q.min(rule.window)).sum::<u32>()
+        })
+        .collect();
+    let late_rows = match kept.iter().copied().max().unwrap_or(0) {
+        0 => 0,
+        busiest => graphs.replay_rows(busiest, rule.window),
+    };
+    step.replay = Some(DpLayerInput::new(
+        steps
+            .iter()
+            .zip(back)
+            .zip(&kept)
+            .map(|((rank, back), &kept)| {
+                let mut layer =
+                    layer_input(GraphMode::Piecewise, late_rows, back.clone(), &rank.decode);
+                layer.scheduled_rows = kept.min(late_rows);
+                layer
+            })
+            .collect(),
+    ));
+    step.deferred = true;
+    step
 }
 
 /// A no-spec DP batch: one group per rank.
@@ -1737,8 +1815,32 @@ fn normalize_ranks(
             ));
         }
     }
-    if steps.iter().all(|step| step.request_count() == 0) {
+    let back = match &input.back_pass {
+        None => None,
+        Some(groups) if groups.len() == dp => Some(
+            groups
+                .iter()
+                .map(|entries| tp_arch::back_pairs(entries, max_model_len))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        ),
+        Some(groups) => {
+            return Err(format!(
+                "back pass has {} groups, expected one per DP rank ({dp})",
+                groups.len()
+            ))
+        }
+    };
+    let flushes = back
+        .as_ref()
+        .is_some_and(|back| back.iter().any(|entries| !entries.is_empty()));
+    // A back-batching caller (`back_pass: Some`) may run an empty step: the
+    // stash's knee probe prices its base `probe(∅)` that way.
+    if steps.iter().all(|step| step.request_count() == 0) && back.is_none() {
         return Err("an iteration must carry at least one token".into());
+    }
+    if let Some(back) = back.filter(|_| flushes || steps.iter().any(|s| !s.prefill.is_empty())) {
+        let rule = replay.ok_or("a deferred back pass needs the bounded-replay cut")?;
+        return Ok(normalize_dp_deferred(graphs, &steps, rule, &back));
     }
     let logits_rows = steps.iter().map(DeepseekV41Step::request_count).collect();
     Ok(normalize_dp_steps(graphs, &steps, 1, logits_rows, replay))
@@ -2362,5 +2464,19 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    #[test]
+    fn an_empty_step_passes_only_for_a_back_batching_caller() {
+        // The stash's knee probe prices `probe(∅)`: no front, no back entries.
+        let model = built();
+        let empty = || vec![group(&[], &[]); 4];
+        assert!(model.check_input(&input(empty())).is_err());
+        model
+            .check_input(&UnifiedArchInput {
+                back_pass: Some(vec![Vec::new(); 4]),
+                ..input(empty())
+            })
+            .unwrap();
     }
 }

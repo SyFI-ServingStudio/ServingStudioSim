@@ -6,7 +6,9 @@ mod build_pipeline_stage_worker;
 mod pipeline_head_worker;
 mod pipeline_stage_worker;
 
-pub(crate) use build_pipeline_head_worker::build_pipeline_head_worker;
+pub(crate) use build_pipeline_head_worker::{
+    build_pipeline_head_worker, build_pipeline_head_worker_with_back,
+};
 pub(crate) use build_pipeline_stage_worker::build_pipeline_stage_worker;
 pub use pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
 pub use pipeline_stage_worker::PipelineStageWorker;

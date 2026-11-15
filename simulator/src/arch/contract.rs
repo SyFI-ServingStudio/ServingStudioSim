@@ -122,6 +122,14 @@ mod arch_group_input_tests {
 pub struct UnifiedArchInput {
     pub groups: Vec<ArchGroupInput>,
     pub tokens_per_source_rank: Vec<u32>,
+    /// Deferred back pass (`Some` only under a worker's back batching, see
+    /// `worker::shared::back_stash`): the layers from a bounded-replay arch's
+    /// cut on run this step only on these entries, `(prefix, rows)` per group,
+    /// each the rows a finished (or, under the per-chunk rule, any) prefill
+    /// chunk left in the stash. This step's own prefill rows stop after the
+    /// cut layer's `write_kv`. Each entry owns one lm-head row. `None` is the
+    /// ordinary forward, where the step's own rows run every layer.
+    pub back_pass: Option<Vec<Vec<(u32, u32)>>>,
 }
 
 /// Iter-wise query face for co-located workers: one call costs the whole

@@ -57,6 +57,7 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             group.decode_tokens = group.decode_kv_lens.len() as u32;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
+        out.back_pass.clone_from(&batch_plan.back_pass);
         if num_partitions > 1 {
             out.tokens_per_source_rank.clear();
             out.tokens_per_source_rank

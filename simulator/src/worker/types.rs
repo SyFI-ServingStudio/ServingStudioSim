@@ -48,6 +48,9 @@ pub struct IterBatchPlan {
     /// Per partition, sorted: the only resident decodes that run when the
     /// partition participates. `None` means all of them.
     selected_decodes: Vec<Option<Vec<RequestId>>>,
+    /// The deferred back pass this step runs (back batching); copied into
+    /// [`crate::arch::contract::UnifiedArchInput::back_pass`].
+    pub back_pass: Option<Vec<Vec<(u32, u32)>>>,
 }
 
 impl IterBatchPlan {
@@ -586,6 +589,9 @@ pub struct WorkerConfig {
     /// cost-class order of those requests; `None`: no bound. Only the two
     /// chunked recipes read it.
     pub force_schedule: Option<crate::worker::admission::ForceSchedule>,
+    /// Back-pass batching (chunked-prefill and pipeline-head recipes on a
+    /// bounded-replay arch); `None` runs the ordinary forward.
+    pub back_batching: Option<crate::worker::shared::back_stash::BackBatchingSpec>,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -670,6 +676,7 @@ impl Default for WorkerConfig {
             microbatch_budget: crate::worker::admission::MicrobatchBudget::default(),
             started_order: crate::worker::admission::StartedOrder::StartOrder,
             force_schedule: None,
+            back_batching: None,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,
