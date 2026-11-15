@@ -1,0 +1,43 @@
+# GLM-5.2 NVFP4 on B200, vLLM DP attention (TP1 per GPU) + EP MoE, prefill only, no MTP.
+# 128 requests, each with a 100,000-token pinned prefix already in KV plus 8,192 fresh prompt tokens, output 1,
+# all eligible at t=0; 8192-token chunk per DP rank.
+# KV per rank follows presets/public_sim/GLM-5.2-NVFP4/glm52_vllm_nvfp4_dp_attn_dsa_moe_chunked_prefill.yaml.
+deployment: unified
+
+workload:
+  trace_files: [artifact/glm52_tiers/presets/prefix100k_new8192_128.csv]
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  run_to_end: true
+
+io:
+  log_dir: logs/20261009_1_bitcheck_base/{layout}
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dp_attn_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          ep_size: ${ep_size}
+          nvl_num_gpu: ${ep_size}
+          max_model_len: 131072
+          # Measured marginal from the vLLM c32_long capture (the public DP preset's choice).
+          routing: popularity
+          routing_seed: null
+          expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 8192
+          batch_policy: mix
+          dp_placement: vllm-least-loaded
+          gpu_time_multiplier: 1.0
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+
+compound:
+  layout:
+    dp4ep4: {ep_size: 4, attn_gpu_memory_gb: 19.59879168}
+    dp8ep8: {ep_size: 8, attn_gpu_memory_gb: 70.55964288}

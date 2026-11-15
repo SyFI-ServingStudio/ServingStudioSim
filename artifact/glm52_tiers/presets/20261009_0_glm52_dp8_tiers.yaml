@@ -1,0 +1,75 @@
+# GLM-5.2 NVFP4 on 8 B200, vLLM DP8 attention (TP1 per GPU) + EP8 MoE, closed-loop TraceLab monotonic sessions with
+# the three-tier prefix store. Template: wt-pp-study logs/20261009_4_blog_rerun/cl_main_dp8.yaml (GLM-5.3-Flash),
+# with the arch, KV budget and routing swapped for GLM-5.2; the scheduler and tier settings are unchanged.
+deployment: unified
+
+workload:
+  trace_files: ${trace}
+  input_file_format: text-generation-session-execution-v2
+  # A closed loop of `conc` sessions (trace/session_closed_loop.py over mono_sessions_d80.csv, after = 20 x conc).
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: false
+  duration_ms: ${duration_ms}
+
+io:
+  log_dir: logs/20261009_0_glm52_dp8_tiers/{load}
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dp_attn_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          ep_size: 8
+          nvl_num_gpu: 8
+          max_model_len: 1048576
+          # Measured marginal from the vLLM c32_long capture (the public GLM-5.2 DP preset's choice).
+          routing: popularity
+          routing_seed: null
+          expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 1024, 1040, 1056, 1072, 1088, 1104, 1120, 1136, 1152, 1168, 1184, 1200, 1216, 1232, 1248, 1264, 1280, 1296, 1312, 1328, 1344, 1360, 1376, 1392, 1408, 1424, 1440, 1456, 1472, 1488, 1504, 1520, 1536, 1552, 1568, 1584, 1600, 1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872, 1888, 1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032, 2048]
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          batch_policy: mix
+          dp_placement: vllm-least-loaded
+          prefill_chunk_alignment: plain
+          gpu_time_multiplier: 1.0
+          # DP8 KV pool from presets/public_sim/GLM-5.2-NVFP4/glm52_vllm_nvfp4_dp_attn_dsa_moe_chunked_prefill.yaml:
+          # the SGLang TP4 measured pool minus the extra non-expert weight each DP rank keeps (1,277,698 tokens/rank).
+          attn_gpu_memory_gb: 70.55964288
+          external_decode: true
+          dram_tier_gb: ${dram_tier_gb}
+          dram_tier_gb_per_s: 50.0
+          ssd_tier_gb: ${ssd_tier_gb}
+          ssd_tier_gb_per_s: ${ssd_gb_per_s}
+          prefix_tier_warm_start: ${warm_start}
+          pending_order: shortest-prefill-first
+          force_schedule_after_ms: ${force_ms}
+          srpt: true
+          load_budget_low_tokens: 4096
+          load_budget_backlog_lo_tokens: 1000000
+          load_budget_backlog_hi_tokens: 3000000
+          prefix_tier_max_read_wait_ms: 1000.0
+          prefix_tier_read_wait_policy: pass-over
+
+sweep:
+  duration_ms: [28800000.0]
+  force_ms: [60000.0]
+compound:
+  tiers:
+    main: {dram_tier_gb: 150.0, ssd_tier_gb: 8000.0, ssd_gb_per_s: 10.0, warm_start: true}
+  load:
+    c100: {trace: [logs/glm52_tiers_traces/closed_c100_s0.csv], conc: 100}
+    c200: {trace: [logs/glm52_tiers_traces/closed_c200_s0.csv], conc: 200}
+    c250: {trace: [logs/glm52_tiers_traces/closed_c250_s0.csv], conc: 250}
+    c375: {trace: [logs/glm52_tiers_traces/closed_c375_s0.csv], conc: 375}
+    c500: {trace: [logs/glm52_tiers_traces/closed_c500_s0.csv], conc: 500}
+    c750: {trace: [logs/glm52_tiers_traces/closed_c750_s0.csv], conc: 750}
+    c1000: {trace: [logs/glm52_tiers_traces/closed_c1000_s0.csv], conc: 1000}
+  mbt:
+    m32k: {max_batch_tokens: 32768}
