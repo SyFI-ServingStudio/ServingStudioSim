@@ -423,6 +423,14 @@ pub trait TieredPrefixKv: ChunkedPrefillKv {
     /// giving its share of HBM's loading area back, just before admission
     /// resolves its prefix.
     fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time);
+    /// Sessions whose context `horizon` more tokens written into
+    /// `partition`'s tiers would evict from every tier holding it, the next
+    /// victims first (an LRU tier's stack distance to eviction). Empty
+    /// without tiers.
+    fn tier_sessions_at_risk(&self, partition: PartitionId, horizon: u64) -> Vec<u32>;
+    /// Whether HBM's evictions go to `partition`'s fastest tier (a victim
+    /// tier), so a context HBM holds survives HBM's own evictions.
+    fn tiers_take_hbm_evictions(&self, partition: PartitionId) -> bool;
 }
 
 /// Additional KV lifecycle required by a PD prefill worker.

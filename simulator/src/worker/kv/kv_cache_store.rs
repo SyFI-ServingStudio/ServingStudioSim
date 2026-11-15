@@ -447,6 +447,18 @@ impl TieredPrefixKv for KvCacheStore {
         })
     }
 
+    fn tier_sessions_at_risk(&self, partition: PartitionId, horizon: u64) -> Vec<u32> {
+        self.tier_chains
+            .get(partition as usize)
+            .map_or_else(Vec::new, |chain| chain.sessions_at_risk(horizon))
+    }
+
+    fn tiers_take_hbm_evictions(&self, partition: PartitionId) -> bool {
+        self.tier_chains
+            .get(partition as usize)
+            .is_some_and(TierChain::takes_hbm_evictions)
+    }
+
     fn stages_tier_reads(&self) -> bool {
         self.tier_chains.first().is_some_and(TierChain::is_staged)
     }
