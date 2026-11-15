@@ -596,6 +596,8 @@ pub struct WorkerConfig {
     pub prefix_resume_interval: Option<u32>,
     /// Layout parts charged other entry bytes than `kv_overhead` gives them.
     pub kv_part_padding: Vec<crate::worker::kv::PartPadding>,
+    /// The engine block in tokens, overriding the arch layout's.
+    pub kv_block_tokens: Option<u32>,
     /// Which round-end recurrent states a retained context keeps. Only the
     /// two chunked recipes set it.
     pub state_retention: crate::worker::kv::StateRetention,
@@ -649,6 +651,7 @@ impl Default for WorkerConfig {
             prefix_resume_points: None,
             prefix_resume_interval: None,
             kv_part_padding: Vec::new(),
+            kv_block_tokens: None,
             state_retention: crate::worker::kv::StateRetention::Latest { k: 1 },
             kv_max_in_flight_tokens: None,
             max_model_len: None,

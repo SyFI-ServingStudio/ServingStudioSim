@@ -265,6 +265,13 @@ pub struct KvAccountingSpec {
     /// `kv_overhead` rule stays. A name the arch's layout lacks is an error.
     #[serde(default)]
     kv_part_padding: Vec<String>,
+    /// The engine block in tokens, overriding the one the arch derives (an
+    /// engine with other pages than vLLM's). It drives per-token block
+    /// rounding, resume-point flooring, the checkpoint chunk boundary and the
+    /// null block; padded parts keep their declared bytes unless
+    /// `kv_part_padding` names them. Absent keeps the arch's block.
+    #[serde(default)]
+    kv_block_tokens: Option<u32>,
 }
 
 impl KvAccountingSpec {
@@ -278,10 +285,15 @@ impl KvAccountingSpec {
             self.kv_max_in_flight_tokens != Some(0),
             "{owner}: kv_max_in_flight_tokens must be positive"
         );
+        ensure!(
+            self.kv_block_tokens != Some(0),
+            "{owner}: kv_block_tokens must be positive"
+        );
         config.kv_overhead = self.kv_overhead;
         config.prefix_resume_points = self.prefix_resume_points;
         config.prefix_resume_interval = self.prefix_resume_interval;
         config.kv_max_in_flight_tokens = self.kv_max_in_flight_tokens;
+        config.kv_block_tokens = self.kv_block_tokens;
         config.kv_part_padding = Vec::with_capacity(self.kv_part_padding.len());
         for value in &self.kv_part_padding {
             let padding: PartPadding = value
@@ -1312,6 +1324,12 @@ mod tests {
         let twice = apply("kv_part_padding: [kda=unpadded, kda=padded]\n").unwrap_err();
         assert!(twice.to_string().contains("twice"), "{twice}");
         assert!(apply("kv_part_padding: [kda]\n").is_err());
+        assert_eq!(apply("").unwrap().kv_block_tokens, None);
+        assert_eq!(
+            apply("kv_block_tokens: 128\n").unwrap().kv_block_tokens,
+            Some(128)
+        );
+        assert!(apply("kv_block_tokens: 0\n").is_err());
     }
 
     #[test]

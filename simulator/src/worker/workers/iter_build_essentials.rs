@@ -48,6 +48,7 @@ pub(crate) fn resolve_kv_accounting(
     let options = KvAccountingOptions {
         overhead: config.kv_overhead,
         part_padding: config.kv_part_padding.clone(),
+        block_tokens: config.kv_block_tokens,
         resume_points: config.prefix_resume_points,
         resume_interval: config.prefix_resume_interval,
         state_retention: config.state_retention,

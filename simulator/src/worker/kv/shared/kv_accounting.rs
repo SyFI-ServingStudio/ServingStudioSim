@@ -162,6 +162,9 @@ pub struct KvAccountingOptions {
     /// Parts charged other entry bytes than `overhead` gives them; each names
     /// a part of the layout at most once.
     pub part_padding: Vec<PartPadding>,
+    /// The engine block in tokens instead of the layout's
+    /// ([`crate::arch::kv_layout::EngineOverhead::with_block_tokens`]).
+    pub block_tokens: Option<u32>,
     /// `None` follows the overhead mode: `prompt_end` under `vllm`,
     /// `response_end` under `none`.
     pub resume_points: Option<PrefixResumePoints>,
@@ -258,6 +261,16 @@ impl KvAccounting {
         options: KvAccountingOptions,
         budget_bytes: u64,
     ) -> anyhow::Result<Self> {
+        let overridden;
+        let layout = match options.block_tokens {
+            Some(block_tokens) => {
+                overridden = layout
+                    .clone()
+                    .with_engine(layout.engine.with_block_tokens(block_tokens));
+                &overridden
+            }
+            None => layout,
+        };
         layout.validate()?;
         for padding in &options.part_padding {
             ensure!(
@@ -1058,6 +1071,39 @@ mod tests {
         // A history edited below the only position resumes nowhere.
         let none = resolve(&gdn_layout(), KvOverhead::None, None);
         assert_eq!(none.resume_positions(8_000, 8_500).floor(8_400), 0);
+    }
+
+    #[test]
+    fn a_block_override_drives_rounding_resume_points_checkpoints_and_the_null_block() {
+        let layout = gdn_layout().with_engine(EngineOverhead {
+            block_tokens: Some(1_056),
+            fixed_device_bytes: 1_056 * 100,
+        });
+        let resolve = |block_tokens| {
+            KvAccounting::resolve(
+                &layout,
+                KvAccountingOptions {
+                    block_tokens,
+                    ..options(KvOverhead::Vllm)
+                },
+                1_000_000,
+            )
+            .unwrap()
+        };
+        let arch = resolve(None);
+        let paged = resolve(Some(128));
+        assert_eq!(arch.capacity_units(), (1_000_000 - 105_600) / 100);
+        assert_eq!(paged.capacity_units(), (1_000_000 - 12_800) / 100);
+        // 2000 tokens take sixteen 128-token blocks; the padded state keeps
+        // its declared bytes.
+        assert_eq!(paged.held_while_running(2_000, 1), 2_048 + 3_168);
+        assert_eq!(paged.resume_positions(8_000, 8_500).floor(8_500), 7_936);
+        assert_eq!(paged.checkpoint_block_tokens(), Some(128));
+        assert_eq!(paged.layout().engine.block_tokens, Some(128));
+        assert_eq!(
+            resolve(None).resume_positions(8_000, 8_500).floor(8_500),
+            7_392
+        );
     }
 
     #[test]
