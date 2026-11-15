@@ -932,14 +932,15 @@ impl DpLayerBody {
         ev: &mut Evaluator,
     ) {
         for (rank, layer) in input.ranks.iter().enumerate() {
+            let mut written;
+            let mut layer = layer;
             if let Some((boundary, step)) = boundary {
                 boundary.eval_rank(step, rank, ev);
                 if step.replay.is_some() {
                     // The cut's `write_kv` stored this layer's main and index KV.
-                    let mut layer = layer.clone();
-                    layer.attention.kv_written = true;
-                    self.eval_rank(&layer, ev);
-                    continue;
+                    written = layer.clone();
+                    written.attention.kv_written = true;
+                    layer = &written;
                 }
             }
             let start = ev.filled();
