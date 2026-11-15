@@ -75,6 +75,7 @@ from profiling.kernels import (
     kv_compress_store,  # noqa: F401
     layered_kv_norm_rope_cache_write,  # noqa: F401
     logits_topk,  # noqa: F401
+    mega_moe,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_fused_sum_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
