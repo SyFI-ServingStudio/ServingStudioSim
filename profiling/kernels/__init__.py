@@ -132,6 +132,7 @@ from profiling.kernels import (
     sparse_indexer_logits_decode,  # noqa: F401
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
+    sparse_mla_norm_rope_cast_prefill,  # noqa: F401
     static_fp8_quant,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401

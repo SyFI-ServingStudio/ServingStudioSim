@@ -125,6 +125,7 @@ pub mod sparse_index_expand;
 pub mod sparse_indexer_logits_decode;
 pub mod sparse_indexer_logits_prefill;
 pub mod sparse_indexer_prepare;
+pub mod sparse_mla_norm_rope_cast_prefill;
 pub mod sparse_indexer_topk;
 pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
@@ -523,6 +524,10 @@ pub use sparse_gqa_paged_attention::{
 pub use sparse_index_expand::{
     SparseIndexExpandKernel, SparseIndexExpandKernelConfig, SparseIndexExpandKernelInput,
     SparseIndexExpandSpec,
+};
+pub use sparse_mla_norm_rope_cast_prefill::{
+    SparseMlaNormRopeCastPrefillKernel, SparseMlaNormRopeCastPrefillKernelConfig,
+    SparseMlaNormRopeCastPrefillKernelInput, SparseMlaNormRopeCastPrefillSpec,
 };
 pub use sparse_indexer_logits_decode::{
     SparseIndexerLogitsDecodeKernel, SparseIndexerLogitsDecodeKernelConfig,

@@ -48,6 +48,7 @@ use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
 use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
 use crate::timing::kernels::DsaPooledLogitsPageTableKernelInput;
 use crate::timing::kernels::DsaPooledTopkPageTableKernelInput;
+use crate::timing::kernels::SparseMlaNormRopeCastPrefillKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
@@ -227,6 +228,7 @@ log_inputs! {
     CompressedSparseMlaDecode => CompressedSparseMlaDecodeKernelInput,
     CompressedSparseMlaPrefill => CompressedSparseMlaPrefillKernelInput,
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
+    SparseMlaNormRopeCastPrefill => SparseMlaNormRopeCastPrefillKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
     EmbeddingRowGather => EmbeddingRowGatherKernelInput,
