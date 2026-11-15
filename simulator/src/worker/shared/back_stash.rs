@@ -35,7 +35,8 @@
 //!   the batched cost per row is within 2x of its asymptote (equivalently
 //!   `2 t(2S) >= 3 t(S)`). No constant is tuned: `a` and `b` are the arch's
 //!   own curve at the current stash.
-//! - `Fixed(k)`: flush once the busiest group holds `k` entries.
+//! - `Fixed(k)`: flush once the busiest group holds `k` prompt tails (entries
+//!   that finish a request; `ChunkTail`'s earlier-chunk entries do not count).
 //!
 //! In every mode the stash also flushes when the front has nothing left to
 //! prefill (waiting longer gains nothing) and when its oldest entry has waited
@@ -251,7 +252,7 @@ impl BackStash {
         let waited = step.saturating_sub(oldest);
         let mut per_group = vec![(0_u32, 0_u32); self.groups];
         for e in &all {
-            per_group[e.group].0 += 1;
+            per_group[e.group].0 += u32::from(e.request.is_some());
             per_group[e.group].1 += e.rows;
         }
         match self.spec.flush {
@@ -439,6 +440,14 @@ mod tests {
         assert!(s.should_flush(&[], false, 1));
         assert!(s.should_flush(&[entry(0, 5, 1, 3), entry(0, 5, 1, 4)], true, 1));
         assert!(s.should_flush(&[], true, 3));
+    }
+
+    #[test]
+    fn fixed_k_counts_prompt_tails_not_chunk_entries() {
+        let mut s = stash(BackFlush::Fixed(2), BackRows::ChunkTail);
+        let middle = BackEntry { request: None, ..entry(0, 1, 1, 0) };
+        assert!(!s.should_flush(&[middle, middle, entry(0, 50, 1, 1)], true, 1));
+        assert!(s.should_flush(&[middle, entry(0, 50, 1, 1), entry(0, 50, 1, 2)], true, 1));
     }
 
     #[test]
