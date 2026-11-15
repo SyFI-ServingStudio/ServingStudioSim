@@ -31,6 +31,7 @@ mod draft_rows;
 pub mod elementwise;
 pub mod embedding_row_gather;
 pub mod engine;
+pub mod engram_gate;
 pub mod engram_lookup;
 pub mod fa4_varlen_attention;
 pub mod fa4_varlen_projection;
@@ -68,6 +69,7 @@ pub mod kv_cache_append;
 pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
+pub mod mega_gate;
 pub mod mega_moe;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_fused_sum_post_pre_rms_norm;
@@ -232,6 +234,7 @@ pub use embedding_row_gather::{
     EmbeddingRowGatherSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
+pub use engram_gate::{EngramGateKernel, EngramGateKernelConfig, EngramGateKernelInput, EngramGateSpec};
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
 };
@@ -364,6 +367,7 @@ pub use kv_compress_store::{
 pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
+pub use mega_gate::{MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaGateSpec};
 pub use mega_moe::{MegaMoeKernel, MegaMoeKernelConfig, MegaMoeKernelInput, MegaMoeSpec};
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
 pub use mhc_fused_sum_post_pre_rms_norm::{

@@ -55,6 +55,7 @@ use crate::timing::kernels::HadamardFp8QuantKernelInput;
 use crate::timing::kernels::HadamardFp8QuantWeightScaleKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MegaMoeKernelInput;
+use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput};
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
@@ -185,6 +186,8 @@ log_inputs! {
     DsaFp32SplitStateUpdate => DsaFp32SplitStateUpdateKernelInput,
     Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
     MegaMoe => MegaMoeKernelInput,
+    MegaGate => MegaGateKernelInput,
+    EngramGate => EngramGateKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,
     GdnCausalConvDecode => GdnCausalConvDecodeKernelInput,
