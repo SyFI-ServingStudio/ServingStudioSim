@@ -69,7 +69,6 @@ use crate::timing::kernels::{
     CandidateBlockMaxKernelInput, DeepSelectTopkKernelInput, MqaLogitsPrefillChunkKernelInput,
     SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsPrefillKernelInput,
 };
-use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput};
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
