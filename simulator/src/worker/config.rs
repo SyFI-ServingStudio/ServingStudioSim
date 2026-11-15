@@ -81,12 +81,35 @@ fn default_back_flush_k() -> u32 {
 }
 
 /// The selector's back-batching fields as the worker's spec.
+/// Rows one back pass may carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackCapKind {
+    #[default]
+    None,
+    Knee,
+}
+
+const BACK_CAP_CHOICES: [&str; 2] = ["none", "knee"];
+
+/// How a pipeline runs a back pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackDispatchKind {
+    #[default]
+    Inline,
+    VirtualStages,
+}
+
+const BACK_DISPATCH_CHOICES: [&str; 2] = ["inline", "virtual-stages"];
+
 pub(crate) fn back_batching_spec(
     flush: BackFlushKind,
     k: u32,
     rows: BackRowsKind,
+    cap: BackCapKind,
 ) -> Option<crate::worker::shared::back_stash::BackBatchingSpec> {
-    use crate::worker::shared::back_stash::{BackBatchingSpec, BackFlush, BackRows};
+    use crate::worker::shared::back_stash::{BackBatchingSpec, BackCap, BackFlush, BackRows};
     let flush = match flush {
         BackFlushKind::Off => return None,
         BackFlushKind::EveryStep => BackFlush::EveryStep,
@@ -97,7 +120,11 @@ pub(crate) fn back_batching_spec(
         BackRowsKind::VllmChunk => BackRows::VllmChunk,
         BackRowsKind::PromptTail => BackRows::PromptTail,
     };
-    Some(BackBatchingSpec { flush, rows })
+    let cap = match cap {
+        BackCapKind::None => BackCap::None,
+        BackCapKind::Knee => BackCap::Knee,
+    };
+    Some(BackBatchingSpec { flush, rows, cap })
 }
 
 /// Where the chunked-prefill worker may end a non-final prefill chunk of an
@@ -1053,6 +1080,11 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
         back_rows: BackRowsKind,
+        /// Rows one back pass may carry: `none` (all the flush releases) or
+        /// `knee` (at most `R* = a / b` per group; the rest waits).
+        #[serde(default)]
+        #[param(string, default = "none", choices = BACK_CAP_CHOICES)]
+        back_cap: BackCapKind,
         /// Archs whose KV layout keeps a resumable recurrent state only:
         /// `checkpoint` ends non-final prefill chunks on the layout's engine
         /// block (vLLM's Mamba `align` mode); `plain` chunks as
@@ -1241,6 +1273,21 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
         back_rows: BackRowsKind,
+        #[serde(default)]
+        #[param(string, default = "none", choices = BACK_CAP_CHOICES)]
+        back_cap: BackCapKind,
+        /// Microbatches the head may keep in flight beyond the pipeline depth
+        /// (vLLM async scheduling allows one more, `vllm/config/vllm.py`).
+        #[serde(default)]
+        #[param(default = 0)]
+        extra_in_flight_microbatches: u16,
+        /// How a back pass runs: `inline` (inside the stage steps of the
+        /// front microbatch that flushes it) or `virtual-stages` (its own
+        /// unit behind that front on every GPU; up to two units per stage in
+        /// flight).
+        #[serde(default)]
+        #[param(string, default = "inline", choices = BACK_DISPATCH_CHOICES)]
+        back_dispatch: BackDispatchKind,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

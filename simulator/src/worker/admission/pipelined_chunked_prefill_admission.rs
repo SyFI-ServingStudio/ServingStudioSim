@@ -578,6 +578,16 @@ where
         ticket
     }
 
+    fn split_back(&mut self, ticket: &mut MicrobatchTicket) -> Option<MicrobatchTicket> {
+        if self.back.is_none() || !ticket.decodes.is_empty() {
+            return None;
+        }
+        Some(MicrobatchTicket {
+            back_requests: std::mem::take(&mut ticket.back_requests),
+            ..MicrobatchTicket::default()
+        })
+    }
+
     fn complete_microbatch(
         &mut self,
         kv_store: &mut K,

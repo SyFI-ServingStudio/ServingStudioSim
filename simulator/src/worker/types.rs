@@ -592,6 +592,11 @@ pub struct WorkerConfig {
     /// Back-pass batching (chunked-prefill and pipeline-head recipes on a
     /// bounded-replay arch); `None` runs the ordinary forward.
     pub back_batching: Option<crate::worker::shared::back_stash::BackBatchingSpec>,
+    /// Microbatches a pipeline head may keep in flight beyond its depth.
+    pub pipeline_extra_in_flight: u16,
+    /// Pipeline back batching: dispatch each back pass as its own unit
+    /// (virtual stages) instead of inside the front's stage steps.
+    pub pipeline_split_back: bool,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -677,6 +682,8 @@ impl Default for WorkerConfig {
             started_order: crate::worker::admission::StartedOrder::StartOrder,
             force_schedule: None,
             back_batching: None,
+            pipeline_extra_in_flight: 0,
+            pipeline_split_back: false,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,

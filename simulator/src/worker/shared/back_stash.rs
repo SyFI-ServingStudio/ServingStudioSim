@@ -89,12 +89,26 @@ pub enum BackRows {
     PromptTail,
 }
 
+/// How many rows one back pass may carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackCap {
+    /// Everything the flush rule releases.
+    #[default]
+    None,
+    /// At most the knee `R* = a / b` rows per group (`a` the pass's fixed
+    /// cost, `b` its per-row cost, both from the probe at the stash being
+    /// flushed); the rest stays, oldest first out, for the next steps. A
+    /// flush then adds at most `a + b R* = 2a` to its step.
+    Knee,
+}
+
 /// The selector's back-batching choice (`Copy`; the probe is built by the
 /// worker recipe from its model).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackBatchingSpec {
     pub flush: BackFlush,
     pub rows: BackRows,
+    pub cap: BackCap,
 }
 
 /// One stashed tail.
@@ -233,33 +247,65 @@ impl BackStash {
                 per_group.iter().any(|&(n, _)| n >= k) || waited >= u64::from(k)
             }
             BackFlush::Knee => {
-                let groups = Self::grouped(all.iter(), self.groups);
-                let doubled: Vec<Vec<(u32, u32)>> = groups
-                    .iter()
-                    .map(|g| g.iter().chain(g.iter()).copied().collect())
-                    .collect();
-                let t1 = self.cost(&groups);
-                let t2 = self.cost(&doubled);
-                // Per-row cost b*R and fixed cost a at the current stash.
-                let per_row = t2 - t1;
-                let fixed = 2.0 * t1 - t2;
-                if per_row <= 0.0 || fixed <= per_row {
-                    return true;
+                let rows = per_group.iter().map(|&(_, r)| r).max().unwrap_or(0);
+                match self.knee_rows(&all) {
+                    Some(knee_rows) if knee_rows > f64::from(rows) => {
+                        let cap = (knee_rows / f64::from(self.window)).ceil() as u64;
+                        waited >= cap.max(1)
+                    }
+                    _ => true,
                 }
-                let rows = per_group.iter().map(|&(_, r)| r).max().unwrap_or(0) as f64;
-                let knee_rows = rows * fixed / per_row;
-                let cap = (knee_rows / f64::from(self.window)).ceil() as u64;
-                waited >= cap.max(1)
             }
         }
     }
 
-    /// Take the stash plus `current` as one back pass.
+    /// The knee `R* = a / b` (busiest-group rows) of a pass over `entries`:
+    /// `t(S)` and `t(2S)` give `b R = t(2S) - t(S)` and `a = 2 t(S) - t(2S)`.
+    /// `None` when the pass has no per-row cost (any size is past the knee).
+    fn knee_rows(&mut self, entries: &[BackEntry]) -> Option<f64> {
+        let groups = Self::grouped(entries.iter(), self.groups);
+        let doubled: Vec<Vec<(u32, u32)>> = groups
+            .iter()
+            .map(|g| g.iter().chain(g.iter()).copied().collect())
+            .collect();
+        let t1 = self.cost(&groups);
+        let t2 = self.cost(&doubled);
+        let per_row = t2 - t1;
+        let fixed = (2.0 * t1 - t2).max(0.0);
+        let rows = groups
+            .iter()
+            .map(|g| g.iter().map(|&(_, r)| r).sum::<u32>())
+            .max()
+            .unwrap_or(0);
+        (per_row > 0.0).then(|| f64::from(rows) * fixed / per_row)
+    }
+
+    /// Take the stash plus `current` as one back pass; under [`BackCap::Knee`]
+    /// each group gives at most `R*` rows (at least one entry), oldest first,
+    /// and the rest stays stashed.
     pub fn take(&mut self, current: &[BackEntry]) -> BackFlushBatch {
-        let entries: Vec<BackEntry> = std::mem::take(&mut self.entries)
+        let mut entries: Vec<BackEntry> = std::mem::take(&mut self.entries)
             .into_iter()
             .chain(current.iter().copied())
             .collect();
+        if self.spec.cap == BackCap::Knee {
+            if let Some(knee_rows) = self.knee_rows(&entries) {
+                entries.sort_by_key(|e| e.step);
+                let mut taken_rows = vec![0_u32; self.groups];
+                let (mut taken, mut kept) = (Vec::new(), Vec::new());
+                for e in entries {
+                    let rows = taken_rows[e.group];
+                    if rows == 0 || f64::from(rows + e.rows) <= knee_rows {
+                        taken_rows[e.group] += e.rows;
+                        taken.push(e);
+                    } else {
+                        kept.push(e);
+                    }
+                }
+                self.entries = kept;
+                entries = taken;
+            }
+        }
         BackFlushBatch {
             groups: Self::grouped(entries.iter(), self.groups),
             requests: entries.iter().filter_map(|e| e.request).collect(),
@@ -293,7 +339,44 @@ mod tests {
     }
 
     fn stash(flush: BackFlush, rows: BackRows) -> BackStash {
-        BackStash::new(BackBatchingSpec { flush, rows }, 128, 2, linear_probe())
+        BackStash::new(
+            BackBatchingSpec {
+                flush,
+                rows,
+                cap: BackCap::None,
+            },
+            128,
+            2,
+            linear_probe(),
+        )
+    }
+
+    #[test]
+    fn the_knee_cap_takes_at_most_r_star_rows_oldest_first() {
+        // Linear probe: a = 10, b = 0.01, R* = 1000 rows.
+        let mut s = BackStash::new(
+            BackBatchingSpec {
+                flush: BackFlush::Fixed(16),
+                rows: BackRows::PromptTail,
+                cap: BackCap::Knee,
+            },
+            128,
+            2,
+            linear_probe(),
+        );
+        for i in 0..10 {
+            s.push(entry(0, 128, i, i)); // 1280 rows in group 0
+        }
+        s.push(entry(1, 128, 3, 50));
+        let batch = s.take(&[]);
+        // 7 x 128 = 896 <= 1000 < 1024: steps 0-6 go, 7-9 stay.
+        assert_eq!(batch.groups[0].len(), 7);
+        assert_eq!(batch.groups[1].len(), 1);
+        assert_eq!(s.len(), 3);
+        assert!(batch.requests.contains(&RequestId(0)) && !batch.requests.contains(&RequestId(9)));
+        // The rest drains next time.
+        assert_eq!(s.take(&[]).groups[0].len(), 3);
+        assert!(s.is_empty());
     }
 
     fn entry(group: usize, rows: u32, step: u64, request: u64) -> BackEntry {

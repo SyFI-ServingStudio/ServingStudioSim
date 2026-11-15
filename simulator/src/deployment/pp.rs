@@ -321,6 +321,9 @@ fn worker_config(
         back_flush,
         back_flush_k,
         back_rows,
+        back_cap,
+        extra_in_flight_microbatches,
+        back_dispatch,
         ..
     } = worker
     else {
@@ -349,7 +352,10 @@ fn worker_config(
             *back_flush,
             *back_flush_k,
             *back_rows,
+            *back_cap,
         ),
+        pipeline_extra_in_flight: *extra_in_flight_microbatches,
+        pipeline_split_back: *back_dispatch == crate::worker::config::BackDispatchKind::VirtualStages,
         prefill_chunk_alignment: *prefill_chunk_alignment,
         external_decode: *external_decode,
         max_model_len,

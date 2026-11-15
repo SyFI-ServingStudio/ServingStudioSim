@@ -78,6 +78,14 @@ where
     batch_plan: IterBatchPlan,
     next_microbatch: u64,
     computing: Option<ComputingMicrobatch>,
+    /// Virtual-stage back dispatch: the back pass formed with the front stage
+    /// 0 is computing, run on this GPU right after it as its own unit.
+    pending_back: Option<(u64, UnifiedArchInput)>,
+    /// Run a microbatch's back pass as its own work unit (`front` then
+    /// `back` on every GPU, each unit FIFO through the stages) instead of
+    /// inside the front's stage steps; the window then counts units, up to
+    /// two per stage.
+    split_back: bool,
     in_flight: VecDeque<(u64, A::Ticket)>,
     /// Exits received since the last tick.
     exits: Vec<(u64, Time)>,
@@ -123,6 +131,8 @@ where
             batch_plan,
             next_microbatch: 1,
             computing: None,
+            pending_back: None,
+            split_back: false,
             in_flight: VecDeque::new(),
             exits: Vec::new(),
             request_arrived: false,
@@ -133,6 +143,18 @@ where
 
     pub fn send_gid(&self) -> u16 {
         self.send_gid
+    }
+
+    /// Dispatch back passes as their own units (virtual stages).
+    pub(super) fn with_split_back(mut self) -> Self {
+        self.split_back = true;
+        self
+    }
+
+    /// Units the head may keep in flight: one per stage, or one per virtual
+    /// stage (front and back on each GPU) under split back dispatch.
+    fn window(&self) -> usize {
+        usize::from(self.layout.depth) * if self.split_back { 2 } else { 1 }
     }
 }
 
@@ -218,12 +240,16 @@ where
                     worker: self.context.id,
                     microbatch,
                 });
+                // The back unit formed with that front runs next on this GPU.
+                if let Some((id, input)) = self.pending_back.take() {
+                    self.computing = Some(self.launch_unit(id, input, compute_end));
+                }
                 progressed = true;
             }
             let start = self.state_changed_at;
             debug_assert!(start <= now, "formation state changed after now");
             if self.computing.is_none()
-                && self.in_flight.len() < usize::from(self.layout.depth)
+                && self.in_flight.len() < self.window()
                 && self.admission.form_microbatch(
                     &mut self.kv_store,
                     &self.context,
@@ -282,8 +308,36 @@ where
         );
         let id = self.next_microbatch;
         self.next_microbatch += 1;
-        let ticket = self.admission.commit_microbatch(&mut self.kv_store, start);
+        let mut ticket = self.admission.commit_microbatch(&mut self.kv_store, start);
+        let back_rows = input
+            .back_pass
+            .as_ref()
+            .is_some_and(|groups| groups.iter().any(|g| !g.is_empty()));
+        // A back-only microbatch (front empty) is already one back unit.
+        let front_rows = input.groups.iter().any(|g| g.batch_tokens > 0);
+        let back_ticket = (self.split_back && back_rows && front_rows)
+            .then(|| self.admission.split_back(&mut ticket))
+            .flatten();
         self.in_flight.push_back((id, ticket));
+        if let Some(back_ticket) = back_ticket {
+            // Front unit: this step's rows, an empty back pass (they stop at
+            // the cut). Back unit: the flushed entries alone, next on this GPU.
+            let back = UnifiedArchInput {
+                groups: vec![Default::default(); input.groups.len()],
+                tokens_per_source_rank: Vec::new(),
+                back_pass: input.back_pass.take(),
+            };
+            input.back_pass = Some(vec![Vec::new(); back.back_pass.as_ref().unwrap().len()]);
+            let back_id = self.next_microbatch;
+            self.next_microbatch += 1;
+            self.in_flight.push_back((back_id, back_ticket));
+            self.pending_back = Some((back_id, back));
+        }
+        self.launch_unit(id, input, start)
+    }
+
+    /// Start one unit (a whole microbatch, or its front or back) on stage 0.
+    fn launch_unit(&mut self, id: u64, input: UnifiedArchInput, start: Time) -> ComputingMicrobatch {
         let tokens: u64 = input
             .groups
             .iter()
@@ -461,6 +515,93 @@ mod tests {
             4
         );
         assert!(completed(&events).is_empty());
+    }
+
+    #[test]
+    fn a_split_back_pass_runs_right_after_its_front_and_the_next_front_follows_at_once() {
+        use crate::worker::shared::back_stash::{BackBatchingSpec, BackCap, BackFlush, BackRows};
+        use crate::worker::workers::pipeline::build_pipeline_head_worker_with_back;
+        // Five 4-token prompts, one per microbatch; every exited tail flushes.
+        let store = shared_with(&[(0, 4, 1), (1, 4, 1), (2, 4, 1), (3, 4, 1), (4, 4, 1)]);
+        let layout = crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 2))
+            .with_part(crate::arch::kv_layout::KvCachePart::sliding_window("swa", 2, 1));
+        let mut worker = build_pipeline_head_worker_with_back(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            LAYOUT,
+            &layout,
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(4),
+                attn_kv_bytes: 1_000,
+                back_batching: Some(BackBatchingSpec {
+                    flush: BackFlush::EveryStep,
+                    rows: BackRows::PromptTail,
+                    cap: BackCap::None,
+                }),
+                pipeline_split_back: true,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+            Some(Arc::new(|_: &[Vec<(u32, u32)>]| 1.0)),
+        );
+        for request in 0..5 {
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(request)));
+        }
+        let mut events = Vec::new();
+        for step in 0..3 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // Fronts 1-3 ran back to back (the window holds four units); front 1
+        // leaves the last stage at 2.5, front 2 at 3.5.
+        worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+            microbatch: 1,
+            at: Time::from_ms(2.5),
+        });
+        events.clear();
+        worker.tick(Time::from_ms(3.0), &mut events);
+        worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+            microbatch: 2,
+            at: Time::from_ms(3.5),
+        });
+        for step in 4..8 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // Front 4 (request 3) takes request 0's tail along: its back unit 5
+        // (no front rows) runs on stage 0 right after it, and front 6 starts
+        // the moment unit 5 is done, with unit 7 (request 1's tail) behind:
+        // stage 0 never waits for anything to leave the pipeline.
+        assert_eq!(
+            launched(&events),
+            vec![
+                (3, 4, Time::from_ms(3.0)),
+                (4, 4, Time::from_ms(4.0)),
+                (5, 0, Time::from_ms(5.0)),
+                (6, 4, Time::from_ms(6.0)),
+                (7, 0, Time::from_ms(7.0)),
+            ]
+        );
+        let back_of = |id: u64| {
+            events
+                .iter()
+                .find_map(|event| match event {
+                    PipelineHeadEvent::MicrobatchLaunched { microbatch, .. }
+                        if microbatch.id == id =>
+                    {
+                        Some(microbatch.input.back_pass.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // The back unit carries the tail; its front carries none.
+        assert_eq!(back_of(5), Some(vec![vec![(2, 2)]]));
+        assert_eq!(back_of(4), Some(vec![vec![]]));
     }
 
     #[test]

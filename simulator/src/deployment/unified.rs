@@ -200,11 +200,13 @@ impl Deployment for UnifiedDeployment {
                     back_flush,
                     back_flush_k,
                     back_rows,
+                    back_cap,
                     ..
                 } => crate::worker::config::back_batching_spec(
                     *back_flush,
                     *back_flush_k,
                     *back_rows,
+                    *back_cap,
                 ),
                 _ => None,
             },
@@ -1491,6 +1493,7 @@ mod tests {
             back_flush: Default::default(),
             back_flush_k: 16,
             back_rows: Default::default(),
+            back_cap: Default::default(),
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
             pending_order: crate::worker::PendingOrderKind::Fifo,

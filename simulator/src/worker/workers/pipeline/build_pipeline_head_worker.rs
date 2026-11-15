@@ -160,12 +160,20 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
             admission.with_back_stash(BackStash::new(spec, back_window(kv_cache_layout), 1, probe));
     }
 
-    PipelineHeadWorker::from_components(
+    let head = PipelineHeadWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         UnifiedIterExecution::new(stage_model, essentials.cost),
-        layout,
+        // The head's in-flight window; `depth` itself stays the stage count.
+        PipelineLayout {
+            depth: layout.depth + config.pipeline_extra_in_flight,
+            ..layout
+        },
         send_gid,
-    )
+    );
+    match config.back_batching.is_some() && config.pipeline_split_back {
+        true => head.with_split_back(),
+        false => head,
+    }
 }
