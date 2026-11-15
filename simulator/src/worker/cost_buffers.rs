@@ -28,7 +28,9 @@ use crate::arch::contract::{
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::common::{Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogPolicy, CostLogger, GroupInputLog};
+use crate::log::{
+    remove_stale_cost_artifacts, CostLogEntry, CostLogPolicy, CostLogger, GroupInputLog,
+};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 
 /// Upper bound on distinct cached section results per worker. AFD attn keys churn
@@ -142,6 +144,11 @@ impl CostBuffers {
         manifest: &CostManifestDoc,
         gpu_time_multiplier: f64,
     ) -> Self {
+        if let Some(dir) = log_dir.as_deref().filter(|_| !policy.writes()) {
+            if let Err(e) = remove_stale_cost_artifacts(dir, pool_tag, worker_id) {
+                tracing::warn!("cost_log off: failed to remove an earlier run's files: {e}");
+            }
+        }
         let logger = match log_dir.filter(|_| policy.writes()) {
             Some(dir) => match CostLogger::open(&dir, pool_tag, worker_id, manifest) {
                 Ok(logger) => Some(logger),
@@ -1074,5 +1081,41 @@ mod tests {
         assert!((time.as_ms() - 2.0).abs() < 1e-9);
         assert!(!dir.path().join("raw/cost_log").exists());
         assert!(!dir.path().join("raw/cost_manifest").exists());
+    }
+
+    /// `off` in a log_dir an earlier run wrote to removes that run's parquet,
+    /// failure marker and manifest for the same worker, so they are not read as
+    /// this run's; another worker's files stay.
+    #[test]
+    fn off_removes_an_earlier_runs_files_for_the_worker() {
+        let dir = tempdir().unwrap();
+        let cost_dir = dir.path().join("raw/cost_log");
+        let manifest_dir = dir.path().join("raw/cost_manifest");
+        std::fs::create_dir_all(&cost_dir).unwrap();
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let stale = [
+            cost_dir.join("worker_attn_0.parquet"),
+            cost_dir.join("worker_attn_0.error"),
+            manifest_dir.join("worker_attn_0.json"),
+        ];
+        let other = cost_dir.join("worker_attn_1.parquet");
+        for path in stale.iter().chain([&other]) {
+            std::fs::write(path, b"earlier run").unwrap();
+        }
+        drop(CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            CostLogPolicy::Off,
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        ));
+        for path in &stale {
+            assert!(!path.exists(), "{path:?} survived");
+        }
+        assert!(other.exists());
+        assert!(crate::log::cost_log_failures(dir.path())
+            .unwrap()
+            .is_empty());
     }
 }

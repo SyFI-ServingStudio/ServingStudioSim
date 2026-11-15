@@ -127,7 +127,7 @@ placeholder — see `launcher/README.md`.
 Prefer one preset with internal sweeps over many sibling experiment folders.
 
 **Cost log on sweeps.** The per-iteration `raw/cost_log/` is the largest output
-of a long high-concurrency run and about a third of its sim wall time. Set
+of a long high-concurrency run and can be a large share of its sim wall time. Set
 `io.cost_log_mode` by what the sweep reads: keep `full` (the default) for any
 point whose kernel reports you will read; `stride` with
 `io.cost_log_stride_iterations: 16` when kernel shares / optimality only need to

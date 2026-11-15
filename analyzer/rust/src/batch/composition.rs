@@ -360,7 +360,8 @@ fn definitions() -> Value {
                   slice), the ffn pool is the aggregator (summed batch)",
         "workers": "worker rows retain the exact (pool_tag, worker_id) identity; pool rows are \
                     aggregate context across those workers",
-        "stats_vs_scatter": "num_calls is exact; report metrics use the regular iter_id-stride \
+        "stats_vs_scatter": "num_calls counts every logged iteration (exact for a full cost_log; \
+                             logged rows x the stride under io.cost_log_mode: stride); report metrics use the regular iter_id-stride \
                              sample; payload scatter is then evenly downsampled to <=4000 points \
                              per pool or worker",
     })

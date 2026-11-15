@@ -221,6 +221,36 @@ pub fn cost_log_failures(log_dir: &Path) -> Result<Vec<String>> {
     Ok(failures)
 }
 
+fn remove_files_if_present(paths: &[&PathBuf]) -> std::io::Result<()> {
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Remove one worker's cost-log parquet, failure marker and manifest sidecar
+/// left by an earlier run in `log_dir`. A run under [`CostLogPolicy::Off`] opens
+/// no writer, so without this the earlier run's rows (or its failure marker)
+/// would be read as this run's.
+pub fn remove_stale_cost_artifacts(
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: WorkerId,
+) -> std::io::Result<()> {
+    let raw = log_dir.join("raw");
+    let stem = cost_artifact_stem(pool_tag, worker_id);
+    remove_files_if_present(&[
+        &raw.join("cost_log").join(format!("{stem}.parquet")),
+        &raw.join("cost_log")
+            .join(format!("{stem}.{FAILURE_MARKER_EXTENSION}")),
+        &raw.join("cost_manifest").join(format!("{stem}.json")),
+    ])
+}
+
 /// Sim-thread handle: buffers `CostLogEntry` rows and offloads encode/write to a
 /// background thread. `flush_all` (also `Drop`) sends the tail and joins.
 pub struct CostLogger {
@@ -287,13 +317,7 @@ impl CostLogger {
         let failure_marker_path = cost_dir.join(format!("{stem}.{FAILURE_MARKER_EXTENSION}"));
         // The parquet is created on the first write, so a file left by an earlier
         // run in this log_dir would otherwise survive a run that fails before it.
-        for stale in [&parquet_path, &failure_marker_path] {
-            match std::fs::remove_file(stale) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        remove_files_if_present(&[&parquet_path, &failure_marker_path])?;
         let encode_threads = EncodeThreads::new(MAX_ENCODE_THREADS);
         let writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
             .with_column_dictionary_disabled(high_cardinality_slot_columns())

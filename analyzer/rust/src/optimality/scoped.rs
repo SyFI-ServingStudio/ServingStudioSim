@@ -324,9 +324,9 @@ pub(crate) async fn compute_scoped(
         compute_semantic_floors(ctx, log_dir, &selection, &manifests, &hardware).await;
     let semantic_provenance;
     match semantic_result {
-        Ok(mut floors) => {
-            floors.r6_gpu_s *= coverage.weight();
-            floors.r7_gpu_s *= coverage.weight();
+        // R6/R7 need no weight here: `compute_saturated_run_labels` already scaled
+        // the workload it labels by the stride.
+        Ok(floors) => {
             rungs.insert(
                 "r6_segmented_necessary".to_owned(),
                 RungReport {

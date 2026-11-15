@@ -171,11 +171,12 @@ occupancy view; `prefix_cache_event` is the exact diagnostic replay.
 |---|---|---|
 | `full` (default) | every iteration | any run whose kernel-level reports you read |
 | `stride` + `cost_log_stride_iterations: N` | iterations with `iter_id % N == 0`, all their sections | sweeps that read kernel shares / optimality as estimates |
-| `off` | none; no `cost_log/` or `cost_manifest/` | sweeps that read request metrics only |
+| `off` | none; no `cost_log/` or `cost_manifest/` (an earlier run's files for the same workers in a reused `log_dir` are removed) | sweeps that read request metrics only |
 
-On a high-concurrency run the cost log is the largest output (~1 GB per
-simulated hour for GLM-5.2 EP8 at c256) and writing it is about a third of the
-sim's wall time. The mode changes only which rows are written: the simulated
+On a long high-concurrency run the cost log is the largest output, and
+capturing and writing it can be a large share of the sim's wall time (measure
+it per deployment: compare a `full` run's wall with an `"off"` run's). The mode
+changes only which rows are written: the simulated
 timeline, `summary.json` and the request streams are identical in every mode.
 In a YAML preset write `cost_log_mode: "off"`: bare `off` is YAML 1.1 `false`,
 which the launcher rejects. `run_meta.json` records the mode so the analyzer weights a sampled log by `N`
