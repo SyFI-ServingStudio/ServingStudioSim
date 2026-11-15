@@ -1877,7 +1877,7 @@ mod tests {
         // their back cut (`fold:30` = GPU0 0-9 + 20-29, GPU1 10-19 + 30-39, V3).
         let splits = std::env::var("DSV41_PP_SPLITS").unwrap_or_else(|_| "8,6,6,20".into());
         for split in splits.split(';') {
-            let (cfgs, partition) = match split.strip_prefix("fold:") {
+            let (cfgs, _partition) = match split.strip_prefix("fold:") {
                 Some(back) => (
                     build_configs(
                         &model,
