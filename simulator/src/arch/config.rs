@@ -224,8 +224,9 @@ fn default_glm53_neuron_torch() -> Vec<String> {
 fn default_glm53_neuron_dsa() -> Vec<String> {
     glm53_neuron_impl("radix")
 }
+/// The engine's `ffn_auto`: the measured best of the two exact impls per shape.
 fn default_glm53_neuron_moe() -> Vec<String> {
-    glm53_neuron_impl("auto")
+    vec!["dense_local".to_string(), "cte_hybrid".to_string()]
 }
 fn default_glm53_neuron_dense() -> Vec<String> {
     glm53_neuron_impl("dense")

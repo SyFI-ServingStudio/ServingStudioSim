@@ -34,7 +34,7 @@ GLM_IMPLS: dict[str, tuple[str, ...]] = {
     "kda_decode": ("torch",),
     "dsa_prefill": ("radix", "topk"),
     "dsa_decode": ("radix", "topk"),
-    "moe_partial": ("auto", "dense_local", "cap_sorted"),
+    "moe_partial": ("auto", "dense_local", "cte_hybrid"),
     "dense_ffn_partial": ("dense",),
     "moe_router": ("fp32",),
     "mhc_pre": ("torch_bf16", "torch_fp32"),

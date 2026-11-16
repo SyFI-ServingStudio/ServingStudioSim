@@ -173,7 +173,7 @@ impl Default for Glm53NeuronImpls {
             kda_prefill: v("torch"),
             kda_decode: v("torch"),
             dsa: v("radix"),
-            moe: v("auto"),
+            moe: vec!["dense_local".to_string(), "cte_hybrid".to_string()],
             dense_ffn: v("dense"),
             mhc_pre: v("torch_bf16"),
             mhc_post: v("torch"),
