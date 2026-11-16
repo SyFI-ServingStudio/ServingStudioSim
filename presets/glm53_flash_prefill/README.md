@@ -14,7 +14,8 @@ uses the same engine choices over the PP arch's vLLM defaults:
   loading area of 10% of HBM (`st10`). Staged reads take no read-wait bound (the engine does not use it either,
   `engine/scheduler.py`); the bound applies only to the unstaged reads of `check_tier_read.yaml`.
 
-`ssengine.yaml` is SSEngine as built (128-token pages, the compact KDA state, two kept states) with every mechanism
+`ssengine.yaml` is SSEngine as built (128-token pages, the compact KDA state) with one kept state, the measured
+eval engine's (the release's two kept states are a one-key variant without a measured run), and every mechanism
 its own key; `ssengine.md` gives each key's engine source and the key an ablation changes. The other presets keep
 the simulator's default KV accounting (`kv_overhead: vllm`: 8,576-token blocks, the KDA state padded to whole
 blocks, one kept state), as in the evaluation (eval_m6.md, engine a78dc6f).

@@ -41,12 +41,15 @@ pools:
           type: pipeline_chunked_prefill
           gpu_time_multiplier: 1.0
           prefill_chunk_alignment: plain
-          # KV: 128-token pages, the compact 320-page KDA state (kpool tails inside it), two kept states.
+          # KV: 128-token pages, the compact 320-page KDA state (kpool tails inside it), one kept state per context
+          # (the measured eval engine a78dc6f). The release's kept_states = 2 is `recurrent_state_checkpoints: 2`:
+          # no measured run backs it, and whether `Latest{k: 2}` charges HBM as the engine's k2 does is unverified.
+          # context_end: the engine saves the state where its pass ended (the default would resume at the prompt end).
           attn_gpu_memory_gb: 100.18
           kv_block_tokens: 128
           kv_part_padding: [kda=66969600, kpool_tail=0]
           prefix_resume_points: context_end
-          recurrent_state_checkpoints: 2
+          recurrent_state_checkpoints: 1
           # Prefill only: a round completes at its first token and decode runs elsewhere.
           external_decode: true
           # Scheduler `good`.
