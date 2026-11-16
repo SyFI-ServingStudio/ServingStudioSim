@@ -42,6 +42,21 @@ use crate::timing::kernels::{
     SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
+use crate::timing::kernels::{
+    AllGatherKernelInput,
+    DenseFfnPartialKernelInput,
+    DsaDecodeKernelInput,
+    DsaPrefillKernelInput,
+    EmbedKernelInput,
+    KdaDecodeKernelInput,
+    KdaPrefillKernelInput,
+    LmHeadKernelInput,
+    MhcPostKernelInput,
+    MhcPreKernelInput,
+    MoePartialKernelInput,
+    MoeRouterKernelInput,
+    ReduceScatterKernelInput,
+};
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
@@ -252,4 +267,17 @@ log_inputs! {
     RsSconvAgResidualRmsNorm => RsSconvAgResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,
+    NeuronAllGather => AllGatherKernelInput,
+    NeuronDenseFfnPartial => DenseFfnPartialKernelInput,
+    NeuronDsaDecode => DsaDecodeKernelInput,
+    NeuronDsaPrefill => DsaPrefillKernelInput,
+    NeuronEmbed => EmbedKernelInput,
+    NeuronKdaDecode => KdaDecodeKernelInput,
+    NeuronKdaPrefill => KdaPrefillKernelInput,
+    NeuronLmHead => LmHeadKernelInput,
+    NeuronMhcPost => MhcPostKernelInput,
+    NeuronMhcPre => MhcPreKernelInput,
+    NeuronMoePartial => MoePartialKernelInput,
+    NeuronMoeRouter => MoeRouterKernelInput,
+    NeuronReduceScatter => ReduceScatterKernelInput,
 }
