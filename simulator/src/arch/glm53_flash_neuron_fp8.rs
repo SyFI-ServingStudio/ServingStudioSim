@@ -1907,3 +1907,429 @@ pub fn golden_accept_rate(k: u32) -> f64 {
     }
     0.5 * (lo + hi)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::contract::{
+        ArchGroupInput, SpeculativeArchGroupInput, SpeculativeDecodeInput,
+    };
+    use std::path::Path;
+
+    fn model() -> Glm53FlashModelCfg {
+        Glm53FlashModelCfg::from_json(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash.json"),
+        )
+        .unwrap()
+    }
+
+    /// A probe whose time encodes its shape: rows (ms) for row kinds,
+    /// rows + context / 1000 for DSA, bytes / 1e6 for collectives.
+    struct FakeRows;
+    impl ShapeProbe<u32> for FakeRows {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn eval_at(&self, n: u32) -> LeafMetrics {
+            let mut m = LeafMetrics::ZERO;
+            m.m.time_ms = n as f32;
+            m
+        }
+        fn input_at(&self, num_tokens: u32) -> SlotInput {
+            SlotInput::from(MhcPreKernelInput { num_tokens })
+        }
+    }
+    struct FakePair;
+    impl ShapeProbe<(u32, u32)> for FakePair {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn eval_at(&self, (n, c): (u32, u32)) -> LeafMetrics {
+            let mut m = LeafMetrics::ZERO;
+            m.m.time_ms = n as f32 + c as f32 / 1000.0;
+            m
+        }
+        fn input_at(&self, (batch_size, context_len): (u32, u32)) -> SlotInput {
+            SlotInput::from(DsaDecodeKernelInput {
+                batch_size,
+                context_len,
+            })
+        }
+    }
+    struct FakeComm;
+    impl ShapeProbe<u64> for FakeComm {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn eval_at(&self, b: u64) -> LeafMetrics {
+            let mut m = LeafMetrics::ZERO;
+            m.m.time_ms = b as f32 / 1e6;
+            m
+        }
+        fn input_at(&self, message_size_bytes: u64) -> SlotInput {
+            SlotInput::from(AllGatherKernelInput { message_size_bytes })
+        }
+    }
+
+    fn fakes(tp: u32) -> Kernels {
+        let r = || -> Rows { Arc::new(FakeRows) };
+        let p = || -> Pair { Arc::new(FakePair) };
+        let c = || -> Comm { Arc::new(FakeComm) };
+        Kernels {
+            embed: r(),
+            mhc_pre: r(),
+            mhc_post: r(),
+            kda_prefill: r(),
+            kda_decode: r(),
+            dsa_prefill: p(),
+            dsa_decode: p(),
+            moe: r(),
+            dense: r(),
+            lm_head: r(),
+            ag_tp: (tp > 1).then(c),
+            rs_tp: (tp > 1).then(c),
+            ag_world: c(),
+            rs_world: c(),
+        }
+    }
+
+    fn parallel(tp: u32) -> Glm53NeuronParallel {
+        let mut p = Glm53NeuronParallel::seed("AWS Trainium2 LNC2");
+        p.attn_tp = tp;
+        p.decode_buckets = vec![8, 16, 32];
+        p.prefill_buckets = vec![512, 2048];
+        // Shape-only tests: the host leaves are zero unless a test sets them.
+        p.region_host_ms = 0.0;
+        p.region_gap_ms = 0.0;
+        p.forward_overhead_ms = 0.0;
+        p.step_overhead_ms = 0.0;
+        p
+    }
+
+    fn built(p: Glm53NeuronParallel) -> Glm53NeuronCore {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let tp = p.attn_tp;
+        let mut core = Glm53NeuronCore::build("unified".into(), &model(), p, &bridge).unwrap();
+        core.kernels = fakes(tp);
+        core
+    }
+
+    fn decode(b: u32, kv: u32) -> ArchGroupInput {
+        ArchGroupInput {
+            batch_tokens: b,
+            decode_tokens: b,
+            decode_kv_lens: vec![kv; b as usize],
+            total_kv_len: kv * b,
+            ..Default::default()
+        }
+    }
+
+    fn prefill(prefix: u32, append: u32) -> ArchGroupInput {
+        ArchGroupInput {
+            batch_tokens: append,
+            prefill_tokens: append,
+            prefill_chunk_pairs: vec![(prefix, append)],
+            ..Default::default()
+        }
+    }
+
+    /// (slot name, ms) of one evaluation, and the step total.
+    fn eval(core: &Glm53NeuronCore, groups: Vec<ArchGroupInput>) -> (Vec<(String, f32)>, f32) {
+        let batch = UnifiedArchInput {
+            groups,
+            tokens_per_source_rank: Vec::new(),
+        };
+        let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+        let total = core.eval(
+            unified_targets(&batch),
+            &mut slots,
+            &mut scratch,
+            Some(&mut inputs),
+        );
+        assert_eq!(inputs.len(), core.n_slots, "one recorded input per slot");
+        let named = core
+            .manifest
+            .slots
+            .iter()
+            .zip(&slots)
+            .map(|(s, m)| (s.name.clone(), m.m.time_ms))
+            .collect();
+        (named, total.m.time_ms)
+    }
+
+    fn ms(named: &[(String, f32)], name: &str) -> f32 {
+        named
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no slot {name}"))
+            .1
+    }
+
+    /// Catches a layer schedule that drifts from the checkpoint: layers 0-2
+    /// KDA + dense FFN, then 31 KDA and 11 DSA layers with MoE.
+    #[test]
+    fn layer_groups_follow_the_checkpoint() {
+        assert_eq!(
+            layer_groups(&model()),
+            [
+                (Mixer::Kda, Ffn::Dense, 3),
+                (Mixer::Dsa, Ffn::Moe, 11),
+                (Mixer::Kda, Ffn::Moe, 31)
+            ]
+        );
+    }
+
+    /// Catches SPMD padding and the sequence-parallel row split going wrong
+    /// in a decode step: groups of 2 / 0 / 0 / 5 requests all run the bucket
+    /// of the largest (8); the mixer sees the group's 8 rows, mHC its rank's
+    /// 8 / tp, the FFN the world's 4 x 8 rows; DSA reads the context bucket
+    /// of the longest KV (5000 -> 8192).
+    #[test]
+    fn decode_pads_every_group_to_the_largest_batch() {
+        let core = built(parallel(8));
+        let (n, _) = eval(
+            &core,
+            vec![decode(2, 3000), decode(0, 0), decode(0, 0), decode(5, 5000)],
+        );
+        assert_eq!(ms(&n, "unified.decode.kda_moe.attn.kda"), 8.0);
+        assert_eq!(ms(&n, "unified.decode.kda_moe.attn.mhc_pre"), 1.0);
+        assert_eq!(ms(&n, "unified.decode.dsa_moe.attn.dsa"), 8.0 + 8.192);
+        assert_eq!(ms(&n, "unified.decode.kda_moe.ffn.moe_partial"), 32.0);
+        assert_eq!(
+            ms(&n, "unified.decode.kda_dense.ffn.dense_ffn_partial"),
+            32.0
+        );
+        let row = 4096.0 * 2.0 / 1e6;
+        assert_eq!(
+            ms(&n, "unified.decode.kda_moe.ffn.reduce_scatter_world"),
+            32.0 * row
+        );
+        assert_eq!(
+            ms(&n, "unified.decode.kda_moe.ffn.all_gather_world"),
+            1.0 * row
+        );
+        assert_eq!(
+            ms(&n, "unified.decode.kda_moe.attn.reduce_scatter_tp"),
+            8.0 * row
+        );
+        assert_eq!(ms(&n, "unified.decode.lm_head"), 8.0);
+        // No prefill chunk: the prefill forward does not run.
+        assert_eq!(ms(&n, "unified.prefill.kda_moe.ffn.moe_partial"), 0.0);
+    }
+
+    /// Catches the prefill forward losing the engine's shape: one chunk of
+    /// 1500 tokens at prefix 2048 in one group runs every group at the 2048
+    /// bucket, the context bucket of 2048 + 2048 (4096), the FFN over 4 x 2048
+    /// rows, and the head over one row per group.
+    #[test]
+    fn prefill_runs_the_longest_chunk_bucket_in_every_group() {
+        let core = built(parallel(8));
+        let (n, _) = eval(
+            &core,
+            vec![
+                prefill(2048, 1500),
+                decode(0, 0),
+                decode(0, 0),
+                decode(0, 0),
+            ],
+        );
+        assert_eq!(ms(&n, "unified.prefill.kda_moe.attn.kda"), 2048.0);
+        assert_eq!(ms(&n, "unified.prefill.dsa_moe.attn.dsa"), 2048.0 + 4.096);
+        assert_eq!(ms(&n, "unified.prefill.kda_moe.attn.mhc_post"), 256.0);
+        assert_eq!(ms(&n, "unified.prefill.kda_moe.ffn.moe_partial"), 8192.0);
+        assert_eq!(ms(&n, "unified.prefill.lm_head"), 1.0);
+        assert_eq!(ms(&n, "unified.decode.kda_moe.attn.kda"), 0.0);
+    }
+
+    /// Catches the what-if `spmd_padding: false` still padding idle groups:
+    /// each group pays its own bucket and the FFN sees the sum of them.
+    #[test]
+    fn without_spmd_each_group_pays_its_own_shape() {
+        let mut p = parallel(8);
+        p.spmd_padding = false;
+        let core = built(p);
+        let (n, _) = eval(
+            &core,
+            vec![decode(2, 100), decode(0, 0), decode(0, 0), decode(20, 100)],
+        );
+        // The slowest group (20 -> 32) sets the per-group leaves.
+        assert_eq!(ms(&n, "unified.decode.kda_moe.attn.kda"), 32.0);
+        assert_eq!(ms(&n, "unified.decode.kda_moe.ffn.moe_partial"), 40.0);
+    }
+
+    /// Catches the pipelined launch model drifting from the trn2-flashnext
+    /// fit: a forward costs max(sum_r max(device_r + gap, host), regions x
+    /// host + overhead); its launch leaf is the excess over the leaves.
+    #[test]
+    fn launch_leaf_is_the_host_excess_over_device() {
+        let mut p = parallel(8);
+        p.region_host_ms = 100.0;
+        p.forward_overhead_ms = 10.0;
+        p.step_overhead_ms = 2.5;
+        let core = built(p);
+        let (n, total) = eval(&core, vec![decode(8, 100); 4]);
+        let device: f32 = n
+            .iter()
+            .filter(|(name, _)| name.starts_with("unified.decode.") && !name.ends_with("launch"))
+            .map(|(name, t)| {
+                let fold = if name.contains("kda_dense") {
+                    3.0
+                } else if name.contains("kda_moe") {
+                    31.0
+                } else if name.contains("dsa_moe") {
+                    11.0
+                } else {
+                    1.0
+                };
+                t * fold
+            })
+            .sum();
+        // 45 layer regions + embed + head + combine, each under the 100 ms
+        // dispatch: the host sets the forward.
+        let host = 48.0 * 100.0 + 10.0;
+        assert!((ms(&n, "unified.decode.launch") - (host - device)).abs() < 1e-2);
+        assert!((total - (host + 2.5)).abs() < 1e-2, "{total}");
+        // Block regions of 15 layers: 3 + 3 regions, each 100 ms of dispatch;
+        // the same device work now exceeds the host's 600 ms.
+        let mut p = parallel(8);
+        p.region_granularity = RegionGranularity::Block;
+        p.block_layers = 15;
+        p.region_host_ms = 100.0;
+        let core = built(p);
+        let (_, total) = eval(&core, vec![decode(8, 100); 4]);
+        assert!(device > 600.0);
+        assert!((total - device).abs() < 1e-2, "{total} vs {device}");
+    }
+
+    /// Catches an idle step being charged host time.
+    #[test]
+    fn an_empty_step_costs_nothing() {
+        let mut p = parallel(8);
+        p.step_overhead_ms = 2.5;
+        p.forward_overhead_ms = 19.0;
+        let core = built(p);
+        let (_, total) = eval(&core, vec![decode(0, 0); 4]);
+        assert_eq!(total, 0.0);
+    }
+
+    /// Catches the HBM check and the pool sizes drifting: TP8 holds ~11.7 GB
+    /// of FP8/BF16 weights per rank; a DSA token is 11 x (512 + 128 + 128)
+    /// bf16 values on every rank of the group; a request's KDA state is 34
+    /// layers of 8 heads x 128 x 128 fp32 (+ conv) at TP8. TP1 with 64
+    /// requests per group does not fit a core.
+    #[test]
+    fn memory_report_and_hbm_check() {
+        let m = model();
+        let r = memory_report(&m, &parallel(8));
+        assert_eq!(r.dsa_cache_per_token, 11 * 768 * 2);
+        assert_eq!(
+            r.kda_state_per_request,
+            34 * (8 * 128 * 128 * 4 + 3 * 3 * 8 * 128 * 2)
+        );
+        let gb = r.weights() as f64 / 1e9;
+        assert!((10.5..13.0).contains(&gb), "TP8 weights {gb:.2} GB/rank");
+        let mut p = parallel(1);
+        p.slots = 65;
+        p.decode_buckets = vec![64];
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let err = Glm53NeuronCore::build("u".into(), &m, p, &bridge)
+            .err()
+            .expect("TP1 x 64 slots must not fit");
+        assert!(err.to_string().contains("exceed"), "{err}");
+    }
+
+    /// Catches layouts the engine cannot run.
+    #[test]
+    fn layouts_are_validated() {
+        let m = model();
+        let mut p = parallel(16);
+        assert!(p.validate(&m).is_err(), "decode bucket 8 < tp 16");
+        p.decode_buckets = vec![16, 32];
+        p.prefill_buckets = vec![2048];
+        p.validate(&m).unwrap();
+        let mut p = parallel(8);
+        p.attn_tp = 3;
+        assert!(p.validate(&m).is_err());
+        let mut p = parallel(8);
+        p.moe_ep = 16;
+        assert!(p.validate(&m).is_err(), "the FFN spans the world");
+    }
+
+    /// Catches the MTP placeholder's passes: verify rows B x (k + 1) in the
+    /// decode forward, the MTP pass over them, k - 1 draft passes of B rows.
+    #[test]
+    fn speculative_adds_mtp_passes() {
+        let mut p = parallel(8);
+        p.draft_tokens = 3;
+        let core = built(p);
+        let names: Vec<_> = core.manifest.slots.iter().map(|s| s.name.clone()).collect();
+        assert!(names
+            .iter()
+            .any(|n| n == "unified.decode.mtp.dsa_moe.attn.dsa"));
+        assert!(names
+            .iter()
+            .any(|n| n == "unified.decode.mtp_draft.lm_head"));
+        let batch = SpeculativeArchInput {
+            draft_tokens: 3,
+            groups: vec![
+                SpeculativeArchGroupInput {
+                    batch_tokens: 32,
+                    decode_tokens: 32,
+                    decode_requests: vec![
+                        SpeculativeDecodeInput {
+                            kv_len: 1000,
+                            query_len: 4,
+                        };
+                        8
+                    ],
+                    ..Default::default()
+                };
+                4
+            ],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let (mut slots, mut scratch) = (Vec::new(), Vec::new());
+        core.eval(speculative_targets(&batch), &mut slots, &mut scratch, None);
+        let at = |name: &str| {
+            slots[names.iter().position(|n| n == name).unwrap()]
+                .m
+                .time_ms
+        };
+        assert_eq!(at("unified.decode.kda_moe.attn.kda"), 32.0);
+        assert_eq!(at("unified.decode.mtp.dsa_moe.attn.mhc_pre"), 4.0);
+        assert_eq!(at("unified.decode.mtp_draft.dsa_moe.attn.mhc_pre"), 1.0);
+    }
+
+    /// Catches the golden acceptance inversion: k = 1 accepts 0.86 per draft.
+    #[test]
+    fn golden_accept_rate_matches_the_acceptance_length() {
+        assert!((golden_accept_rate(1) - 0.86).abs() < 1e-9);
+        for k in 1..=5 {
+            let p = golden_accept_rate(k);
+            let al: f64 = (0..=k).map(|i| p.powi(i as i32)).sum();
+            assert!((al - GOLDEN_ACCEPTANCE_LENGTH[k as usize - 1]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn kind_time_scale_parses() {
+        let s = KindTimeScale::parse("moe_partial@256=0.5").unwrap();
+        assert_eq!(
+            (s.kind.as_str(), s.min_rows, s.factor),
+            ("moe_partial", 256, 0.5)
+        );
+        assert!(KindTimeScale::parse("moe_partial").is_err());
+        assert!(KindTimeScale::parse("x=0").is_err());
+    }
+}

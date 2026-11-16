@@ -938,6 +938,88 @@ mod tests {
         );
     }
 
+    fn capped_worker(
+        store: SharedRequests,
+        budget: u32,
+        chunks: Option<u32>,
+        chunk_tokens: Option<u32>,
+        requests: Option<u32>,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(budget),
+                max_prefill_chunks_per_partition: chunks,
+                max_prefill_chunk_tokens: chunk_tokens,
+                max_requests_per_partition: requests,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Catches the per-partition chunk cap admitting a second prompt into the
+    /// same iteration: two 4-token prompts fit an 8-token budget, but the
+    /// Neuron engines schedule one prefill chunk per DP group per step.
+    #[test]
+    fn prefill_chunk_cap_defers_a_second_prompt_to_the_next_iteration() {
+        for (cap, chunks) in [(None, vec![(0, 4), (0, 4)]), (Some(1), vec![(0, 4)])] {
+            let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+            let mut worker = capped_worker(Rc::clone(&store), 8, cap, None, None);
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            let first = form_chunked_input(&mut worker, Time::ZERO);
+            assert_eq!(first.groups[0].prefill_chunk_pairs, chunks, "cap {cap:?}");
+            if cap.is_some() {
+                complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+                let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
+                assert_eq!(second.groups[0].prefill_chunk_pairs, [(0, 4)]);
+                assert_eq!(second.groups[0].decode_tokens, 1, "request 0 decodes");
+            }
+        }
+    }
+
+    /// Catches the chunk-token cap leaking the decode rows' unused budget into
+    /// a chunk: the engine compiles one chunk size, so a 20-token prompt runs
+    /// as chunks of 8 even with a 16-token budget.
+    #[test]
+    fn prefill_chunk_tokens_cap_fixes_the_chunk_size() {
+        let store = shared_with(&[(0, 20, 2)]);
+        let mut worker = capped_worker(Rc::clone(&store), 16, Some(1), Some(8), None);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for (step, chunk) in [(0, (0, 8)), (1, (8, 8)), (2, (16, 4))] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(step as f64));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [chunk]);
+            complete_chunked_iteration(&mut worker, Time::from_ms(step as f64 + 1.0));
+        }
+    }
+
+    /// Catches the request cap: with room for one request per partition, a
+    /// second prompt waits until the first finishes, even though the budget
+    /// and the KV would take it.
+    #[test]
+    fn request_cap_holds_a_prompt_until_a_slot_frees() {
+        let store = shared_with(&[(0, 4, 2), (1, 4, 2)]);
+        let mut worker = capped_worker(Rc::clone(&store), 64, None, None, Some(1));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let first = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(first.groups[0].prefill_chunk_pairs, [(0, 4)]);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
+        assert!(second.groups[0].prefill_chunk_pairs.is_empty(), "request 1 waits");
+        assert_eq!(second.groups[0].decode_tokens, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(2.0));
+        let third = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(third.groups[0].prefill_chunk_pairs, [(0, 4)], "request 0 finished");
+    }
+
     #[test]
     fn mix_preserves_shared_prefill_decode_budget_and_progress() {
         let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
