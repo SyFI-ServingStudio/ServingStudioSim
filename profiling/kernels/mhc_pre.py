@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import arg
+from profiling.db.doc import KernelDoc, arg
 from profiling.db.registry import register
 from profiling.kernels.neuron_common import GLM_IMPLS, neuron_spec
 
@@ -26,6 +26,28 @@ class MhcPreArgs(KernelArgs):
     hc_mult: int = arg(unit="elements", doc="Residual streams.")
     sinkhorn_iters: int = arg(unit="elements", doc="Sinkhorn iterations.")
     dtype: DType = arg(doc="Activation dtype.")
+
+
+DOC = KernelDoc(
+    title="mHC pre (Neuron)",
+    summary="Hyper-connection pre: stream mixing weights (Sinkhorn), the collapse to one row and the module's RMSNorm, on the rank's own rows.",
+    description=(
+        "One compiled region of the glm5-trn2 Neuron engine on one Trainium2 LNC2 logical core, "
+        "at per-rank shapes (heads / experts / vocab of this rank). Rows are imported from the "
+        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are separate kinds."
+    ),
+    category="Normalization",
+    subcategory="Hyper-connections",
+    formula=('x = rmsnorm(sum_i pre_i(S) s_i), (post, comb) = sinkhorn(W S)',),
+    default_metric="time_ms",
+    method=(
+        "NRT system-trace device time of one region per call (glmflash runtime.device_bench, "
+        "median over the bench's iterations), imported by tools/neuron-bench-import; cells the "
+        "bench did not measure are derived rows (analytic x measured ratio, backend_version derived:*)."
+    ),
+    caveats=("Imported, not profiled live: a missing row fails the build under --no-gpu.",),
+    reference=None,
+)
 
 
 for _impl in GLM_IMPLS[KIND]:
