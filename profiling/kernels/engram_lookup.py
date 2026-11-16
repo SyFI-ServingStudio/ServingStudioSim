@@ -61,8 +61,10 @@ class EngramLookupArgs(KernelArgs):
     table_rows: int = arg(unit="rows", doc="Rows of this GPU's table slice.")
     residency: str = arg(
         doc=(
-            "Where the table lives: host_uva (pinned host memory read over UVA, "
-            "half-SM background grid) or device (HBM, full-SM grid)."
+            "Where the table lives. vllm_triton: host_uva (pinned host memory read over UVA, "
+            "half-SM background grid) or device (HBM, full-SM grid). sglang_triton: "
+            "host_shared_4k / host_shared_huge (SGLang's shared host table on 4 KiB or huge "
+            "shmem pages, sorted reads on non-ATS GPUs) or device."
         )
     )
     weight_dtype: DType = arg(doc="Element type of the table rows.")
@@ -135,6 +137,39 @@ register(
                 "vLLM's Triton _engram_lookup_kernel through ParallelEngramEmbedding.lookup, "
                 "with the module's own grid rule."
             ),
+        ),
+    )
+)
+
+# SGLang v0.5.23 shared host table (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1, layout "shared"):
+# every TP rank gathers all hash columns of its tokens from the whole layer table, via
+# kernels/ops/embeddings/engram_gather.py engram_gather (torch.sort of the ids on GPUs without
+# ATS, then _engram_gather_kernel). Full-SM grid, no background stream. Time depends on the host
+# (PCIe, IOMMU, shmem huge pages), not only the GPU.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_triton",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.embedding.engram_sglang",
+            function_name="profile_engram_lookup_sglang_triton",
+        ),
+        table_name=KIND,
+        args_schema=EngramLookupArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # tl.float8e4nv loads lower only on SM89+.
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            min_compute_capability=(8, 9),
+        ),
+        subprocess_env="sglang_env",
+        doc=BackendDoc(
+            summary=(
+                "SGLang engram_gather on the shared host table (srt/layers/engram.py:1098): "
+                "id sort on non-ATS GPUs + _engram_gather_kernel, both timed."
+            ),
+            url="https://github.com/sgl-project/sglang",
         ),
     )
 )

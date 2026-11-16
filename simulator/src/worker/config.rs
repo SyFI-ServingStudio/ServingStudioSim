@@ -412,6 +412,11 @@ pub enum IterWorkerSel {
         /// compatibility but kept as one typed selector component.
         #[serde(flatten)]
         kv_admission: KvAdmissionSpec,
+        /// Cap on requests running at once: once this many are resident (decoding or
+        /// mid-prefill), no waiting request is admitted until one finishes. SGLang
+        /// `--max-running-requests`. None = no cap beyond the token budget and KV.
+        #[serde(default)]
+        max_running_requests: Option<u32>,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -482,6 +487,11 @@ pub enum IterWorkerSel {
         /// next-step headroom at the verify width.
         #[serde(flatten)]
         kv_admission: KvAdmissionSpec,
+        /// Cap on requests running at once: once this many are resident (decoding or
+        /// mid-prefill), no waiting request is admitted until one finishes. SGLang
+        /// `--max-running-requests`. None = no cap beyond the token budget and KV.
+        #[serde(default)]
+        max_running_requests: Option<u32>,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -586,6 +596,22 @@ pub enum IterWorkerSel {
 }
 
 impl IterWorkerSel {
+    /// SGLang `--max-running-requests`, for the chunked-prefill and speculative
+    /// recipes; other recipes have no such cap.
+    pub fn max_running_requests(&self) -> Option<u32> {
+        match self {
+            IterWorkerSel::ChunkedPrefill {
+                max_running_requests,
+                ..
+            }
+            | IterWorkerSel::Speculative {
+                max_running_requests,
+                ..
+            } => *max_running_requests,
+            _ => None,
+        }
+    }
+
     /// The selector's KV accounting knobs; every iteration-wise worker owns KV.
     pub(crate) fn kv_accounting(&self) -> KvAccountingSpec {
         match self {

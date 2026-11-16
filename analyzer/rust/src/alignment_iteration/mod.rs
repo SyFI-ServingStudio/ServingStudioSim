@@ -901,6 +901,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // Screened first: see `screen_duty_cycle_outliers`.
     let (multiplier_excluded_iterations, sum_measured_gpu_cycle, sum_measured_ms) =
         screen_duty_cycle_outliers(&duty_cycle_samples);
+    let gpu_time_multiplier_by_stage =
+        duty_cycle_by_stage(&duty_cycle_samples, &multiplier_excluded_iterations);
     let raw_gpu_time_multiplier =
         pooled_gpu_time_multiplier(sum_measured_gpu_cycle, sum_measured_ms);
     let (recommended_gpu_time_multiplier, duty_cycle_unavailable_reason) =
@@ -1066,6 +1068,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
             "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
+            "gpu_time_multiplier_by_stage": gpu_time_multiplier_by_stage,
             "pdl_wait_under_collective_ms": iteration_rows
                 .iter()
                 .filter_map(|row| row.get("pdl_wait_under_collective_ms").and_then(Value::as_f64))
@@ -1134,6 +1137,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
             "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
+            "gpu_time_multiplier_by_stage": gpu_time_multiplier_by_stage,
         },
         "iterations": report["iterations"],
         "sequences": sequences,
@@ -2709,6 +2713,16 @@ const DUTY_CYCLE_MODIFIED_Z_CUT: f64 = 3.5;
 /// the hundreds. An iteration whose GPU cycle is under twice its kernel time
 /// spent most of that cycle computing, whatever its z, and stays in the pool.
 const DUTY_CYCLE_FACTOR_FLOOR: f64 = 2.0;
+/// Second screen, on the idle itself (`measured_gpu_cycle_ms - measured_ms`).
+/// The factor test misses a stall that also inflates the kernel path: on the
+/// SM120 SGLang DeepSeek-V4.1 capture a JIT warm-up prefill ran 2.9 s of
+/// critical path (collective waits on ranks still compiling) inside a 5.0 s
+/// cycle -- factor 1.7, under the floor -- yet its 2.1 s of idle was ~60x the
+/// stage's median idle and alone moved the pooled multiplier from ~1.09 to
+/// 1.25. An iteration is dropped on idle when that idle is an outlier in its
+/// stage, at least this many times the stage's median idle, and longer than
+/// the stage's median whole iteration: a stall bigger than a typical step.
+const DUTY_CYCLE_IDLE_FLOOR_RATIO: f64 = 10.0;
 
 /// Drop iterations whose duty-cycle factor is both extreme in absolute terms
 /// and an outlier within its own stage, then pool the rest.
@@ -2754,6 +2768,26 @@ fn screen_duty_cycle_outliers(samples: &[DutyCycleSample]) -> (Vec<serde_json::V
         })
         .collect();
 
+    // Per stage: (median idle, MAD of idle, median measured_ms).
+    let mut idle_by_stage: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for sample in samples {
+        if let Some(cycle) = sample.measured_gpu_cycle_ms {
+            if sample.measured_ms > 0.0 {
+                let entry = idle_by_stage.entry(sample.stage.as_str()).or_default();
+                entry.0.push((cycle - sample.measured_ms).max(0.0));
+                entry.1.push(sample.measured_ms);
+            }
+        }
+    }
+    let idle_statistics: BTreeMap<&str, (f64, f64, f64)> = idle_by_stage
+        .iter()
+        .map(|(stage, (idles, measured))| {
+            let centre = median(idles);
+            let deviations: Vec<f64> = idles.iter().map(|idle| (idle - centre).abs()).collect();
+            (*stage, (centre, median(&deviations), median(measured)))
+        })
+        .collect();
+
     let mut excluded = Vec::new();
     let mut sum_cycle = 0.0;
     let mut sum_measured = 0.0;
@@ -2779,13 +2813,33 @@ fn screen_duty_cycle_outliers(samples: &[DutyCycleSample]) -> (Vec<serde_json::V
         } else {
             0.0
         };
-        let screened = population >= DUTY_CYCLE_MIN_STAGE_SAMPLES
+        let factor_screened = population >= DUTY_CYCLE_MIN_STAGE_SAMPLES
             && factor > DUTY_CYCLE_FACTOR_FLOOR
             && modified_z > DUTY_CYCLE_MODIFIED_Z_CUT;
-        if screened {
+        let idle = (cycle - sample.measured_ms).max(0.0);
+        let (idle_centre, idle_deviation, stage_median_measured) = idle_statistics
+            .get(sample.stage.as_str())
+            .copied()
+            .unwrap_or((idle, 0.0, sample.measured_ms));
+        let idle_z = if idle_deviation > 0.0 {
+            0.6745 * (idle - idle_centre) / idle_deviation
+        } else if idle > idle_centre {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+        let idle_screened = population >= DUTY_CYCLE_MIN_STAGE_SAMPLES
+            && idle > DUTY_CYCLE_IDLE_FLOOR_RATIO * idle_centre
+            && idle > stage_median_measured
+            && idle_z > DUTY_CYCLE_MODIFIED_Z_CUT;
+        if factor_screened || idle_screened {
             excluded.push(json!({
                 "iteration": sample.iteration,
                 "stage": sample.stage,
+                "screen": if factor_screened { "duty_cycle_factor" } else { "idle" },
+                "idle_ms": idle,
+                "stage_median_idle_ms": idle_centre,
+                "idle_modified_z_score": idle_z,
                 "duty_cycle_factor": factor,
                 "stage_median_factor": centre,
                 "modified_z_score": modified_z,
@@ -2817,6 +2871,37 @@ fn median(values: &[f64]) -> f64 {
     } else {
         sorted[middle]
     }
+}
+
+/// Per-stage duty-cycle ratio over the iterations the screen kept: the
+/// physical correction each stage needs on its own (CUDA-graph decode idles far
+/// less than eager prefill). The pooled multiplier mixes the two by the
+/// capture's stage mix, which a serving workload does not share; a worker with
+/// `prefill_gpu_time_multiplier` can take the `mixed` value for its
+/// prefill-bearing iterations and the `decode` value as `gpu_time_multiplier`.
+fn duty_cycle_by_stage(
+    samples: &[DutyCycleSample],
+    excluded: &[serde_json::Value],
+) -> BTreeMap<String, f64> {
+    let dropped: std::collections::BTreeSet<u64> = excluded
+        .iter()
+        .filter_map(|row| row["iteration"].as_u64())
+        .collect();
+    let mut sums: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    for sample in samples {
+        let Some(cycle) = sample.measured_gpu_cycle_ms else {
+            continue;
+        };
+        if sample.measured_ms <= 0.0 || dropped.contains(&sample.iteration) {
+            continue;
+        }
+        let entry = sums.entry(sample.stage.clone()).or_default();
+        entry.0 += cycle;
+        entry.1 += sample.measured_ms;
+    }
+    sums.into_iter()
+        .map(|(stage, (cycle, measured))| (stage, pooled_gpu_time_multiplier(cycle, measured)))
+        .collect()
 }
 
 /// Pooled duty-cycle correction: Σ measured GPU cycle / Σ measured kernel path.
@@ -3062,7 +3147,8 @@ fn definitions() -> Value {
         ("comparison.absolute_error_pct", "aggregate absolute error = sum(abs(simulated_ms - measured_ms)) / sum(measured_ms) * 100. This is duration-weighted and differs from the unweighted abs_relative_error_pct mean"),
         ("operation_impact_rank", "semantic operations ordered by descending aggregate absolute_error_ms, then operation name. Physical kernels and simulated slots are not forced into a false one-to-one join"),
         ("measured_gpu_cycle_ms", "CUPTI first-kernel start of the next valid measured iteration minus first-kernel start of this iteration; the final valid iteration has no cycle. Idle, collective skew, and the inter-iteration gap live here, not in measured_ms; the recommended_gpu_time_multiplier is the correction that spans them"),
-        ("multiplier_excluded_iterations", "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when measured_gpu_cycle_ms / measured_ms both exceeds 2.0 and is an Iglewicz-Hoaglin outlier within its own stage"),
+        ("multiplier_excluded_iterations", "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when measured_gpu_cycle_ms / measured_ms both exceeds 2.0 and is an Iglewicz-Hoaglin outlier within its own stage, or when its idle (cycle minus measured_ms) is an Iglewicz-Hoaglin outlier, at least 10x the stage's median idle, and longer than the stage's median measured_ms"),
+        ("gpu_time_multiplier_by_stage", "Σ measured_gpu_cycle_ms / Σ measured_ms per stage over the iterations the screen kept: the decode value fits gpu_time_multiplier and the mixed value prefill_gpu_time_multiplier"),
         ("recommended_gpu_time_multiplier", "validated physical duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_ms after the per-stage outlier screen. measured_ms is the barrier critical path (busy + collective) that timing-predict models. Null when the raw ratio is non-finite or below one"),
         ("raw_gpu_time_multiplier", "the physical duty-cycle ratio before validation; retained when no recommendation can safely be injected into simulation"),
         ("simulated_gpu_cycle_ms", "timing-predict total_time_ms multiplied by recommended_gpu_time_multiplier (the measured pooled duty-cycle correction), i.e. the kernel-only prediction scaled up to wall-clock"),
@@ -3937,6 +4023,45 @@ mod tests {
         // Everything else pooled: 24 steady samples, none of them dropped.
         assert_eq!(sum_measured, 24.0);
         assert!((sum_cycle - (12.0 * 1.04 + 12.0 * 1.30) * 1.001).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_stall_that_also_inflates_the_kernel_path_is_screened_on_idle() {
+        // The SM120 SGLang warm-up prefill: 2912 ms of critical path in a 4980 ms
+        // cycle (factor 1.71, under the floor) among ~205 ms chunks idling ~30 ms.
+        let mut samples: Vec<DutyCycleSample> = (0..20)
+            .map(|index| {
+                let measured = 205.0 + (index % 4) as f64;
+                duty_sample(
+                    index,
+                    "mixed",
+                    measured + 30.0 + (index % 3) as f64,
+                    measured,
+                )
+            })
+            .collect();
+        samples.push(duty_sample(100, "mixed", 4979.7, 2912.2));
+
+        let (excluded, _, sum_measured) = screen_duty_cycle_outliers(&samples);
+
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0]["iteration"], 100);
+        assert_eq!(excluded[0]["screen"], "idle");
+        assert!(sum_measured < 20.0 * 210.0);
+        let by_stage = duty_cycle_by_stage(&samples, &excluded);
+        assert!((by_stage["mixed"] - 1.15).abs() < 0.01, "{by_stage:?}");
+    }
+
+    #[test]
+    fn idle_jitter_shorter_than_a_step_stays_in_the_pool() {
+        // 15x the median idle and a huge z, but shorter than one iteration: kept.
+        let mut samples = duty_stage("decode", 0, 1.02, None);
+        samples.push(duty_sample(300, "decode", 1.30, 1.0));
+
+        let (excluded, _, sum_measured) = screen_duty_cycle_outliers(&samples);
+
+        assert!(excluded.is_empty());
+        assert_eq!(sum_measured, 13.0);
     }
 
     #[test]

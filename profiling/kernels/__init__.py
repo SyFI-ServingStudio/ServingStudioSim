@@ -34,6 +34,7 @@ from profiling.kernels import (
     dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
     embedding_row_gather,  # noqa: F401
+    engram_gate,  # noqa: F401
     engram_lookup,  # noqa: F401
     fa4_varlen_attention,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
@@ -62,7 +63,10 @@ from profiling.kernels import (
     kv_cache_append,  # noqa: F401
     kv_compress_store,  # noqa: F401
     logits_topk,  # noqa: F401
+    mhc_combine_rms_norm,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
+    mhc_mix_stats_sinkhorn,  # noqa: F401
+    mhc_post,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
     mhc_terminal_head,  # noqa: F401
     mla_cache_append,  # noqa: F401
@@ -88,6 +92,7 @@ from profiling.kernels import (
     packed_kv_cache_gather,  # noqa: F401
     paged_attn_batch_decode,  # noqa: F401
     paged_attn_batch_prefill,  # noqa: F401
+    paged_sparse_mla,  # noqa: F401
     ple_gate,  # noqa: F401
     ple_ngram_ids,  # noqa: F401
     ple_short_conv,  # noqa: F401

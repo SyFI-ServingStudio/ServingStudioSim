@@ -532,6 +532,33 @@
       "nvl_domain_size": null,
       "dollar_per_hour": null,
       "notes": "BF16 and FP8 have same peak TFLOPS by design. Not listed on getdeploying at the as_of date."
+    },
+    {
+      "name": "RTX-PRO-6000-Blackwell-Server-96GB",
+      "aliases": [
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "RTX PRO 6000 Blackwell Server Edition",
+        "RTX PRO 6000"
+      ],
+      "vendor": "NVIDIA",
+      "architecture": "Blackwell",
+      "compute_capability": "12.0",
+      "year": 2025,
+      "mem_size_gb": 96,
+      "mem_type": "GDDR7",
+      "mem_bandwidth_gbps": 1792,
+      "fp16_tflops": null,
+      "fp8_tflops": null,
+      "bf16_tflops": null,
+      "fp32_tflops": 125,
+      "fp4_tflops": null,
+      "int8_tops": null,
+      "tdp_watts": 600,
+      "interconnect": "PCIe 5.0",
+      "interconnect_bandwidth_gbps": 128,
+      "nvl_domain_size": 1,
+      "dollar_per_hour": null,
+      "notes": "SM120 (GB202). Dense tensor-core peaks left null: not catalog-verified. No NVLink; multi-GPU traffic is PCIe Gen5 x16, P2P availability depends on the host (a Massed Compute VM on 2026-11-05 had none: NCCL used SHM, about 18 GB/s all-reduce bus bandwidth). Rental 2026-11-05: about $1.64-2.49 per GPU-hour (RunPod community/secure), $2.19 (Massed Compute 4x)."
     }
   ]
 }

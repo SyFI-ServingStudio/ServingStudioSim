@@ -63,6 +63,10 @@ mod tests {
         assert_eq!(compute_capability("NVIDIA H200"), Some((9, 0)));
         assert_eq!(compute_capability("B200-SXM-180GB"), Some((10, 0)));
         assert_eq!(compute_capability("NVIDIA B300"), Some((10, 3)));
+        assert_eq!(
+            compute_capability("NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+            Some((12, 0))
+        );
         assert_eq!(compute_capability("  nvidia h200 "), Some((9, 0)));
         assert_eq!(compute_capability("AMD MI300X"), None);
         assert_eq!(compute_capability("No Such GPU"), None);

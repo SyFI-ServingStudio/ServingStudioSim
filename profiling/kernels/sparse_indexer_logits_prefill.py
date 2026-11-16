@@ -94,4 +94,36 @@ register(
     )
 )
 
+# SGLang v0.5.23 DeepSeek-V4.1 prefill indexer on SM12x (dense-blocks backend, torch
+# scoring): prefill_requests (srt/layers/attention/dsv4/v41_indexer/scoring.py:356)
+# dequantizes the request's visible FP4 index K to bf16 and scores 1 GiB row chunks
+# with einsum + ReLU + head-weight sum (DeepseekV41Indexer.scores,
+# srt/layers/attention/dsv4/dsv41_sparse.py:285). Every launch of the request is one row.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_torch_fp4",
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP4_E2M1}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.sparse_indexer_logits_sglang_fp4",
+            function_name="profile_sparse_indexer_logits_prefill_sglang_torch_fp4",
+        ),
+        table_name=KIND,
+        args_schema=SparseIndexerLogitsPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+        doc=BackendDoc(
+            summary=(
+                "SGLang DeepSeek-V4.1 torch prefill indexer: FP4 index-K dequant to bf16, then "
+                "chunked einsum('bhd,nd->bhn') + ReLU + head-weight sum, masked past each row."
+            ),
+            url="https://github.com/sgl-project/sglang",
+        ),
+    )
+)
+
 __all__ = ["KIND", "SparseIndexerLogitsPrefillArgs"]

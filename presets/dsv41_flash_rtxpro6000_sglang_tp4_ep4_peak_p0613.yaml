@@ -1,0 +1,66 @@
+# DeepSeek-V4.1-Flash(-1017) on 4x RTX PRO 6000 (SM120, PCIe) as SGLang v0.5.23 serves it:
+# TP4 attention + EP4 experts, chunked prefill 2048, separate prefill/decode batches, 16 running
+# requests, FP8 KV, Engram host tables (doc/pr/dsv41-sglang-sm120/). Decycle peak day.
+#
+# DSpark speculative decoding, block 6 (verify 7 rows per decoding request), as the measured
+# server ran it. Acceptance is a PLACEHOLDER: a uniform 0.8 conditional acceptance at every draft
+# position (about 3.95 tokens per verify), stamped on a copy of the Decycle trace
+# (decycle-<day>-accept080.csv). Replace it with the per-position acceptance the B2
+# workload_metrics pass measures on real text (launcher alignment prepare-workload); the
+# 2026-11-05 random-token run accepted 5.2-5.9 per verify, which is optimistic. Draft experts
+# draw uniform routing (no measured draft routing yet). Routing reuses the B200 vLLM diverse_100 corpus until the SM120 SGLang
+# token_corpus pass exists. gpu_time_multiplier from kernel-align (below).
+deployment: unified
+workload:
+  trace_files: [/mnt/storage/yilegu/airbox/airbox-cost-calculator/data/traces/decycle/decycle-peak-accept0613.csv]
+  input_file_format: text-generation-session-execution-v2
+  input_file_tags: [speculative]
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  run_to_end: true
+  duration_ms: 86400000.0
+io:
+  log_dir: logs/dsv41_flash_rtxpro6000_sglang_tp4_ep4_peak_p0613
+  log_stage_transitions: false
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+        replicas: 1
+        arch:
+          type: deepseek_v41_sglang_dspark
+          model_config: model/config/deepseek_v41_flash.json
+          fp8: true
+          # SGLang --context-length on the 2026-11-05 run.
+          max_model_len: 1048576
+          routing: corpus
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+          engram_residency: host_shared_huge
+          # --speculative-dspark-block-size 6.
+          draft_tokens: 6
+        worker:
+          type: speculative
+          # Must match the arch's: the verify width selects profiled kernel shapes.
+          draft_tokens: 6
+          # --chunked-prefill-size 2048.
+          max_batch_tokens: 2048
+          # SGLang default (enable_mixed_chunk=False): extend or decode batches, never both.
+          batch_policy: separate-prefill-priority
+          # --max-running-requests 16 (graph-capture memory forced it down from 32).
+          max_running_requests: 16
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4096
+          kv_initial_new_token_ratio: 0.7
+          kv_minimum_new_token_ratio: 0.098
+          kv_new_token_ratio_decay_steps: 600
+          kv_retract_decode_steps: 20
+          decode_retraction_policy: length
+          # Kernel-align duty cycle on the B2 nsys captures (07 / 01), warm-up iterations screened
+          # (doc/pr/dsv41-sglang-sm120/KERNEL_ALIGN.md): decode 1.040 / 1.034, prefill 1.151 / 1.204.
+          gpu_time_multiplier: 1.04
+          prefill_gpu_time_multiplier: 1.17
+          # SGLang DSV4 pools per GPU at --mem-fraction-static 0.86: full 2929152 tokens x
+          # 1673 B + the SWA pools, 49664 tokens x 584 B x (target layers + 3 DSpark draft
+          # layers; a fixed engine allocation).
+          attn_gpu_memory_gb: 6.1476

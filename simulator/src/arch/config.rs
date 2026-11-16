@@ -97,6 +97,14 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
+fn default_dsv41_engram_residency() -> String {
+    "host_shared_huge".to_string()
+}
+
+const fn default_dsv41_dspark_draft_tokens() -> u32 {
+    6
+}
+
 const fn default_decoder_swa_bounded_replay() -> bool {
     true
 }
@@ -588,6 +596,101 @@ pub enum IterArchSel {
         /// verify width. Omitted: vLLM's default list up to 2048. Empty: eager.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// DeepSeek-V4.1-Flash as SGLang v0.5.23 serves it on SM12x (RTX PRO 6000,
+    /// PCIe): TP4 attention + EP4 experts over the same four ranks, chunked
+    /// prefill, FP8 KV, Engram host tables. Target model only: DSpark
+    /// speculative decoding is not modeled yet.
+    DeepseekV41Sglang {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes (`token_corpus` pass manifest).
+        /// Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// SGLang `--context-length`. Omitted, the checkpoint's 1048576.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Engram host-table page backing: `host_shared_huge` (transparent huge
+        /// pages on) or `host_shared_4k`.
+        #[serde(default = "default_dsv41_engram_residency")]
+        #[param(string, default = "host_shared_huge", cache_key)]
+        engram_residency: String,
+        /// SGLang `--enable-decoder-swa-bounded-replay`, which v0.5.23 turns on
+        /// for DeepSeek-V4.1 by default (`deepseek_v4_hook.py`): from the last
+        /// KV source layer on, each prefill request runs only its last
+        /// `sliding_window` extend tokens (the 2026-11-05 capture shows it).
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// GPU peer-to-peer between the TP ranks. Off: the profiled Massed
+        /// Compute VM (NCCL over host shared memory; collective rows keyed by
+        /// fabric `pcie`). On: a P2P host such as RunPod's (rows keyed
+        /// `pcie_p2p`). Only the collectives change.
+        #[serde(default)]
+        #[param(cache_key)]
+        gpu_p2p: bool,
+    },
+    /// [`Self::DeepseekV41Sglang`] with DSpark speculative decoding: the target
+    /// forward at the verify width plus the DSpark draft (KV inject, 3 stages,
+    /// lm_head, per-position Markov sampling). Pairs with worker `speculative`.
+    DeepseekV41SglangDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes (`token_corpus` pass manifest).
+        /// Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// SGLang `--context-length`. Omitted, the checkpoint's 1048576.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Engram host-table page backing: `host_shared_huge` (transparent huge
+        /// pages on) or `host_shared_4k`.
+        #[serde(default = "default_dsv41_engram_residency")]
+        #[param(string, default = "host_shared_huge", cache_key)]
+        engram_residency: String,
+        /// SGLang `--enable-decoder-swa-bounded-replay`, which v0.5.23 turns on
+        /// for DeepSeek-V4.1 by default (`deepseek_v4_hook.py`): from the last
+        /// KV source layer on, each prefill request runs only its last
+        /// `sliding_window` extend tokens (the 2026-11-05 capture shows it).
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// GPU peer-to-peer between the TP ranks. Off: the profiled Massed
+        /// Compute VM (NCCL over host shared memory; collective rows keyed by
+        /// fabric `pcie`). On: a P2P host such as RunPod's (rows keyed
+        /// `pcie_p2p`). Only the collectives change.
+        #[serde(default)]
+        #[param(cache_key)]
+        gpu_p2p: bool,
+        /// DSpark block size (`--speculative-dspark-block-size`): draft
+        /// positions per request; the verify window is one more. Must equal the
+        /// speculative worker's `draft_tokens`.
+        #[serde(default = "default_dsv41_dspark_draft_tokens")]
+        #[param(default = 6, cache_key)]
+        draft_tokens: u32,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -1380,6 +1483,8 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
+            | Self::DeepseekV41Sglang { model, .. }
+            | Self::DeepseekV41SglangDspark { model, .. }
             | Self::DeepseekV41VllmDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoeDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
@@ -1452,6 +1557,19 @@ impl IterArchSel {
                 max_model_len,
                 ..
             } => super::deepseek_v41_vllm::resolve_max_model_len(
+                *max_model_len,
+                model.max_position_embeddings()?,
+            ),
+            Self::DeepseekV41Sglang {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41SglangDspark {
+                model,
+                max_model_len,
+                ..
+            } => super::deepseek_v41_sglang::resolve_max_model_len(
                 *max_model_len,
                 model.max_position_embeddings()?,
             ),

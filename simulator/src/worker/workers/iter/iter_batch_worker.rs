@@ -939,6 +939,54 @@ mod tests {
     }
 
     #[test]
+    fn max_running_requests_holds_new_prompts_until_a_request_finishes() {
+        // Three 4-token prompts that each want 3 output tokens; the 64-token
+        // budget could start all of them at once.
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3), (2, 4, 3)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                batch_policy: BatchPolicy::SeparatePrefillPriority,
+                max_running_requests: Some(2),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        let first = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(
+            first.groups[0].prefill_chunk_pairs,
+            [(0, 4), (0, 4)],
+            "only two prompts start while the cap is two"
+        );
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        // Both are now decoding: still two running, so request 2 keeps waiting.
+        let decode = form_chunked_input(&mut worker, Time::from_ms(1.0));
+        assert!(decode.groups[0].prefill_chunk_pairs.is_empty());
+        assert_eq!(decode.groups[0].decode_tokens, 2);
+        complete_chunked_iteration(&mut worker, Time::from_ms(2.0));
+        assert!(store.borrow()[RequestId(2)].progress.output_tokens_emitted == 0);
+
+        // Run until a request finishes; then request 2 is admitted.
+        for step in 2..40 {
+            worker.tick(Time::from_ms(step as f64), &mut Vec::new());
+        }
+        assert!(
+            store.borrow()[RequestId(2)].progress.output_tokens_emitted > 0,
+            "the third prompt starts once one of the first two finishes"
+        );
+    }
+
+    #[test]
     fn mix_preserves_shared_prefill_decode_budget_and_progress() {
         let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
         let mut worker = chunked_worker(Rc::clone(&store), BatchPolicy::Mix, 8);
