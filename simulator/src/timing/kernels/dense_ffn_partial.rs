@@ -91,7 +91,17 @@ mod tests {
         let payloads = DenseFfnPartialSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "dtype", "hidden_size", "intermediate_size", "num_tokens", "weight_dtype"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "dtype",
+                "hidden_size",
+                "intermediate_size",
+                "num_tokens",
+                "weight_dtype"
+            ]
+        );
     }
 
     #[test]

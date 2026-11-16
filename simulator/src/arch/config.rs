@@ -31,6 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+use super::glm53_flash_neuron_fp8::RegionGranularity as Glm53NeuronRegionGranularity;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
@@ -153,6 +154,192 @@ const fn default_qwen4_exp_draft_tokens() -> u32 {
 const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
 /// [`PleTableResidency`]'s serde representation.
 const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
+
+// ── GLM-5.3-Flash FP8 on Trainium2 (glm5-trn2 seed engine) ───────────────────
+
+const GLM53_NEURON_REGION_GRANULARITIES: [&str; 2] = Glm53NeuronRegionGranularity::CHOICES;
+
+const fn default_glm53_neuron_draft_tokens() -> u32 {
+    3
+}
+const fn default_glm53_neuron_world() -> u32 {
+    32
+}
+const fn default_glm53_neuron_attn_tp() -> u32 {
+    8
+}
+const fn default_glm53_neuron_max_model_len() -> u32 {
+    9216
+}
+const fn default_glm53_neuron_block_layers() -> u32 {
+    4
+}
+const fn default_glm53_neuron_true() -> bool {
+    true
+}
+/// trn2-flashnext fit (doc/pr/trn2-flashnext/ALIGNMENT.md), barrier-off engine.
+const fn default_glm53_neuron_region_gap_ms() -> f64 {
+    0.17
+}
+const fn default_glm53_neuron_forward_overhead_ms() -> f64 {
+    19.0
+}
+const fn default_glm53_neuron_mtp_forward_overhead_ms() -> f64 {
+    2.0
+}
+const fn default_glm53_neuron_step_overhead_ms() -> f64 {
+    2.5
+}
+const fn default_glm53_neuron_host_time_scale() -> f64 {
+    1.0
+}
+/// One Trainium2 LNC2 core's HBM bank: 96 GiB per chip / 4 = 24 GiB.
+const fn default_glm53_neuron_hbm_per_core_gb() -> f64 {
+    25.769_803_776
+}
+const fn default_glm53_neuron_hbm_reserve_gb() -> f64 {
+    2.0
+}
+const fn default_glm53_neuron_slots() -> u32 {
+    17
+}
+const fn default_glm53_neuron_cmax() -> u32 {
+    9216
+}
+fn default_glm53_neuron_prefill_buckets() -> Vec<u32> {
+    vec![2048]
+}
+fn default_glm53_neuron_decode_buckets() -> Vec<u32> {
+    vec![8, 16]
+}
+fn default_glm53_neuron_context_buckets() -> Vec<u32> {
+    vec![2048, 4096, 8192, 9216]
+}
+fn glm53_neuron_impl(x: &str) -> Vec<String> {
+    vec![x.to_string()]
+}
+fn default_glm53_neuron_torch() -> Vec<String> {
+    glm53_neuron_impl("torch")
+}
+fn default_glm53_neuron_dsa() -> Vec<String> {
+    glm53_neuron_impl("radix")
+}
+fn default_glm53_neuron_moe() -> Vec<String> {
+    glm53_neuron_impl("auto")
+}
+fn default_glm53_neuron_dense() -> Vec<String> {
+    glm53_neuron_impl("dense")
+}
+fn default_glm53_neuron_mhc_pre() -> Vec<String> {
+    glm53_neuron_impl("torch_bf16")
+}
+
+/// The serving knobs of the glm5-trn2 seed engine for GLM-5.3-Flash FP8 on
+/// Trainium2, flattened into both `glm53_flash_neuron_fp8` tags. Ranks are LNC2
+/// logical cores (4 per chip). See `arch/glm53_flash_neuron_fp8.rs`.
+#[derive(Debug, Clone, Deserialize, ParamStruct)]
+pub struct Glm53NeuronSpec {
+    /// Context cap (prompt + completion).
+    #[serde(default = "default_glm53_neuron_max_model_len")]
+    #[param(default = 9216, cache_key)]
+    pub max_model_len: u32,
+    /// Ranks (LNC2 logical cores) of one replica; the FFN spans all of them.
+    #[serde(default = "default_glm53_neuron_world")]
+    #[param(default = 32, cache_key)]
+    pub world: u32,
+    /// Attention TP group size (1, 2, 4, 8, 16); world / attn_tp DP groups.
+    #[serde(default = "default_glm53_neuron_attn_tp")]
+    #[param(default = 8, cache_key)]
+    pub attn_tp: u32,
+    /// FFN expert parallelism; omitted = world (the engine's only layout).
+    #[serde(default)]
+    #[param(cache_key)]
+    pub moe_ep: Option<u32>,
+    /// `layer` (one region per layer, the engine) or `block` (what-if).
+    #[serde(default)]
+    #[param(string, default = "layer", choices = GLM53_NEURON_REGION_GRANULARITIES, cache_key)]
+    pub region_granularity: Glm53NeuronRegionGranularity,
+    /// Layers per region under `block`.
+    #[serde(default = "default_glm53_neuron_block_layers")]
+    #[param(default = 4, cache_key)]
+    pub block_layers: u32,
+    /// Every DP group runs the forward's padded shape (SPMD).
+    #[serde(default = "default_glm53_neuron_true")]
+    #[param(default = true, cache_key)]
+    pub spmd_padding: bool,
+    /// f_g on every compute leaf.
+    #[serde(default)]
+    pub region_device_factor: Option<f64>,
+    /// Host dispatch per region (ms); omitted = the granularity's fit.
+    #[serde(default)]
+    pub region_host_ms: Option<f64>,
+    /// Device per region launch outside the regions (ms).
+    #[serde(default = "default_glm53_neuron_region_gap_ms")]
+    #[param(default = 0.17)]
+    pub region_gap_ms: f64,
+    /// Host work per target forward (ms), overlapping the device.
+    #[serde(default = "default_glm53_neuron_forward_overhead_ms")]
+    #[param(default = 19.0)]
+    pub forward_overhead_ms: f64,
+    /// Host work per MTP forward (ms).
+    #[serde(default = "default_glm53_neuron_mtp_forward_overhead_ms")]
+    #[param(default = 2.0)]
+    pub mtp_forward_overhead_ms: f64,
+    /// Host per step outside the forwards (ms).
+    #[serde(default = "default_glm53_neuron_step_overhead_ms")]
+    #[param(default = 2.5)]
+    pub step_overhead_ms: f64,
+    /// What-if: scales every host constant.
+    #[serde(default = "default_glm53_neuron_host_time_scale")]
+    #[param(default = 1.0)]
+    pub host_time_scale: f64,
+    /// Compiled prefill chunk sizes (multiples of attn_tp).
+    #[serde(default = "default_glm53_neuron_prefill_buckets")]
+    pub prefill_buckets: Vec<u32>,
+    /// Compiled decode batch sizes per DP group (multiples of attn_tp).
+    #[serde(default = "default_glm53_neuron_decode_buckets")]
+    pub decode_buckets: Vec<u32>,
+    /// Compiled DSA context buckets.
+    #[serde(default = "default_glm53_neuron_context_buckets")]
+    pub context_buckets: Vec<u32>,
+    /// HBM of one LNC2 core (GB).
+    #[serde(default = "default_glm53_neuron_hbm_per_core_gb")]
+    #[param(default = 25.769803776)]
+    pub hbm_per_core_gb: f64,
+    /// Runtime and activation reserve per core (GB).
+    #[serde(default = "default_glm53_neuron_hbm_reserve_gb")]
+    #[param(default = 2.0)]
+    pub hbm_reserve_gb: f64,
+    /// Engine request slots per DP group (slot 0 is scratch).
+    #[serde(default = "default_glm53_neuron_slots")]
+    #[param(default = 17, cache_key)]
+    pub slots: u32,
+    /// Per-slot DSA cache length the engine preallocates.
+    #[serde(default = "default_glm53_neuron_cmax")]
+    #[param(default = 9216, cache_key)]
+    pub cmax: u32,
+    #[serde(default = "default_glm53_neuron_torch")]
+    pub kda_prefill_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_torch")]
+    pub kda_decode_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_dsa")]
+    pub dsa_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_moe")]
+    pub moe_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_dense")]
+    pub dense_ffn_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_mhc_pre")]
+    pub mhc_pre_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_torch")]
+    pub mhc_post_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_torch")]
+    pub lm_head_impls: Vec<String>,
+    #[serde(default = "default_glm53_neuron_torch")]
+    pub embed_impls: Vec<String>,
+    /// What-if device scales, `kind=factor` or `kind@min_rows=factor`.
+    #[serde(default)]
+    pub kind_time_scale: Vec<String>,
+}
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
@@ -1363,6 +1550,28 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// GLM-5.3-Flash (FP8 checkpoint) on AWS Trainium2 LNC2 logical cores,
+    /// served by the glm5-trn2 seed engine: attention DP x TP (KDA and MLA
+    /// heads over TP, indexer and latent cache replicated), FFN EP over the
+    /// replica, sequence-parallel mHC streams, one compiled region per layer.
+    Glm53FlashNeuronFp8 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(flatten)]
+        neuron: Glm53NeuronSpec,
+    },
+    /// [`Self::Glm53FlashNeuronFp8`] with an MTP drafter (placeholder: the
+    /// engine has no MTP yet; one DSA + MoE layer per draft pass).
+    Glm53FlashNeuronFp8Speculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(flatten)]
+        neuron: Glm53NeuronSpec,
+        /// MTP drafts per step: the verify width is draft_tokens + 1.
+        #[serde(default = "default_glm53_neuron_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+    },
 }
 
 impl IterArchSel {
@@ -1399,7 +1608,9 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
             | Self::Qwen35VllmNvfp4GdnDense { model, .. }
-            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. }
+            | Self::Glm53FlashNeuronFp8 { model, .. }
+            | Self::Glm53FlashNeuronFp8Speculative { model, .. } => model,
         }
     }
 
@@ -1427,6 +1638,8 @@ impl IterArchSel {
             | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
                 Ok(*max_model_len)
             }
+            Self::Glm53FlashNeuronFp8 { neuron, .. }
+            | Self::Glm53FlashNeuronFp8Speculative { neuron, .. } => Ok(neuron.max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

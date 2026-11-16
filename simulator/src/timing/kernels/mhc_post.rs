@@ -87,7 +87,10 @@ mod tests {
         let payloads = MhcPostSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "dtype", "hc_mult", "hidden_size", "num_tokens"]);
+        assert_eq!(
+            keys,
+            ["backend", "dtype", "hc_mult", "hidden_size", "num_tokens"]
+        );
     }
 
     #[test]

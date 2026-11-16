@@ -149,6 +149,14 @@ pub struct DsaIndexerPrefillLog {
     pub prefill_query_key_pairs: Vec<(u32, u32)>,
 }
 
+/// A Neuron forward's launch leaf: the regions it dispatched (`forward` =
+/// `u32::MAX` for the per-step host leaf).
+#[derive(Clone, Serialize)]
+pub struct NeuronLaunchLog {
+    pub regions: u32,
+    pub forward: u32,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -267,6 +275,7 @@ log_inputs! {
     RsSconvAgResidualRmsNorm => RsSconvAgResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,
+    NeuronLaunch => NeuronLaunchLog,
     NeuronAllGather => AllGatherKernelInput,
     NeuronDenseFfnPartial => DenseFfnPartialKernelInput,
     NeuronDsaDecode => DsaDecodeKernelInput,

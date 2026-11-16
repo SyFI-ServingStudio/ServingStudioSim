@@ -114,7 +114,23 @@ mod tests {
         let payloads = DsaDecodeSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "batch_size", "context_len", "dtype", "head_dim", "hidden_size", "index_head_dim", "index_heads", "index_topk", "kv_lora_rank", "num_heads", "weight_dtype"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "batch_size",
+                "context_len",
+                "dtype",
+                "head_dim",
+                "hidden_size",
+                "index_head_dim",
+                "index_heads",
+                "index_topk",
+                "kv_lora_rank",
+                "num_heads",
+                "weight_dtype"
+            ]
+        );
     }
 
     #[test]

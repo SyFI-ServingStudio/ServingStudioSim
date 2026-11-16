@@ -852,6 +852,46 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53FlashNeuronFp8 { neuron, .. } => {
+                ensure_chunked_prefill_worker("GLM-5.3-Flash FP8 on Trainium2", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_neuron_fp8(
+                    model_spec, neuron, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                assemble_barebone_or_chunked_flow(
+                    "GLM-5.3-Flash FP8 on Trainium2",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Glm53FlashNeuronFp8Speculative {
+                neuron,
+                draft_tokens,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_flash_neuron_fp8_speculative(
+                    model_spec,
+                    neuron,
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
                 max_model_len,
                 draft_tokens,

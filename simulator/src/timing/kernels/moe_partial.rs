@@ -107,7 +107,21 @@ mod tests {
         let payloads = MoePartialSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "dtype", "hidden_size", "intermediate_size", "local_experts", "num_experts", "num_tokens", "shared_intermediate_size", "top_k", "weight_dtype"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "dtype",
+                "hidden_size",
+                "intermediate_size",
+                "local_experts",
+                "num_experts",
+                "num_tokens",
+                "shared_intermediate_size",
+                "top_k",
+                "weight_dtype"
+            ]
+        );
     }
 
     #[test]

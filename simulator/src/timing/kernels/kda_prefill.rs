@@ -99,7 +99,19 @@ mod tests {
         let payloads = KdaPrefillSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "conv_kernel_size", "dtype", "head_dim", "hidden_size", "num_heads", "num_tokens", "weight_dtype"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "conv_kernel_size",
+                "dtype",
+                "head_dim",
+                "hidden_size",
+                "num_heads",
+                "num_tokens",
+                "weight_dtype"
+            ]
+        );
     }
 
     #[test]

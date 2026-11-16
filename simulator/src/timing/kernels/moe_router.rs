@@ -91,7 +91,17 @@ mod tests {
         let payloads = MoeRouterSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "dtype", "hidden_size", "num_experts", "num_tokens", "top_k"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "dtype",
+                "hidden_size",
+                "num_experts",
+                "num_tokens",
+                "top_k"
+            ]
+        );
     }
 
     #[test]

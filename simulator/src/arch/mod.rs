@@ -19,6 +19,7 @@ pub mod glm52_vllm_dsa_moe;
 pub mod glm52_vllm_nvfp4_dp_attn_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod glm52_vllm_nvfp4_pp_dsa_moe;
+pub mod glm53_flash_neuron_fp8;
 pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;

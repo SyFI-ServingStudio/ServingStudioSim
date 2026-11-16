@@ -91,7 +91,17 @@ mod tests {
         let payloads = EmbedSpec::enumerate(&cfg, &grid, "neuron_torch");
         assert!(!payloads.is_empty());
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backend", "dtype", "hc_mult", "hidden_size", "num_tokens", "vocab_size"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "dtype",
+                "hc_mult",
+                "hidden_size",
+                "num_tokens",
+                "vocab_size"
+            ]
+        );
     }
 
     #[test]
