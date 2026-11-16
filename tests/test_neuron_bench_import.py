@@ -223,3 +223,64 @@ def test_inferencex_point_drops_warmup(tmp_path):
     assert p["intvty"] == pytest.approx(10.0)
     assert p["window_s"] == pytest.approx((5 * 1000 + 1100 - 2000) / 1e3)
     assert p["tok_s_per_chip"] == pytest.approx(4 * 1011 / p["window_s"] / 16)
+
+
+def test_engine_align_parses_a_timeline_and_drops_first_use(tmp_path):
+    """Catches a compile stall kept in a measured median, or a decode step put in the wrong
+    context bucket (positions rebuilt from the request rows)."""
+    engine_align = importlib.import_module("engine_align")
+    eng = {
+        "world": 32,
+        "tp": 8,
+        "dp": 4,
+        "slots": 17,
+        "cmax": 9216,
+        "prefill_buckets": [2048],
+        "decode_buckets": [8, 16],
+        "context_buckets": [2048, 4096, 8192, 9216],
+    }
+    rows = [{"kind": "header", "engine": eng}]
+    t = 0.0
+    for i, ms in enumerate([50000.0] + [100.0] * 9):  # the first decode compiles
+        rows.append(
+            {
+                "kind": "step",
+                "step": i,
+                "t": t,
+                "decode": {"rows": [4] * 4, "ms": ms},
+                "wall_ms": ms,
+            }
+        )
+        t += ms / 1e3 + 0.0001
+    rows.append(
+        {
+            "kind": "step",
+            "step": 10,
+            "t": t,
+            "prefill": {"rows": [2048, 0, 0, 0], "ms": 1200.0, "starts": [2048, 0, 0, 0]},
+            "wall_ms": 1200.0,
+        }
+    )
+    rows.append(
+        {
+            "kind": "request",
+            "rid": 0,
+            "isl": 7000,
+            "osl": 1024,
+            "arrival": 0.0,
+            "ttft": 0.0,
+            "e2e": 1000.0,
+            "tpot": 0.1,
+        }
+    )
+    path = tmp_path / "serve.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    parsed = engine_align.parse(path)
+    by_key = {tuple(c["key"]): c for c in parsed["cases"]}
+    dec = by_key[("decode", 8, 8192)]
+    assert (dec["n"], dec["dropped"], dec["measured_ms"]) == (9, 1, 100.0)
+    assert by_key[("prefill", 2048, 4096, 2048)]["measured_ms"] == 1200.0
+    assert parsed["step_gap_ms"] == pytest.approx(0.1, abs=1e-6)
+    # The pipelined forward: device-bound regions, then host-bound ones.
+    assert engine_align.forward_ms([(10.0, 2)], 1.0, 0.1, 0.0, 1.0) == pytest.approx(20.2)
+    assert engine_align.forward_ms([(0.1, 2)], 1.0, 0.1, 5.0, 1.0) == pytest.approx(7.0)

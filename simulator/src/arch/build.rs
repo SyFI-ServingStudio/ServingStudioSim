@@ -2358,6 +2358,10 @@ fn glm53_neuron_parallel(
         decode_buckets: spec.decode_buckets.clone(),
         context_buckets: spec.context_buckets.clone(),
         region_device_factor: spec.region_device_factor.map_or(1.0, |f| f as f32),
+        prefill_device_factor: spec.prefill_device_factor.map_or(
+            crate::arch::glm53_flash_neuron_fp8::PREFILL_DEVICE_FACTOR,
+            |f| f as f32,
+        ),
         region_host_ms: host
             * spec
                 .region_host_ms

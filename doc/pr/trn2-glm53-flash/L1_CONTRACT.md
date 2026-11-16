@@ -116,5 +116,6 @@ Predictions that depend on derived rows are labeled as such in `CONFIG_SEARCH.md
 
 The TP and world collectives inside a region are separate leaves (above). Host time (region
 dispatch, per-forward input assembly / H2D / id readback, the step's scheduling) is the arch's
-pipelined launch model with the trn2-flashnext constants. First-execution stalls of a new shape
+pipelined launch model, its constants fitted on the seed engine (`ALIGNMENT.md`), plus the
+prefill-forward device factor. First-execution stalls of a new shape
 and sampling (non-greedy) are not modeled.

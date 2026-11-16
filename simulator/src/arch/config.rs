@@ -177,9 +177,11 @@ const fn default_glm53_neuron_block_layers() -> u32 {
 const fn default_glm53_neuron_true() -> bool {
     true
 }
-/// trn2-flashnext fit (doc/pr/trn2-flashnext/ALIGNMENT.md), barrier-off engine.
+/// Fitted on the glm5-trn2 seed engine (doc/pr/trn2-glm53-flash/ALIGNMENT.md);
+/// `forward_overhead_ms` and `mtp_forward_overhead_ms` keep the trn2-flashnext
+/// fit (not identifiable: the seed engine's forwards are device-bound).
 const fn default_glm53_neuron_region_gap_ms() -> f64 {
-    0.17
+    0.1
 }
 const fn default_glm53_neuron_forward_overhead_ms() -> f64 {
     19.0
@@ -188,7 +190,7 @@ const fn default_glm53_neuron_mtp_forward_overhead_ms() -> f64 {
     2.0
 }
 const fn default_glm53_neuron_step_overhead_ms() -> f64 {
-    2.5
+    0.12
 }
 const fn default_glm53_neuron_host_time_scale() -> f64 {
     1.0
@@ -268,15 +270,19 @@ pub struct Glm53NeuronSpec {
     #[serde(default = "default_glm53_neuron_true")]
     #[param(default = true, cache_key)]
     pub spmd_padding: bool,
-    /// f_g on every compute leaf.
+    /// f_g on the decode-side compute leaves.
     #[serde(default)]
     pub region_device_factor: Option<f64>,
+    /// f_g on the prefill forwards' compute leaves; omitted = the seed-engine
+    /// fit (1.78).
+    #[serde(default)]
+    pub prefill_device_factor: Option<f64>,
     /// Host dispatch per region (ms); omitted = the granularity's fit.
     #[serde(default)]
     pub region_host_ms: Option<f64>,
     /// Device per region launch outside the regions (ms).
     #[serde(default = "default_glm53_neuron_region_gap_ms")]
-    #[param(default = 0.17)]
+    #[param(default = 0.1)]
     pub region_gap_ms: f64,
     /// Host work per target forward (ms), overlapping the device.
     #[serde(default = "default_glm53_neuron_forward_overhead_ms")]
@@ -288,7 +294,7 @@ pub struct Glm53NeuronSpec {
     pub mtp_forward_overhead_ms: f64,
     /// Host per step outside the forwards (ms).
     #[serde(default = "default_glm53_neuron_step_overhead_ms")]
-    #[param(default = 2.5)]
+    #[param(default = 0.12)]
     pub step_overhead_ms: f64,
     /// What-if: scales every host constant.
     #[serde(default = "default_glm53_neuron_host_time_scale")]

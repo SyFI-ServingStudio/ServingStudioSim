@@ -76,6 +76,9 @@ const FP8: u64 = 1;
 pub const CORES_PER_CHIP: u32 = 4;
 /// mHC Sinkhorn iterations (`hc_sinkhorn_iters`).
 const SINKHORN_ITERS: u32 = 20;
+/// The prefill forward's measured device over the sum of its L1 rows on the
+/// seed engine (ALIGNMENT.md): 1.78 at chunk 2048, dp4 x tp8.
+pub const PREFILL_DEVICE_FACTOR: f32 = 1.78;
 /// The MTP placeholder's acceptance curve source: InferenceX `glm-5.3-flash`
 /// golden acceptance length (accepted tokens per verify step, the target's own
 /// included) at k = 1..5 drafts.
@@ -97,11 +100,12 @@ pub enum RegionGranularity {
 impl RegionGranularity {
     pub const CHOICES: [&'static str; 2] = ["layer", "block"];
 
-    /// Host dispatch per region (ms): the trn2-flashnext engine fit with the
-    /// NRT execution barrier off (layer 1.3 ms, 4-layer block 3.7 ms).
+    /// Host dispatch per region (ms): layer 1.1 ms fitted on the glm5-trn2
+    /// seed engine (`doc/pr/trn2-glm53-flash/ALIGNMENT.md`); block keeps the
+    /// trn2-flashnext 4-layer-block fit (3.7 ms, not measured on this engine).
     pub fn region_host_ms(self) -> f32 {
         match self {
-            Self::Layer => 1.3,
+            Self::Layer => 1.1,
             Self::Block => 3.7,
         }
     }
@@ -204,6 +208,9 @@ pub struct Glm53NeuronParallel {
     pub decode_buckets: Vec<u32>,
     pub context_buckets: Vec<u32>,
     pub region_device_factor: f32,
+    /// f_g of the prefill forwards' compute leaves (the decode side uses
+    /// `region_device_factor`): the engine-fitted in-step composition factor.
+    pub prefill_device_factor: f32,
     pub region_host_ms: f32,
     pub region_gap_ms: f32,
     pub forward_overhead_ms: f32,
@@ -237,11 +244,12 @@ impl Glm53NeuronParallel {
             decode_buckets: vec![8, 16],
             context_buckets: vec![2048, 4096, 8192, 9216],
             region_device_factor: 1.0,
+            prefill_device_factor: PREFILL_DEVICE_FACTOR,
             region_host_ms: RegionGranularity::Layer.region_host_ms(),
-            region_gap_ms: 0.17,
+            region_gap_ms: 0.1,
             forward_overhead_ms: 19.0,
             mtp_forward_overhead_ms: 2.0,
-            step_overhead_ms: 2.5,
+            step_overhead_ms: 0.12,
             hbm_per_core_gb: 25.769_803_776,
             hbm_reserve_gb: 2.0,
             slots: 17,
@@ -1438,7 +1446,12 @@ impl Glm53NeuronCore {
         let k = &self.kernels;
         let tp = self.parallel.attn_tp;
         let row_bytes = u64::from(self.hidden) * BF16;
-        let factor = self.parallel.region_device_factor;
+        let factor = match self.forwards[plan.forward].view {
+            View::Prefill | View::MtpPrefill | View::MtpPrefillDraft => {
+                self.parallel.prefill_device_factor
+            }
+            _ => self.parallel.region_device_factor,
+        };
         let scale = |rows: u32| -> f32 {
             plan.scales
                 .iter()
@@ -2012,6 +2025,7 @@ mod tests {
         p.region_gap_ms = 0.0;
         p.forward_overhead_ms = 0.0;
         p.step_overhead_ms = 0.0;
+        p.prefill_device_factor = 1.0;
         p
     }
 
@@ -2149,6 +2163,26 @@ mod tests {
         assert_eq!(ms(&n, "unified.prefill.kda_moe.ffn.moe_partial"), 8192.0);
         assert_eq!(ms(&n, "unified.prefill.lm_head"), 1.0);
         assert_eq!(ms(&n, "unified.decode.kda_moe.attn.kda"), 0.0);
+    }
+
+    /// Catches the prefill-side device factor leaking into decode leaves (or
+    /// missing from prefill ones): the seed-engine fit scales only the prefill
+    /// forward's compute leaves, never its collectives.
+    #[test]
+    fn prefill_device_factor_scales_only_prefill_compute() {
+        let mut p = parallel(8);
+        p.prefill_device_factor = 2.0;
+        let core = built(p);
+        let mut groups = vec![prefill(0, 2048), decode(0, 0), decode(0, 0), decode(0, 0)];
+        groups[1] = decode(8, 100);
+        let (n, _) = eval(&core, groups);
+        assert_eq!(ms(&n, "unified.prefill.kda_moe.attn.kda"), 2.0 * 2048.0);
+        assert_eq!(ms(&n, "unified.decode.kda_moe.attn.kda"), 8.0);
+        let row = 4096.0 * 2.0 / 1e6;
+        assert_eq!(
+            ms(&n, "unified.prefill.kda_moe.ffn.reduce_scatter_world"),
+            4.0 * 2048.0 * row
+        );
     }
 
     /// Catches the what-if `spmd_padding: false` still padding idle groups:
