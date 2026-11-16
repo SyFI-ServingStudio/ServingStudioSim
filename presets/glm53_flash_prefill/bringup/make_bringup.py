@@ -1,4 +1,4 @@
-"""Write the bring-up traces (req-frontend CSVs) beside this file.
+"""Write the bring-up traces (req-frontend CSVs) beside this file, or into OUT_DIR when given.
 
 For each prompt length L = 1,024 * 2^k, k = 0..7, one output token, no prefix (`text-generation-independent`):
   one_<L>.csv   5 requests of L tokens, 10 s apart: each runs alone on idle GPUs (4_iteration.md).
@@ -25,12 +25,15 @@ Scheduling check (`text-generation-independent`, 6_scheduler.md):
   force_check.csv       a 32k prompt at t = 0, then 1k prompts at 200 per second from t = 0 to t = 80 s: more than
                         the pipeline computes, so a shortest-first order keeps the 32k prompt waiting.
 
-usage: make_bringup.py
+The CSVs are not committed; the presets read them from this directory, so run this once before using them.
+
+usage: make_bringup.py [OUT_DIR]
 """
 import csv
+import sys
 from pathlib import Path
 
-here = Path(__file__).parent
+here = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent
 for k in range(8):
     length, name = 1024 << k, f"{1 << k}k"
     plans = {"one": [(i, 10_000 * i) for i in range(5)],

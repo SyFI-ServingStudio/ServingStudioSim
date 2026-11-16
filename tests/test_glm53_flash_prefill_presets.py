@@ -1,11 +1,18 @@
 """The GLM-5.3-Flash PP4 prefill presets (`presets/glm53_flash_prefill/`): every
 member expands against the simulator's schema and builds its deployment
-through the binary's ``dry-run`` (the flow is built, nothing simulated)."""
+through the binary's ``dry-run`` (the flow is built, nothing simulated).
+
+The bring-up CSVs the ``check_*`` presets read are not committed: a session
+fixture regenerates them in place with ``bringup/make_bringup.py`` (they are
+git-ignored there), so the presets' repo-relative trace paths resolve."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,6 +26,7 @@ from launcher.schema.loader import _load_preset, load_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PRESET_DIR = REPO_ROOT / "presets/glm53_flash_prefill"
+BRINGUP_DIR = PRESET_DIR / "bringup"
 PRESETS = sorted(path for path in PRESET_DIR.glob("*.yaml") if not path.stem.startswith("backends"))
 JOBS = min(32, os.cpu_count() or 8)
 
@@ -35,6 +43,20 @@ def _missing_traces(member: dict) -> list[str]:
     ]
 
 
+@pytest.fixture(scope="session")
+def bringup_traces() -> None:
+    """Regenerate the bring-up CSVs beside their generator. Each file is written
+    in a scratch directory on the same filesystem and moved into place, so a
+    concurrent reader (another xdist worker) sees a whole file, never a partial one."""
+    scratch = Path(tempfile.mkdtemp(prefix=".gen-", dir=BRINGUP_DIR))
+    try:
+        subprocess.run([sys.executable, str(BRINGUP_DIR / "make_bringup.py"), str(scratch)], check=True)
+        for csv in scratch.glob("*.csv"):
+            os.replace(csv, BRINGUP_DIR / csv.name)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_the_presets_are_there():
     names = {path.stem for path in PRESETS}
     assert {"ssengine", "check_scheduler_order", "check_tier_read", "v3_m6_full"} <= names
@@ -43,7 +65,7 @@ def test_the_presets_are_there():
 @pytest.mark.presets
 @pytest.mark.needs_binary
 @pytest.mark.parametrize("path", PRESETS, ids=[path.stem for path in PRESETS])
-def test_every_member_builds(path, sim_bin, tmp_path):
+def test_every_member_builds(path, sim_bin, tmp_path, bringup_traces):
     members = _members(path)
     assert members
     runnable = [member for member in members if not _missing_traces(member)]

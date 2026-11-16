@@ -42,6 +42,9 @@ otherwise. Run any preset from the repository root:
 | `v3_m6_dram128_ssd8t.yaml` | v3 M6 sessions, N = 300, HBM 100.18 + DRAM 128 GB + SSD 8 TB |
 | `v3_8h_steady.yaml` | v3 closed loop of 2,000 sessions for 8 hours, DRAM 150 GB + SSD 8 TB |
 
-The bring-up CSVs and their generator are under `bringup/` (from the v2 handoff's `data/bringup/`). The v3 session
+The `check_*` presets read bring-up CSVs from `bringup/` (from the v2 handoff's `data/bringup/`). They are not
+committed; generate them in place before running one of those presets:
+`uv run python presets/glm53_flash_prefill/bringup/make_bringup.py` (deterministic; the script's docstring describes
+each file). `tests/test_glm53_flash_prefill_presets.py` regenerates them itself. The v3 session
 traces (`trace/sessions_2ps_v3.csv`, `trace/closed_c2000_v3.csv`) are not committed; their manifests and the
 closed-loop generator are under `traces/`.
