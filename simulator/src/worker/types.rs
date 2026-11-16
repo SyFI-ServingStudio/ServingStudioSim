@@ -615,6 +615,12 @@ pub struct WorkerConfig {
     /// Prefill chunks one attention-DP partition may schedule per iteration
     /// (chunked-prefill and speculative selectors). `None` is unbounded.
     pub max_prefill_chunks_per_partition: Option<u32>,
+    /// Tokens one prefill chunk may hold (chunked-prefill and speculative
+    /// selectors). `None` is the batch budget.
+    pub max_prefill_chunk_tokens: Option<u32>,
+    /// Requests one partition may hold at once (chunked-prefill and
+    /// speculative selectors). `None` is bounded by KV only.
+    pub max_requests_per_partition: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -644,6 +650,8 @@ impl Default for WorkerConfig {
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
             max_prefill_chunks_per_partition: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
         }
     }
 }

@@ -89,7 +89,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
     };
-    let admission = admission.with_max_prefill_chunks(config.max_prefill_chunks_per_partition);
+    let admission = admission
+        .with_max_prefill_chunks(config.max_prefill_chunks_per_partition)
+        .with_max_prefill_chunk_tokens(config.max_prefill_chunk_tokens)
+        .with_max_requests_per_partition(config.max_requests_per_partition);
 
     IterBatchWorker::from_components(
         essentials.context,

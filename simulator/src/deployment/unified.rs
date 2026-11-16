@@ -186,6 +186,8 @@ impl Deployment for UnifiedDeployment {
             prefix_cache,
             prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
             max_prefill_chunks_per_partition: g.worker.max_prefill_chunks_per_partition(),
+            max_prefill_chunk_tokens: g.worker.max_prefill_chunk_tokens(),
+            max_requests_per_partition: g.worker.max_requests_per_partition(),
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
@@ -1387,6 +1389,8 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
             max_prefill_chunks_per_partition: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
             kv_accounting: Default::default(),
         }
     }
@@ -1555,6 +1559,8 @@ pools:
             kv_accounting: Default::default(),
             prefill_chunk_alignment: None,
             max_prefill_chunks_per_partition: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
             dp_placement: DpPlacement::RoundRobin,
         }
     }

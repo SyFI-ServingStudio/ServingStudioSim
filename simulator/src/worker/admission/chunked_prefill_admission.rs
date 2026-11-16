@@ -92,6 +92,14 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Prefill chunks one partition may schedule per iteration (`None`:
     /// as many as the budget admits).
     max_prefill_chunks: Option<u32>,
+    /// Tokens one prefill chunk may hold (`None`: as many as the budget
+    /// admits). An engine with a fixed compiled chunk (the Neuron engines)
+    /// caps every chunk at it, whatever budget the decode rows leave.
+    max_prefill_chunk_tokens: Option<u32>,
+    /// Requests one partition may hold at once, decoding or prefilling
+    /// (`None`: bounded by KV only). The Neuron engines have a fixed number of
+    /// request slots per DP group and admit a prompt only into a free one.
+    max_requests_per_partition: Option<u32>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -161,6 +169,8 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             decode_completion,
             drafting_slots,
             max_prefill_chunks: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
         }
     }
 
@@ -172,6 +182,21 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             "max prefill chunks per partition must be positive"
         );
         self.max_prefill_chunks = chunks;
+        self
+    }
+
+    /// Cap every prefill chunk at `tokens` (the engine's compiled chunk).
+    pub(crate) fn with_max_prefill_chunk_tokens(mut self, tokens: Option<u32>) -> Self {
+        assert!(tokens != Some(0), "max prefill chunk tokens must be positive");
+        self.max_prefill_chunk_tokens = tokens;
+        self
+    }
+
+    /// Admit a prompt only while its partition holds fewer than `requests`
+    /// requests (decoding plus prefilling).
+    pub(crate) fn with_max_requests_per_partition(mut self, requests: Option<u32>) -> Self {
+        assert!(requests != Some(0), "max requests per partition must be positive");
+        self.max_requests_per_partition = requests;
         self
     }
 
@@ -520,7 +545,12 @@ where
         // their prompt is complete, matching one EngineCore scheduler queue per
         // DP partition. One that cannot run this iteration keeps its place.
         let chunk_cap = self.max_prefill_chunks.unwrap_or(u32::MAX);
+        let chunk_tokens_cap = self.max_prefill_chunk_tokens.unwrap_or(u32::MAX);
         let mut chunks_scheduled = vec![0u32; num_partitions];
+        // Prompts whose last chunk runs this iteration: no longer started,
+        // not yet decoding, still holding their partition's request slot.
+        let mut finishing_prefills = vec![0u32; num_partitions];
+        let request_cap = self.max_requests_per_partition.unwrap_or(u32::MAX);
         for partition_index in 0..num_partitions {
             let mut started_prefills = std::mem::take(&mut self.started_prefills[partition_index]);
             let chunks_here = &mut chunks_scheduled[partition_index];
@@ -531,7 +561,9 @@ where
                 let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
                 let chunk_tokens = next_chunk_tokens(
                     resolved_prefill,
-                    remaining_budgets[partition_index].saturating_sub(drafting_slots),
+                    remaining_budgets[partition_index]
+                        .saturating_sub(drafting_slots)
+                        .min(chunk_tokens_cap),
                     chunk_end_alignment,
                     max_batch_tokens,
                 );
@@ -545,7 +577,11 @@ where
                 );
                 *chunks_here += 1;
                 remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
-                chunk_tokens < resolved_prefill.remaining_prefill_tokens()
+                let more = chunk_tokens < resolved_prefill.remaining_prefill_tokens();
+                if !more {
+                    finishing_prefills[partition_index] += 1;
+                }
+                more
             });
             self.started_prefills[partition_index] = started_prefills;
         }
@@ -555,6 +591,10 @@ where
             while !retracted_before_admission
                 && remaining_budgets[partition_index] > drafting_slots
                 && chunks_scheduled[partition_index] < chunk_cap
+                && kv_store.live_decode_count(partition)
+                    + self.started_prefills[partition_index].len() as u32
+                    + finishing_prefills[partition_index]
+                    < request_cap
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 policy.refresh_head(&mut |candidate| {
@@ -583,7 +623,7 @@ where
                 // waiting loop here rather than skipping ahead).
                 let chunk_tokens = next_chunk_tokens(
                     resolved_prefill,
-                    remaining_budgets[partition_index] - drafting_slots,
+                    (remaining_budgets[partition_index] - drafting_slots).min(chunk_tokens_cap),
                     chunk_end_alignment,
                     max_batch_tokens,
                 );
@@ -662,6 +702,8 @@ where
                 remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
                 if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
                     self.started_prefills[partition_index].push(candidate);
+                } else {
+                    finishing_prefills[partition_index] += 1;
                 }
             }
         }

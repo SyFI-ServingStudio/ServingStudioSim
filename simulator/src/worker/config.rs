@@ -447,6 +447,17 @@ pub enum IterWorkerSel {
         /// per step (`1`).
         #[serde(default)]
         max_prefill_chunks_per_partition: Option<u32>,
+        /// Tokens one prefill chunk may hold, whatever budget the decode rows
+        /// leave; absent is the budget. An engine with one compiled chunk size
+        /// (the Neuron engines: `--chunk`) sets it to that size.
+        #[serde(default)]
+        max_prefill_chunk_tokens: Option<u32>,
+        /// Requests one attention-DP partition may hold at once, decoding or
+        /// prefilling; a prompt waits for a free one. Absent is bounded by KV
+        /// only. The Neuron engines have `slots - 1` request slots per DP group
+        /// and cap running requests at their largest decode bucket.
+        #[serde(default)]
+        max_requests_per_partition: Option<u32>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -515,6 +526,17 @@ pub enum IterWorkerSel {
         /// per step (`1`).
         #[serde(default)]
         max_prefill_chunks_per_partition: Option<u32>,
+        /// Tokens one prefill chunk may hold, whatever budget the decode rows
+        /// leave; absent is the budget. An engine with one compiled chunk size
+        /// (the Neuron engines: `--chunk`) sets it to that size.
+        #[serde(default)]
+        max_prefill_chunk_tokens: Option<u32>,
+        /// Requests one attention-DP partition may hold at once, decoding or
+        /// prefilling; a prompt waits for a free one. Absent is bounded by KV
+        /// only. The Neuron engines have `slots - 1` request slots per DP group
+        /// and cap running requests at their largest decode bucket.
+        #[serde(default)]
+        max_requests_per_partition: Option<u32>,
     },
     /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
     /// requests and owns the pipeline's KV, later stages pull activations and
@@ -623,6 +645,36 @@ impl IterWorkerSel {
                 max_prefill_chunks_per_partition,
                 ..
             } => *max_prefill_chunks_per_partition,
+            _ => None,
+        }
+    }
+
+    /// The prefill chunk cap a chunked selector asks for.
+    pub(crate) fn max_prefill_chunk_tokens(&self) -> Option<u32> {
+        match self {
+            Self::ChunkedPrefill {
+                max_prefill_chunk_tokens,
+                ..
+            }
+            | Self::Speculative {
+                max_prefill_chunk_tokens,
+                ..
+            } => *max_prefill_chunk_tokens,
+            _ => None,
+        }
+    }
+
+    /// The per-partition request cap a chunked selector asks for.
+    pub(crate) fn max_requests_per_partition(&self) -> Option<u32> {
+        match self {
+            Self::ChunkedPrefill {
+                max_requests_per_partition,
+                ..
+            }
+            | Self::Speculative {
+                max_requests_per_partition,
+                ..
+            } => *max_requests_per_partition,
             _ => None,
         }
     }
