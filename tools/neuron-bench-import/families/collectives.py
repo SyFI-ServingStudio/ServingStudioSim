@@ -38,6 +38,11 @@ def rows(path: Path):
         )
         nb = bus_bytes(r["op"], args["num_gpus"], args["message_size_bytes"])
         yield ImportRow(
-            r["op"], "neuron_cc", args, float(r["time_ms"]), "imported:trn2-flashnext",
-            bytes=nb, comm=True,
+            r["op"],
+            "neuron_cc",
+            args,
+            float(r["time_ms"]),
+            "imported:trn2-flashnext",
+            bytes=nb,
+            comm=True,
         )

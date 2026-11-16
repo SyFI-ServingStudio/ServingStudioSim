@@ -64,7 +64,10 @@ register(
         KIND,
         "cc",
         ReduceScatterArgs,
-        "torch functional reduce_scatter traced into one compiled region (gloo world, a process per core).",
+        (
+            "torch functional reduce_scatter traced into one compiled region (gloo world, a "
+            "process per core)."
+        ),
         compute=None,
         metric_family=MetricFamily.COMM,
     )

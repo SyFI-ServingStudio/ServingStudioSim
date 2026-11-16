@@ -1013,11 +1013,18 @@ mod tests {
         assert_eq!(first.groups[0].prefill_chunk_pairs, [(0, 4)]);
         complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
         let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
-        assert!(second.groups[0].prefill_chunk_pairs.is_empty(), "request 1 waits");
+        assert!(
+            second.groups[0].prefill_chunk_pairs.is_empty(),
+            "request 1 waits"
+        );
         assert_eq!(second.groups[0].decode_tokens, 1);
         complete_chunked_iteration(&mut worker, Time::from_ms(2.0));
         let third = form_chunked_input(&mut worker, Time::from_ms(2.0));
-        assert_eq!(third.groups[0].prefill_chunk_pairs, [(0, 4)], "request 0 finished");
+        assert_eq!(
+            third.groups[0].prefill_chunk_pairs,
+            [(0, 4)],
+            "request 0 finished"
+        );
     }
 
     #[test]

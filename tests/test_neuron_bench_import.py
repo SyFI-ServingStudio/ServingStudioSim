@@ -1,4 +1,5 @@
-"""CPU tests for the GLM-5.3-Flash Trainium2 L1 importer, the InferenceX trace and the search prefilter.
+"""CPU tests for the GLM-5.3-Flash Trainium2 L1 importer, the InferenceX trace and the search
+prefilter.
 
 Covers ``tools/neuron-bench-import`` (bench row mapping, the derived grid fill, the profile.db
 round trip), ``trace/generate_inferencex.py`` and ``tools/trn2-config-search`` (HBM prefilter,
@@ -39,26 +40,45 @@ def _bench(tmp_path: Path, rows: list[dict], name: str = "moe.jsonl") -> Path:
 
 
 def _row(kind, impl, tokens, batch=None, context=0, tp=1, ep=1, ms=1.0, **kw):
-    return dict(kind=kind, impl=impl, phase="prefill", tokens=tokens, batch=batch or tokens,
-                context=context, tp=tp, ep=ep, dtype="bf16", device_ms=ms, latency_ms=ms,
-                pipelined_ms=ms, env={}, **kw)
+    return dict(
+        kind=kind,
+        impl=impl,
+        phase="prefill",
+        tokens=tokens,
+        batch=batch or tokens,
+        context=context,
+        tp=tp,
+        ep=ep,
+        dtype="bf16",
+        device_ms=ms,
+        latency_ms=ms,
+        pipelined_ms=ms,
+        env={},
+        **kw,
+    )
 
 
 def test_bench_rows_map_to_per_rank_args(tmp_path):
     """Catches a bench field landing on the wrong per-rank arg (heads by tp, experts by ep)."""
-    d = _bench(tmp_path, [
-        _row("kda_prefill", "torch", 2048, tp=8),
-        _row("dsa_decode", "radix", 16, batch=16, context=4096, tp=4),
-        _row("moe_partial", "cte_hybrid", 8192, ep=32),
-        _row("router", "fp32", 64),
-        _row("lm_head", "torch", 8, tp=16),
-        _row("moe_partial", "no_such_impl", 8, ep=32),
-        _row("mhc_pre", "torch_bf16", 4096, ms=None, error="boom"),
-    ])
+    d = _bench(
+        tmp_path,
+        [
+            _row("kda_prefill", "torch", 2048, tp=8),
+            _row("dsa_decode", "radix", 16, batch=16, context=4096, tp=4),
+            _row("moe_partial", "cte_hybrid", 8192, ep=32),
+            _row("router", "fp32", 64),
+            _row("lm_head", "torch", 8, tp=16),
+            _row("moe_partial", "no_such_impl", 8, ep=32),
+            _row("mhc_pre", "torch_bf16", 4096, ms=None, error="boom"),
+        ],
+    )
     rows = {r.kind: r for r in glm53.rows(d)}
     assert rows["kda_prefill"].args["num_heads"] == 8
     assert rows["kda_prefill"].backend == "neuron_torch"
-    assert (rows["dsa_decode"].args["batch_size"], rows["dsa_decode"].args["context_len"]) == (16, 4096)
+    assert (rows["dsa_decode"].args["batch_size"], rows["dsa_decode"].args["context_len"]) == (
+        16,
+        4096,
+    )
     assert rows["dsa_decode"].args["num_heads"] == 16
     assert rows["moe_partial"].args["local_experts"] == 9
     assert rows["moe_partial"].args["shared_intermediate_size"] == 64
@@ -74,14 +94,26 @@ def test_fill_grid_interpolates_ratios_and_never_overwrites_measured(tmp_path):
     measured = []
     for t, ratio in [(512, 2.0), (2048, 4.0)]:
         args = dict(num_tokens=t, **G.kda(8))
-        measured.append(import_bench.ImportRow(
-            "kda_prefill", "neuron_torch", args, analytic.estimate("kda_prefill", args)[0] * ratio,
-            "imported:kda.jsonl:1"))
-    coll = list(importlib.import_module("families.collectives").rows(
-        IMPORT_DIR / "data" / "trn2_flashnext_collectives.jsonl"))
+        measured.append(
+            import_bench.ImportRow(
+                "kda_prefill",
+                "neuron_torch",
+                args,
+                analytic.estimate("kda_prefill", args)[0] * ratio,
+                "imported:kda.jsonl:1",
+            )
+        )
+    coll = list(
+        importlib.import_module("families.collectives").rows(
+            IMPORT_DIR / "data" / "trn2_flashnext_collectives.jsonl"
+        )
+    )
     derived = grid.fill_grid(measured + coll, [8], 32)
-    kda8 = {r.args["num_tokens"]: r for r in derived
-            if r.kind == "kda_prefill" and r.args["num_heads"] == 8}
+    kda8 = {
+        r.args["num_tokens"]: r
+        for r in derived
+        if r.kind == "kda_prefill" and r.args["num_heads"] == 8
+    }
     assert 512 not in kda8 and 2048 not in kda8, "measured cells stay measured"
     est = lambda t: analytic.estimate("kda_prefill", dict(num_tokens=t, **G.kda(8)))[0]  # noqa: E731
     assert kda8[1024].time_ms == pytest.approx(est(1024) * (2.0 * 4.0) ** 0.5)  # log-midpoint
@@ -94,8 +126,11 @@ def test_fill_grid_interpolates_ratios_and_never_overwrites_measured(tmp_path):
 
 def test_fill_grid_covers_every_cell_and_collective(tmp_path):
     """Catches a grid cell the Rust arch asks for that the fill leaves empty (a build miss)."""
-    coll = list(importlib.import_module("families.collectives").rows(
-        IMPORT_DIR / "data" / "trn2_flashnext_collectives.jsonl"))
+    coll = list(
+        importlib.import_module("families.collectives").rows(
+            IMPORT_DIR / "data" / "trn2_flashnext_collectives.jsonl"
+        )
+    )
     derived = grid.fill_grid(coll, [2, 4, 8, 16], 32)
     keys = {r.key for r in coll + derived}
     for kind, names, cfg, cells in G.series([2, 4, 8, 16], 32):
@@ -122,14 +157,18 @@ def test_rows_round_trip_through_profile_db(tmp_path):
     counts = import_bench.insert(rows, db, dry_run=False)
     assert counts[("mhc_post", "neuron_torch", "measured")] == 1
     spec = find_kernel_profiler_spec("mhc_post", "neuron_torch")
-    got = Table(spec, db).query([spec.args_schema(**rows[0].args)], backend="neuron_torch",
-                                gpu_name=import_bench.GPU_NAME)
+    got = Table(spec, db).query(
+        [spec.args_schema(**rows[0].args)], backend="neuron_torch", gpu_name=import_bench.GPU_NAME
+    )
     assert got[0].time_ms == pytest.approx(0.25)
 
 
 def test_inferencex_trace_shape(tmp_path):
-    """Catches the 8k1k trace drifting from InferenceX: 12C requests, ISL in [0.8 ISL, ISL], OSL fixed."""
-    spec = importlib.util.spec_from_file_location("generate_inferencex", ROOT / "trace" / "generate_inferencex.py")
+    """Catches the 8k1k trace drifting from InferenceX: 12C requests, ISL in
+    [0.8 ISL, ISL], OSL fixed."""
+    spec = importlib.util.spec_from_file_location(
+        "generate_inferencex", ROOT / "trace" / "generate_inferencex.py"
+    )
     gen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gen)
     out = tmp_path / "t.csv"
@@ -146,7 +185,9 @@ def test_search_prefilter_and_buckets():
     search = importlib.import_module("search")
     assert not search.memory_gb(search.Layout(attn_tp=1, dmax=8))["fits"]
     assert search.memory_gb(search.Layout(attn_tp=8, dmax=64))["fits"]
-    assert search.memory_gb(search.Layout(attn_tp=1))["weights_gb"] == pytest.approx(24.47, abs=0.01)
+    assert search.memory_gb(search.Layout(attn_tp=1))["weights_gb"] == pytest.approx(
+        24.47, abs=0.01
+    )
     assert search.Layout(attn_tp=16, dmax=64).decode_buckets() == [16, 32, 64]
     assert search.Layout(attn_tp=2, dmax=16).decode_buckets() == [8, 16]
     assert not search.Layout(attn_tp=16, dmax=8).valid()
@@ -163,9 +204,18 @@ def test_inferencex_point_drops_warmup(tmp_path):
     reqs = []
     for i in range(6):  # C = 1 x (2 warm-up + 4 measured)
         start = i * 1000.0
-        reqs.append(dict(request_id=i, completed=True, arrival_time_ms=start, ttft_ms=100.0,
-                         num_output_tokens=11, finish_decode_time_ms=start + 1100.0,
-                         prefill_processed=1000, fresh_prompt_tokens=1000))
+        reqs.append(
+            dict(
+                request_id=i,
+                completed=True,
+                arrival_time_ms=start,
+                ttft_ms=100.0,
+                num_output_tokens=11,
+                finish_decode_time_ms=start + 1100.0,
+                prefill_processed=1000,
+                fresh_prompt_tokens=1000,
+            )
+        )
     pq.write_table(pa.Table.from_pylist(reqs), run / "raw" / "request_slo.parquet")
     p = inferencex.point(run, conc=1, warmup=2)
     assert p["requests"] == 4

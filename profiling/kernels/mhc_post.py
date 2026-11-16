@@ -3,8 +3,10 @@
 Hyper-connection post: write the module output back into the residual streams (post and comb mix).
 
 Wire string ``'mhc_post'`` (Rust ``KernelSpec::KIND``); args and their order follow
-``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported from the glm5-trn2
-bench (bench_mhc_head.py kind mhc_post) by ``tools/neuron-bench-import`` and are never profiled live here.
+``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported
+from the glm5-trn2
+bench (bench_mhc_head.py kind mhc_post) by ``tools/neuron-bench-import`` and are never profiled
+live here.
 """
 
 from __future__ import annotations
@@ -29,11 +31,15 @@ class MhcPostArgs(KernelArgs):
 
 DOC = KernelDoc(
     title="mHC post (Neuron)",
-    summary='Hyper-connection post: write the module output back into the residual streams (post and comb mix).',
+    summary=(
+        "Hyper-connection post: write the module output back into the residual streams (post "
+        "and comb mix)."
+    ),
     description=(
         "One compiled region of the glm5-trn2 Neuron engine on one Trainium2 LNC2 logical core, "
         "at per-rank shapes (heads / experts / vocab of this rank). Rows are imported from the "
-        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are separate kinds."
+        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are"
+        " separate kinds."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -42,7 +48,8 @@ DOC = KernelDoc(
     method=(
         "NRT system-trace device time of one region per call (glmflash runtime.device_bench, "
         "median over the bench's iterations), imported by tools/neuron-bench-import; cells the "
-        "bench did not measure are derived rows (analytic x measured ratio, backend_version derived:*)."
+        "bench did not measure are derived rows (analytic x measured ratio, "
+        "backend_version derived:*)."
     ),
     caveats=("Imported, not profiled live: a missing row fails the build under --no-gpu.",),
     reference=None,

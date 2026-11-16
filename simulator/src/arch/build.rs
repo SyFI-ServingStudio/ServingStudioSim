@@ -18,11 +18,11 @@ use serde::Deserialize;
 use crate::arch::config::{
     AttnArchSel, FfnArchSel, Glm53NeuronSpec, IterArchSel, ModelSpec, RoutingKind,
 };
+use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::glm53_flash_neuron_fp8::{
     Glm53FlashNeuronFp8Model, Glm53FlashNeuronFp8SpeculativeModel, Glm53NeuronCore,
     Glm53NeuronImpls, Glm53NeuronParallel, KindTimeScale as Glm53NeuronKindTimeScale,
 };
-use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -2427,7 +2427,10 @@ pub fn glm53_flash_neuron_fp8_speculative(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashNeuronFp8SpeculativeModel> {
-    ensure!(draft_tokens > 0, "glm53_flash_neuron_fp8_speculative needs draft_tokens >= 1");
+    ensure!(
+        draft_tokens > 0,
+        "glm53_flash_neuron_fp8_speculative needs draft_tokens >= 1"
+    );
     Ok(Glm53FlashNeuronFp8SpeculativeModel {
         core: glm53_neuron_core(model_spec, spec, draft_tokens, gpu, name, bridge)?,
     })

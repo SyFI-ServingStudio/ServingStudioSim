@@ -1,10 +1,13 @@
 """DSA prefill (Neuron).
 
-The whole DSA block of one rank over one request chunk: MLA (NoPE) with TP-sharded heads, the replicated indexer and top-k selection, latent/indexer cache writes.
+The whole DSA block of one rank over one request chunk: MLA (NoPE) with TP-sharded heads, the
+replicated indexer and top-k selection, latent/indexer cache writes.
 
 Wire string ``'dsa_prefill'`` (Rust ``KernelSpec::KIND``); args and their order follow
-``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported from the glm5-trn2
-bench (bench_dsa.py kind dsa_prefill) by ``tools/neuron-bench-import`` and are never profiled live here.
+``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported
+from the glm5-trn2
+bench (bench_dsa.py kind dsa_prefill) by ``tools/neuron-bench-import`` and are never profiled live
+here.
 """
 
 from __future__ import annotations
@@ -22,7 +25,9 @@ KIND = "dsa_prefill"
 @dataclass(frozen=True)
 class DsaPrefillArgs(KernelArgs):
     num_tokens: int = arg(unit="tokens", doc="Tokens of the one request chunk (bucket-padded).")
-    context_len: int = arg(unit="tokens", doc="Context bucket the region reads ([:C], C >= start + T).")
+    context_len: int = arg(
+        unit="tokens", doc="Context bucket the region reads ([:C], C >= start + T)."
+    )
     hidden_size: int = arg(unit="elements", doc="Model hidden width.")
     num_heads: int = arg(unit="elements", doc="MLA heads on this rank (64 / attn_tp).")
     kv_lora_rank: int = arg(unit="elements", doc="Latent KV width.")
@@ -36,20 +41,25 @@ class DsaPrefillArgs(KernelArgs):
 
 DOC = KernelDoc(
     title="DSA prefill (Neuron)",
-    summary='The whole DSA block of one rank over one request chunk: MLA (NoPE) with TP-sharded heads, the replicated indexer and top-k selection, latent/indexer cache writes.',
+    summary=(
+        "The whole DSA block of one rank over one request chunk: MLA (NoPE) with TP-sharded "
+        "heads, the replicated indexer and top-k selection, latent/indexer cache writes."
+    ),
     description=(
         "One compiled region of the glm5-trn2 Neuron engine on one Trainium2 LNC2 logical core, "
         "at per-rank shapes (heads / experts / vocab of this rank). Rows are imported from the "
-        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are separate kinds."
+        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are"
+        " separate kinds."
     ),
     category="Attention",
     subcategory="DSA",
-    formula=('y = o_proj(MLA(q, latent[topk(indexer(q, keys[:C]))]))',),
+    formula=("y = o_proj(MLA(q, latent[topk(indexer(q, keys[:C]))]))",),
     default_metric="time_ms",
     method=(
         "NRT system-trace device time of one region per call (glmflash runtime.device_bench, "
         "median over the bench's iterations), imported by tools/neuron-bench-import; cells the "
-        "bench did not measure are derived rows (analytic x measured ratio, backend_version derived:*)."
+        "bench did not measure are derived rows (analytic x measured ratio, "
+        "backend_version derived:*)."
     ),
     caveats=("Imported, not profiled live: a missing row fails the build under --no-gpu.",),
     reference=None,

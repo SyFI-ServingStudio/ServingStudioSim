@@ -45,7 +45,9 @@ def write_inferencex_trace(
     rnd = random.Random(seed)
     n = (warmup + measure) * concurrency
     lo = int(isl * ratio)
-    header = "id,input_len,output_len,arrival_time" + (",accept_rate" if accept_rate is not None else "")
+    header = "id,input_len,output_len,arrival_time" + (
+        ",accept_rate" if accept_rate is not None else ""
+    )
     lines = [header]
     for i in range(n):
         row = f"{i},{rnd.randint(lo, isl)},{osl},0.0"
@@ -58,7 +60,9 @@ def write_inferencex_trace(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("output", type=Path)
     ap.add_argument("--conc", type=int, required=True)
     ap.add_argument("--isl", type=int, default=8192)
@@ -70,8 +74,15 @@ def main() -> None:
     ap.add_argument("--accept-rate", type=float, default=None)
     a = ap.parse_args()
     write_inferencex_trace(
-        a.output, concurrency=a.conc, isl=a.isl, osl=a.osl, ratio=a.ratio, warmup=a.warmup,
-        measure=a.measure, seed=a.seed, accept_rate=a.accept_rate,
+        a.output,
+        concurrency=a.conc,
+        isl=a.isl,
+        osl=a.osl,
+        ratio=a.ratio,
+        warmup=a.warmup,
+        measure=a.measure,
+        seed=a.seed,
+        accept_rate=a.accept_rate,
     )
 
 

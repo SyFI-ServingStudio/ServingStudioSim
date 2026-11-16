@@ -49,11 +49,14 @@ class Layout:
     dmax: int = 16
     regions: str = "layer"
     host: float = 1.0
+    # What-if device scales (arch kind_time_scale), ";"-separated `kind=factor`.
+    scales: str = ""
 
     @property
     def label(self) -> str:
         h = "" if self.host == 1.0 else f"_host{self.host:g}"
-        return f"tp{self.attn_tp}_chunk{self.chunk}_d{self.dmax}_{self.regions}{h}"
+        k = "".join(f"_{e.replace('=', 'x')}" for e in self.scales.split(";") if e)
+        return f"tp{self.attn_tp}_chunk{self.chunk}_d{self.dmax}_{self.regions}{h}{k}"
 
     def decode_buckets(self) -> list[int]:
         b, out = max(8, self.attn_tp), []
@@ -80,6 +83,7 @@ class Layout:
             "granularity": gran,
             "block_layers": block,
             "host": self.host,
+            "kts": [e for e in self.scales.split(";") if e],
         }
 
 
@@ -109,17 +113,34 @@ def memory_gb(lay: Layout) -> dict:
     kda_state = KDA_LAYERS * (hl * 128 * 128 * 4 + 3 * 3 * hl * 128 * 2)
     dsa_tok = DSA_LAYERS * (512 + 256) * 2
     pools = (lay.dmax + 1) * (kda_state + CMAX * dsa_tok)
-    return {"weights_gb": weights / 1e9, "pools_gb": pools / 1e9,
-            "fits": weights + pools + RESERVE_GB * 1e9 <= HBM_GB * 1e9}
+    return {
+        "weights_gb": weights / 1e9,
+        "pools_gb": pools / 1e9,
+        "fits": weights + pools + RESERVE_GB * 1e9 <= HBM_GB * 1e9,
+    }
 
 
 def stage_layouts(stage: str) -> list[Layout]:
     if stage == "main":
-        grid = itertools.product([1, 2, 4, 8, 16], [512, 1024, 2048, 4096], [8, 16, 32, 64],
-                                 ["layer"], [1.0])
+        grid = itertools.product(
+            [1, 2, 4, 8, 16], [512, 1024, 2048, 4096], [8, 16, 32, 64], ["layer"], [1.0]
+        )
     elif stage == "whatif":
-        grid = itertools.product([4, 8, 16], [1024, 2048], [16, 32, 64],
-                                 ["block4", "block15", "block45"], [1.0, 0.25])
+        grid = itertools.product(
+            [4, 8, 16], [1024, 2048], [16, 32, 64], ["block4", "block15", "block45"], [1.0, 0.25]
+        )
+    elif stage == "kernels":
+        # What the device would need: one region per forward, a quarter of the host time, and
+        # faster kernels (the decode-dominant MoE partial, mHC, DSA) alone and together.
+        scales = [
+            "moe_partial=0.25",
+            "moe_partial=0.25;mhc_pre=0.25;mhc_post=0.25",
+            "moe_partial=0.25;mhc_pre=0.25;mhc_post=0.25;dsa=0.5;kda=0.5",
+            "moe_partial=0.1;mhc_pre=0.1;mhc_post=0.1;dsa=0.25;kda=0.25",
+        ]
+        grid = itertools.product(
+            [4, 8, 16], [1024, 2048], [16, 32, 64], ["block45"], [0.25], scales
+        )
     elif stage == "smoke":
         grid = [(8, 2048, 16, "layer", 1.0)]
     else:
@@ -145,17 +166,25 @@ def preset(layouts: list[Layout], concs: list[int], log_root: Path, trace_dir: P
     base["workload"]["max_concurrency"] = "${conc}"
     base["io"]["log_dir"] = str(log_root / "{point}")
     arch = base["pools"]["main"]["groups"][0]["arch"]
-    arch.update(attn_tp="${attn_tp}", prefill_buckets="${prefill_buckets}",
-                decode_buckets="${decode_buckets}", slots="${slots}",
-                region_granularity="${granularity}", block_layers="${block_layers}",
-                host_time_scale="${host}", context_buckets=CONTEXT_BUCKETS)
+    arch.update(
+        attn_tp="${attn_tp}",
+        prefill_buckets="${prefill_buckets}",
+        decode_buckets="${decode_buckets}",
+        slots="${slots}",
+        region_granularity="${granularity}",
+        block_layers="${block_layers}",
+        host_time_scale="${host}",
+        kind_time_scale="${kts}",
+        context_buckets=CONTEXT_BUCKETS,
+    )
     worker = base["pools"]["main"]["groups"][0]["worker"]
-    worker.update(max_batch_tokens="${max_batch_tokens}", max_prefill_chunk_tokens="${chunk}",
-                  max_requests_per_partition="${max_req}")
+    worker.update(
+        max_batch_tokens="${max_batch_tokens}",
+        max_prefill_chunk_tokens="${chunk}",
+        max_requests_per_partition="${max_req}",
+    )
     base["compound"] = {
-        "point": {
-            f"{lay.label}__c{c}": lay.members(c, trace_dir) for lay in layouts for c in concs
-        }
+        "point": {f"{lay.label}__c{c}": lay.members(c, trace_dir) for lay in layouts for c in concs}
     }
     return base
 
@@ -167,8 +196,16 @@ def run(stage: str, out: Path, parallelism: int, concs: list[int]) -> list[dict]
     log_root = out / "runs"
     p = out / f"search_{stage}.yaml"
     p.write_text(yaml.safe_dump(preset(layouts, concs, log_root, trace_dir), sort_keys=False))
-    cmd = [sys.executable, "-m", "launcher", str(p), "--no-gpu", "--no-analyze",
-           "--parallelism", str(parallelism)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "launcher",
+        str(p),
+        "--no-gpu",
+        "--no-analyze",
+        "--parallelism",
+        str(parallelism),
+    ]
     print("[search]", len(layouts), "layouts x", len(concs), "concurrencies:", " ".join(cmd))
     subprocess.run(cmd, cwd=ROOT, check=False)
     return collect(layouts, concs, log_root, out / f"results_{stage}.json")
@@ -192,7 +229,11 @@ def collect(layouts: list[Layout], concs: list[int], log_root: Path, path: Path)
 def _error(run_dir: Path, e: Exception) -> str:
     log = run_dir / "stdout.log"
     if log.exists():
-        lines = [ln for ln in log.read_text(errors="replace").splitlines() if "exceed" in ln or "rror" in ln]
+        lines = [
+            ln
+            for ln in log.read_text(errors="replace").splitlines()
+            if "exceed" in ln or "rror" in ln
+        ]
         if lines:
             return lines[-1][-300:]
     return f"{type(e).__name__}: {e}"[:300]
@@ -214,8 +255,10 @@ def pareto(results: list[dict]) -> list[dict]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stage", default="main", choices=["smoke", "main", "whatif"])
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--stage", default="main", choices=["smoke", "main", "whatif", "kernels"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--parallelism", type=int, default=64)
     ap.add_argument("--concs", default=",".join(map(str, CONCS)))
@@ -223,21 +266,34 @@ def main() -> None:
     a = ap.parse_args()
     concs = [int(c) for c in a.concs.split(",")]
     if a.collect_only:
-        results = collect(stage_layouts(a.stage), concs, a.out / "runs", a.out / f"results_{a.stage}.json")
+        results = collect(
+            stage_layouts(a.stage), concs, a.out / "runs", a.out / f"results_{a.stage}.json"
+        )
     else:
         results = run(a.stage, a.out, a.parallelism, concs)
     ok = [r for r in results if "error" not in r]
     print(f"[search] {len(ok)} points, {len(results) - len(ok)} failed")
     for lay, mem in refused_layouts(a.stage):
-        print(f"  refused tp{lay.attn_tp} d{lay.dmax}: {mem['weights_gb']:.2f} GB weights + "
-              f"{mem['pools_gb']:.2f} GB pools per rank > {HBM_GB - RESERVE_GB:.2f} GB")
+        print(
+            f"  refused tp{lay.attn_tp} d{lay.dmax}: {mem['weights_gb']:.2f} GB weights + "
+            f"{mem['pools_gb']:.2f} GB pools per rank > {HBM_GB - RESERVE_GB:.2f} GB"
+        )
     for x in TARGETS:
         b = best_under(results, x)
-        print(f"intvty >= {x}: " + (f"{b['layout']} C={b['conc']} {b['tok_s_per_chip']:.1f} tok/s/chip "
-                                    f"(intvty {b['intvty']:.1f})" if b else "none"))
+        print(
+            f"intvty >= {x}: "
+            + (
+                f"{b['layout']} C={b['conc']} {b['tok_s_per_chip']:.1f} tok/s/chip "
+                f"(intvty {b['intvty']:.1f})"
+                if b
+                else "none"
+            )
+        )
     for r in pareto(results):
-        print(f"  pareto {r['layout']:36s} C={r['conc']:4d} {r['tok_s_per_chip']:8.1f} tok/s/chip "
-              f"intvty {r['intvty']:6.2f} ttft {r['ttft_s']:.2f}s")
+        print(
+            f"  pareto {r['layout']:36s} C={r['conc']:4d} {r['tok_s_per_chip']:8.1f} tok/s/chip "
+            f"intvty {r['intvty']:6.2f} ttft {r['ttft_s']:.2f}s"
+        )
     best = {r["layout"] + f"__c{r['conc']}": r for r in pareto(results)}
     bd = {}
     for key in list(best)[:6]:

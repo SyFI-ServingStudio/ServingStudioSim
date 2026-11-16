@@ -3,8 +3,10 @@
 The whole DSA block of one rank over a decode batch at one context bucket.
 
 Wire string ``'dsa_decode'`` (Rust ``KernelSpec::KIND``); args and their order follow
-``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported from the glm5-trn2
-bench (bench_dsa.py kind dsa_decode) by ``tools/neuron-bench-import`` and are never profiled live here.
+``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported
+from the glm5-trn2
+bench (bench_dsa.py kind dsa_decode) by ``tools/neuron-bench-import`` and are never profiled live
+here.
 """
 
 from __future__ import annotations
@@ -36,20 +38,22 @@ class DsaDecodeArgs(KernelArgs):
 
 DOC = KernelDoc(
     title="DSA decode (Neuron)",
-    summary='The whole DSA block of one rank over a decode batch at one context bucket.',
+    summary="The whole DSA block of one rank over a decode batch at one context bucket.",
     description=(
         "One compiled region of the glm5-trn2 Neuron engine on one Trainium2 LNC2 logical core, "
         "at per-rank shapes (heads / experts / vocab of this rank). Rows are imported from the "
-        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are separate kinds."
+        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are"
+        " separate kinds."
     ),
     category="Attention",
     subcategory="DSA",
-    formula=('y = o_proj(MLA(q, latent[topk(indexer(q, keys[:C]))]))',),
+    formula=("y = o_proj(MLA(q, latent[topk(indexer(q, keys[:C]))]))",),
     default_metric="time_ms",
     method=(
         "NRT system-trace device time of one region per call (glmflash runtime.device_bench, "
         "median over the bench's iterations), imported by tools/neuron-bench-import; cells the "
-        "bench did not measure are derived rows (analytic x measured ratio, backend_version derived:*)."
+        "bench did not measure are derived rows (analytic x measured ratio, "
+        "backend_version derived:*)."
     ),
     caveats=("Imported, not profiled live: a missing row fails the build under --no-gpu.",),
     reference=None,

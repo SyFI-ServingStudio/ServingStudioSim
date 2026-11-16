@@ -76,7 +76,9 @@ def fill_grid(measured: list[ImportRow], tps: list[int], world: int) -> list[Imp
         for backend in sorted(backends[kind] | defaults):
             series = ratios.get((kind, backend, json.dumps(cfg, sort_keys=True)), {})
             same_kind = [
-                v for (k, b, _), cs in ratios.items() if k == kind and b == backend
+                v
+                for (k, b, _), cs in ratios.items()
+                if k == kind and b == backend
                 for v in cs.values()
             ] or kind_ratios.get(kind, [])
             for cell in cells:
@@ -91,7 +93,9 @@ def fill_grid(measured: list[ImportRow], tps: list[int], world: int) -> list[Imp
                     r, how = statistics.median(same_kind), f"kind-median(n={len(same_kind)})"
                 else:
                     r, how = 1.0, "analytic"
-                out.append(ImportRow(kind, backend, args, base * r, f"derived:{how}", flops, nbytes))
+                out.append(
+                    ImportRow(kind, backend, args, base * r, f"derived:{how}", flops, nbytes)
+                )
                 have.add(row_key)
 
     # Collectives: every (op, group) the arch builds, over COMM_BYTES.
@@ -112,8 +116,17 @@ def fill_grid(measured: list[ImportRow], tps: list[int], world: int) -> list[Imp
                 if not pts:
                     raise SystemExit(f"no collective rows for {op} over {n} ranks ({fabric})")
                 t = _comm_interp(pts, b)
-                out.append(ImportRow(op, "neuron_cc", args, t, f"derived:comm-interp(n={len(pts)})",
-                                     bytes=b, comm=True))
+                out.append(
+                    ImportRow(
+                        op,
+                        "neuron_cc",
+                        args,
+                        t,
+                        f"derived:comm-interp(n={len(pts)})",
+                        bytes=b,
+                        comm=True,
+                    )
+                )
                 have.add(row_key)
     return out
 

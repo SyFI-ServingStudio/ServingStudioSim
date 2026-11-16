@@ -187,7 +187,10 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
 
     /// Cap every prefill chunk at `tokens` (the engine's compiled chunk).
     pub(crate) fn with_max_prefill_chunk_tokens(mut self, tokens: Option<u32>) -> Self {
-        assert!(tokens != Some(0), "max prefill chunk tokens must be positive");
+        assert!(
+            tokens != Some(0),
+            "max prefill chunk tokens must be positive"
+        );
         self.max_prefill_chunk_tokens = tokens;
         self
     }
@@ -195,7 +198,10 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     /// Admit a prompt only while its partition holds fewer than `requests`
     /// requests (decoding plus prefilling).
     pub(crate) fn with_max_requests_per_partition(mut self, requests: Option<u32>) -> Self {
-        assert!(requests != Some(0), "max requests per partition must be positive");
+        assert!(
+            requests != Some(0),
+            "max requests per partition must be positive"
+        );
         self.max_requests_per_partition = requests;
         self
     }

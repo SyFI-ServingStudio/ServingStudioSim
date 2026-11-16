@@ -171,7 +171,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"{key:40s} measured {c['measured']:5d}  derived {c['derived']:5d}")
     total_m = sum(c["measured"] for c in summary.values())
     total_d = sum(c["derived"] for c in summary.values())
-    print(f"{'(dry run) ' if a.dry_run else ''}{total_m} measured + {total_d} derived rows -> {a.db}")
+    print(
+        f"{'(dry run) ' if a.dry_run else ''}{total_m} measured + {total_d} derived rows -> {a.db}"
+    )
     if a.report:
         a.report.parent.mkdir(parents=True, exist_ok=True)
         sources = sorted({r.source.split(":")[1] for r in rows if r.source.startswith("imported:")})

@@ -28,25 +28,50 @@ COMM_BYTES = [16384, 262144, 1048576, 4194304, 16777216]
 
 
 def kda(tp: int) -> dict:
-    return dict(hidden_size=H, num_heads=KDA_HEADS // tp, head_dim=KDA_DIM, conv_kernel_size=CONV,
-                dtype="bf16", weight_dtype="bf16")
+    return dict(
+        hidden_size=H,
+        num_heads=KDA_HEADS // tp,
+        head_dim=KDA_DIM,
+        conv_kernel_size=CONV,
+        dtype="bf16",
+        weight_dtype="bf16",
+    )
 
 
 def dsa(tp: int) -> dict:
-    return dict(hidden_size=H, num_heads=MLA_HEADS // tp, kv_lora_rank=KV_LORA, head_dim=MLA_DIM,
-                index_heads=IDX_HEADS, index_head_dim=IDX_DIM, index_topk=IDX_TOPK, dtype="bf16",
-                weight_dtype="bf16")
+    return dict(
+        hidden_size=H,
+        num_heads=MLA_HEADS // tp,
+        kv_lora_rank=KV_LORA,
+        head_dim=MLA_DIM,
+        index_heads=IDX_HEADS,
+        index_head_dim=IDX_DIM,
+        index_topk=IDX_TOPK,
+        dtype="bf16",
+        weight_dtype="bf16",
+    )
 
 
 def moe(ep: int) -> dict:
-    return dict(hidden_size=H, num_experts=EXPERTS, top_k=TOP_K, local_experts=EXPERTS // ep,
-                intermediate_size=MOE_INTER, shared_intermediate_size=-(-MOE_INTER * SHARED // ep),
-                dtype="bf16", weight_dtype="fp8_e4m3")
+    return dict(
+        hidden_size=H,
+        num_experts=EXPERTS,
+        top_k=TOP_K,
+        local_experts=EXPERTS // ep,
+        intermediate_size=MOE_INTER,
+        shared_intermediate_size=-(-MOE_INTER * SHARED // ep),
+        dtype="bf16",
+        weight_dtype="fp8_e4m3",
+    )
 
 
 def dense(ep: int) -> dict:
-    return dict(hidden_size=H, intermediate_size=-(-DENSE_INTER // ep), dtype="bf16",
-                weight_dtype="fp8_e4m3")
+    return dict(
+        hidden_size=H,
+        intermediate_size=-(-DENSE_INTER // ep),
+        dtype="bf16",
+        weight_dtype="fp8_e4m3",
+    )
 
 
 def router() -> dict:
@@ -98,6 +123,7 @@ def comm_groups(tps: list[int], world: int) -> list[tuple[int, str]]:
 # Default implementation of each kind (the Rust arch's Glm53NeuronImpls::default()).
 DEFAULT_IMPL = {
     "kda_prefill": "torch", "kda_decode": "torch", "dsa_prefill": "radix", "dsa_decode": "radix",
-    "moe_partial": ("dense_local", "cte_hybrid"), "dense_ffn_partial": "dense", "moe_router": "fp32",
+    "moe_partial": ("dense_local", "cte_hybrid"), "dense_ffn_partial": "dense",
+    "moe_router": "fp32",
     "mhc_pre": "torch_bf16", "mhc_post": "torch", "lm_head": "torch", "embed": "torch",
 }  # fmt: skip

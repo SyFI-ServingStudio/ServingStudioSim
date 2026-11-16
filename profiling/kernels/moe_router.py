@@ -3,7 +3,8 @@
 The replicated fp32 router alone (logits, sigmoid, bias, top-k) over the gathered rows.
 
 Wire string ``'moe_router'`` (Rust ``KernelSpec::KIND``); args and their order follow
-``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported from the glm5-trn2
+``doc/pr/trn2-glm53-flash/L1_CONTRACT.md``. Every backend is ``neuron_<impl>``; rows are imported
+from the glm5-trn2
 bench (bench_moe.py kind router) by ``tools/neuron-bench-import`` and are never profiled live here.
 """
 
@@ -30,20 +31,24 @@ class MoeRouterArgs(KernelArgs):
 
 DOC = KernelDoc(
     title="MoE router (Neuron)",
-    summary='The replicated fp32 router alone (logits, sigmoid, bias, top-k) over the gathered rows.',
+    summary=(
+        "The replicated fp32 router alone (logits, sigmoid, bias, top-k) over the gathered rows."
+    ),
     description=(
         "One compiled region of the glm5-trn2 Neuron engine on one Trainium2 LNC2 logical core, "
         "at per-rank shapes (heads / experts / vocab of this rank). Rows are imported from the "
-        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are separate kinds."
+        "engine's own benchmark (L1_CONTRACT.md); the region's TP / world collectives are"
+        " separate kinds."
     ),
     category="MoE",
     subcategory="Routing and combine",
-    formula=('topk(sigmoid(W_r x) + bias)',),
+    formula=("topk(sigmoid(W_r x) + bias)",),
     default_metric="time_ms",
     method=(
         "NRT system-trace device time of one region per call (glmflash runtime.device_bench, "
         "median over the bench's iterations), imported by tools/neuron-bench-import; cells the "
-        "bench did not measure are derived rows (analytic x measured ratio, backend_version derived:*)."
+        "bench did not measure are derived rows (analytic x measured ratio, "
+        "backend_version derived:*)."
     ),
     caveats=("Imported, not profiled live: a missing row fails the build under --no-gpu.",),
     reference=None,

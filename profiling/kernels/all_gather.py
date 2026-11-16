@@ -65,7 +65,10 @@ register(
         KIND,
         "cc",
         AllGatherArgs,
-        "torch functional all_gather traced into one compiled region (gloo world, a process per core).",
+        (
+            "torch functional all_gather traced into one compiled region (gloo world, a "
+            "process per core)."
+        ),
         compute=None,
         metric_family=MetricFamily.COMM,
     )

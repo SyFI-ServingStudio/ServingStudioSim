@@ -30,8 +30,16 @@ CORES_PER_CHIP = 4
 def _requests(run: Path) -> list[dict]:
     import pyarrow.parquet as pq
 
-    cols = ["request_id", "completed", "arrival_time_ms", "ttft_ms", "num_output_tokens",
-            "finish_decode_time_ms", "prefill_processed", "fresh_prompt_tokens"]
+    cols = [
+        "request_id",
+        "completed",
+        "arrival_time_ms",
+        "ttft_ms",
+        "num_output_tokens",
+        "finish_decode_time_ms",
+        "prefill_processed",
+        "fresh_prompt_tokens",
+    ]
     return pq.read_table(run / "raw" / "request_slo.parquet", columns=cols).to_pylist()
 
 
@@ -43,7 +51,7 @@ def chips(run: Path) -> float:
 def point(run: Path, conc: int, warmup: int = 2) -> dict:
     reqs = [r for r in _requests(run) if r["completed"]]
     reqs.sort(key=lambda r: r["finish_decode_time_ms"])
-    meas = reqs[warmup * conc:]
+    meas = reqs[warmup * conc :]
     if not meas:
         raise ValueError(f"{run}: no measured requests after {warmup * conc} warm-up completions")
     t0 = min(r["arrival_time_ms"] for r in meas)
@@ -79,7 +87,7 @@ def _multiplicity(manifest: dict) -> list[int]:
 
     def walk(i: int, m: int) -> None:
         node = nodes[i]
-        (op, body), = node.items()
+        ((op, body),) = node.items()
         if op == "Leaf":
             mult[body] = m
             return
@@ -134,13 +142,17 @@ def breakdown(run: Path) -> dict:
         out[key] = {
             "steps": n,
             "step_ms": step_ms[key] / n,
-            "kinds": dict(sorted(((k, v / n) for k, v in sums[key].items()), key=lambda kv: -kv[1])),
+            "kinds": dict(
+                sorted(((k, v / n) for k, v in sums[key].items()), key=lambda kv: -kv[1])
+            ),
         }
     return out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("run", type=Path)
     ap.add_argument("--conc", type=int, required=True)
     ap.add_argument("--warmup", type=int, default=2)
