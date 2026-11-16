@@ -167,7 +167,8 @@ def run(stage: str, out: Path, parallelism: int, concs: list[int]) -> list[dict]
     log_root = out / "runs"
     p = out / f"search_{stage}.yaml"
     p.write_text(yaml.safe_dump(preset(layouts, concs, log_root, trace_dir), sort_keys=False))
-    cmd = [sys.executable, "-m", "launcher", str(p), "--no-gpu", "--parallelism", str(parallelism)]
+    cmd = [sys.executable, "-m", "launcher", str(p), "--no-gpu", "--no-analyze",
+           "--parallelism", str(parallelism)]
     print("[search]", len(layouts), "layouts x", len(concs), "concurrencies:", " ".join(cmd))
     subprocess.run(cmd, cwd=ROOT, check=False)
     return collect(layouts, concs, log_root, out / f"results_{stage}.json")

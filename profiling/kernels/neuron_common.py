@@ -30,8 +30,8 @@ RUNNER_MODULE = "profiling.runners.neuron.imported"
 
 # The bench `impl` values each GLM-5.3-Flash kind is registered for.
 GLM_IMPLS: dict[str, tuple[str, ...]] = {
-    "kda_prefill": ("torch", "torch_barrier"),
-    "kda_decode": ("torch",),
+    "kda_prefill": ("torch", "torch_barrier", "torch_nobarrier"),
+    "kda_decode": ("torch", "torch_nobarrier"),
     "dsa_prefill": ("radix", "topk"),
     "dsa_decode": ("radix", "topk"),
     "moe_partial": ("auto", "dense_local", "cte_hybrid"),

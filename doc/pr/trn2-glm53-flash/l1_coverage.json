@@ -3,6 +3,7 @@
  "bench_dir": "/home/ec2-user/glm5-trn2/logs/bench",
  "sources": [
   "dsa.jsonl",
+  "kda.jsonl",
   "mhc_embed.jsonl",
   "mhc_lm_head.jsonl",
   "mhc_mhc_post.jsonl",
@@ -21,24 +22,32 @@
    "derived": 2
   },
   "dsa_decode:neuron_radix": {
-   "measured": 37,
-   "derived": 188
+   "measured": 48,
+   "derived": 177
   },
   "dsa_prefill:neuron_radix": {
-   "measured": 29,
-   "derived": 131
+   "measured": 38,
+   "derived": 122
   },
   "embed:neuron_torch": {
    "measured": 70,
    "derived": 0
   },
   "kda_decode:neuron_torch": {
-   "measured": 0,
-   "derived": 45
+   "measured": 24,
+   "derived": 21
+  },
+  "kda_decode:neuron_torch_nobarrier": {
+   "measured": 24,
+   "derived": 21
   },
   "kda_prefill:neuron_torch": {
-   "measured": 0,
-   "derived": 35
+   "measured": 18,
+   "derived": 17
+  },
+  "kda_prefill:neuron_torch_nobarrier": {
+   "measured": 18,
+   "derived": 17
   },
   "lm_head:neuron_torch": {
    "measured": 45,

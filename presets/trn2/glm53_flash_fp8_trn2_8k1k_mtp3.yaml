@@ -1,0 +1,58 @@
+# GLM-5.3-Flash FP8 on one trn2.48xlarge with the MTP PLACEHOLDER (k = 3 drafts): the seed engine
+# has no MTP yet. Same layout as glm53_flash_fp8_trn2_8k1k.yaml; the decode forward verifies
+# B x (k + 1) rows (KDA / DSA decode rows at that width), then one MTP pass (embed, one DSA + MoE
+# layer, head) over the verify rows and k - 1 draft passes of B rows; the prefill forward adds an
+# MTP pass over the chunk. Acceptance is synthetic: every draft position accepts with p = 0.8105,
+# whose chain acceptance length 1 + p + p^2 + p^3 = 3.00 is InferenceX's golden glm-5.3-flash AL at
+# k = 3 (golden: k=1 1.86, 2 2.52, 3 3.00, 4 3.35, 5 3.60; arch::golden_accept_rate). Decode
+# buckets count requests; the verify rows are bucket x (k + 1).
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_8k1k_mtp3/{point}"
+
+pools:
+  main:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8_speculative
+          draft_tokens: 3
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: [8, 16]
+          context_buckets: [2048, 4096, 8192, 9216]
+          slots: 17
+          cmax: 9216
+          max_model_len: 9216
+        worker:
+          type: speculative
+          draft_tokens: 3
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2112
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: 16
+          dp_placement: vllm-least-loaded
+
+compound:
+  point:
+    c4: {conc: 4, traces: [presets/trn2/inferencex_8k1k_mtp3_c4.csv]}
+    c8: {conc: 8, traces: [presets/trn2/inferencex_8k1k_mtp3_c8.csv]}
+    c16: {conc: 16, traces: [presets/trn2/inferencex_8k1k_mtp3_c16.csv]}
+    c32: {conc: 32, traces: [presets/trn2/inferencex_8k1k_mtp3_c32.csv]}
+    c64: {conc: 64, traces: [presets/trn2/inferencex_8k1k_mtp3_c64.csv]}
+    c128: {conc: 128, traces: [presets/trn2/inferencex_8k1k_mtp3_c128.csv]}
+    c256: {conc: 256, traces: [presets/trn2/inferencex_8k1k_mtp3_c256.csv]}
