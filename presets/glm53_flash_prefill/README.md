@@ -41,11 +41,11 @@ otherwise. Run any preset from the repository root:
 | `sessions_ssd_size.yaml` | v3 M6 sessions at N = 300, 400: SSD 32-256 GB under the full and tiers settings |
 | `v3_m6_full.yaml` | v3 M6 sessions, N = 300, full setting (HBM 100.18 + DRAM 50 + SSD 128 GB) |
 | `v3_m6_dram128_ssd8t.yaml` | v3 M6 sessions, N = 300, HBM 100.18 + DRAM 128 GB + SSD 8 TB |
-| `v3_8h_steady.yaml` | v3 closed loop of 2,000 sessions for 8 hours, DRAM 150 GB + SSD 8 TB |
 
 The `check_*` presets read bring-up CSVs from `bringup/` (from the v2 handoff's `data/bringup/`). They are not
 committed; generate them in place before running one of those presets:
 `uv run python presets/glm53_flash_prefill/bringup/make_bringup.py` (deterministic; the script's docstring describes
 each file). `tests/test_glm53_flash_prefill_presets.py` regenerates them itself. The v3 session
-traces (`trace/sessions_2ps_v3.csv`, `trace/closed_c2000_v3.csv`) are not committed; their manifests and the
-closed-loop generator are under `traces/`.
+traces (`trace/sessions_2ps_v3.csv`, `trace/closed_c2000_v3.csv`) are not committed; the session trace's manifest and
+the closed-loop generator are under `traces/`. The 8 h closed-loop preset that read `trace/closed_c2000_v3.csv` is the
+tuned preset `presets/tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.yaml` (its manifest is beside it).

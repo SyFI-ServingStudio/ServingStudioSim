@@ -1,7 +1,12 @@
 # Branch `artifact-glm-5.3-flash-prefill`
 
-Research material for GLM-5.3-Flash NVFP4 prefill on B200 PP4, kept off `pp-tiers`: this branch is `pp-tiers` plus
-`presets/glm53_flash_prefill/` and its test, exactly as at `f1587d7c`.
+Research material for GLM-5.3-Flash NVFP4 prefill on B200 PP4, kept off `pp-tiers`: this branch is `pp-tiers` (merged
+in) plus `presets/glm53_flash_prefill/` and its test, as at `f1587d7c` except for the 8 h preset below.
+
+- The 8 h closed-loop preset (2,000 v3 sessions, DRAM 150 GB + SSD 8 TB, formerly `v3_8h_steady.yaml` here) is now
+  the SSEngine tuned preset on `pp-tiers`: `presets/tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.yaml`, with
+  its trace manifest `closed_c2000_v3.manifest.json` beside it and its 8 h / 24 h results in
+  `b200_pp4_prefill.md`.
 
 - Code: the presets need `pp-tiers`' simulator (the `pipeline_chunked_prefill` worker with per-rank host tiers,
   `external_decode`, the staged loading area, the `good` scheduler keys). They share the SSEngine preset's backends
@@ -13,5 +18,5 @@ Research material for GLM-5.3-Flash NVFP4 prefill on B200 PP4, kept off `pp-tier
     regenerates them);
   - `sessions_*.yaml`, `v3_m6_*.yaml`: `trace/sessions_2ps_v3.csv` (manifest `traces/sessions_2ps_v3.manifest.json`,
     the same file as the SSEngine preset's);
-  - `v3_8h_steady.yaml`: `trace/closed_c2000_v3.csv` (manifest `traces/closed_c2000_v3.manifest.json`, generator
-    `traces/session_closed_loop.py`).
+  - the closed-loop trace generator `traces/session_closed_loop.py` makes `trace/closed_c2000_v3.csv`, which the
+    tuned preset reads (manifest: `presets/tuned_engine/GLM-5.3-Flash-NVFP4/closed_c2000_v3.manifest.json`).
