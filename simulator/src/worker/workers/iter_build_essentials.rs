@@ -91,6 +91,7 @@ pub(crate) fn kv_cache_store(
         sampler,
         prefix_cache_logger,
     )
+    .with_external_decode(config.external_decode)
 }
 
 /// The token boundary non-final prefill chunks end on, if any: the layout's

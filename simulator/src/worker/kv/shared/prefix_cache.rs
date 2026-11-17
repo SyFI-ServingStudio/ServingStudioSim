@@ -238,6 +238,9 @@ pub(crate) struct PrefixCacheInsertResult {
 pub(crate) struct PrefixCache {
     accounting: SharedKvAccounting,
     retention: StateRetention,
+    /// Round-end states a round adds to its context
+    /// ([`Self::states_added_per_round`]).
+    added_per_round: u32,
     max_retained_units: u64,
     /// Units the entries occupy, the sum of their charges, plus the states
     /// running requests carry.
@@ -261,6 +264,7 @@ impl PrefixCache {
         Self {
             max_retained_units: budget.max_retained_units.min(accounting.capacity_units()),
             retention: accounting.state_retention(),
+            added_per_round: 1,
             accounting,
             used_units: 0,
             used_tokens: 0,
@@ -270,6 +274,20 @@ impl PrefixCache {
             eviction_order: BTreeSet::new(),
             next_sequence: 0,
         }
+    }
+
+    /// Round-end states a round adds to its context: its pass's end, and
+    /// with a decode run elsewhere the handed-back decode's end; 1 unless
+    /// [`Self::set_states_added_per_round`]. A take carries the states that
+    /// survive that many more, and a host tier's read moves the same ones
+    /// (the store builds its tier chains with this value).
+    pub(crate) fn states_added_per_round(&self) -> u32 {
+        self.added_per_round
+    }
+
+    pub(crate) fn set_states_added_per_round(&mut self, added: u32) {
+        assert!(added >= 1, "a round leaves at least its pass's end state");
+        self.added_per_round = added;
     }
 
     /// Context tokens held, as receipts report them. Every capacity decision
@@ -330,10 +348,10 @@ impl PrefixCache {
                 .states()
                 .filter(|state| state.at <= u64::from(hit_tokens))
                 .collect();
-            // HBM leaves room for one state the round adds, also when its
-            // decode runs elsewhere; a tier read leaves room for both.
             let carried = Carried {
-                states: self.retention.survivors(&below, resume.tag, 1),
+                states: self
+                    .retention
+                    .survivors(&below, resume.tag, self.added_per_round),
                 resume: Some(resume.tag),
             };
             self.used_units += self.state_units(carried.states.len());
@@ -1077,9 +1095,10 @@ mod tests {
         // 3_010 tokens and states at 1_000, 3_000 and 3_010.
         assert_eq!(cache.used_units(), 3_010 + 3 * 500);
         // Round 3 takes the entry: it carries the states that survive its
-        // pass, still charged, while its own state is live. HBM leaves room
-        // for one added state only, so the hand-back end at 3_010 survives
-        // beside the round-2 anchor at 3_000.
+        // pass, still charged, while its own state is live. The cache counts
+        // one added state (the default: round 3 shares its context back
+        // instead of handing back a decode), so the hand-back end at 3_010
+        // survives beside the round-2 anchor at 3_000.
         cache.take(1, 3_011);
         assert_eq!(cache.used_units(), 2 * 500);
         let carried = cache.take_carried(1);
@@ -1087,6 +1106,61 @@ mod tests {
         assert_eq!(carried.resume.map(|tag| tag.round), Some(2));
         cache.share(1, 4_000, 3_011, carried, 1_000_000);
         assert_eq!(cache.used_units(), 4_000 + 3 * 500);
+    }
+
+    /// With the decode run elsewhere a round adds two states, its pass's end
+    /// and the handed-back decode's end. A round resuming from an earlier
+    /// state inside the entry then carries the same states whether it takes
+    /// the entry from HBM or reads it back from a host tier first.
+    #[test]
+    fn an_inside_round_carries_the_same_states_from_hbm_and_from_a_tier() {
+        use crate::common::Time;
+        use crate::worker::kv::shared::tier_chain::{
+            TierBytes, TierChain, TierSpec, TierStateOptions, TierWrites,
+        };
+        // (states kept, the states the inside round carries)
+        for (k, expected) in [(2, vec![]), (3, vec![2_000])] {
+            let mut hbm = round_end_cache(1_000_000, k);
+            hbm.set_states_added_per_round(2);
+            // k = 2: states at 2_000 and 2_010; k = 3: also 1_010.
+            hand_back_rounds(&mut hbm, 2);
+            let entry = &hbm.entries[&1];
+            let mut chain = TierChain::new(
+                &[TierSpec {
+                    name: "dram",
+                    capacity_gb: 1.0,
+                    read_gb_per_s: 1.0,
+                    writes: TierWrites::Evictions,
+                }],
+                TierBytes {
+                    per_token: 1,
+                    state: 500,
+                },
+                StateRetention::Latest { k },
+                hbm.states_added_per_round(),
+                TierStateOptions::default(),
+            );
+            chain.take_hbm_eviction(LeavingContext {
+                session_id: 1,
+                positions: entry.positions,
+                end: entry.end,
+                earlier: entry.earlier.clone(),
+            });
+            // The round keeps 2_005 tokens: it resumes from round 1's pass end.
+            let hit = chain.lookup(1, 2_005).expect("the tier holds the entry");
+            assert_eq!(hit.tokens, 2_000);
+            let read = chain.read(1, hit, 0, Time::ZERO);
+            let mut restored = round_end_cache(1_000_000, k);
+            restored.set_states_added_per_round(2);
+            restored.restore(1, read.positions, read.end, read.earlier, 1_000_000);
+            restored.take(1, 2_005);
+            let from_tier = restored.take_carried(1);
+            hbm.take(1, 2_005);
+            let from_hbm = hbm.take_carried(1);
+            assert_eq!(positions(&from_hbm), positions(&from_tier), "k {k}");
+            assert_eq!(positions(&from_hbm), expected, "k {k}");
+            assert_eq!(from_hbm.resume, from_tier.resume, "k {k}");
+        }
     }
 
     #[test]

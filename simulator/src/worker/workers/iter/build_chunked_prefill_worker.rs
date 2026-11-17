@@ -92,7 +92,6 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &config.prefix_tiers,
         tier_bytes,
         TierStateOptions {
-            added_per_round: 1 + u32::from(config.external_decode),
             compression_ratio: config.tier_state_compression_ratio,
             anchors_in_place: config.recurrent_state_anchors_in_place,
         },

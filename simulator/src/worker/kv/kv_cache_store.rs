@@ -853,8 +853,26 @@ impl KvCacheStore {
         }
     }
 
+    /// A decode run elsewhere hands each round's output back
+    /// (`external_decode`): a round then adds two round-end states, its pass's
+    /// end and the decode's, to one otherwise. Every partition's prefix cache
+    /// takes, and its host tiers (built after this) read, the states that
+    /// survive that many.
+    pub(crate) fn with_external_decode(mut self, external_decode: bool) -> Self {
+        assert!(
+            self.tier_chains.is_empty(),
+            "set external decode before the host tiers, which take its state count"
+        );
+        for cache in &mut self.prefix_caches {
+            cache.set_states_added_per_round(1 + u32::from(external_decode));
+        }
+        self
+    }
+
     /// Put `specs`'s host tiers, fastest first, behind each partition's
     /// prefix cache, storing `bytes` per context token and state on each GPU.
+    /// A tier read moves the states that survive the round as an HBM take
+    /// keeps them ([`Self::with_external_decode`]).
     pub(crate) fn with_prefix_tiers(
         mut self,
         specs: &[TierSpec],
@@ -864,9 +882,14 @@ impl KvCacheStore {
         if !specs.is_empty() {
             let retention = self.accounting.state_retention();
             let logging = self.journal.is_logging();
+            let added_per_round = self
+                .prefix_caches
+                .first()
+                .map_or(1, PrefixCache::states_added_per_round);
             self.tier_chains = (0..self.partitions.len())
                 .map(|_| {
-                    let mut chain = TierChain::new(specs, bytes, retention, options);
+                    let mut chain =
+                        TierChain::new(specs, bytes, retention, added_per_round, options);
                     if logging {
                         chain.record_events();
                     }

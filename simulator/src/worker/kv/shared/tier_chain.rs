@@ -41,9 +41,9 @@
 //! the KV HBM lacks and, of the entry's states at or before the hit, only those
 //! that survive the round it serves ([`StateRetention::survivors`]): the state
 //! it resumes from and the latest earlier ones still kept once the round adds
-//! its own ([`TierStateOptions::added_per_round`]: its pass's end, and with a
-//! decode run elsewhere the handed-back decode's end). Writes are free: only
-//! counted.
+//! its own (`added_per_round`, the HBM prefix cache's value, passed in by the
+//! store: its pass's end, and with a decode run elsewhere the handed-back
+//! decode's end). Writes are free: only counted.
 //!
 //! With anchors kept in place ([`TierStateOptions::anchors_in_place`]), an
 //! anchor ([`StateRetention::anchors`]: a kept state that is neither the
@@ -118,10 +118,6 @@ pub const DRAM_TIER: &str = "dram";
 /// How tiers move recurrent states, beside the retention that picks them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TierStateOptions {
-    /// Round-end states a round adds to its context: its pass's end, and with
-    /// a decode run elsewhere the handed-back decode's end. A read moves only
-    /// the states that survive that many more.
-    pub added_per_round: u32,
     /// Tiers store a state over this ratio, rounded up; `1`: as HBM holds it.
     pub compression_ratio: f64,
     /// Each anchor stays in the tier it first lands in; needs
@@ -132,7 +128,6 @@ pub struct TierStateOptions {
 impl Default for TierStateOptions {
     fn default() -> Self {
         Self {
-            added_per_round: 1,
             compression_ratio: 1.0,
             anchors_in_place: false,
         }
@@ -547,6 +542,11 @@ pub(crate) struct TierChain {
     /// One state in tier tokens, decoded as HBM holds it.
     decoded_state_tokens: u64,
     retention: StateRetention,
+    /// Round-end states a round adds to its context: its pass's end, and with
+    /// a decode run elsewhere the handed-back decode's end. A read moves only
+    /// the states that survive that many more, as an HBM take keeps
+    /// ([`super::prefix_cache::PrefixCache::states_added_per_round`]).
+    added_per_round: u32,
     options: TierStateOptions,
     /// Staged loading; `None`: reads land straight in HBM.
     loading: Option<LoadingAreas>,
@@ -559,10 +559,11 @@ impl TierChain {
         specs: &[TierSpec],
         bytes: TierBytes,
         retention: StateRetention,
+        added_per_round: u32,
         options: TierStateOptions,
     ) -> Self {
         assert!(
-            options.added_per_round >= 1,
+            added_per_round >= 1,
             "a round leaves at least its pass's end state"
         );
         assert!(
@@ -602,6 +603,7 @@ impl TierChain {
             state_tokens: bytes.tokens_of(options.stored_state_bytes(bytes.state)),
             decoded_state_tokens: bytes.state_tokens(),
             retention,
+            added_per_round,
             options,
             loading: None,
             events: None,
@@ -1230,7 +1232,7 @@ impl TierChain {
             .collect();
         let mut moved = self
             .retention
-            .survivors(&below, resume.tag, self.options.added_per_round);
+            .survivors(&below, resume.tag, self.added_per_round);
         moved.retain(|state| state.at < hit.tokens);
         moved
     }
@@ -1439,6 +1441,7 @@ mod tests {
                 state: state_bytes,
             },
             StateRetention::Latest { k: states },
+            1,
             TierStateOptions::default(),
         )
     }
@@ -1853,10 +1856,8 @@ mod tests {
                     state: 10_000,
                 },
                 StateRetention::Latest { k },
-                TierStateOptions {
-                    added_per_round,
-                    ..TierStateOptions::default()
-                },
+                added_per_round,
+                TierStateOptions::default(),
             );
             for (tokens, shared) in [(100, 0), (120, 100), (150, 120), (180, 150)] {
                 chain.store_round(1, round(tokens, shared));
@@ -1913,8 +1914,8 @@ mod tests {
                 count: 1,
                 stride: 2,
             },
+            2,
             TierStateOptions {
-                added_per_round: 2,
                 anchors_in_place: in_place,
                 ..TierStateOptions::default()
             },
@@ -2308,6 +2309,7 @@ mod tests {
                 state: 50_000_000,
             },
             StateRetention::Latest { k: 2 },
+            1,
             TierStateOptions {
                 compression_ratio: ratio,
                 ..TierStateOptions::default()

@@ -56,9 +56,10 @@ the simulator models differently; the right column says how to check it.
 - **Null block.** The simulator's engine overhead is one null block of 128 tokens (204 KiB). The engine's reserved
   pages are 未验证 (`FakeConfig.num_blocks` comment counts one null block of 8,576 tokens before pages).
 - **External decode and the kept states.** The engine has no hand-back: a round adds one state, and a tier read moves
-  only the state the round resumes from (`kept_states.md`). The simulator's HBM take keeps survivors with one added
-  state, but its tier reads use `1 + external_decode` = 2 added states, so with k = 2 no earlier state survives a
-  tier read. At this preset's k = 1 no earlier state is kept, so neither acts. Not fixed.
+  only the state the round resumes from (`kept_states.md`). The simulator's round under `external_decode` adds two
+  (its pass's end and the handed-back decode's end), and an HBM take and a tier read both keep the states that
+  survive those two, so with k = 2 a round carries no earlier state either way. At this preset's k = 1 no earlier
+  state is kept, so the count does not act.
 - **Host costs.** Plan forming, dispatch and admission host time (scheduler.md "Low load": ~4 ms before a GPU start)
   are not in the simulator.
 
@@ -82,6 +83,12 @@ committed):
   preset with only `recurrent_state_checkpoints: 1`, i.e. this preset); the k = 2 column and `evaleng` come from
   the same report (§3, §5, §6). eval_m6 deviations are computed from report.md's two-decimal r/s.
 
+The k = 2 numbers predate the unified state count (an HBM take then counted one added state under
+`external_decode`, a tier read two); the current code carries one state fewer per running round there, so they are
+not what k = 2 gives now (未跑 at the current code). The k = 1 numbers are unaffected: one kept state carries no
+earlier state, and the unit-8 regression's `external_decode` k = 1 runs are byte-identical across the change
+(`logs/20261114_10_pp_u8_preset/regress/compare.txt`).
+
 | Anchor | This preset (k = 1) | Target | Deviation and where it comes from |
 | --- | --- | --- | --- |
 | Scheduling check, `good` | 58 microbatches, all 58 chunk for chunk; 128k TTFT 1,875.1 ms | 58; 1,862.8 ms | +0.66% worst TTFT. Every microbatch's compute is 0.0-0.9% above T (41 of 58 above); the order is exact. The per-kernel source of the 0.9% (profile.db rows vs T's 20261016 profile.db.new) is 未验证: compare the two runs' cost_log kernel times. k = 2 gives the same request table byte for byte |
@@ -104,6 +111,6 @@ less recompute than measured), whose cause is 未验证. No measured run of the 
 `RunConfig.kept_states`).
 
 `external_decode: false` gave per-request identical results in all 18 tiered/untiered pairs run at k = 2 (sessions
-v2 and eval_m6, 2026-11-14): on these traces every round resumes at its context's end, where a tier read moves no
-earlier state under either assumption (`StateRetention::survivors`). At k = 1 no earlier state is kept at all; the
+v2 and eval_m6, 2026-11-14, when an HBM take still counted one added state): on these traces every round resumes
+at its context's end, where a tier read moves no earlier state under either count (`StateRetention::survivors`). At k = 1 no earlier state is kept at all; the
 `ed_off` pairs were not rerun at k = 1 (未跑).

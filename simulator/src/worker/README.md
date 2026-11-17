@@ -205,9 +205,12 @@ With `prefix_tier_loading_area` > 0 reads are staged: a loading area of
 `floor(capacity x fraction)` units stays held on HBM (and a DRAM area carved
 from DRAM when SSD is behind it); a staged read holds only what it lands, starts
 when it fits its area or the area is empty, and an SSD read lands in DRAM before
-it hops on to HBM on DRAM's channel. `TierStateOptions` sets how tiers move
-states: the states a round adds (`1 + external_decode`, which a read leaves
-room for), `tier_state_compression_ratio` (stored size in tiers and on SSD,
+it hops on to HBM on DRAM's channel. A read
+moves the states that survive the round as an HBM take carries them: the states
+a round adds (`1 + external_decode`) are set once, by
+`KvCacheStore::with_external_decode` on each prefix cache, and the tier chains
+take that value. `TierStateOptions` sets the rest of how tiers move states:
+`tier_state_compression_ratio` (stored size in tiers and on SSD,
 decoded on DRAM's channel and in HBM's area), and
 `recurrent_state_anchors_in_place`. With `external_decode` the store's
 `release_handing_back` / `hand_back_context` split a request's release from its
