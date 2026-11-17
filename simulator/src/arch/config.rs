@@ -177,14 +177,17 @@ const fn default_glm53_neuron_block_layers() -> u32 {
 const fn default_glm53_neuron_true() -> bool {
     true
 }
-/// Fitted on the glm5-trn2 seed engine (doc/pr/trn2-glm53-flash/ALIGNMENT.md);
-/// `forward_overhead_ms` and `mtp_forward_overhead_ms` keep the trn2-flashnext
-/// fit (not identifiable: the seed engine's forwards are device-bound).
+/// Fitted on the glm5-trn2 seed engine (doc/pr/trn2-glm53-flash/ALIGNMENT.md).
+/// `forward_overhead_ms` with the layer `region_host_ms` (0.9) is the measured
+/// host dispatch of a whole decode forward on the slowest rank (42-46 ms for 48
+/// regions, engine throttle lifted; glm5-trn2 round-2 Tick host probe): the
+/// device-bound serving timelines cannot identify it. `mtp_forward_overhead_ms`
+/// keeps the trn2-flashnext fit.
 const fn default_glm53_neuron_region_gap_ms() -> f64 {
     0.1
 }
 const fn default_glm53_neuron_forward_overhead_ms() -> f64 {
-    19.0
+    2.0
 }
 const fn default_glm53_neuron_mtp_forward_overhead_ms() -> f64 {
     2.0
@@ -286,7 +289,7 @@ pub struct Glm53NeuronSpec {
     pub region_gap_ms: f64,
     /// Host work per target forward (ms), overlapping the device.
     #[serde(default = "default_glm53_neuron_forward_overhead_ms")]
-    #[param(default = 19.0)]
+    #[param(default = 2.0)]
     pub forward_overhead_ms: f64,
     /// Host work per MTP forward (ms).
     #[serde(default = "default_glm53_neuron_mtp_forward_overhead_ms")]

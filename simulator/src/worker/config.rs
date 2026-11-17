@@ -458,6 +458,28 @@ pub enum IterWorkerSel {
         /// and cap running requests at their largest decode bucket.
         #[serde(default)]
         max_requests_per_partition: Option<u32>,
+        /// Decode-protected waves (the glm5-trn2 service scheduler) instead of
+        /// continuous admission: waiting requests start together once the
+        /// worker is empty and quiet, prefill-only iterations (one chunk per
+        /// partition, round-robin over its prompts) run until every prompt is
+        /// done, then decode-only iterations until the wave drains.
+        #[serde(default)]
+        #[param(default = false)]
+        wave_admission: bool,
+        /// Wave start: no arrival for this long after the worker emptied or
+        /// the last arrival (ms).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        wave_quiet_ms: f64,
+        /// Wave start: at most this long after the wave could first start (ms).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        wave_cap_ms: f64,
+        /// Lockstep first token: every request of a wave gets its first token
+        /// from the wave's first decode step, not its prompt's last chunk.
+        #[serde(default)]
+        #[param(default = false)]
+        wave_first_token_from_decode: bool,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -660,6 +682,24 @@ impl IterWorkerSel {
                 max_prefill_chunk_tokens,
                 ..
             } => *max_prefill_chunk_tokens,
+            _ => None,
+        }
+    }
+
+    /// The wave admission a chunked selector asks for (`None`: continuous).
+    pub(crate) fn wave_admission(&self) -> Option<crate::worker::admission::WaveAdmission> {
+        match self {
+            Self::ChunkedPrefill {
+                wave_admission: true,
+                wave_quiet_ms,
+                wave_cap_ms,
+                wave_first_token_from_decode,
+                ..
+            } => Some(crate::worker::admission::WaveAdmission::from_ms(
+                *wave_quiet_ms,
+                wave_cap_ms.max(*wave_quiet_ms),
+                *wave_first_token_from_decode,
+            )),
             _ => None,
         }
     }

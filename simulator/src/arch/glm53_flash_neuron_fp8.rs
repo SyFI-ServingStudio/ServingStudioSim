@@ -100,12 +100,14 @@ pub enum RegionGranularity {
 impl RegionGranularity {
     pub const CHOICES: [&'static str; 2] = ["layer", "block"];
 
-    /// Host dispatch per region (ms): layer 1.1 ms fitted on the glm5-trn2
-    /// seed engine (`doc/pr/trn2-glm53-flash/ALIGNMENT.md`); block keeps the
-    /// trn2-flashnext 4-layer-block fit (3.7 ms, not measured on this engine).
+    /// Host dispatch per region (ms): layer 0.9 ms, the slowest rank's
+    /// measured whole-forward dispatch (42-46 ms for 48 regions with the
+    /// engine's throttle lifted; `doc/pr/trn2-glm53-flash/ALIGNMENT.md`); block
+    /// keeps the trn2-flashnext 4-layer-block fit (3.7 ms, not measured on
+    /// this engine).
     pub fn region_host_ms(self) -> f32 {
         match self {
-            Self::Layer => 1.1,
+            Self::Layer => 0.9,
             Self::Block => 3.7,
         }
     }
@@ -247,7 +249,7 @@ impl Glm53NeuronParallel {
             prefill_device_factor: PREFILL_DEVICE_FACTOR,
             region_host_ms: RegionGranularity::Layer.region_host_ms(),
             region_gap_ms: 0.1,
-            forward_overhead_ms: 19.0,
+            forward_overhead_ms: 2.0,
             mtp_forward_overhead_ms: 2.0,
             step_overhead_ms: 0.12,
             hbm_per_core_gb: 25.769_803_776,

@@ -1,9 +1,11 @@
 """InferenceX metrics and the step bottleneck breakdown of one simulation run.
 
 ``point(run_dir, conc)``: the InferenceX fixed-seq point of a closed-loop run (trace from
-``trace/generate_inferencex.py``, workload ``arrival_mode: saturated`` + ``max_concurrency: C``):
-the first ``warmup * C`` completed requests are warm-up and dropped, as the InferenceX client does
-(it sends 2C warm-up prompts first); the rest are measured:
+``trace/generate_inferencex.py``, workload ``arrival_mode: saturated`` + ``max_concurrency: C``).
+The InferenceX client drains its 2C warm-up requests before the measured run starts on an idle
+server, so the trace holds the measured requests only and every completion counts
+(``warmup`` = 0); ``--warmup W`` drops the first ``W * C`` completions of a trace generated with
+``--warmup W``:
 
 - ``tok_s_per_chip`` = (input + output tokens of the measured requests) / measured window / chips,
   the window from the first measured request's start to the last one's finish;
@@ -48,7 +50,7 @@ def chips(run: Path) -> float:
     return summary["num_gpus"] / CORES_PER_CHIP
 
 
-def point(run: Path, conc: int, warmup: int = 2) -> dict:
+def point(run: Path, conc: int, warmup: int = 0) -> dict:
     reqs = [r for r in _requests(run) if r["completed"]]
     reqs.sort(key=lambda r: r["finish_decode_time_ms"])
     meas = reqs[warmup * conc :]
@@ -155,7 +157,7 @@ def main() -> None:
     )
     ap.add_argument("run", type=Path)
     ap.add_argument("--conc", type=int, required=True)
-    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--breakdown", action="store_true")
     a = ap.parse_args()
     print(json.dumps(point(a.run, a.conc, a.warmup), indent=1))

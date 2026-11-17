@@ -19,6 +19,19 @@
 //! resident and unadvanced until a later decode-only iteration. This is the
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
+//!
+//! [`WaveAdmission`] is a third composition, the decode-protected waves of the
+//! glm5-trn2 service scheduler (`glmflash/service/scheduler.py`). Fresh
+//! requests wait until the worker holds no request at all and a quiet window
+//! has passed; then every waiting request starts at once (up to the
+//! partition caps). While any of them has prompt left, the worker runs
+//! prefill-only iterations, one chunk per partition, round-robin over the
+//! partition's prefilling requests in admission order; then decode-only
+//! iterations until the wave drains. Optionally the first output token comes
+//! from the wave's first decode step instead of each prompt's last chunk
+//! (lockstep first token). Placement is fixed at arrival on the partition
+//! with the fewest waiting requests, which spreads a wave as the engine's
+//! least-loaded admission over an empty worker does.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -63,6 +76,35 @@ impl ChunkEndAlignment {
     }
 }
 
+/// Decode-protected wave admission (see the module doc).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveAdmission {
+    /// A wave starts once the worker is empty and no request arrived for this
+    /// long (measured from the later of the last arrival and the moment the
+    /// worker emptied).
+    pub quiet: Time,
+    /// ... but at most this long after the wave could first start (the later
+    /// of the first waiting arrival and the moment the worker emptied).
+    pub cap: Time,
+    /// The first output token comes from the wave's first decode step, not
+    /// from the prompt's last prefill chunk.
+    pub first_token_from_decode: bool,
+}
+
+impl WaveAdmission {
+    pub fn from_ms(quiet_ms: f64, cap_ms: f64, first_token_from_decode: bool) -> Self {
+        assert!(
+            quiet_ms >= 0.0 && cap_ms >= 0.0,
+            "wave quiet / cap windows must be non-negative"
+        );
+        Self {
+            quiet: Time::from_ms(quiet_ms),
+            cap: Time::from_ms(cap_ms),
+            first_token_from_decode,
+        }
+    }
+}
+
 pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
@@ -100,6 +142,16 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (`None`: bounded by KV only). The Neuron engines have a fixed number of
     /// request slots per DP group and admit a prompt only into a free one.
     max_requests_per_partition: Option<u32>,
+    /// Decode-protected waves instead of continuous admission (`None`).
+    wave: Option<WaveAdmission>,
+    /// Per partition: chunks scheduled in the current wave (the round-robin
+    /// cursor over the partition's prefilling requests).
+    wave_rr: Vec<usize>,
+    /// When the worker last became empty; `None` while a wave runs.
+    wave_idle_since: Option<Time>,
+    /// Arrival of the oldest and the newest request waiting for a wave.
+    wave_first_arrival: Option<Time>,
+    wave_last_arrival: Time,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -171,6 +223,11 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             max_prefill_chunks: None,
             max_prefill_chunk_tokens: None,
             max_requests_per_partition: None,
+            wave: None,
+            wave_rr: Vec::new(),
+            wave_idle_since: None,
+            wave_first_arrival: None,
+            wave_last_arrival: Time::ZERO,
         }
     }
 
@@ -211,6 +268,186 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         assert!(alignment.quantum > 0, "chunk-end quantum must be positive");
         self.chunk_end_alignment = Some(alignment);
         self
+    }
+
+    /// Admit in decode-protected waves (`None`: continuous admission).
+    pub(crate) fn with_wave(mut self, wave: Option<WaveAdmission>) -> Self {
+        assert!(
+            wave.is_none() || matches!(self.kv_admission, KvAdmissionConfig::FullFootprint),
+            "wave admission reserves the full request footprint"
+        );
+        self.wave = wave;
+        self
+    }
+
+    fn first_token_from_decode(&self) -> bool {
+        self.wave.is_some_and(|wave| wave.first_token_from_decode)
+    }
+
+    /// Wave placement: the partition with the fewest waiting requests, ties
+    /// to the lowest index.
+    fn wave_partition(&self) -> usize {
+        self.partition_policies
+            .iter()
+            .enumerate()
+            .min_by_key(|(partition, (policy, _))| (policy.len(), *partition))
+            .map(|(partition, _)| partition)
+            .expect("chunked prefill requires at least one partition")
+    }
+
+    /// One wave-mode iteration (see the module doc). Returns whether a batch
+    /// was formed.
+    fn form_wave_batch<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+        wave: WaveAdmission,
+    ) -> bool {
+        let num_partitions = kv_store.num_partitions();
+        self.started_prefills.resize_with(num_partitions, Vec::new);
+        self.wave_rr.resize(num_partitions, 0);
+        batch_plan.reset_decode_participation(num_partitions, true);
+        let decoding =
+            |kv_store: &K| (0..num_partitions as u16).any(|p| kv_store.has_live_decode(p));
+        let prefilling =
+            |started: &[Vec<AdmissionCandidate>]| started.iter().any(|s| !s.is_empty());
+
+        if !decoding(kv_store) && !prefilling(&self.started_prefills) {
+            let idle_since = *self.wave_idle_since.get_or_insert(now);
+            let Some(first_arrival) = self.wave_first_arrival else {
+                return false;
+            };
+            let first = first_arrival.max(idle_since);
+            let deadline =
+                (self.wave_last_arrival.max(idle_since) + wave.quiet).min(first + wave.cap);
+            if now < deadline {
+                // The shell keeps a worker with queued requests due; it starts
+                // the wave on the first outer tick past the deadline.
+                return false;
+            }
+            self.start_wave(kv_store, context, now);
+            if !prefilling(&self.started_prefills) {
+                return false;
+            }
+        }
+
+        if prefilling(&self.started_prefills) {
+            let chunk_tokens_cap = self.max_prefill_chunk_tokens.unwrap_or(u32::MAX);
+            for partition_index in 0..num_partitions {
+                let members = &mut self.started_prefills[partition_index];
+                if members.is_empty() {
+                    continue;
+                }
+                let index = self.wave_rr[partition_index] % members.len();
+                let request = members[index].request_id;
+                let resolved_prefill = kv_store.resolved_prefill_context(request);
+                let chunk_tokens = next_chunk_tokens(
+                    resolved_prefill,
+                    self.max_batch_tokens.min(chunk_tokens_cap),
+                    self.chunk_end_alignment,
+                    self.max_batch_tokens,
+                );
+                assert!(
+                    chunk_tokens > 0,
+                    "a wave member's chunk must fit the empty batch"
+                );
+                kv_store.schedule_prefill_chunk(request, partition_index as u16, chunk_tokens);
+                if chunk_tokens >= resolved_prefill.remaining_prefill_tokens() {
+                    members.remove(index);
+                }
+                self.wave_rr[partition_index] += 1;
+            }
+            // Prompts that finished earlier in the wave decode only once every
+            // member's prompt is done.
+            for partition in 0..num_partitions as u16 {
+                batch_plan.set_partition_runs_decode(partition, false);
+            }
+            return true;
+        }
+        decoding(kv_store)
+    }
+
+    /// Start a wave on an empty worker: every waiting request, partition by
+    /// partition in arrival order, up to the partition's request cap and KV.
+    fn start_wave<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        now: Time,
+    ) {
+        let request_cap = self.max_requests_per_partition.unwrap_or(u32::MAX);
+        for partition_index in 0..kv_store.num_partitions() {
+            let partition = partition_index as u16;
+            loop {
+                if self.started_prefills[partition_index].len() as u32 >= request_cap {
+                    break;
+                }
+                let (policy, policy_context) = &mut self.partition_policies[partition_index];
+                policy.refresh_head(&mut |candidate| {
+                    kv_store.resident_prefix_tokens(
+                        candidate.fresh_prompt_tokens,
+                        candidate.session_input,
+                    )
+                });
+                let Some(candidate) = policy.peek() else {
+                    break;
+                };
+                let resolved_prefill = kv_store.preview_prefill_context(
+                    partition,
+                    candidate.fresh_prompt_tokens,
+                    candidate.session_input,
+                );
+                let footprint = kv_store.footprint(
+                    candidate.request_id,
+                    resolved_prefill.post_prefill_context_tokens(),
+                    candidate.remaining_output_tokens,
+                );
+                if !kv_store.fits(partition, &footprint) {
+                    break;
+                }
+                let popped = policy.pop(policy_context);
+                debug_assert_eq!(popped, Some(candidate));
+                self.admission_order
+                    .insert(candidate.request_id, self.next_admission);
+                self.next_admission += 1;
+                kv_store.reserve_chunked_prefill_context(
+                    candidate.request_id,
+                    partition,
+                    resolved_prefill,
+                    footprint,
+                    now,
+                );
+                {
+                    let mut store = context.requests.borrow_mut();
+                    store.mark_admitted(candidate.request_id);
+                    let record = &mut store[candidate.request_id];
+                    record
+                        .record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
+                    context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+                }
+                assert!(
+                    self.prefill_episodes
+                        .insert(candidate.request_id, false)
+                        .is_none(),
+                    "request entered two simultaneous prefill episodes"
+                );
+                self.started_prefills[partition_index].push(candidate);
+            }
+        }
+        self.wave_rr.iter_mut().for_each(|rr| *rr = 0);
+        self.wave_idle_since = None;
+        // Requests left waiting (caps or KV) count as arrivals of the next wave.
+        self.wave_first_arrival = (self.queued_requests_len() > 0).then_some(now);
+        self.wave_last_arrival = now;
+    }
+
+    fn queued_requests_len(&self) -> usize {
+        self.partition_policies
+            .iter()
+            .map(|(policy, _)| policy.len())
+            .sum()
     }
 
     fn choose_partition<K: ChunkedPrefillKv>(
@@ -471,8 +708,17 @@ where
         );
         // Placement is frozen when the request enters the worker. Retained KV
         // has hard affinity; cold requests use the same generic balance policy
-        // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
+        // as ordinary local admission, or the wave placement.
+        let partition = if self.wave.is_some() {
+            let arrival = context.requests.borrow()[request].request.core.arrival_time;
+            self.wave_first_arrival.get_or_insert(arrival);
+            self.wave_last_arrival = self.wave_last_arrival.max(arrival);
+            kv_store
+                .retained_prefix_partition(session_input)
+                .map_or_else(|| self.wave_partition(), usize::from)
+        } else {
+            self.choose_partition(kv_store, session_input)
+        };
         let (policy, policy_context) = &mut self.partition_policies[partition];
         debug_assert!(!policy.contains(request));
         policy.push(candidate, policy_context);
@@ -485,6 +731,9 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        if let Some(wave) = self.wave {
+            return self.form_wave_batch(kv_store, context, batch_plan, now, wave);
+        }
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
         self.started_prefills.resize_with(num_partitions, Vec::new);
@@ -783,6 +1032,9 @@ where
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {
+        // Lockstep: a finished prompt emits nothing; the first decode step
+        // records its first token.
+        let lockstep_first_token = self.first_token_from_decode();
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
             if batch_plan.partition_runs_decode(partition) {
@@ -834,7 +1086,7 @@ where
                         if reprocessed {
                             record.complete_reprocessed_prefill();
                             record.record_token(now, context.log_tokens());
-                        } else {
+                        } else if !lockstep_first_token {
                             record.record_first_token(now, context.log_tokens());
                         }
                         context.stamp_stage(

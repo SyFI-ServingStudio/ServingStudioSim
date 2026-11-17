@@ -6,7 +6,15 @@ logical cores, so that it can predict the engine's InferenceX 8k1k serving perfo
 configurations. The Trainium machinery comes from the (unmerged) `trn2-flashnext` branch, ported
 onto main and cut to what this model needs.
 
-**Status.** The model is aligned on the seed engine's measured C = 16 run (one replica, dp4 x tp8).
+**Status (2026-11-17).** Re-aligned out of sample on the round-1 R1 service's official measurement
+(two replicas, decode-protected waves, C = 8): 40.6 vs 40.20 tok/s/chip, median TPOT 99.1 vs
+98.66 ms (`ALIGNMENT.md`, last section). The service's scheduler is the worker's `wave_admission`
+mode and its frontend the pool's `least-loaded` placement
+(`presets/trn2/glm53_flash_fp8_trn2_service_r1.yaml`). The host floor is now measured (45 ms per
+decode forward). The InferenceX traces draw output lengths in [819, 1024] and hold the measured
+requests only. The seed-policy sections below predate those fixes except where marked.
+
+**Before (2026-11-16).** The model is aligned on the seed engine's measured C = 16 run (one replica, dp4 x tp8).
 It predicts 1107 vs 1099 measured tok/s, a median TPOT of 113.3 vs 114.1 ms, and a median TTFT of
 6.47 vs 6.63 s; this is in sample (`ALIGNMENT.md`). The L1 rows are the complete glm5-trn2 benchmark
 set (477 measured) plus 393 derived grid cells. The search answer is in `CONFIG_SEARCH.md`: no
@@ -123,6 +131,24 @@ Closed-loop fixed concurrency is `arrival_mode: saturated` + `max_concurrency: C
 `12C` requests (`trace/generate_inferencex.py`); the metrics drop the first `2C` completions.
 
 ## Preset results (8k1k, seed layout, aligned predictions)
+
+Re-run 2026-11-17 with the corrected workload (outputs U[819, 1024], 10C measured requests from
+an idle server) and the measured host floor; the seed's continuous batching (serve.py):
+
+| C | tok/s/chip | intvty (tok/s/user) | median TPOT (ms) | median TTFT (s) | median E2E (s) | total tok/s |
+|---|---|---|---|---|---|---|
+| 4 | 20.3 | 9.61 | 104.1 | 5.21 | 97.1 | 325 |
+| 8 | 37.3 | 8.75 | 114.3 | 5.21 | 108.3 | 598 |
+| 16 | 64.6 | 7.46 | 134.1 | 5.22 | 126.1 | 1033 |
+| 32 | 102.7 | 5.87 | 170.4 | 5.22 | 159.1 | 1643 |
+| 64 | 147.1 | 4.09 | 244.2 | 5.22 | 227.1 | 2354 |
+| 128 | 197.3 | 2.75 | 363.7 | 6.57 | 337.8 | 3157 |
+| 256 | 183.5 | 2.52 | 396.3 | 373.53 | 734.6 | 2937 |
+
+With random output lengths the closed loop desynchronizes the groups and prefill chunks stall
+running decodes; the R1 service's decode-protected waves avoid that (C 64: 240 tok/s/chip at
+9.6 tok/s/user, `glm53_flash_fp8_trn2_service_r1.yaml`). The table below is the original
+(exact 1024-token outputs, 2C warm-up dropped from a continuous loop):
 
 `presets/trn2/glm53_flash_fp8_trn2_8k1k.yaml`: 2 replicas x (dp4 x tp8, EP32), layer regions,
 chunk 2048, decode buckets 8/16, 16 requests per DP group (128 per instance).

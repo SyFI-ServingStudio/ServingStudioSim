@@ -111,6 +111,7 @@ where
     pub fn admit(&mut self, request: RequestId) {
         let replica = match self.placement {
             DpPlacementPolicy::LeastQueued => self.least_queued_replica(),
+            DpPlacementPolicy::LeastLoaded => self.least_loaded_replica(),
             DpPlacementPolicy::RoundRobin => {
                 let replica = self.rr_next;
                 self.rr_next = (self.rr_next + 1) % self.replicas.len();
@@ -118,6 +119,18 @@ where
             }
         };
         self.route_to_head(replica, PipelineHeadMsg::Request(request));
+    }
+
+    fn least_loaded_replica(&self) -> usize {
+        self.replicas
+            .iter()
+            .enumerate()
+            .min_by_key(|(replica, pipeline)| {
+                let status = pipeline.head.status();
+                (status.queued_requests + status.active_requests, *replica)
+            })
+            .map(|(replica, _)| replica)
+            .expect("pp has at least one replica")
     }
 
     fn least_queued_replica(&self) -> usize {

@@ -15,6 +15,14 @@
 
     uv run --no-sync python tools/trn2-config-search/engine_align.py \\
         /home/ec2-user/glm5-trn2/results/seed/serve_c16_replica0.jsonl --out <dir>
+
+A service measurement (glm5-trn2 ``glmflash.service``) has no step timeline: pass its evaluator
+``metrics.json`` (``measure-*/measure/metrics.json``) instead. Its cases are the warm-up's
+steady-state forwards (every compiled shape once per replica, pass 1, one request per DP group),
+and the in-service decode / prefill means are reported beside the fit. ``--host-ms H,F`` fixes
+``region_host_ms`` / ``forward_overhead_ms`` to directly measured values (a device-bound
+timeline cannot identify them; ``campaigns/glm8k1k/round2/tick2/host_probe.py`` measures the
+whole-forward dispatch with the engine's throttle lifted).
 """
 
 from __future__ import annotations
@@ -98,6 +106,60 @@ def parse(path: Path, stall_x: float = 3.0) -> dict:
         "cases": cases,
         "step_gap_ms": statistics.median(gaps),
         "summary": summary,
+    }
+
+
+def parse_service(path: Path) -> dict:
+    """Cases from a service evaluator's metrics.json: warm-up forwards per shape (both replicas)."""
+    m = json.loads(path.read_text())
+    cfg = json.loads((path.parent / "config.json").read_text())
+    reps = m["final_state"]["replicas"]
+    fwd = defaultdict(list)
+    for rep in reps:
+        for key, ms in rep["warm_ms"].items():
+            kind, shape = key.split("_")
+            x, ctx = (int(v) for v in shape.split("x"))
+            fwd[(kind, x, ctx) if kind == "decode" else (kind, x, ctx, ctx - x)].append(ms)
+    cases = [
+        {"key": list(k), "n": len(v), "dropped": 0, "measured_ms": statistics.median(v)}
+        for k, v in sorted(fwd.items())
+    ]
+    eng = {
+        k: cfg[k]
+        for k in (
+            "tp",
+            "dp",
+            "prefill_buckets",
+            "decode_buckets",
+            "context_buckets",
+            "slots",
+            "cmax",
+        )
+    }
+    eng["world"] = cfg["world_per_replica"]
+    service = {
+        "decode_step_ms_mean": [r["decode_step_ms_mean"] for r in reps],
+        "prefill_step_ms_mean": [r["prefill_step_ms_mean"] for r in reps],
+        "host_gap_ms_mean": [r["host_gap_ms_mean"] for r in reps],
+        "decode_ctx_hist": [r["decode_ctx_hist"] for r in reps],
+    }
+    gap = statistics.mean(service["host_gap_ms_mean"])
+    return {
+        "engine": eng,
+        "cases": cases,
+        "step_gap_ms": gap,
+        "summary": {
+            k: m[k]
+            for k in (
+                "conc",
+                "completed",
+                "tput_per_chip",
+                "median_tpot_ms",
+                "median_intvty",
+                "median_ttft_ms",
+            )
+        },
+        "service": service,
     }
 
 
@@ -196,14 +258,14 @@ def forward_ms(
     return max(floored, n_regions * h + ovh)
 
 
-def fit(parsed: dict, regions: list[dict]) -> dict:
+def fit(parsed: dict, regions: list[dict], host: tuple[float, float] | None = None) -> dict:
     meas = []
     for c, reg in zip(parsed["cases"], regions):
         side = c["key"][0]
         meas.append((side, reg[side], c["measured_ms"], c["n"]))
-    grid_h = [0.5 + 0.1 * i for i in range(26)]
-    grid_gap = [0.0, 0.05, 0.1, 0.17, 0.25, 0.35, 0.5]
-    grid_ovh = [0.0, 5.0, 10.0, 15.0, 19.0, 25.0, 30.0, 40.0]
+    grid_h = [0.5 + 0.1 * i for i in range(26)] if host is None else [host[0]]
+    grid_gap = [0.0, 0.05, 0.1, 0.15, 0.17, 0.2, 0.25, 0.35, 0.5]
+    grid_ovh = [0.0, 5.0, 10.0, 15.0, 19.0, 25.0, 30.0, 40.0] if host is None else [host[1]]
     grid_f = [0.8 + 0.02 * i for i in range(91)]
     best = None
     for h, gap, ovh in itertools.product(grid_h, grid_gap, grid_ovh):
@@ -258,15 +320,20 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("timeline", type=Path)
+    ap.add_argument("timeline", type=Path, help="serve.py JSONL timeline or a service metrics.json")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--stall-x", type=float, default=3.0)
+    ap.add_argument("--host-ms", default=None, help="fix region_host_ms,forward_overhead_ms")
     a = ap.parse_args()
-    parsed = parse(a.timeline, a.stall_x)
+    service = a.timeline.name == "metrics.json"
+    parsed = parse_service(a.timeline) if service else parse(a.timeline, a.stall_x)
+    host = tuple(float(v) for v in a.host_ms.split(",")) if a.host_ms else None
     regions = predict_cases(parsed, a.out)
-    result = fit(parsed, regions)
+    result = fit(parsed, regions, host)
     result["summary"] = parsed["summary"]
     result["step_gap_ms"] = parsed["step_gap_ms"]
+    if service:
+        result["service"] = parsed["service"]
     (a.out / "alignment.json").write_text(json.dumps(result, indent=1) + "\n")
     print(json.dumps(result["fit"], indent=1))
     for c in result["cases"]:

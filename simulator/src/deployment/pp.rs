@@ -61,6 +61,7 @@ impl Deployment for PpDeployment {
         let placement = match pool.placement {
             PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
             PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            PlacementPolicy::LeastLoaded => DpPlacementPolicy::LeastLoaded,
         };
         let model_spec = g.arch.model();
         let _scope =

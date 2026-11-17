@@ -76,7 +76,9 @@ same controller without teaching L6 a new L5 composition.
 ## Unified (`simple_dp.rs`)
 
 `SimpleDpPoolController` owns one pool's workers. `admit` selects by
-`DpPlacementPolicy` (`LeastQueued` or `RoundRobin`), while `tick_collect` enters
+`DpPlacementPolicy` (`LeastQueued`: fewest queued then active; `LeastLoaded`:
+fewest queued + active, a frontend that counts every routed request until it
+finishes; or `RoundRobin`), while `tick_collect` enters
 only workers whose stored wakeup is due.
 
 `SimpleDpFlow` inserts arrivals, admits them to the controller, and maps worker
@@ -127,7 +129,7 @@ One `stage` pool holds `replicas` pipelines of `depth` workers each; worker
 `r * depth + s` is stage `s` of replica `r`, built in that order so a replica's
 GPUs are contiguous. `PpStagePoolController`:
 
-- places arrivals on heads (least-queued or round-robin);
+- places arrivals on heads (least-queued, least-loaded or round-robin);
 - routes `MicrobatchLaunched` / `StageDone` to the next stage of the same replica;
 - turns the last stage's `StageDone` into `MicrobatchExit` for the head;
 - repeats the sweep at one `now` until no worker emits an event, and makes every

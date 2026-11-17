@@ -16,7 +16,7 @@ mod prefill_handoff_admission;
 mod token_budget;
 
 pub(crate) use chunked_prefill_admission::ChunkEndAlignment;
-pub use chunked_prefill_admission::ChunkedPrefillAdmission;
+pub use chunked_prefill_admission::{ChunkedPrefillAdmission, WaveAdmission};
 pub use decode_completion::{
     DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
 };

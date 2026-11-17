@@ -164,20 +164,69 @@ def test_rows_round_trip_through_profile_db(tmp_path):
 
 
 def test_inferencex_trace_shape(tmp_path):
-    """Catches the 8k1k trace drifting from InferenceX: 12C requests, ISL in
-    [0.8 ISL, ISL], OSL fixed."""
+    """Catches the 8k1k trace drifting from InferenceX (`sample_random_requests`): the 10C
+    measured requests only (the client drains its warm-up first), ISL in [0.8 ISL, ISL] and
+    OSL in [0.8 OSL, OSL]; `fixed_output` keeps the old exact-OSL completions."""
     spec = importlib.util.spec_from_file_location(
         "generate_inferencex", ROOT / "trace" / "generate_inferencex.py"
     )
     gen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gen)
     out = tmp_path / "t.csv"
-    assert gen.write_inferencex_trace(out, concurrency=4, accept_rate=0.8) == 48
+    assert gen.write_inferencex_trace(out, concurrency=4, accept_rate=0.8) == 40
     lines = out.read_text().splitlines()
     assert lines[0] == "id,input_len,output_len,arrival_time,accept_rate"
     rows = [ln.split(",") for ln in lines[1:]]
-    assert len(rows) == 48
-    assert all(6553 <= int(r[1]) <= 8192 and r[2] == "1024" and r[3] == "0.0" for r in rows)
+    assert len(rows) == 40
+    assert all(6553 <= int(r[1]) <= 8192 and 819 <= int(r[2]) <= 1024 for r in rows)
+    assert all(r[3] == "0.0" for r in rows)
+    assert len({r[2] for r in rows}) > 1
+    assert gen.write_inferencex_trace(out, concurrency=4, warmup=2, fixed_output=True) == 48
+    assert all(ln.split(",")[2] == "1024" for ln in out.read_text().splitlines()[1:])
+
+
+def test_engine_align_reads_a_service_measurement(tmp_path):
+    """Catches the service evidence (evaluator metrics.json) mapped to the wrong shapes: warm-up
+    forwards per (kind, bucket, context), both replicas pooled, prefill chunks at the bucket's
+    end."""
+    engine_align = importlib.import_module("engine_align")
+    meas = tmp_path / "measure"
+    meas.mkdir()
+    cfg = {
+        "tp": 8,
+        "dp": 4,
+        "world_per_replica": 32,
+        "prefill_buckets": [2048],
+        "decode_buckets": [8],
+        "context_buckets": [2048, 8192],
+        "slots": 17,
+        "cmax": 9216,
+    }
+    (meas / "config.json").write_text(json.dumps(cfg))
+    rep = {
+        "warm_ms": {"prefill_2048x8192": 1250.0, "decode_8x8192": 98.0},
+        "decode_step_ms_mean": 98.5,
+        "prefill_step_ms_mean": 1230.0,
+        "host_gap_ms_mean": 0.1,
+        "decode_ctx_hist": {"8192": 10},
+    }
+    rep2 = dict(rep, warm_ms={"prefill_2048x8192": 1260.0, "decode_8x8192": 100.0})
+    metrics = {
+        "final_state": {"replicas": [rep, rep2]},
+        "conc": 8,
+        "completed": 80,
+        "tput_per_chip": 40.2,
+        "median_tpot_ms": 98.7,
+        "median_intvty": 10.1,
+        "median_ttft_ms": 9700.0,
+    }
+    (meas / "metrics.json").write_text(json.dumps(metrics))
+    parsed = engine_align.parse_service(meas / "metrics.json")
+    keys = {tuple(c["key"]): (c["n"], c["measured_ms"]) for c in parsed["cases"]}
+    assert keys[("decode", 8, 8192)] == (2, 99.0)
+    assert keys[("prefill", 2048, 8192, 6144)] == (2, 1255.0)
+    assert parsed["engine"]["world"] == 32
+    assert parsed["step_gap_ms"] == pytest.approx(0.1)
 
 
 def test_search_prefilter_and_buckets():

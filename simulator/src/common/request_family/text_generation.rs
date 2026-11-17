@@ -45,6 +45,11 @@ impl ActiveRequest<TextGenerationDefinition> {
     }
 
     pub fn record_token(&mut self, now: Time, log_tokens: bool) {
+        if self.progress.output_tokens_emitted == 0 {
+            // A token before any first token is the first one (a lockstep
+            // engine emits nothing at the end of the prompt).
+            return self.record_first_token(now, log_tokens);
+        }
         self.progress.output_tokens_emitted += 1;
         self.telemetry.last_output_time = Some(now);
         if log_tokens {

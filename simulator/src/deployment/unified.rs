@@ -188,6 +188,7 @@ impl Deployment for UnifiedDeployment {
             max_prefill_chunks_per_partition: g.worker.max_prefill_chunks_per_partition(),
             max_prefill_chunk_tokens: g.worker.max_prefill_chunk_tokens(),
             max_requests_per_partition: g.worker.max_requests_per_partition(),
+            wave: g.worker.wave_admission(),
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
@@ -1377,6 +1378,7 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::LeastLoaded => DpPlacementPolicy::LeastLoaded,
     }
 }
 
@@ -1431,6 +1433,10 @@ mod tests {
             max_prefill_chunks_per_partition: None,
             max_prefill_chunk_tokens: None,
             max_requests_per_partition: None,
+            wave_admission: false,
+            wave_quiet_ms: 0.0,
+            wave_cap_ms: 0.0,
+            wave_first_token_from_decode: false,
             kv_accounting: Default::default(),
         }
     }

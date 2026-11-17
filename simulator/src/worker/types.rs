@@ -621,6 +621,9 @@ pub struct WorkerConfig {
     /// Requests one partition may hold at once (chunked-prefill and
     /// speculative selectors). `None` is bounded by KV only.
     pub max_requests_per_partition: Option<u32>,
+    /// Decode-protected wave admission (chunked-prefill selector). `None` is
+    /// continuous admission.
+    pub wave: Option<crate::worker::admission::WaveAdmission>,
 }
 
 impl Default for WorkerConfig {
@@ -652,6 +655,7 @@ impl Default for WorkerConfig {
             max_prefill_chunks_per_partition: None,
             max_prefill_chunk_tokens: None,
             max_requests_per_partition: None,
+            wave: None,
         }
     }
 }

@@ -1,6 +1,10 @@
 # Config search: GLM-5.3-Flash FP8 on one trn2.48xlarge, InferenceX 8k1k
 
-**These are simulator predictions from the aligned model.**
+**These are simulator predictions from the aligned model.** They predate the 2026-11-17 fixes
+(InferenceX output lengths U[819, 1024] and the main-run window; the measured 45 ms host floor;
+the R1 service's wave scheduler): read them as the seed engine's continuous batching with exact
+1024-token outputs. The glm5-trn2 campaign Ticks search the service model instead
+(`campaigns/glm8k1k/round*/tick*/` in glm5-trn2).
 
 - **Host constants and prefill factor** are fitted on the seed engine's measured C = 16 run
   (`ALIGNMENT.md`): `region_host_ms` 1.1, `region_gap_ms` 0.1, `step_overhead_ms` 0.12,

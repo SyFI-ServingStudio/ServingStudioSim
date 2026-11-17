@@ -1,0 +1,61 @@
+# The glm5-trn2 R1 service (round 1 retained, `d41eb54`; glmflash/service) on one trn2.48xlarge:
+# two replicas of the seed engine (32 LNC2 ranks each, dp4 x tp8, EP32 FFN, one compiled region
+# per layer) behind a frontend that routes each request to the replica with the fewest active +
+# queued requests (`placement: least-loaded`). Each replica runs the service's decode-protected
+# waves (glmflash/service/scheduler.py): queued requests start together once the replica is empty
+# and no request arrived for 100 ms (cap 300 ms), at most 8 per DP group (max(decode_buckets));
+# prefill-only steps (one 2048-token chunk per group, round-robin over the group's prompts) run
+# until every prompt is done, then decode-only steps (bucket 8) until the wave drains.
+#
+# Workload: InferenceX 8k1k closed loop at C (trace/generate_inferencex.py: input U[6553, 8192],
+# output U[819, 1024], 10C measured requests from an idle server). `r1_official` replays the
+# official round-1 measurement's own 80 requests (measure-20261116-223250, C = 8).
+# tools/trn2-config-search/inferencex.py turns a run into the InferenceX point.
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_service_r1/{point}"
+
+pools:
+  main:
+    placement: least-loaded
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: [8]
+          context_buckets: [2048, 4096, 6144, 6656, 7168, 7680, 8192, 8704, 9216]
+          slots: 17
+          cmax: 9216
+          max_model_len: 9216
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2048
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: 8
+          wave_admission: true
+          wave_quiet_ms: 100
+          wave_cap_ms: 300
+
+compound:
+  point:
+    r1_official: {conc: 8, traces: [presets/trn2/glm8k1k_r1_official_c8.csv]}
+    c8: {conc: 8, traces: [presets/trn2/inferencex_8k1k_c8.csv]}
+    c16: {conc: 16, traces: [presets/trn2/inferencex_8k1k_c16.csv]}
+    c32: {conc: 32, traces: [presets/trn2/inferencex_8k1k_c32.csv]}
+    c64: {conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv]}
