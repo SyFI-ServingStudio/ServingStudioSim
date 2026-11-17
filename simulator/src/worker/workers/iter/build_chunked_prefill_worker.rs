@@ -24,12 +24,13 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{TierBytes, TierStateOptions};
+use crate::worker::kv::TierBytes;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    resolve_kv_accounting, with_host_tiers,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -75,11 +76,6 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &kv_accounting,
         num_partitions,
     );
-    let tier_bytes = TierBytes::of_layout(&kv_cache_layout).per_gpu(model.num_attn_shards());
-    assert!(
-        config.prefix_tier_loading_area == 0.0 || tier_bytes.state > 0,
-        "chunked prefill: prefix_tier_loading_area needs an arch with recurrent state"
-    );
     let kv_store = kv_cache_store(
         kv_accounting,
         num_partitions,
@@ -87,26 +83,15 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &config,
         essentials.sampler,
         prefix_cache_logger,
-    )
-    .with_prefix_tiers(
-        &config.prefix_tiers,
-        tier_bytes,
-        TierStateOptions {
-            compression_ratio: config.tier_state_compression_ratio,
-            anchors_in_place: config.recurrent_state_anchors_in_place,
-        },
     );
-    let kv_store = if config.prefix_tier_loading_area > 0.0 {
-        kv_store.with_loading_area(config.prefix_tier_loading_area)
-    } else {
-        kv_store
-    };
-    let kv_store = if config.prefix_tier_warm_start {
-        kv_store.with_tier_warm_start()
-    } else {
-        kv_store
-    }
-    .with_tiers_reports(essentials.tiers_reports);
+    let kv_store = with_host_tiers(
+        kv_store,
+        TierBytes::of_layout(&kv_cache_layout).per_gpu(model.num_attn_shards()),
+        &config,
+        essentials.tiers_reports,
+        pool_tag,
+        id,
+    );
     let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)

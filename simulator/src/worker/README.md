@@ -195,8 +195,8 @@ The pipeline head may put host tiers behind its prefix cache, and
 the rank's layout over its attention shards, `TierBytes::per_gpu`)
 (`PrefixTierSpec`: `dram_tier_*`, `ssd_tier_*`, `prefix_tier_*`). Each
 partition's `TierChain` (`kv/shared/tier_chain.rs`) keeps one entry per session
-per tier in tier tokens (one GPU's per-token bytes, `TierBytes`, which the
-deployment derives from the stages' layouts), written through or as the victim
+per tier in tier tokens (one GPU's per-token bytes, `TierBytes`; a pipeline's
+folds the stages' layouts, `TierBytes::of_pipeline`), written through or as the victim
 tier of the one above, LRU-evicted, and cut at admission when a victim entry
 outgrows what the request shares. `TieredPrefixKv` plans, starts, lands and
 restores reads (`kv/shared/tier_reads.rs`): a read holds its request's whole
@@ -387,7 +387,9 @@ the resolved `KvAccounting`, partition count, cost manifest — instead of a mod
 handle, so it names no L4 model trait and cannot select an execution adapter. It
 returns the `CostBuffers`; the recipe wraps them. The same file holds the KV
 helpers every KV-owning recipe shares: `resolve_kv_accounting` (layout, attention
-shard count and worker options to `KvAccounting`), `kv_cache_store`, and
+shard count and worker options to `KvAccounting`), `kv_cache_store`,
+`with_host_tiers` (the config's host tiers and loading area; it rejects a
+loading area on a layout whose tiers store no recurrent state), and
 `prefill_chunk_end_quantum`. PD decode sets its pull budget aside with
 `KvAccounting::reserving`; the pipeline head resolves the most constrained
 stage's layout (`pipeline_kv_cache_layout`).

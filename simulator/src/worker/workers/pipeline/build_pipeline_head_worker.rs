@@ -10,10 +10,10 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::TierStateOptions;
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    resolve_kv_accounting, with_host_tiers,
 };
 
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
@@ -87,26 +87,15 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         &config,
         essentials.sampler,
         prefix_cache_logger,
-    )
-    .with_prefix_tiers(
-        &config.prefix_tiers,
-        layout.tier_bytes,
-        TierStateOptions {
-            compression_ratio: config.tier_state_compression_ratio,
-            anchors_in_place: config.recurrent_state_anchors_in_place,
-        },
     );
-    let kv_store = if config.prefix_tier_loading_area > 0.0 {
-        kv_store.with_loading_area(config.prefix_tier_loading_area)
-    } else {
-        kv_store
-    };
-    let kv_store = if config.prefix_tier_warm_start {
-        kv_store.with_tier_warm_start()
-    } else {
-        kv_store
-    }
-    .with_tiers_reports(essentials.tiers_reports);
+    let kv_store = with_host_tiers(
+        kv_store,
+        layout.tier_bytes,
+        &config,
+        essentials.tiers_reports,
+        pool_tag,
+        id,
+    );
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),

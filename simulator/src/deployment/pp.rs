@@ -7,7 +7,9 @@
 //! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
 //! The arch builds every stage's model once; the stage models are shared across
 //! replicas. The head sizes the pipeline's KV from the arch's
-//! `pipeline_kv_cache_layout`: the most constrained stage's cache.
+//! `pipeline_kv_cache_layout`: the most constrained stage's cache. Its host
+//! tiers store per GPU what `TierBytes::of_pipeline` folds from the stages'
+//! layouts.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +18,6 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
@@ -94,13 +95,10 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: tier_bytes(
-                        pipeline
-                            .stages()
-                            .iter()
-                            .map(|stage| stage.kv_cache_layout()),
-                        &worker_config,
-                    )?,
+                    tier_bytes: TierBytes::of_pipeline(
+                        pipeline.stage_kv_cache_layouts(),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -178,13 +176,10 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: tier_bytes(
-                        pipeline
-                            .stages()
-                            .iter()
-                            .map(|stage| stage.kv_cache_layout()),
-                        &worker_config,
-                    )?,
+                    tier_bytes: TierBytes::of_pipeline(
+                        pipeline.stage_kv_cache_layouts(),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -274,24 +269,6 @@ fn worker_config(
     Ok(config)
 }
 
-/// What each GPU stores in and reads from a host tier, from every stage's
-/// layout: the first stage with the most KV bytes per token, or with
-/// `prefix_tier_balanced_load` the stages' means. A loading area needs a
-/// recurrent state in the tiers.
-fn tier_bytes(
-    stages: impl Iterator<Item = KvCacheLayout>,
-    config: &WorkerConfig,
-) -> anyhow::Result<TierBytes> {
-    let stages: Vec<TierBytes> = stages.map(|layout| TierBytes::of_layout(&layout)).collect();
-    let bytes = TierBytes::of_stages(&stages, config.prefix_tier_balanced_load);
-    ensure!(
-        config.prefix_tier_loading_area == 0.0 || bytes.state > 0,
-        "pp: prefix_tier_loading_area needs an arch with recurrent state; this one is full \
-         attention"
-    );
-    Ok(bytes)
-}
-
 /// Stages of one pipeline share an NVLink domain, so activations move on the
 /// profiled `p2p_intra` curve.
 fn build_activation_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
@@ -345,26 +322,4 @@ where
             )
         },
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::arch::kv_layout::KvCachePart;
-
-    #[test]
-    fn a_loading_area_needs_an_arch_with_recurrent_state() {
-        let full_attention = || KvCacheLayout::new().with_part(KvCachePart::per_token("mla", 545));
-        let hybrid = || full_attention().with_part(KvCachePart::per_request("kda", 1_000));
-        let staged = WorkerConfig {
-            prefix_tier_loading_area: 0.1,
-            ..WorkerConfig::default()
-        };
-        assert!(tier_bytes([full_attention()].into_iter(), &staged).is_err());
-        assert!(tier_bytes([full_attention()].into_iter(), &WorkerConfig::default()).is_ok());
-        assert_eq!(
-            tier_bytes([hybrid()].into_iter(), &staged).unwrap().state,
-            1_000
-        );
-    }
 }

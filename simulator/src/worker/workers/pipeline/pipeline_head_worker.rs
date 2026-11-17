@@ -1618,6 +1618,30 @@ mod tests {
         }
     }
 
+    /// A head whose tiers store a recurrent state of 2 bytes (one tier
+    /// token) per context, as a loading area needs.
+    fn staged_head(store: SharedRequests, config: WorkerConfig) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout {
+                tier_bytes: TierBytes {
+                    per_token: 2,
+                    state: 2,
+                },
+                ..LAYOUT
+            },
+            &kv_layout(),
+            store,
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
     /// 40% of HBM's 120 tokens is the loading area: 48 tokens.
     fn staged_config(prefix_tiers: Vec<crate::worker::kv::TierSpec>) -> WorkerConfig {
         WorkerConfig {
@@ -1630,15 +1654,16 @@ mod tests {
 
     #[test]
     fn staged_reads_start_in_order_and_a_later_one_never_jumps_the_head() {
-        // Pre-run contexts of 40, 30 and 5 tokens in DRAM. Session 7's read
-        // takes 40 of the 48-token area; session 8's does not fit beside it,
-        // and session 9's would but may not jump it. Both wait in the queue,
+        // Pre-run contexts of 40, 30 and 5 tokens in DRAM, each with its
+        // state's one tier token. Session 7's read takes 41 of the 48-token
+        // area; session 8's 31 do not fit beside it, and session 9's 6 would
+        // but may not jump it. Both wait in the queue,
         // passed over: the plain prompt behind them runs at once.
         let store = shared_with(&[(0, 4, 1), (1, 4, 1), (2, 4, 1), (3, 8, 1)]);
         as_session(&store, 0, 7, 40, 0.0);
         as_session(&store, 1, 8, 30, 0.0);
         as_session(&store, 2, 9, 5, 0.0);
-        let mut worker = head_with(
+        let mut worker = staged_head(
             Rc::clone(&store),
             staged_config(tiered_config().prefix_tiers),
         );
@@ -1658,9 +1683,10 @@ mod tests {
 
     #[test]
     fn a_staged_ssd_read_lands_in_dram_and_hops_on_to_hbm() {
-        // Session 7's 40 pre-run tokens are in SSD (5 tokens per ms): they
-        // reach DRAM's loading area at 8 ms and hop on to HBM on DRAM's
-        // channel (50 tokens per ms) by 8.8 ms; then the request launches.
+        // Session 7's 40 pre-run tokens and its state's one tier token are in
+        // SSD (5 tokens per ms): they reach DRAM's loading area at 8.2 ms and
+        // hop on to HBM on DRAM's channel (50 tokens per ms) by 9.02 ms; then
+        // the request launches.
         let store = shared_with(&[(0, 4, 1)]);
         as_session(&store, 0, 7, 40, 0.0);
         let mut tiers = tiered_config().prefix_tiers;
@@ -1670,25 +1696,25 @@ mod tests {
             read_gb_per_s: 1e-5,
             writes: crate::worker::kv::TierWrites::EveryContext,
         });
-        let mut worker = head_with(Rc::clone(&store), staged_config(tiers));
+        let mut worker = staged_head(Rc::clone(&store), staged_config(tiers));
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         assert_eq!(
             worker.tick(Time::ZERO, &mut events),
-            Some(Time::from_ms(8.0))
+            Some(Time::from_us(8_200))
         );
         assert_eq!(
-            worker.tick(Time::from_ms(8.0), &mut events),
-            Some(Time::from_ms(8.8))
+            worker.tick(Time::from_us(8_200), &mut events),
+            Some(Time::from_us(9_020))
         );
         assert!(events.is_empty());
         run_until(
             &mut worker,
-            Time::from_ms(8.8),
+            Time::from_us(9_020),
             Time::from_ms(60.0),
             &mut events,
         );
-        assert_eq!(launched(&events), [(1, 4, Time::from_ms(9.8))]);
+        assert_eq!(launched(&events), [(1, 4, Time::from_us(10_020))]);
         assert_eq!(hit_tokens(&store, 0), Some(40));
     }
 

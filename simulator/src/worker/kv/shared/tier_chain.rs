@@ -187,6 +187,16 @@ impl TierBytes {
         }
     }
 
+    /// What one GPU of a pipeline stores and reads, from each stage's layout
+    /// in order ([`Self::of_layout`] folded by [`Self::of_stages`]).
+    pub fn of_pipeline<'a>(
+        stages: impl IntoIterator<Item = &'a KvCacheLayout>,
+        balanced: bool,
+    ) -> Self {
+        let stages: Vec<TierBytes> = stages.into_iter().map(Self::of_layout).collect();
+        Self::of_stages(&stages, balanced)
+    }
+
     /// What one GPU of a pipeline reads, given each stage's bytes: the first
     /// stage with the most bytes per token, or with `balanced` the stages'
     /// means, each rounded up.
@@ -2208,6 +2218,32 @@ mod tests {
                 per_token: 545,
                 state: 1_000
             }
+        );
+    }
+
+    #[test]
+    fn a_pipeline_folds_its_stage_layouts() {
+        use crate::arch::kv_layout::KvCachePart;
+        // A 1-DSA stage with a 30 B state, then a 2-DSA one with 20 B.
+        let stages = [(1, 30), (2, 20)].map(|(layers, state)| {
+            KvCacheLayout::new()
+                .with_part(KvCachePart::per_token("mla", layers * 545))
+                .with_part(KvCachePart::per_request("kda", state))
+        });
+        assert_eq!(
+            TierBytes::of_pipeline(&stages, false),
+            TierBytes {
+                per_token: 1_090,
+                state: 20
+            }
+        );
+        assert_eq!(
+            TierBytes::of_pipeline(&stages, true),
+            TierBytes {
+                per_token: 818,
+                state: 25
+            },
+            "1635 B and 50 B over 2 stages, rounded up"
         );
     }
 

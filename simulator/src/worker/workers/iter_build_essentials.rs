@@ -22,6 +22,7 @@ use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::{KvPoolFacts, SharedGpuCluster};
 use crate::worker::kv::{
     KvAccounting, KvAccountingOptions, KvCacheStore, SharedKvAccounting, SharedTiersReports,
+    TierBytes, TierStateOptions,
 };
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
@@ -92,6 +93,48 @@ pub(crate) fn kv_cache_store(
         prefix_cache_logger,
     )
     .with_external_decode(config.external_decode)
+}
+
+/// `kv_store` with the config's host tiers behind each partition's prefix
+/// cache, each GPU storing and reading `tier_bytes`, reads staged through
+/// loading areas when the config has one, and the tiers' end-of-run report
+/// left in `tiers_reports`. Without tiers the store is unchanged but for the
+/// report. A loading area stages reads of recurrent state, so a layout whose
+/// tiers store none (full attention) cannot take one.
+pub(crate) fn with_host_tiers(
+    kv_store: KvCacheStore,
+    tier_bytes: TierBytes,
+    config: &WorkerConfig,
+    tiers_reports: SharedTiersReports,
+    pool_tag: &str,
+    id: WorkerId,
+) -> KvCacheStore {
+    let area = config.prefix_tier_loading_area;
+    assert!(
+        area == 0.0 || tier_bytes.state > 0,
+        "{pool_tag} worker {}: prefix_tier_loading_area ({area}) needs an arch with recurrent \
+         state in its host tiers; this one stores none per GPU (full attention)",
+        id.0
+    );
+    let kv_store = kv_store.with_prefix_tiers(
+        &config.prefix_tiers,
+        tier_bytes,
+        TierStateOptions {
+            compression_ratio: config.tier_state_compression_ratio,
+            anchors_in_place: config.recurrent_state_anchors_in_place,
+        },
+    );
+    let kv_store = if area > 0.0 {
+        kv_store.with_loading_area(area)
+    } else {
+        kv_store
+    };
+    if config.prefix_tier_warm_start {
+        kv_store.with_tier_warm_start()
+    } else {
+        kv_store
+    }
+    .with_tiers_reports(tiers_reports)
 }
 
 /// The token boundary non-final prefill chunks end on, if any: the layout's
@@ -172,5 +215,61 @@ pub(super) fn prepare_iter_build_essentials(
         sampler,
         cost,
         tiers_reports,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::kv::{TierSpec, TierWrites, TieredPrefixKv};
+
+    /// A one-partition store with a DRAM tier and a loading area of `area`,
+    /// its tiers storing `state` bytes per context.
+    fn staged(area: f64, state: u64) -> KvCacheStore {
+        let config = WorkerConfig {
+            prefix_tiers: vec![TierSpec {
+                name: "dram",
+                capacity_gb: 1e-3,
+                read_gb_per_s: 1e-3,
+                writes: TierWrites::EveryContext,
+            }],
+            prefix_tier_loading_area: area,
+            ..WorkerConfig::default()
+        };
+        let kv_store = kv_cache_store(
+            KvAccounting::tokens_for_test(1_000),
+            1,
+            1,
+            &config,
+            None,
+            None,
+        );
+        with_host_tiers(
+            kv_store,
+            TierBytes {
+                per_token: 545,
+                state,
+            },
+            &config,
+            SharedTiersReports::default(),
+            "stage",
+            WorkerId(3),
+        )
+    }
+
+    #[test]
+    fn a_loading_area_needs_an_arch_with_recurrent_state() {
+        assert!(staged(0.1, 1_000).stages_tier_reads());
+        assert!(!staged(0.0, 0).stages_tier_reads());
+        let Err(full_attention) = std::panic::catch_unwind(|| staged(0.1, 0)) else {
+            panic!("a full-attention layout cannot take a loading area");
+        };
+        let message = full_attention
+            .downcast_ref::<String>()
+            .expect("a formatted panic");
+        assert!(
+            message.starts_with("stage worker 3: prefix_tier_loading_area (0.1)"),
+            "{message}"
+        );
     }
 }
