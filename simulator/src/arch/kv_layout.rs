@@ -75,6 +75,19 @@ pub struct PartOverhead {
     /// mode: one plus vLLM's speculative blocks. `None` means one. L5 adds
     /// align mode's previous-step copy to vLLM's concurrency estimate only.
     pub copies: Option<u32>,
+    /// Bytes the engine charges per engine block the part's tokens occupy,
+    /// when it allocates the part in whole blocks whose bytes are not a whole
+    /// number per entry: vLLM's block-outermost hybrid pool, where every block
+    /// id costs the widest group's page rounded up to the kernels' block-stride
+    /// alignment (`_get_kv_cache_bytes_per_block`), whichever group holds it.
+    /// A per-token part then takes `cdiv(len, block_tokens)` blocks, a sliding
+    /// window `cdiv(kept, block_tokens) + 1` (the window need not start on a
+    /// block boundary: `SlidingWindowSpec.max_admission_blocks_per_request`).
+    /// Under `vllm` it replaces the per-entry charge of the part's live
+    /// tokens; `none` ignores it. A per-request part pads with
+    /// `padded_bytes_per_entry` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padded_bytes_per_block: Option<u64>,
 }
 
 /// What the serving engine adds to the whole pool.
@@ -119,6 +132,9 @@ impl KvCacheLayout {
             if let Some(padded) = &mut part.overhead.padded_bytes_per_entry {
                 *padded *= ranks;
             }
+            if let Some(padded) = &mut part.overhead.padded_bytes_per_block {
+                *padded *= ranks;
+            }
         }
         self.engine.fixed_device_bytes *= ranks;
         self
@@ -155,6 +171,14 @@ impl KvCacheLayout {
                     "KV cache part {} pads {} bytes down to {padded}",
                     part.name,
                     part.bytes_per_entry
+                );
+            }
+            if let Some(block_bytes) = part.overhead.padded_bytes_per_block {
+                anyhow::ensure!(
+                    block_bytes > 0 && !matches!(part.growth, KvGrowth::PerRequest),
+                    "KV cache part {} charges {block_bytes} bytes per block; only a \
+                     per-token or sliding-window part is charged in blocks",
+                    part.name
                 );
             }
             anyhow::ensure!(
@@ -233,6 +257,13 @@ impl KvCachePart {
 
     pub fn padded_to(mut self, padded_bytes_per_entry: u64) -> Self {
         self.overhead.padded_bytes_per_entry = Some(padded_bytes_per_entry);
+        self
+    }
+
+    /// Charge the part `bytes_per_block` per engine block under `vllm`
+    /// ([`PartOverhead::padded_bytes_per_block`]).
+    pub fn padded_per_block(mut self, bytes_per_block: u64) -> Self {
+        self.overhead.padded_bytes_per_block = Some(bytes_per_block);
         self
     }
 
@@ -339,7 +370,10 @@ mod tests {
                 block_tokens: Some(64),
                 fixed_device_bytes: 4096,
             });
+        let one_rank =
+            one_rank.with_part(KvCachePart::sliding_window("swa", 64, 8).padded_per_block(700));
         let tp4 = one_rank.clone().held_on_each_rank(4);
+        assert_eq!(tp4.parts[2].overhead.padded_bytes_per_block, Some(4 * 700));
         assert_eq!(tp4.parts[0].bytes_per_entry, 4 * 576);
         assert_eq!(tp4.parts[0].overhead.padded_bytes_per_entry, Some(4 * 640));
         assert_eq!(tp4.parts[1].bytes_per_entry, 4 * 1000);
@@ -369,5 +403,11 @@ mod tests {
         assert!(shrinking.validate().is_err());
         let ok = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 8));
         assert!(ok.validate().is_ok());
+        let state_in_blocks = KvCacheLayout::new()
+            .with_part(KvCachePart::per_request("state", 8).padded_per_block(64));
+        assert!(state_in_blocks.validate().is_err());
+        let zero_block =
+            KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 8).padded_per_block(0));
+        assert!(zero_block.validate().is_err());
     }
 }

@@ -29,6 +29,16 @@
 //!   total are exact; only how the slots spread over rows is approximated.
 //!   A new L1 encoding with explicit per-row counts would remove that; this op
 //!   does not add one.
+//!
+//! Speculative verify (`decode_next_n` = K + 1 > 1) changes no launch: the
+//! fork's `FlashInferMLASparseImpl._run_mqa_kernel`
+//! (`v1/attention/backends/mla/flashinfer_mla_sparse.py:667-736`) always
+//! flattens to one query row per token (`q.unsqueeze(1)`, q_len_per_request
+//! 1), each with its own top-k row. A verify request is `decode_next_n` rows
+//! whose row `t` sees `kv_len - decode_next_n + 1 + t` tokens (the indexer's
+//! per-token `seq_lens`, `v1/attention/backends/mla/indexer.py:618-621`), so
+//! consecutive rows walk consecutive kpool tail phases -- the very phase mix
+//! `PooledUniformFull` encodes, at `num_queries = requests x decode_next_n`.
 
 use std::sync::Arc;
 
@@ -76,6 +86,9 @@ pub struct Glm53KpoolSparseMlaConfig {
     pub mla_cache_format: String,
     pub page_table_mapping: String,
     pub max_model_len: u32,
+    /// Query rows per decode request: 1 for plain decode, K + 1 for a
+    /// speculative verify step.
+    pub decode_next_n: u32,
 }
 
 /// Per-rank inputs for one logical sparse MLA call.
@@ -83,7 +96,8 @@ pub struct Glm53KpoolSparseMlaConfig {
 pub struct Glm53KpoolSparseMlaInput {
     /// `(append, prefix + append)` per prefill request.
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
-    /// One KV length per decode request, including the token being decoded.
+    /// One KV length per decode request, including every token it decodes
+    /// this step (all `decode_next_n` verify rows).
     pub decode_context_lens: Vec<u32>,
 }
 
@@ -96,6 +110,7 @@ pub struct Glm53KpoolSparseMlaOp {
     index_topk: u32,
     index_kpool: u32,
     selected_k: u32,
+    decode_next_n: u32,
 }
 
 /// The four L1 configurations one op identity expands into.
@@ -123,6 +138,9 @@ impl Glm53KpoolSparseMlaOp {
         }
         if cfg.softmax_scale_denominator == 0 {
             return Err(fit_failed("softmax_scale_denominator must be positive"));
+        }
+        if cfg.decode_next_n == 0 {
+            return Err(fit_failed("decode_next_n must be positive"));
         }
         if cfg.mla_cache_block_size == 0 || cfg.max_model_len == 0 {
             return Err(fit_failed(
@@ -214,6 +232,7 @@ impl Glm53KpoolSparseMlaOp {
             index_topk: cfg.index_topk,
             index_kpool: cfg.index_kpool,
             selected_k: cfg.selected_k,
+            decode_next_n: cfg.decode_next_n,
             name,
         })
     }
@@ -239,8 +258,14 @@ impl Glm53KpoolSparseMlaOp {
 
     /// Push the four slots in compile order (INV-2).
     pub fn eval(&self, input: &Glm53KpoolSparseMlaInput, ev: &mut Evaluator) {
-        let shape = derive_shape(input, self.index_topk, self.index_kpool, self.selected_k)
-            .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
+        let shape = derive_shape(
+            input,
+            self.index_topk,
+            self.index_kpool,
+            self.selected_k,
+            self.decode_next_n,
+        )
+        .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
 
         let cache_append = MlaCacheAppendKernelInput {
             num_tokens: shape.num_rows,
@@ -290,7 +315,7 @@ impl Glm53KpoolSparseMlaOp {
         ev.push(metrics, || {
             DsaSparseMlaDecodeLog {
                 context_lens: input.decode_context_lens.clone(),
-                decode_next_n: 1,
+                decode_next_n: self.decode_next_n,
                 projected_context: shape
                     .decode
                     .as_ref()
@@ -396,16 +421,26 @@ fn derive_shape(
     index_topk: u32,
     index_kpool: u32,
     selected_k: u32,
+    decode_next_n: u32,
 ) -> Result<Shape, String> {
     let mut num_rows: u64 = 0;
     let mut total_valid_count: u64 = 0;
-    // vLLM lays decode rows out ahead of prefill rows in a mixed batch.
+    // vLLM lays decode rows out ahead of prefill rows in a mixed batch. A
+    // decode request's `decode_next_n` rows end at its context, one token
+    // apart.
     for (request, &context) in input.decode_context_lens.iter().enumerate() {
-        if context == 0 {
-            return Err(format!("decode request {request} context must be positive"));
+        if context < decode_next_n.max(1) {
+            return Err(format!(
+                "decode request {request} context {context} must be at least \
+                 decode_next_n {decode_next_n}"
+            ));
         }
-        num_rows += 1;
-        total_valid_count += u64::from(pooled_valid_count(context, index_topk, index_kpool));
+        num_rows += u64::from(decode_next_n);
+        total_valid_count += if decode_next_n == 1 {
+            u64::from(pooled_valid_count(context, index_topk, index_kpool))
+        } else {
+            pooled_valid_total(context - decode_next_n + 1, context, index_topk, index_kpool)
+        };
     }
     for (request, &(num_queries, context)) in input.prefill_query_cache_pairs.iter().enumerate() {
         if num_queries == 0 || num_queries > context {
@@ -429,7 +464,7 @@ fn derive_shape(
         .max()
         .filter(|_| !prefill_bearing)
         .map(|context| DsaSparseMlaAttentionKernelInput {
-            num_queries: input.decode_context_lens.len() as u32,
+            num_queries: num_rows,
             num_cache_tokens: context,
         });
     Ok(Shape {
@@ -479,6 +514,7 @@ mod tests {
             mla_cache_format: "plain".to_string(),
             page_table_mapping: "interleaved_requests".to_string(),
             max_model_len: 8192,
+            decode_next_n: 1,
         }
     }
 
@@ -541,7 +577,7 @@ mod tests {
             prefill_query_cache_pairs: vec![(3, 5)],
             decode_context_lens: vec![1000, 4003],
         };
-        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&input, 2048, 4, 2176, 1).unwrap();
         assert_eq!(shape.num_rows, 5);
         let remap = shape.remap.unwrap();
         assert_eq!(remap.num_queries, 5);
@@ -561,10 +597,52 @@ mod tests {
             prefill_query_cache_pairs: Vec::new(),
             decode_context_lens: vec![1000, 4003],
         };
-        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&input, 2048, 4, 2176, 1).unwrap();
         assert!(shape.prefill.is_none());
         let decode = shape.decode.unwrap();
         assert_eq!((decode.num_queries, decode.num_cache_tokens), (2, 4003));
+    }
+
+    /// A verify step bills every request's `next_n` rows, each at its own
+    /// position: a width that only reached the log would price one row per
+    /// request and miss the rows' tail phases.
+    #[test]
+    fn verify_rows_walk_their_positions_on_decode_and_mixed_paths() {
+        let decode = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: Vec::new(),
+            decode_context_lens: vec![1000, 4003],
+        };
+        let shape = derive_shape(&decode, 2048, 4, 2176, 4).unwrap();
+        assert_eq!(shape.num_rows, 8);
+        let attention = shape.decode.unwrap();
+        assert_eq!(
+            (attention.num_queries, attention.num_cache_tokens),
+            (8, 4003)
+        );
+        // 997..=1000 read every slot; 4000..=4003 read 2048 pools plus their
+        // 0..=3 tail tokens.
+        assert_eq!(
+            shape.remap.unwrap().total_valid_count,
+            (997 + 998 + 999 + 1000) + (2048 + 2049 + 2050 + 2051)
+        );
+        // Mixed: the verify rows join the one prefill-shaped launch.
+        let mixed = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(3, 5)],
+            decode_context_lens: vec![1000],
+        };
+        let shape = derive_shape(&mixed, 2048, 4, 2176, 2).unwrap();
+        assert!(shape.decode.is_none());
+        assert_eq!(shape.prefill.unwrap().num_queries, 5);
+        assert_eq!(
+            shape.remap.unwrap().total_valid_count,
+            999 + 1000 + 3 + 4 + 5
+        );
+        // A context shorter than the verify group is not a verify request.
+        let short = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: Vec::new(),
+            decode_context_lens: vec![3],
+        };
+        assert!(derive_shape(&short, 2048, 4, 2176, 4).is_err());
     }
 
     #[test]
@@ -574,7 +652,7 @@ mod tests {
             prefill_query_cache_pairs: vec![(1000, 1500)],
             decode_context_lens: Vec::new(),
         };
-        let prefill = derive_shape(&input, 2048, 4, 2176)
+        let prefill = derive_shape(&input, 2048, 4, 2176, 1)
             .unwrap()
             .prefill
             .unwrap();
@@ -593,13 +671,13 @@ mod tests {
 
     #[test]
     fn empty_batch_has_no_remap_and_bad_pairs_fail() {
-        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4, 2176, 1).unwrap();
         assert!(shape.remap.is_none() && shape.decode.is_none() && shape.prefill.is_none());
         let bad = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(6, 5)],
             decode_context_lens: Vec::new(),
         };
-        assert!(derive_shape(&bad, 2048, 4, 2176).is_err());
+        assert!(derive_shape(&bad, 2048, 4, 2176, 1).is_err());
     }
 
     #[test]

@@ -36,12 +36,16 @@ use crate::timing::{
     SlotInput,
 };
 
+#[cfg(test)]
 const HIDDEN_DIM: u32 = 6144;
 const HEAD_DIM: u32 = 128;
+#[cfg(test)]
 const NUM_KV_HEADS: u32 = 8;
+#[cfg(test)]
 const NUM_DRAFT_LAYERS: u32 = 6;
 /// Target layers whose hidden states the draft consumes — `dflash_config.target_layer_ids`
 /// is `[5, 19, 33, 47, 61, 75]`, so `fc` reads six concatenated hidden vectors.
+#[cfg(test)]
 const NUM_AUX_LAYERS: u32 = 6;
 
 /// Raw DFlash2 context-KV identity for one rank-local compute section.
@@ -365,13 +369,12 @@ impl Dflash2ContextKvLocalWorklet {
     }
 }
 
+/// Checkpoint dimensions (hidden, heads, intermediate, layer counts) come from
+/// the draft's own config and are not pinned here; only the structure the
+/// measured kernels assume is.
 fn validate_config(cfg: &Dflash2ContextKvLocalWorkletConfig) -> Result<(), String> {
     for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
         ("head_dim", cfg.head_dim.get(), HEAD_DIM),
-        ("num_kv_heads", cfg.num_kv_heads.get(), NUM_KV_HEADS),
-        ("num_draft_layers", cfg.num_draft_layers, NUM_DRAFT_LAYERS),
-        ("num_aux_layers", cfg.num_aux_layers, NUM_AUX_LAYERS),
     ] {
         if actual != required {
             return Err(format!("{name} must be {required}, got {actual}"));
@@ -383,6 +386,9 @@ fn validate_config(cfg: &Dflash2ContextKvLocalWorkletConfig) -> Result<(), Strin
             DType::Bf16.as_str(),
             cfg.dtype.as_str()
         ));
+    }
+    if cfg.num_draft_layers == 0 || cfg.num_aux_layers == 0 {
+        return Err("num_draft_layers and num_aux_layers must be positive".to_string());
     }
     if cfg.tp_size == 0 || cfg.num_kv_heads.get() % u32::from(cfg.tp_size) != 0 {
         return Err(format!(
@@ -504,9 +510,12 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_layer_count_other_than_the_checkpoint_is_rejected() {
-        let mut bad = cfg();
-        bad.num_draft_layers = 8;
-        assert!(validate_config(&bad).is_err());
+    fn layer_counts_come_from_the_draft_config_but_must_be_positive() {
+        let mut other = cfg();
+        other.num_draft_layers = 5;
+        other.num_aux_layers = 5;
+        assert!(validate_config(&other).is_ok());
+        other.num_draft_layers = 0;
+        assert!(validate_config(&other).is_err());
     }
 }

@@ -68,10 +68,14 @@ use crate::timing::{
     PerfApiBridge, Probe, SlotInput,
 };
 
+#[cfg(test)]
 const HIDDEN_DIM: u32 = 6144;
+#[cfg(test)]
 const INTERMEDIATE_DIM: u32 = 12288;
 const HEAD_DIM: u32 = 128;
+#[cfg(test)]
 const NUM_QO_HEADS: u32 = 64;
+#[cfg(test)]
 const NUM_KV_HEADS: u32 = 8;
 /// `dflash_config.conv_kernel_size` — the convolution reaches back one position.
 const CONV_TAPS: u32 = 2;
@@ -661,17 +665,12 @@ impl Dflash2DraftFfnLocalWorklet {
 
 // ------------------------------------------------------------------ shared --
 
+/// Checkpoint dimensions (hidden, heads, intermediate, layer counts) come from
+/// the draft's own config and are not pinned here; only the structure the
+/// measured kernels assume is.
 fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), String> {
     for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        (
-            "intermediate_dim",
-            cfg.intermediate_dim.get(),
-            INTERMEDIATE_DIM,
-        ),
         ("head_dim", cfg.head_dim.get(), HEAD_DIM),
-        ("num_qo_heads", cfg.num_qo_heads.get(), NUM_QO_HEADS),
-        ("num_kv_heads", cfg.num_kv_heads.get(), NUM_KV_HEADS),
         ("conv_taps", cfg.conv_taps, CONV_TAPS),
         ("conv_group_size", cfg.conv_group_size, CONV_GROUP_SIZE),
     ] {

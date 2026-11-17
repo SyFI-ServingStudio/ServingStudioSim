@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg, optional_arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -58,6 +58,15 @@ class KdaRecurrentDecodeArgs(KernelArgs):
     num_heads: int = arg(unit="heads", doc="Heads, each with its own query, key, value and state.")
     head_dim: int = arg(unit="elements", doc="Features in each query, key and value head.")
     dtype: DType = arg(doc="Element type of the activations, gate input and output.")
+    num_tokens: int | None = optional_arg(
+        unit="tokens",
+        same_as="batch_size",
+        doc=(
+            "Tokens across the batch, an equal number per request: a speculative "
+            "verify step's accepted token plus drafts. Absent when each request "
+            "decodes one token."
+        ),
+    )
 
 
 DOC = KernelDoc(
@@ -79,9 +88,9 @@ DOC = KernelDoc(
         "decay = exp(−5·sigmoid(exp(A_log)·(raw_g + dt_bias))), per head and key channel",
         "q, k = L2Norm(q, k); q = q·head_dim⁻¹ᐟ²; beta = sigmoid(b)",
         "S′ = diag(decay)·S + k·(beta·(v − kᵀ(diag(decay)·S)))ᵀ; y = qᵀS′",
-        "FLOPs = 7·batch_size·num_heads·head_dim²",
-        "bytes = 10·batch_size·num_heads·head_dim + 2·batch_size·num_heads + "
-        "8·batch_size·num_heads·head_dim²",
+        "T = num_tokens (batch_size when absent)",
+        "FLOPs = 7·T·num_heads·head_dim²",
+        "bytes = 10·T·num_heads·head_dim + 2·T·num_heads + 4·(batch_size + T)·num_heads·head_dim²",
         "TFLOPS = FLOPs / time",
         "GB/s = bytes / time",
     ),
@@ -94,9 +103,16 @@ DOC = KernelDoc(
     ),
     caveats=(
         "The kernel takes any head_dim.",
-        "Only a plain decode step is measured, one token per request and no speculative decoding.",
+        "num_tokens > batch_size is a pure speculative verify step: q = num_tokens / "
+        "batch_size tokens per request, cu_seqlens = arange(B+1)·q, a [B, q] table of "
+        "distinct state slots and num_accepted_tokens cycling 1..q. Each request reads "
+        "one state, from slot [n, accepted − 1], and writes one per token. The kernel's "
+        "work does not depend on the accepted counts, which only pick the slot read.",
         "The short causal convolution before the call is a separate kind, gdn_causal_conv_decode.",
         "GB/s counts each input once and leaves out the copies' extra reads and writes.",
+        "The pinned vLLM fork (since 1768273c13, strided KDA recurrent inputs) reads "
+        "q/k/v/beta as strided views and launches no copies; one-token rows measured "
+        "before it include the four copy launches (B200, H=16: 11.8 vs 4.3 us at batch 2).",
     ),
     reference="profiling.runners.attention.kda_recurrent_decode_reference",
 )

@@ -66,3 +66,58 @@ def kda_recurrent_decode_reference(
     updated = state_pool.clone()
     updated[slots] = state.transpose(-1, -2).to(state_pool.dtype)
     return output.to(v.dtype), updated
+
+
+def kda_recurrent_verify_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted: torch.Tensor,
+    *,
+    lower_bound: float,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Speculative-verify form: ``q`` tokens per request, one state slot per token.
+
+    Tokens are request-major ``[B·q, ...]`` (the ``cu_seqlens = arange(B+1)·q``
+    layout). ``state_indices`` is vLLM's ``[B, q]`` spec-state table. Request
+    ``n`` starts from slot ``state_indices[n, num_accepted[n] − 1]`` (the state
+    after its last accepted token of the previous step) and writes the state
+    after its token ``t`` to ``state_indices[n, t]``. Returns ``(o [B·q,H,V],
+    updated copy of state_pool)``; the input pool is not mutated.
+    """
+    batch, per_request = state_indices.shape
+    indices = state_indices.long()
+    accepted = num_accepted.long().to(indices.device)
+    requests = torch.arange(batch, device=indices.device)
+    # Each request's running state, held as its own pool row (fp32, like the
+    # kernel's registers between tokens).
+    state = state_pool[indices[requests, accepted - 1]].clone()
+    rows_of_request = requests * per_request
+    own = requests.to(torch.int32)
+    updated = state_pool.clone()
+    outputs = torch.empty(batch * per_request, *v.shape[1:], dtype=v.dtype, device=v.device)
+    for token in range(per_request):
+        rows = rows_of_request + token
+        o, state = kda_recurrent_decode_reference(
+            q[rows],
+            k[rows],
+            v[rows],
+            raw_g[rows],
+            raw_beta[rows],
+            a_log,
+            dt_bias,
+            state,
+            own,
+            lower_bound=lower_bound,
+            scale=scale,
+        )
+        outputs[rows] = o
+        updated[indices[:, token]] = state.to(state_pool.dtype)
+    return outputs, updated

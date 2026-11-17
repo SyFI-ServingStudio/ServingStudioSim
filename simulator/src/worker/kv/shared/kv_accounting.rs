@@ -129,7 +129,7 @@ pub(super) struct PartInEstimate {
     /// part, the kept window for a sliding window; `None` for per-request state.
     pub tokens_held: Option<u64>,
     /// Entries charged: tokens over `tokens_per_entry`, window tokens, or state
-    /// copies.
+    /// copies; engine blocks for a part charged per block.
     pub entries: u64,
     pub units: u64,
 }
@@ -138,6 +138,9 @@ pub(super) struct PartInEstimate {
 struct PerTokenCharge {
     units_per_entry: u64,
     tokens_per_entry: u64,
+    /// `Some` when the part is charged in whole engine blocks
+    /// ([`KvCachePart::padded_per_block`]).
+    units_per_block: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +148,8 @@ struct WindowCharge {
     units_per_token: u64,
     window_tokens: u64,
     prefix_reusable: bool,
+    /// `Some` when the window's live tokens are charged in whole engine blocks.
+    units_per_block: Option<u64>,
 }
 
 /// Resolved charges of one KV partition. Built once per worker.
@@ -204,7 +209,13 @@ impl KvAccounting {
         let bytes_per_unit = layout
             .parts
             .iter()
-            .map(|part| charged_bytes_per_entry(part, options.overhead))
+            .flat_map(|part| {
+                [
+                    Some(charged_bytes_per_entry(part, options.overhead)),
+                    charged_bytes_per_block(part, options.overhead),
+                ]
+            })
+            .flatten()
             .fold(0, gcd);
 
         let mut per_token = Vec::new();
@@ -214,15 +225,19 @@ impl KvAccounting {
         let mut reusable_state_units = 0;
         for part in &layout.parts {
             let units = charged_bytes_per_entry(part, options.overhead) / bytes_per_unit;
+            let units_per_block =
+                charged_bytes_per_block(part, options.overhead).map(|bytes| bytes / bytes_per_unit);
             match part.growth {
                 KvGrowth::PerToken { tokens_per_entry } => per_token.push(PerTokenCharge {
                     units_per_entry: units,
                     tokens_per_entry: u64::from(tokens_per_entry),
+                    units_per_block,
                 }),
                 KvGrowth::SlidingWindow { window_tokens } => windows.push(WindowCharge {
                     units_per_token: units,
                     window_tokens: u64::from(window_tokens),
                     prefix_reusable: part.prefix_reusable,
+                    units_per_block,
                 }),
                 KvGrowth::PerRequest => {
                     let (copies, aligns) = state_copies(part, layout, options);
@@ -248,7 +263,9 @@ impl KvAccounting {
         let capacity_units = (budget_bytes.saturating_sub(fixed_bytes) / bytes_per_unit).max(1);
         let linear_units_per_token = (windows.is_empty()
             && block_tokens == 1
-            && per_token.iter().all(|part| part.tokens_per_entry == 1))
+            && per_token
+                .iter()
+                .all(|part| part.tokens_per_entry == 1 && part.units_per_block.is_none()))
         .then(|| per_token.iter().map(|part| part.units_per_entry).sum());
 
         let resume_points = options.resume_points.unwrap_or(match options.overhead {
@@ -396,17 +413,29 @@ impl KvAccounting {
         if len == 0 {
             return 0;
         }
-        let allocated = len.div_ceil(self.block_tokens) * self.block_tokens;
+        let blocks = len.div_ceil(self.block_tokens);
+        let allocated = blocks * self.block_tokens;
         self.per_token
             .iter()
-            .map(|part| part.units_per_entry * allocated.div_ceil(part.tokens_per_entry))
+            .map(|part| match part.units_per_block {
+                Some(units_per_block) => units_per_block * blocks,
+                None => part.units_per_entry * allocated.div_ceil(part.tokens_per_entry),
+            })
             .sum()
     }
 
     fn window_units(&self, len: u64, kept: impl Fn(u64) -> u64) -> u64 {
         self.windows
             .iter()
-            .map(|part| part.units_per_token * len.min(kept(part.window_tokens)))
+            .map(|part| {
+                let tokens = len.min(kept(part.window_tokens));
+                match part.units_per_block {
+                    Some(units_per_block) => {
+                        units_per_block * window_blocks(tokens, self.block_tokens)
+                    }
+                    None => part.units_per_token * tokens,
+                }
+            })
             .sum()
     }
 
@@ -453,10 +482,16 @@ impl KvAccounting {
             .map(|part| {
                 let units_per_entry =
                     charged_bytes_per_entry(part, self.overhead) / self.bytes_per_unit;
+                let units_per_block = charged_bytes_per_block(part, self.overhead)
+                    .map(|bytes| bytes / self.bytes_per_unit);
                 let (tokens_held, entries) = match part.growth {
                     KvGrowth::PerToken { tokens_per_entry } => {
                         let tokens = if prompt_tokens == 0 { 0 } else { allocated };
-                        (Some(tokens), tokens.div_ceil(u64::from(tokens_per_entry)))
+                        let entries = match units_per_block {
+                            Some(_) => tokens / self.block_tokens,
+                            None => tokens.div_ceil(u64::from(tokens_per_entry)),
+                        };
+                        (Some(tokens), entries)
                     }
                     KvGrowth::SlidingWindow { window_tokens } => {
                         let window = u64::from(window_tokens);
@@ -465,7 +500,11 @@ impl KvAccounting {
                             KvOverhead::None => window,
                         };
                         let tokens = prompt_tokens.min(kept);
-                        (Some(tokens), tokens)
+                        let entries = match units_per_block {
+                            Some(_) => window_blocks(tokens, self.block_tokens),
+                            None => tokens,
+                        };
+                        (Some(tokens), entries)
                     }
                     KvGrowth::PerRequest => {
                         let (copies, aligns) = state_copies(part, &self.layout, self.options);
@@ -475,7 +514,7 @@ impl KvAccounting {
                 PartInEstimate {
                     tokens_held,
                     entries,
-                    units: units_per_entry * entries,
+                    units: units_per_block.unwrap_or(units_per_entry) * entries,
                 }
             })
             .collect()
@@ -727,6 +766,25 @@ pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) 
             .padded_bytes_per_entry
             .unwrap_or(part.bytes_per_entry),
         KvOverhead::None => part.bytes_per_entry,
+    }
+}
+
+/// What `part` is charged per engine block under `overhead`, when it is
+/// charged in blocks ([`KvCachePart::padded_per_block`]); `None` under `none`.
+pub(super) fn charged_bytes_per_block(part: &KvCachePart, overhead: KvOverhead) -> Option<u64> {
+    match overhead {
+        KvOverhead::Vllm => part.overhead.padded_bytes_per_block,
+        KvOverhead::None => None,
+    }
+}
+
+/// Blocks a sliding window of `tokens` live tokens spans: one more than they
+/// fill, since the window need not start on a block boundary.
+fn window_blocks(tokens: u64, block_tokens: u64) -> u64 {
+    if tokens == 0 {
+        0
+    } else {
+        tokens.div_ceil(block_tokens) + 1
     }
 }
 
@@ -1022,6 +1080,48 @@ mod tests {
         let vllm = KvAccounting::resolve(&layout, options(KvOverhead::Vllm), 10_000).unwrap();
         let none = KvAccounting::resolve(&layout, options(KvOverhead::None), 10_000).unwrap();
         assert_eq!((vllm.capacity_units(), none.capacity_units()), (900, 1_000));
+    }
+
+    /// A block-outermost pool whose block id costs 1300 B (a 100-token block of
+    /// 10 B/token latent plus 1 B/token index, rounded up to a 650 B stride):
+    /// the latent pads per block, a 64-token window spans whole blocks plus one.
+    fn block_charged_layout() -> KvCacheLayout {
+        KvCacheLayout::new()
+            .with_part(KvCachePart::per_token("latent", 10).padded_per_block(1_300 - 100))
+            .with_part(KvCachePart::per_token("index", 1))
+            .with_part(KvCachePart::sliding_window("swa", 64, 5).padded_per_block(1_300))
+            .with_engine(EngineOverhead {
+                block_tokens: Some(100),
+                fixed_device_bytes: 0,
+            })
+    }
+
+    #[test]
+    fn parts_charged_per_block_take_whole_pool_blocks_under_vllm() {
+        let in_flight = KvAccountingOptions {
+            max_in_flight_tokens: Some(100),
+            ..options(KvOverhead::Vllm)
+        };
+        let vllm = KvAccounting::resolve(&block_charged_layout(), in_flight, 130_000).unwrap();
+        // gcd(10, 1200, 1, 5, 1300) = 1 B per unit; 130_000 units: 100 blocks.
+        assert_eq!(vllm.capacity_units(), 130_000);
+        // 250 tokens: three blocks of latent + index (3 * 1300), the window's
+        // min(250, 63 + 100) = 163 tokens over two blocks plus one (3 * 1300).
+        assert_eq!(vllm.needed_to_admit(250), 6 * 1_300);
+        assert_eq!(vllm.concurrency_at(250), 100.0 / 6.0);
+        // A step of one token keeps 63 + 1 window tokens: one block plus one.
+        assert_eq!(vllm.held_while_running(250, 1), 5 * 1_300);
+        let split = vllm.estimated_request_by_part(250);
+        assert_eq!(
+            split.iter().map(|part| (part.entries, part.units)).collect::<Vec<_>>(),
+            [(3, 3 * 1_200), (300, 300), (3, 3 * 1_300)]
+        );
+        assert_eq!(vllm.linear_units_per_token(), None);
+        // `none` charges the model's own bytes: 250 * 11 + a 64-token window.
+        let none =
+            KvAccounting::resolve(&block_charged_layout(), options(KvOverhead::None), 130_000)
+                .unwrap();
+        assert_eq!(none.needed_to_admit(250), 250 * 11 + 64 * 5);
     }
 
     #[test]

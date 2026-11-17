@@ -483,6 +483,8 @@ pub struct Glm53FlashKernelPath {
     pub mla_layout_copies: bool,
     /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
     pub indexer_max_logits_mb: u32,
+    /// Whose hybrid KV allocator sizes the pool.
+    pub kv_allocator: FlashKvAllocator,
 }
 
 impl Default for Glm53FlashKernelPath {
@@ -491,6 +493,7 @@ impl Default for Glm53FlashKernelPath {
         Self {
             mla_layout_copies: true,
             indexer_max_logits_mb: 512,
+            kv_allocator: FlashKvAllocator::FORK,
         }
     }
 }
@@ -861,7 +864,7 @@ enum Attention {
     Dsa(Glm53DsaAttnLocalWorklet),
 }
 
-struct MoeBlock {
+pub(crate) struct MoeBlock {
     name: String,
     router: Glm53MoeRouterLocalWorklet,
     input_glue: Op<ElementwiseKernel>,
@@ -875,7 +878,7 @@ impl MoeBlock {
     /// routed slice (a contended `Max`), plus serial copies of both for
     /// batches too large for the aux stream. One of the two pairs is filled
     /// per iteration; INV-1 fixes the shape.
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let ep = self.routed.len();
         let router = self.router.compile(builder);
         let input_glue = self.input_glue.compile(builder);
@@ -916,7 +919,7 @@ impl MoeBlock {
         }
     }
 
-    fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
         let overlapped = num_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD;
         self.router
             .eval(&Glm53MoeRouterLocalWorkletInput { num_tokens }, ev);
@@ -966,7 +969,7 @@ enum Ffn {
 /// pynccl, and at TP8 torch symmetric memory up to 128 MiB, for which the
 /// measured NCCL curve stands in. Both slots are compiled and the inactive one
 /// is pushed as zero, so the slot layout does not depend on the batch.
-struct TpAllReduce {
+pub(crate) struct TpAllReduce {
     fused: Op<AllReduceFusionKernel>,
     large: Op<AllReduceKernel>,
     max_fused_tokens: u32,
@@ -974,7 +977,7 @@ struct TpAllReduce {
 }
 
 impl TpAllReduce {
-    fn build(
+    pub(crate) fn build(
         prefix: &str,
         suffix: &str,
         cfg: &Glm53FlashVllmConfigs,
@@ -1001,14 +1004,14 @@ impl TpAllReduce {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
             self.fused.compile(builder),
             self.large.compile(builder),
         ])
     }
 
-    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, tokens: u32, ev: &mut Evaluator) {
         let fused_input = AllReduceFusionKernelInput { num_tokens: tokens };
         let large_input = AllReduceKernelInput {
             message_size_bytes: u64::from(tokens) * self.bytes_per_token,
@@ -1107,6 +1110,57 @@ impl LayerGroup {
     }
 }
 
+/// One MoE sublayer's leaves, named `{moe}.*`: the router, the shared expert
+/// and one routed slice per EP rank from `routed` (the target's body demand, or
+/// a drafter's own).
+pub(crate) fn build_moe_block(
+    moe: &str,
+    resolved: &Glm53FlashVllmResolved,
+    routed: &[Glm53RoutedMoeLocalWorkletResolved],
+    bridge: &PerfApiBridge,
+) -> std::result::Result<MoeBlock, BuildError> {
+    let cfg = &resolved.raw_cfg;
+    let m = moe;
+    Ok(MoeBlock {
+                router: Glm53MoeRouterLocalWorklet::build(
+                    format!("{m}.router"),
+                    Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
+                    bridge,
+                )?,
+                input_glue: atomic(
+                    m,
+                    "input_glue",
+                    cfg.moe_input_glue.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                shared_expert: Glm53MlpLocalWorklet::build(
+                    format!("{m}.shared_expert"),
+                    resolved.shared_expert.clone(),
+                    bridge,
+                )?,
+                routed: routed
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, routed)| {
+                        Glm53RoutedMoeLocalWorklet::build(
+                            format!("{m}.routed_rank{rank}"),
+                            routed.clone(),
+                            bridge,
+                        )
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+                combine_glue: atomic(
+                    m,
+                    "combine_glue",
+                    cfg.moe_combine_glue.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                name: moe.to_string(),
+            })
+}
+
 /// Build one layer group's leaves, named `{name}.{group label}.*`.
 /// `all_reduce` adds the TP all-reduce that closes each sublayer.
 pub(crate) fn build_layer_group(
@@ -1154,49 +1208,12 @@ pub(crate) fn build_layer_group(
             resolved.dense_ffn.clone(),
             bridge,
         )?),
-        FfnKind::Moe => {
-            let moe = format!("{p}.moe");
-            let m = moe.as_str();
-            Ffn::Moe(MoeBlock {
-                router: Glm53MoeRouterLocalWorklet::build(
-                    format!("{m}.router"),
-                    Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
-                    bridge,
-                )?,
-                input_glue: atomic(
-                    m,
-                    "input_glue",
-                    cfg.moe_input_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )?,
-                shared_expert: Glm53MlpLocalWorklet::build(
-                    format!("{m}.shared_expert"),
-                    resolved.shared_expert.clone(),
-                    bridge,
-                )?,
-                routed: resolved
-                    .routed
-                    .iter()
-                    .enumerate()
-                    .map(|(rank, routed)| {
-                        Glm53RoutedMoeLocalWorklet::build(
-                            format!("{m}.routed_rank{rank}"),
-                            routed.clone(),
-                            bridge,
-                        )
-                    })
-                    .collect::<std::result::Result<_, _>>()?,
-                combine_glue: atomic(
-                    m,
-                    "combine_glue",
-                    cfg.moe_combine_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )?,
-                name: moe,
-            })
-        }
+        FfnKind::Moe => Ffn::Moe(build_moe_block(
+            &format!("{p}.moe"),
+            resolved,
+            &resolved.routed,
+            bridge,
+        )?),
     };
     let reduce = |suffix: &str| {
         all_reduce
@@ -1221,13 +1238,10 @@ pub(crate) fn build_layer_group(
     })
 }
 
-pub struct Glm53FlashVllmModel {
-    pub name: String,
-    pub tp_size: u16,
-    pub enable_expert_parallel: bool,
-    pub max_model_len: u32,
-    /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
-    cudagraph_capture_sizes: Vec<u32>,
+/// The target forward pass: embedding, every decoder layer group, the terminal
+/// mHC contraction, the final norm and the lm_head. The no-spec model runs it
+/// alone; a speculative model runs it as the verify pass before its drafter.
+pub(crate) struct Glm53FlashTargetForward {
     embedding: Op<ElementwiseKernel>,
     embedding_all_reduce: TpAllReduce,
     hc_expand: Op<ElementwiseKernel>,
@@ -1236,6 +1250,138 @@ pub struct Glm53FlashVllmModel {
     hc_contract_mean: Op<ElementwiseKernel>,
     final_norm: Op<RmsNormKernel>,
     lm_head: Op<SingleGemmKernel>,
+}
+
+impl Glm53FlashTargetForward {
+    pub(crate) fn build(
+        n: &str,
+        resolved: &Glm53FlashVllmResolved,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        let cfg = &resolved.raw_cfg;
+        Ok(Self {
+            embedding: atomic(
+                n,
+                "embedding",
+                cfg.embedding.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )?,
+            embedding_all_reduce: TpAllReduce::build(n, "embedding_all_reduce", cfg, bridge)?,
+            hc_expand: atomic(
+                n,
+                "hc_expand",
+                cfg.hc_expand.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )?,
+            groups: cfg
+                .groups
+                .iter()
+                .map(|group| build_layer_group(n, group, resolved, true, bridge))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            terminal_post: MhcTerminalPostOp::build(
+                format!("{n}.final_mhc_post"),
+                MhcTerminalPostConfig {
+                    mhc: cfg.mhc.clone(),
+                    pre_backends: MHC_BACKENDS.to_vec(),
+                    fused_backends: MHC_BACKENDS.to_vec(),
+                },
+                bridge,
+            )?,
+            hc_contract_mean: atomic(
+                n,
+                "hc_contract_mean",
+                cfg.hc_contract_mean.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )?,
+            final_norm: atomic(
+                n,
+                "final_norm",
+                cfg.final_norm.clone(),
+                RmsNormKernel::build,
+                bridge,
+            )?,
+            lm_head: atomic(
+                n,
+                "lm_head",
+                cfg.lm_head.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
+        })
+    }
+
+    /// The pass's leaves in eval push order (INV-2).
+    pub(crate) fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut children = vec![
+            self.embedding.compile(builder),
+            self.embedding_all_reduce.compile(builder),
+            self.hc_expand.compile(builder),
+        ];
+        for group in &self.groups {
+            children.push(group.compile(builder));
+        }
+        children.extend([
+            self.terminal_post.compile(builder),
+            self.hc_contract_mean.compile(builder),
+            self.final_norm.compile(builder),
+            self.lm_head.compile(builder),
+        ]);
+        children
+    }
+
+    /// `tokens` is the graph-padded row count; `logits_rows` the rows the
+    /// lm_head scores (one per request without speculation, 0 to skip it).
+    pub(crate) fn eval(
+        &self,
+        batch: &NormalizedBatch,
+        tokens: u32,
+        logits_rows: u32,
+        ev: &mut Evaluator,
+    ) {
+        push(
+            &self.embedding,
+            ElementwiseKernelInput { num_tokens: tokens },
+            ev,
+        );
+        self.embedding_all_reduce.eval(tokens, ev);
+        push(
+            &self.hc_expand,
+            ElementwiseKernelInput { num_tokens: tokens },
+            ev,
+        );
+        for group in &self.groups {
+            group.eval(batch, tokens, ev);
+        }
+        self.terminal_post
+            .eval(&MhcTerminalPostInput { num_tokens: tokens }, ev);
+        push(
+            &self.hc_contract_mean,
+            ElementwiseKernelInput { num_tokens: tokens },
+            ev,
+        );
+        push(&self.final_norm, RmsNormKernelInput { m: tokens }, ev);
+        // Zero rows: a caller that scores the rows with its own head (the
+        // speculative verify head) keeps this slot empty.
+        let head = SingleGemmKernelInput { m: logits_rows };
+        if logits_rows == 0 {
+            ev.push(LeafMetrics::ZERO, || head.into());
+        } else {
+            push(&self.lm_head, head, ev);
+        }
+    }
+}
+
+pub struct Glm53FlashVllmModel {
+    pub name: String,
+    pub tp_size: u16,
+    pub enable_expert_parallel: bool,
+    pub max_model_len: u32,
+    /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
+    cudagraph_capture_sizes: Vec<u32>,
+    target: Glm53FlashTargetForward,
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -1248,82 +1394,18 @@ pub fn build(
 ) -> std::result::Result<Glm53FlashVllmModel, BuildError> {
     let cfg = &resolved.raw_cfg;
     refuse_unfused_all_reduce(&cfg.parallel)?;
-    let n = name.as_str();
-    let groups = cfg
-        .groups
-        .iter()
-        .map(|group| build_layer_group(n, group, &resolved, true, bridge))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let model_cfg = &cfg.model;
-    let dsa_layers = model_cfg.num_dsa_layers();
-    let kda_layers = model_cfg.kda_layers.len() as u32;
-    let kda_state_bytes = kda_layer_state_bytes_per_request(&resolved);
-    let kv_cache_layout = hybrid_kv_cache_layout(
-        model_cfg,
-        kda_state_bytes,
-        dsa_layers,
-        kda_layers,
-        kda_layers.div_ceil(dsa_layers.max(1)),
-        hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
-    )
-    .held_on_each_rank(u64::from(cfg.parallel.tp_size));
     let mut model = Glm53FlashVllmModel {
-        embedding: atomic(
-            n,
-            "embedding",
-            cfg.embedding.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?,
-        embedding_all_reduce: TpAllReduce::build(n, "embedding_all_reduce", cfg, bridge)?,
-        hc_expand: atomic(
-            n,
-            "hc_expand",
-            cfg.hc_expand.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?,
-        groups,
-        terminal_post: MhcTerminalPostOp::build(
-            format!("{n}.final_mhc_post"),
-            MhcTerminalPostConfig {
-                mhc: cfg.mhc.clone(),
-                pre_backends: MHC_BACKENDS.to_vec(),
-                fused_backends: MHC_BACKENDS.to_vec(),
-            },
-            bridge,
-        )?,
-        hc_contract_mean: atomic(
-            n,
-            "hc_contract_mean",
-            cfg.hc_contract_mean.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?,
-        final_norm: atomic(
-            n,
-            "final_norm",
-            cfg.final_norm.clone(),
-            RmsNormKernel::build,
-            bridge,
-        )?,
-        lm_head: atomic(
-            n,
-            "lm_head",
-            cfg.lm_head.clone(),
-            SingleGemmKernel::build,
-            bridge,
-        )?,
+        target: Glm53FlashTargetForward::build(name.as_str(), &resolved, bridge)?,
         tp_size: cfg.parallel.tp_size,
         enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
-        cudagraph_capture_sizes: {
-            let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
-            sizes.sort_unstable();
-            sizes.dedup();
-            sizes
-        },
-        kv_cache_layout,
+        cudagraph_capture_sizes: sorted_capture_sizes(&cfg.parallel.cudagraph_capture_sizes),
+        kv_cache_layout: flash_kv_cache_layout_for(
+            &resolved,
+            0,
+            None,
+            cfg.parallel.kernel_path.kv_allocator,
+        ),
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1334,18 +1416,126 @@ pub fn build(
     Ok(model)
 }
 
-/// One request's cache on one rank for `dsa_layers` DSA and `kda_layers` KDA
-/// layers, as vLLM's GLM-5.3 hybrid manager allocates it
-/// (`kv_cache_utils.py` `_get_kv_cache_groups_glm5_next`).
+pub(crate) fn sorted_capture_sizes(sizes: &[u32]) -> Vec<u32> {
+    let mut sizes = sizes.to_vec();
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// Which vLLM allocator the deployment's KV layout follows. The GLM-5.3 fork
+/// and vLLM main (0.31.1 dev / 0.32) group the Flash layers identically
+/// (`kv_cache_utils.py` `_get_packed_kv_cache_groups`) and differ in two
+/// charges, both pinned by their server logs:
 ///
-/// One block id spans every DSA layer's MLA latent and kpool index pages for
-/// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
-/// keeps its state in a slot of one of those blocks, padded to an MLA page, and
-/// the KDA layers are dealt over `kda_groups` groups: a request holds one block
-/// per group, `kda_groups` blocks however few KDA layers fill the last one. The
-/// kpool tail, the raw index keys of a pool still filling up, takes one more
-/// block per request and is never reused by a prefix hit. vLLM reserves one null
-/// block out of the pool.
+/// - main's KDA `MambaSpec` carries `num_prefill_checkpoint_blocks =
+///   int(alignment is not None)` (`models/glm5next/common/kda.py`), 1 under the
+///   FlashKDA prefill backend B200 runs, and in align mode
+///   `max_memory_usage_bytes` counts `2 + num_speculative_blocks +
+///   num_prefill_checkpoint_blocks` pages per group; the fork counts `2 + K`.
+/// - main rounds a block id's bytes up to the lcm of every layer's block-stride
+///   alignment (`_get_kv_cache_bytes_per_block`): the sparse MLA kernels read
+///   the latent in rows of 32 tokens, the kpool indexer in DeepGEMM pages of
+///   up to 64 entries. The fork packs the pages unrounded.
+/// - main's kpool tail ring widens to hold a verify step's drafts
+///   (`Glm5NextTailCache`: `index_kpool * next_pow2(cdiv(index_kpool + K,
+///   index_kpool))` tokens); the fork's stays `index_kpool` (its MTP K=3 log:
+///   group sizes `[2304, 4, 2304, 2304, 2304]`). The ring is one padded block
+///   id either way, so only the model's own bytes differ.
+///
+/// The fork's MTP K=3 capture (max_model_len 16384, 166.25x) confirms it also
+/// counts `2 + K` KDA pages per group with no checkpoint page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashKvAllocator {
+    /// KDA state pages per group per request for the prefill checkpoint.
+    pub prefill_checkpoint_pages: u32,
+    /// Whether a block id's bytes round up to the kernels' block-stride lcm.
+    pub aligns_block_stride: bool,
+    /// Whether the kpool tail ring widens with the draft tokens.
+    pub tail_ring_holds_drafts: bool,
+}
+
+impl FlashKvAllocator {
+    /// The GLM-5.3 fork the no-spec Flash captures came from.
+    pub const FORK: Self = Self {
+        prefill_checkpoint_pages: 0,
+        aligns_block_stride: false,
+        tail_ring_holds_drafts: false,
+    };
+    /// vLLM main 187a0eb98 and 0.32.0rc0, the measured spec-decode servers.
+    pub const MAIN: Self = Self {
+        prefill_checkpoint_pages: 1,
+        aligns_block_stride: true,
+        tail_ring_holds_drafts: true,
+    };
+}
+
+/// A drafter's sliding-window attention cache (DFlash2), on one rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DraftWindowKv {
+    /// Every draft layer's K and V for one token on one rank.
+    pub bytes_per_token: u64,
+    pub window_tokens: u32,
+}
+
+/// Sparse-MLA kernel block (`FlashInferMLASparseTRTLLMBackend`,
+/// `MultipleOf(32)`): main aligns latent blocks to 32-token rows.
+const MLA_SPARSE_KERNEL_ROWS: u64 = 32;
+/// Largest DeepGEMM paged-MQA page (`get_paged_mqa_page_sizes`, entries).
+const INDEXER_KERNEL_PAGE_ENTRIES: u64 = 64;
+
+
+/// The deployment's hybrid KV layout, held on each TP rank.
+///
+/// `mtp_layers` is the number of MTP layers the deployment runs (0 without an
+/// MTP drafter). Each is a DSA layer, so vLLM files its latent and index pages
+/// into the same MLA group as the body's DSA layers, which also changes how
+/// many groups the KDA layers are dealt over. The KDA state slots per request
+/// come from the KDA build: one without speculation, the verify width under it.
+/// `draft_window` is a DFlash2 drafter's sliding-window cache.
+pub(crate) fn flash_kv_cache_layout_for(
+    resolved: &Glm53FlashVllmResolved,
+    mtp_layers: u32,
+    draft_window: Option<DraftWindowKv>,
+    allocator: FlashKvAllocator,
+) -> KvCacheLayout {
+    let cfg = &resolved.raw_cfg;
+    let model_cfg = &cfg.model;
+    let dsa_layers = model_cfg.num_dsa_layers() + mtp_layers;
+    let kda_layers = model_cfg.kda_layers.len() as u32;
+    let kda_state_bytes = kda_layer_state_bytes_per_request(resolved);
+    hybrid_kv_cache_layout_for(
+        model_cfg,
+        HybridKvShape {
+            kda_state_bytes_per_layer: kda_state_bytes,
+            state_slots: resolved.kda.state_slots_per_request,
+            dsa_layers,
+            kda_layers,
+            kda_groups: kda_layers.div_ceil(dsa_layers.max(1)),
+            block_tokens: hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
+        },
+        draft_window,
+        allocator,
+    )
+    .held_on_each_rank(u64::from(cfg.parallel.tp_size))
+}
+
+/// The layer counts and pages [`hybrid_kv_cache_layout_for`] lays out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HybridKvShape {
+    /// One rank's state page of one KDA layer (SSM state plus conv window).
+    pub kda_state_bytes_per_layer: u64,
+    /// The verify width `1 + num_speculative_tokens` (1 without speculation).
+    pub state_slots: u32,
+    pub dsa_layers: u32,
+    pub kda_layers: u32,
+    pub kda_groups: u32,
+    pub block_tokens: u32,
+}
+
+/// One request's cache on one rank for `dsa_layers` DSA and `kda_layers` KDA
+/// layers, as the GLM-5.3 fork allocates it: [`hybrid_kv_cache_layout_for`]
+/// without speculation, draft or the main allocator's charges.
 pub(crate) fn hybrid_kv_cache_layout(
     model: &Glm53FlashModelCfg,
     kda_state_bytes_per_layer: u64,
@@ -1354,43 +1544,156 @@ pub(crate) fn hybrid_kv_cache_layout(
     kda_groups: u32,
     block_tokens: u32,
 ) -> KvCacheLayout {
+    hybrid_kv_cache_layout_with_slots(
+        model,
+        kda_state_bytes_per_layer,
+        1,
+        dsa_layers,
+        kda_layers,
+        kda_groups,
+        block_tokens,
+    )
+}
+
+/// [`hybrid_kv_cache_layout`] with `state_slots` KDA state pages per layer per
+/// request (the verify width), still under [`FlashKvAllocator::FORK`].
+pub(crate) fn hybrid_kv_cache_layout_with_slots(
+    model: &Glm53FlashModelCfg,
+    kda_state_bytes_per_layer: u64,
+    state_slots: u32,
+    dsa_layers: u32,
+    kda_layers: u32,
+    kda_groups: u32,
+    block_tokens: u32,
+) -> KvCacheLayout {
+    hybrid_kv_cache_layout_for(
+        model,
+        HybridKvShape {
+            kda_state_bytes_per_layer,
+            state_slots,
+            dsa_layers,
+            kda_layers,
+            kda_groups,
+            block_tokens,
+        },
+        None,
+        FlashKvAllocator::FORK,
+    )
+}
+
+/// One request's cache on one rank, as vLLM's hybrid allocator lays the GLM-5.3
+/// Flash specs out (`kv_cache_utils.py` `_get_packed_kv_cache_groups` over the
+/// KDA `MambaSpec`, the DSA latent and kpool-index `MLAAttentionSpec`s, the
+/// kpool-tail `CircularBufferSpec` and a DFlash2 draft's `SlidingWindowSpec`).
+///
+/// The pool is block-outermost: one block id spans one page of every group,
+/// so it costs the widest group's bytes, the DSA layers' latent and index pages
+/// for `block_tokens` tokens, rounded up to the kernels' block-stride lcm under
+/// [`FlashKvAllocator::MAIN`]. Every part is charged in those block ids:
+///
+/// - the DSA latent and index grow per token, one block id per `block_tokens`;
+/// - the KDA layers are dealt over `kda_groups` groups, each holding
+///   `1 + num_speculative_blocks` pages (one per verify row) plus the prefill
+///   checkpoint page while a request runs; vLLM's concurrency estimate adds
+///   align mode's previous-step page (`state_copies`);
+/// - the kpool tail, the raw index keys of a pool still filling up, is one block
+///   id per request that a prefix hit never reuses; its ring holds
+///   `index_kpool * next_pow2(cdiv(index_kpool + K, index_kpool))` tokens
+///   (`Glm5NextTailCache`);
+/// - a draft window holds `cdiv(min(W - 1 + in-flight, len), block_tokens) + 1`
+///   block ids.
+///
+/// vLLM reserves one null block id out of the pool.
+pub(crate) fn hybrid_kv_cache_layout_for(
+    model: &Glm53FlashModelCfg,
+    shape: HybridKvShape,
+    draft_window: Option<DraftWindowKv>,
+    allocator: FlashKvAllocator,
+) -> KvCacheLayout {
+    let HybridKvShape {
+        kda_state_bytes_per_layer,
+        state_slots,
+        dsa_layers,
+        kda_layers,
+        kda_groups,
+        block_tokens,
+    } = shape;
+    let slots = state_slots.max(1);
     let dsa = u64::from(dsa_layers);
+    let tokens = u64::from(block_tokens);
+    let kpool = u64::from(model.index_kpool);
+    let latent_row_bytes = u64::from(model.kv_lora_rank);
     let index_entry_bytes = u64::from(model.index_head_dim + DType::Fp32.size_bytes());
-    let block_bytes = dsa
-        * (u64::from(block_tokens) * u64::from(model.kv_lora_rank)
-            + u64::from(block_tokens / model.index_kpool) * index_entry_bytes);
-    // The tail ring holds [K, gate score] for `index_kpool` tokens in bf16.
-    let tail_bytes = dsa
-        * u64::from(model.index_kpool)
-        * 2
-        * u64::from(model.index_head_dim)
-        * u64::from(DType::Bf16.size_bytes());
-    let mut layout = KvCacheLayout::new()
-        .with_part(KvCachePart::per_token(
-            "mla",
-            dsa * u64::from(model.kv_lora_rank),
-        ))
-        .with_part(KvCachePart::compressed(
-            "indexer",
-            model.index_kpool,
-            dsa * index_entry_bytes,
-        ));
+    let index_block_bytes = dsa * (tokens / kpool) * index_entry_bytes;
+    let dsa_block_bytes = dsa * tokens * latent_row_bytes + index_block_bytes;
+    // Every other group's page: a KDA group's padded state pages, the draft
+    // window's block (the tail ring is far smaller).
+    let kda_group_bytes =
+        u64::from(kda_layers.div_ceil(kda_groups.max(1))) * tokens * latent_row_bytes;
+    let draft_group_bytes = draft_window.map_or(0, |draft| tokens * draft.bytes_per_token);
+    let widest_group_bytes = dsa_block_bytes.max(kda_group_bytes).max(draft_group_bytes);
+    let block_bytes = if allocator.aligns_block_stride {
+        let latent_stride = MLA_SPARSE_KERNEL_ROWS * latent_row_bytes;
+        let index_kernel_tokens = gcd(INDEXER_KERNEL_PAGE_ENTRIES * kpool, tokens);
+        let index_stride = index_kernel_tokens / kpool * index_entry_bytes;
+        let stride = latent_stride / gcd(latent_stride, index_stride) * index_stride;
+        widest_group_bytes.div_ceil(stride) * stride
+    } else {
+        widest_group_bytes
+    };
+
+    let mut latent = KvCachePart::per_token("mla", dsa * latent_row_bytes);
+    if block_bytes != dsa_block_bytes {
+        latent = latent.padded_per_block(block_bytes - index_block_bytes);
+    }
+    let mut layout = KvCacheLayout::new().with_part(latent).with_part(KvCachePart::compressed(
+        "indexer",
+        model.index_kpool,
+        dsa * index_entry_bytes,
+    ));
     if kda_layers > 0 {
+        let state_bytes = u64::from(kda_layers) * kda_state_bytes_per_layer;
+        let mut kda = KvCachePart::per_request("kda", state_bytes)
+            .padded_to(u64::from(kda_groups) * block_bytes);
+        let copies = slots + allocator.prefill_checkpoint_pages;
+        if copies != 1 {
+            kda = kda.with_copies(copies);
+        }
+        layout = layout.with_part(kda);
+    }
+    // The tail ring holds [K, gate score] per token in bf16; under main, with
+    // room for the drafts a verify step stashes before acceptance.
+    let draft_tokens = if allocator.tail_ring_holds_drafts {
+        u64::from(slots - 1)
+    } else {
+        0
+    };
+    let ring_tokens = kpool * (kpool + draft_tokens).div_ceil(kpool).next_power_of_two();
+    let ring_entry_bytes = 2 * u64::from(model.index_head_dim) * u64::from(DType::Bf16.size_bytes());
+    let tail_bytes = dsa * ring_tokens * ring_entry_bytes;
+    layout = layout.with_part(
+        KvCachePart::per_request("kpool_tail", tail_bytes)
+            .padded_to(block_bytes)
+            .not_prefix_reusable(),
+    );
+    if let Some(draft) = draft_window {
         layout = layout.with_part(
-            KvCachePart::per_request("kda", u64::from(kda_layers) * kda_state_bytes_per_layer)
-                .padded_to(u64::from(kda_groups) * block_bytes),
+            KvCachePart::sliding_window("draft_swa", draft.window_tokens, draft.bytes_per_token)
+                .padded_per_block(block_bytes),
         );
     }
-    layout
-        .with_part(
-            KvCachePart::per_request("kpool_tail", tail_bytes)
-                .padded_to(block_bytes)
-                .not_prefix_reusable(),
-        )
-        .with_engine(EngineOverhead {
-            block_tokens: Some(block_tokens),
-            fixed_device_bytes: block_bytes,
-        })
+    layout.with_engine(EngineOverhead {
+        block_tokens: Some(block_tokens),
+        fixed_device_bytes: block_bytes,
+    })
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 /// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
@@ -1418,20 +1721,7 @@ pub(crate) fn hybrid_block_tokens(kda_state_page_bytes: u64, mla_bytes_per_token
 impl Glm53FlashVllmModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
-        let mut children = vec![
-            self.embedding.compile(&mut builder),
-            self.embedding_all_reduce.compile(&mut builder),
-            self.hc_expand.compile(&mut builder),
-        ];
-        for group in &self.groups {
-            children.push(group.compile(&mut builder));
-        }
-        children.extend([
-            self.terminal_post.compile(&mut builder),
-            self.hc_contract_mean.compile(&mut builder),
-            self.final_norm.compile(&mut builder),
-            self.lm_head.compile(&mut builder),
-        ]);
+        let children = self.target.compile_children(&mut builder);
         let layout = if self.enable_expert_parallel {
             format!("TP=EP{}", self.tp_size)
         } else {
@@ -1451,35 +1741,7 @@ impl Glm53FlashVllmModel {
         let batch = normalize_input(input, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
-        push(
-            &self.embedding,
-            ElementwiseKernelInput { num_tokens: tokens },
-            ev,
-        );
-        self.embedding_all_reduce.eval(tokens, ev);
-        push(
-            &self.hc_expand,
-            ElementwiseKernelInput { num_tokens: tokens },
-            ev,
-        );
-        for group in &self.groups {
-            group.eval(&batch, tokens, ev);
-        }
-        self.terminal_post
-            .eval(&MhcTerminalPostInput { num_tokens: tokens }, ev);
-        push(
-            &self.hc_contract_mean,
-            ElementwiseKernelInput { num_tokens: tokens },
-            ev,
-        );
-        push(&self.final_norm, RmsNormKernelInput { m: tokens }, ev);
-        push(
-            &self.lm_head,
-            SingleGemmKernelInput {
-                m: batch.request_count,
-            },
-            ev,
-        );
+        self.target.eval(&batch, tokens, batch.request_count, ev);
     }
 
     fn eval_checked(
@@ -1573,6 +1835,24 @@ pub(crate) struct NormalizedBatch {
     pub(crate) request_count: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
+}
+
+impl NormalizedBatch {
+    /// A step lowered by another front end (the speculative model's verify
+    /// normalization) to the per-layer inputs this target forward reads.
+    pub(crate) fn from_parts(
+        total_tokens: u32,
+        request_count: u32,
+        kda: Glm53KdaAttnLocalWorkletInput,
+        dsa: Glm53DsaAttnLocalWorkletInput,
+    ) -> Self {
+        Self {
+            total_tokens,
+            request_count,
+            kda,
+            dsa,
+        }
+    }
 }
 
 pub(crate) fn normalize_input(
@@ -1908,9 +2188,9 @@ mod tests {
                 cap
             );
             assert_eq!(configs.large_all_reduce.backends, ["nccl"]);
-            assert_eq!(model.embedding_all_reduce.max_fused_tokens, cap);
-            assert_eq!(model.embedding_all_reduce.bytes_per_token, 8192);
-            for group in &model.groups {
+            assert_eq!(model.target.embedding_all_reduce.max_fused_tokens, cap);
+            assert_eq!(model.target.embedding_all_reduce.bytes_per_token, 8192);
+            for group in &model.target.groups {
                 assert_eq!(
                     group.attn_all_reduce.as_ref().unwrap().max_fused_tokens,
                     cap

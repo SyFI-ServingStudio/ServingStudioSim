@@ -80,8 +80,8 @@ pub struct Dflash2DraftResolved {
 
 /// The proposer: one context-KV precomputation, `num_draft_layers` identical
 /// decoder layers, and the selector head.
-struct Dflash2DraftStage {
-    name: String,
+pub(crate) struct Dflash2DraftStage {
+    pub(crate) name: String,
     num_draft_layers: u32,
     sliding_window: u32,
     context_kv: Dflash2ContextKvLocalWorklet,
@@ -95,7 +95,7 @@ struct Dflash2DraftStage {
 }
 
 impl Dflash2DraftStage {
-    fn build(
+    pub(crate) fn build(
         name: String,
         resolved: &Dflash2DraftResolved,
         bridge: &PerfApiBridge,
@@ -154,7 +154,7 @@ impl Dflash2DraftStage {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let layers = self.num_draft_layers;
         CostNode::Sum(vec![
             CostNode::Labeled {
@@ -192,22 +192,42 @@ impl Dflash2DraftStage {
 
     fn eval(&self, batch: &NormalizedBatch, draft_tokens: u32, ev: &mut Evaluator) {
         let group = &batch.groups[0];
+        self.eval_parts(
+            group.request_count,
+            group.batch_tokens,
+            &group.endpoint_context_lens,
+            draft_tokens,
+            ev,
+        );
+    }
+
+    /// One proposer call over a step of `request_count` requests whose target
+    /// pass scheduled `batch_tokens` rows, each request ending at its
+    /// `endpoint_context_lens` entry. Any target whose step reduces to these
+    /// three numbers drives the same stage.
+    pub(crate) fn eval_parts(
+        &self,
+        request_count: u32,
+        batch_tokens: u32,
+        endpoint_context_lens: &[u32],
+        draft_tokens: u32,
+        ev: &mut Evaluator,
+    ) {
         let query_width = draft_tokens.saturating_add(1);
-        let query_tokens = group.request_count.saturating_mul(query_width);
+        let query_tokens = request_count.saturating_mul(query_width);
 
         // The proposer consumes the target's hidden states for every row this
         // step scheduled -- prefilling and verifying alike.
         self.context_kv.eval(
             &Dflash2ContextKvLocalWorkletInput {
-                context_tokens: group.batch_tokens,
+                context_tokens: batch_tokens,
             },
             ev,
         );
 
         // One rectangle per request: the whole query block against the context
         // the sliding window admits.
-        let rectangles = group
-            .endpoint_context_lens
+        let rectangles = endpoint_context_lens
             .iter()
             .map(|&context| (query_width, context.min(self.sliding_window)))
             .collect::<Vec<_>>();
@@ -237,7 +257,7 @@ impl Dflash2DraftStage {
         // target's, not a proposal.
         self.selector.eval(
             &Dflash2SelectorLocalWorkletInput {
-                scored_rows: group.request_count.saturating_mul(draft_tokens),
+                scored_rows: request_count.saturating_mul(draft_tokens),
             },
             ev,
         );

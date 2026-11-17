@@ -10,8 +10,8 @@ use serde::Serialize;
 
 use crate::arch::kv_layout::{KvCacheLayout, KvGrowth};
 use crate::worker::kv::shared::kv_accounting::{
-    charged_bytes_per_entry, state_copies, KvAccounting, KvAccountingOptions, KvOverhead,
-    PrefixResumePoints,
+    charged_bytes_per_block, charged_bytes_per_entry, state_copies, KvAccounting,
+    KvAccountingOptions, KvOverhead, PrefixResumePoints,
 };
 
 /// One KV pool's report. Bytes are over one KV partition, as in the layout;
@@ -61,6 +61,9 @@ pub struct KvPartChargeReport {
     /// The padded entry under `vllm`, the model's own under `none`.
     pub charged_bytes_per_entry: u64,
     pub units_per_entry: u64,
+    /// Under `vllm`, what one engine block of a part charged per block costs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_bytes_per_block: Option<u64>,
     /// Copies a running request holds; 1 for a part that grows with context.
     pub held_copies: u32,
     /// For a per-request part, whether vLLM's concurrency estimate adds align
@@ -132,6 +135,7 @@ impl KvAccounting {
                     name: part.name,
                     charged_bytes_per_entry,
                     units_per_entry: charged_bytes_per_entry / self.bytes_per_unit(),
+                    charged_bytes_per_block: charged_bytes_per_block(part, overhead),
                     held_copies,
                     align_copy,
                 }

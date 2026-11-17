@@ -65,6 +65,19 @@ impl ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
+/// Which vLLM's hybrid KV allocator sizes a GLM-5.3-Flash pool: the alignment
+/// fork's, or vLLM main / 0.32's (a KDA prefill-checkpoint page, block ids
+/// rounded to the kernels' stride, a kpool tail ring sized for the drafts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Glm53FlashKvAllocatorSel {
+    #[default]
+    Fork,
+    Main,
+}
+
+const GLM53_FLASH_KV_ALLOCATORS: [&str; 2] = ["fork", "main"];
+
 /// Where a MoE arch's expert demand comes from: synthetic uniform/random
 /// demand, or a measured distribution loaded from `expert_popularity_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -718,6 +731,150 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// Whose hybrid KV allocator sizes the pool (`fork` or `main`).
+        #[serde(default)]
+        #[param(string, default = "fork", choices = GLM53_FLASH_KV_ALLOCATORS, cache_key)]
+        kv_allocator: Glm53FlashKvAllocatorSel,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`] drafting with the checkpoint's MTP
+    /// layer (`--speculative-config {"method":"mtp"}`, index sharing on): the
+    /// target verifies `draft_tokens + 1` rows per decode request, then the
+    /// MTP layer runs once over every target row and `draft_tokens - 1` times
+    /// over one row per request.
+    Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Whose hybrid KV allocator sizes the pool (`fork` or `main`).
+        #[serde(default)]
+        #[param(string, default = "fork", choices = GLM53_FLASH_KV_ALLOCATORS, cache_key)]
+        kv_allocator: Glm53FlashKvAllocatorSel,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects profiled kernel
+        /// shapes and so cannot vary per iteration.
+        #[param(cache_key)]
+        draft_tokens: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`] drafting with the DFlash2
+    /// block-parallel proposer `incoai/GLM-5.3-Flash-DFlash2`
+    /// (`--speculative-config {"method":"dflash"}`): one proposer pass per
+    /// iteration over five aux hidden states of the target.
+    Glm53FlashVllmFp8KdaDsaMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Whose hybrid KV allocator sizes the pool (`fork` or `main`).
+        #[serde(default)]
+        #[param(string, default = "fork", choices = GLM53_FLASH_KV_ALLOCATORS, cache_key)]
+        kv_allocator: Glm53FlashKvAllocatorSel,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects profiled kernel
+        /// shapes and so cannot vary per iteration.
+        #[param(cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window (it caps the context each draft
+        /// query attends to, not the draft's KV).
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -1212,6 +1369,8 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeSpeculative { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmFp8DpAttnEpMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
@@ -1237,6 +1396,8 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeSpeculative { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmFp8DpAttnEpMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }

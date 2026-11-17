@@ -42,6 +42,7 @@ use crate::timing::{
     SlotInput,
 };
 
+#[cfg(test)]
 const HIDDEN_DIM: u32 = 6144;
 const VOCAB_SIZE: u32 = 154880;
 /// `dflash_config.selector_rank`.
@@ -277,9 +278,11 @@ impl Dflash2SelectorLocalWorklet {
     }
 }
 
+/// Checkpoint dimensions (hidden, heads, intermediate, layer counts) come from
+/// the draft's own config and are not pinned here; only the structure the
+/// measured kernels assume is.
 fn validate_config(cfg: &Dflash2SelectorLocalWorkletConfig) -> Result<(), String> {
     for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
         ("vocab_size", cfg.vocab_size.get(), VOCAB_SIZE),
         ("selector_rank", cfg.selector_rank, SELECTOR_RANK),
         ("selector_top_k", cfg.selector_top_k, SELECTOR_TOP_K),

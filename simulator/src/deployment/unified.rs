@@ -842,6 +842,25 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { draft_tokens, .. }
+            | IterArchSel::Glm53FlashVllmFp8KdaDsaMoeDflash2 { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_flash_speculative_from_selector(
+                    &g.arch,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
                 ep_size,
                 nvl_num_gpu,

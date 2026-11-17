@@ -21,6 +21,7 @@ from profiling.runners.attention.kda_chunk_prefill_reference import (
 )
 from profiling.runners.attention.kda_recurrent_decode_reference import (
     kda_recurrent_decode_reference,
+    kda_recurrent_verify_reference,
 )
 
 # The in-situ capture: decode iteration 727, 32 requests, TP4.
@@ -30,7 +31,7 @@ _CAPTURE = dict(batch_size=32, num_heads=16, head_dim=128, dtype="bf16")
 def test_args_fields_are_the_runner_kwargs() -> None:
     # Defect: schema/DB key order drifting from what the worker passes the runner.
     names = [f.name for f in fields(KdaRecurrentDecodeArgs)]
-    assert names == ["batch_size", "num_heads", "head_dim", "dtype"]
+    assert names == ["batch_size", "num_heads", "head_dim", "dtype", "num_tokens"]
     signature = inspect.signature(runner.profile_kda_recurrent_decode_vllm_triton)
     assert list(signature.parameters) == names
 
@@ -152,3 +153,77 @@ def test_oracle_decays_per_key_channel_and_sigmoids_raw_beta() -> None:
     decay = kda_safe_gate(raw_g, a_log, dt_bias, -5.0).exp()  # [B, H, K]
     for seq, slot in enumerate(slots.tolist()):
         torch.testing.assert_close(updated[slot], pool[slot] * decay[seq][:, None, :])
+
+
+def test_verify_invoke_is_the_spec_branch_call() -> None:
+    # Defect: timing a verify step with 1-D state indices (one state write per
+    # request instead of one per token), without num_accepted_tokens, or with
+    # cu_seqlens that do not give each request its q tokens.
+    shape = runner.validate_args(
+        batch_size=3, num_heads=2, head_dim=128, dtype="bf16", num_tokens=12
+    )
+    assert (shape.per_request, shape.num_tokens) == (4, 12)
+    operands = runner.build_operands(torch, shape, device=torch.device("cpu"))
+    seen: dict = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out"], kwargs["initial_state"]
+
+    runner.invoke(fake, operands)
+    width = 3 * 256 + 2 + 2 * 128
+    for name in ("q", "k", "v"):
+        assert seen[name].shape == (1, 12, 2, 128) and seen[name].stride(1) == width
+    assert seen["cu_seqlens"].tolist() == [0, 4, 8, 12]
+    indices = seen["ssm_state_indices"]
+    assert indices.shape == (3, 4) and indices.dtype is torch.int32
+    assert sorted(indices.reshape(-1).tolist()) == list(range(1, 13))
+    accepted = seen["num_accepted_tokens"]
+    assert accepted.dtype is torch.int32 and set(accepted.tolist()) <= {1, 2, 3, 4}
+    assert seen["initial_state"].shape == (13, 2, 128, 128)
+    assert seen["out"].shape == (1, 12, 2, 128) and seen["out"].is_contiguous()
+    with pytest.raises(ValueError):
+        runner.validate_args(batch_size=3, num_heads=2, head_dim=128, dtype="bf16", num_tokens=10)
+
+
+def test_verify_oracle_is_the_chunk_oracle_from_the_accepted_slot() -> None:
+    # Defect: starting a request from the wrong spec slot (column 0 instead of
+    # accepted − 1), writing only the final state, or mixing requests' tokens.
+    # Each request's q tokens are one length-q sequence of the independent
+    # chunk oracle, whose per-token states land in that request's q slots.
+    batch, per_request, heads, dim = 2, 3, 2, 4
+    tokens = batch * per_request
+    q, k, v, raw_g = _inputs(tokens, heads, dim, seed=5)
+    raw_beta = torch.randn(tokens, heads, generator=torch.Generator().manual_seed(6))
+    a_log = torch.tensor([0.5, 1.5]).log().view(1, 1, 2, 1)
+    dt_bias = torch.randn(heads * dim, generator=torch.Generator().manual_seed(7)) * 0.1
+    pool = torch.randn(tokens + 2, heads, dim, dim, generator=torch.Generator().manual_seed(8))
+    indices = torch.tensor([[3, 1, 6], [2, 7, 4]], dtype=torch.int32)
+    accepted = torch.tensor([2, 3], dtype=torch.int32)
+    o, updated = kda_recurrent_verify_reference(
+        q, k, v, raw_g, raw_beta, a_log, dt_bias, pool, indices, accepted, lower_bound=-5.0
+    )
+    for request in range(batch):
+        rows = slice(request * per_request, (request + 1) * per_request)
+        start = int(indices[request, int(accepted[request]) - 1])
+        states = []
+        for length in range(1, per_request + 1):
+            sub = slice(rows.start, rows.start + length)
+            expected_o, expected_state = kda_chunk_prefill_reference(
+                q[sub],
+                k[sub],
+                v[sub],
+                raw_g[sub],
+                raw_beta[sub].sigmoid(),
+                a_log,
+                dt_bias,
+                pool[start : start + 1],
+                [0, length],
+                lower_bound=-5.0,
+            )
+            states.append(expected_state[0])
+        torch.testing.assert_close(o[rows], expected_o)
+        for token, state in enumerate(states):
+            torch.testing.assert_close(updated[int(indices[request, token])], state)
+    for untouched in (0, 5):
+        assert torch.equal(updated[untouched], pool[untouched])

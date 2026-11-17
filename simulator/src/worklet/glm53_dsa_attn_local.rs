@@ -32,6 +32,46 @@
 //!
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
 //! context (the measured decode grids are uniform in context).
+//!
+//! # Speculative decoding ([`Glm53DsaSpecMode`])
+//!
+//! A verify step of width `next_n` = K + 1 runs every decode request as
+//! `next_n` query rows; row `t` sees `kv_len - next_n + 1 + t` tokens
+//! (`v1/attention/backends/mla/indexer.py:618-621`). On B200 the indexer keeps
+//! the `[B, next_n]` grid natively (`_supports_native_decode`, `indexer.py:829-
+//! 840`), so in the fork's `sparse_attn_indexer_kpool`
+//! (`glm5next/nvidia/sparse_indexer.py`):
+//!
+//! * per-token launches (`wq_b`, `wk_weights`, the fp32 head weights, k norm,
+//!   FWHT quant, weight scale, `gate_score`, q absorb / quant, `W_UV`, `o_proj`,
+//!   glue) scale with rows only;
+//! * the kpool decode update is ONE `kpool_decode_update_and_maybe_write_cache_
+//!   batched` launch over `[B, next_n]`, a program per request walking its
+//!   tokens in order (`:486-498`; `ops/kpool_compress.py:460-503,631-729`):
+//!   priced as one elementwise launch over the `B x next_n` rows;
+//! * `fp8_fp4_paged_mqa_logits` takes q `[B, next_n, H, D]` and 2-D
+//!   `seq_lens` (`:538-561`) and the decode top-k takes `next_n` (`:578-585`):
+//!   both change kernel identity, so `next_n` is their config key, with
+//!   `batch_size` = requests;
+//! * `expand_pools_and_append_tail` runs over `B x next_n` rows (`:588-607`);
+//! * sparse MLA flattens to one row per token (see `glm53_kpool_sparse_mla`).
+//!
+//! Prefill-path launches (`_kpool_compress_insert`, the tail seed, the
+//! chunked prefill logits / top-k) see only the tokens after
+//! `num_decode_tokens` (`:197-210`, `:286-372`), so a mixed step's prefill
+//! rows are unchanged; its verify rows join the decode-path launches and the
+//! one combined sparse-MLA launch.
+//!
+//! MTP index sharing (`index_share_for_mtp_iteration`,
+//! [`Glm53DsaIndexerMode::ReuseShared`]): on draft steps 1+ the fork sets
+//! `skip_topk` (`v1/spec_decode/llm_base_proposer.py:581-613`,
+//! `glm5next/common/mtp.py:146-149`) and `MultiHeadLatentAttentionWrapper.
+//! forward` skips the whole `self.indexer(...)` call
+//! (`model_executor/layers/mla.py:232-233`): every launch of
+//! `Indexer.forward` (`glm5next/common/attention.py:316-401`) and of
+//! `sparse_attn_indexer_kpool` disappears, the kpool cache and tail writes
+//! included. The MLA projections, cache append, remap and attention still
+//! run over the indices step 0 wrote.
 
 use std::sync::Arc;
 
@@ -89,6 +129,71 @@ const OUTPUT_COPY_EFFECTIVE_DEN: u32 = 2;
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
+/// The [`GLUE_LAUNCHES`] that belong to the indexer on a decode step, from
+/// the fork source (not a capture): `hidden_states.float()` ahead of the fp32
+/// head-weight mm (`common/attention.py:333`), the `topk_indices_buffer` -1
+/// fill (`nvidia/sparse_indexer.py:239`), the int32 position cast for the
+/// kpool update (`:452`), `pool_topk.to(int64)` (`:589`), the cast and `+ 1`
+/// of `_decode_topk_seq_lens` (`common/sparse_indexer.py:95`), and the
+/// copy into `topk_indices_buffer` (`:616`). An index-sharing step skips them.
+const INDEXER_GLUE_LAUNCHES: u32 = 7;
+
+/// Which indexer work a DSA instance runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Glm53DsaIndexerMode {
+    /// The full pooled indexer (every target layer; MTP draft step 0).
+    #[default]
+    Compute,
+    /// MTP draft steps 1+ under `index_share_for_mtp_iteration`: no indexer
+    /// launch runs; attention reuses the top-k rows step 0 wrote.
+    ReuseShared,
+}
+
+/// Deployment-time speculative shape of one DSA instance. A config identity,
+/// not per-step input: it selects decode-kernel cache keys and which slots
+/// carry work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Glm53DsaSpecMode {
+    /// Query rows per decode request: 1 without speculation, K + 1 on a
+    /// verify step (and on the MTP drafter's first pass).
+    pub verify_width: u32,
+    pub indexer: Glm53DsaIndexerMode,
+}
+
+impl Glm53DsaSpecMode {
+    pub const NO_SPEC: Self = Self {
+        verify_width: 1,
+        indexer: Glm53DsaIndexerMode::Compute,
+    };
+
+    /// A target verify step (or the MTP drafter's step 0) of `verify_width`
+    /// rows per request.
+    pub fn verify(verify_width: u32) -> Self {
+        Self {
+            verify_width,
+            indexer: Glm53DsaIndexerMode::Compute,
+        }
+    }
+
+    /// An MTP draft step 1+ that reuses step 0's indices (one row per
+    /// request in the fork's draft loop).
+    pub fn index_share_reuse() -> Self {
+        Self {
+            verify_width: 1,
+            indexer: Glm53DsaIndexerMode::ReuseShared,
+        }
+    }
+
+    fn reuses_indices(self) -> bool {
+        self.indexer == Glm53DsaIndexerMode::ReuseShared
+    }
+}
+
+impl Default for Glm53DsaSpecMode {
+    fn default() -> Self {
+        Self::NO_SPEC
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Glm53DsaAttnLocalWorkletConfig {
@@ -136,6 +241,7 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct Glm53DsaAttnLocalWorkletResolved {
     pub raw_cfg: Glm53DsaAttnLocalWorkletConfig,
+    pub spec: Glm53DsaSpecMode,
     pub fused_qkv_a: SingleGemmKernelConfig,
     pub q_kv_norm: QKvRmsNormKernelConfig,
     pub q_b: SingleGemmKernelConfig,
@@ -171,7 +277,9 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
 pub struct Glm53DsaAttnLocalWorkletInput {
     /// `(prefix, append)` per prefill request.
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
-    /// KV length per decode request, including the token being decoded.
+    /// KV length per decode request, including every token it decodes this
+    /// step: under a verify width W each request is W query rows, the last at
+    /// this length. Must be at least W.
     pub decode_kv_lens: Vec<u32>,
 }
 
@@ -213,9 +321,19 @@ pub struct Glm53DsaAttnLocalWorklet {
 }
 
 impl Glm53DsaAttnLocalWorklet {
+    /// The no-speculation instance (`Glm53DsaSpecMode::NO_SPEC`).
     pub fn resolve_config(
         cfg: &Glm53DsaAttnLocalWorkletConfig,
     ) -> Glm53DsaAttnLocalWorkletResolved {
+        Self::resolve_config_for(cfg, Glm53DsaSpecMode::NO_SPEC)
+    }
+
+    pub fn resolve_config_for(
+        cfg: &Glm53DsaAttnLocalWorkletConfig,
+        spec: Glm53DsaSpecMode,
+    ) -> Glm53DsaAttnLocalWorkletResolved {
+        assert!(spec.verify_width > 0, "verify_width must be positive");
+        let next_n = spec.verify_width;
         let bf16 = DType::Bf16;
         let heads = cfg.num_heads.get();
         let latent = cfg.kv_lora_rank.get();
@@ -289,7 +407,7 @@ impl Glm53DsaAttnLocalWorklet {
             mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: cfg.mqa_logits_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
+                next_n,
                 max_model_len: max_model_len.clone(),
                 num_heads: cfg.index_num_heads.clone(),
                 head_dim: cfg.index_head_dim.clone(),
@@ -307,7 +425,7 @@ impl Glm53DsaAttnLocalWorklet {
             topk_decode: DsaPersistentTopkDecodeKernelConfig {
                 backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
+                next_n,
                 max_model_len: max_model_len.clone(),
                 top_k: cfg.index_topk / kpool,
                 logits_row_stride: max_model_len,
@@ -375,6 +493,7 @@ impl Glm53DsaAttnLocalWorklet {
                 mla_cache_format: "plain".into(),
                 page_table_mapping: "interleaved_requests".into(),
                 max_model_len: cfg.max_model_len,
+                decode_next_n: next_n,
             },
             output_copy: ew(
                 latent_q_bytes * OUTPUT_COPY_EFFECTIVE_NUM / OUTPUT_COPY_EFFECTIVE_DEN,
@@ -390,6 +509,7 @@ impl Glm53DsaAttnLocalWorklet {
             // One int32 index row of `selected_k` lanes in and out per row.
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
             raw_cfg: cfg.clone(),
+            spec,
         }
     }
 
@@ -507,10 +627,23 @@ impl Glm53DsaAttnLocalWorklet {
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let cfg = &self.resolved.raw_cfg;
+        let spec = self.resolved.spec;
+        let spec_label = match (spec.verify_width, spec.indexer) {
+            (1, Glm53DsaIndexerMode::Compute) => String::new(),
+            (width, Glm53DsaIndexerMode::Compute) => format!(", next_n={width}"),
+            (width, Glm53DsaIndexerMode::ReuseShared) => {
+                format!(", next_n={width}, indexer reused (MTP index share)")
+            }
+        };
+        let glue_launches = if spec.reuses_indices() {
+            GLUE_LAUNCHES - INDEXER_GLUE_LAUNCHES
+        } else {
+            GLUE_LAUNCHES
+        };
         CostNode::Labeled {
             label: format!(
                 "{} (Glm53DsaAttnLocalWorklet) [TP rank; H={}, index heads={} replicated, \
-                 kpool top-{} x {}]",
+                 kpool top-{} x {}{spec_label}]",
                 self.name, cfg.num_heads, cfg.index_num_heads, cfg.index_topk, cfg.index_kpool
             ),
             child: Box::new(CostNode::Sum(vec![
@@ -540,7 +673,7 @@ impl Glm53DsaAttnLocalWorklet {
                 self.output_copy.compile(builder),
                 self.v_up.compile(builder),
                 self.o_proj.compile(builder),
-                repeated(&self.glue, GLUE_LAUNCHES, builder),
+                repeated(&self.glue, glue_launches, builder),
                 repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
             ])),
         }
@@ -548,13 +681,16 @@ impl Glm53DsaAttnLocalWorklet {
 
     pub fn eval(&self, input: &Glm53DsaAttnLocalWorkletInput, ev: &mut Evaluator) {
         let cfg = &self.resolved.raw_cfg;
-        let w = derive_work(input, &self.indexer_budget())
+        let spec = self.resolved.spec;
+        let w = derive_work(input, &self.indexer_budget(), spec.verify_width)
             .unwrap_or_else(|reason| panic!("invalid Glm53DsaAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
         let tokens = |num_tokens| ElementwiseKernelInput { num_tokens };
         let all = tokens(w.total_tokens);
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
+        // An index-sharing draft step launches nothing of the indexer.
+        let skip = spec.reuses_indices();
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
             &self.q_kv_norm,
@@ -565,66 +701,74 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.q_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wq_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wk_weights, rows.clone(), false, ev);
+        push_or_zero(&self.index_wq_b, rows.clone(), skip, ev);
+        push_or_zero(&self.index_wk_weights, rows.clone(), skip, ev);
         push_or_zero(
             &self.index_head_weights,
             GemmFp32OutputKernelInput { m: w.total_tokens },
-            false,
+            skip,
             ev,
         );
-        push_or_zero(&self.index_k_norm, all.clone(), false, ev);
-        push_or_zero(&self.index_q_fwht_quant, all.clone(), false, ev);
-        push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
-        push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
+        push_or_zero(&self.index_k_norm, all.clone(), skip, ev);
+        push_or_zero(&self.index_q_fwht_quant, all.clone(), skip, ev);
+        push_or_zero(&self.index_weight_scale, all.clone(), skip, ev);
+        push_or_zero(&self.kpool_gate_score, rows.clone(), skip, ev);
         push_or_zero(
             &self.prefill_gather,
             tokens(w.prefill_tokens),
-            no_prefill,
+            skip || no_prefill,
             ev,
         );
         push_or_zero(
             &self.kpool_decode_update,
             tokens(w.decode_rows),
-            no_decode,
+            skip || no_decode,
             ev,
         );
         push_or_zero(
             &self.kpool_prefill_write,
             tokens(w.prefill_tokens),
-            no_prefill,
+            skip || no_prefill,
             ev,
         );
         push_or_zero(
             &self.kpool_tail_seed,
             tokens(w.prefill_tokens),
-            no_prefill,
+            skip || no_prefill,
             ev,
         );
+        // The `[B, next_n]` grid: one launch row group per request.
         push_or_zero(
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
-                batch_size: w.decode_rows,
+                batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             },
-            no_decode,
+            skip || no_decode,
             ev,
         );
         push_or_zero(
             &self.topk_decode,
             DsaPersistentTopkDecodeKernelInput {
-                batch_size: w.decode_rows,
+                batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             },
-            no_decode,
+            skip || no_decode,
             ev,
         );
-        self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
+        self.eval_prefill_indexer(
+            if skip {
+                &[]
+            } else {
+                &w.prefill_indexer_chunks
+            },
+            ev,
+        );
         let expand_rows = w.decode_rows + w.prefill_indexer_rows;
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
-            expand_rows == 0,
+            skip || expand_rows == 0,
             ev,
         );
         push_or_zero(
@@ -718,6 +862,8 @@ impl Glm53DsaAttnLocalWorklet {
 struct Work {
     total_tokens: u32,
     prefill_tokens: u32,
+    decode_requests: u32,
+    /// `decode_requests x verify_width` query rows.
     decode_rows: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
@@ -834,6 +980,7 @@ fn indexer_chunk(
 fn derive_work(
     input: &Glm53DsaAttnLocalWorkletInput,
     budget: &IndexerBudget,
+    verify_width: u32,
 ) -> Result<Work, String> {
     let (index_topk, index_kpool) = (budget.index_topk, budget.index_kpool);
     let mut prefill_tokens = 0_u32;
@@ -858,10 +1005,22 @@ fn derive_work(
     } else {
         (0, Vec::new())
     };
-    let decode_rows = input.decode_kv_lens.len() as u32;
+    let decode_requests = input.decode_kv_lens.len() as u32;
     if input.decode_kv_lens.contains(&0) {
         return Err("decode KV lengths must be positive".into());
     }
+    if let Some(short) = input
+        .decode_kv_lens
+        .iter()
+        .find(|&&kv_len| kv_len < verify_width)
+    {
+        return Err(format!(
+            "decode KV length {short} is shorter than the verify width {verify_width}"
+        ));
+    }
+    let decode_rows = decode_requests
+        .checked_mul(verify_width)
+        .ok_or("decode row count overflows u32")?;
     let max_decode = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
     let total_tokens = prefill_tokens
         .checked_add(decode_rows)
@@ -872,6 +1031,7 @@ fn derive_work(
     Ok(Work {
         total_tokens,
         prefill_tokens,
+        decode_requests,
         decode_rows,
         decode_pools: max_decode.div_ceil(index_kpool),
         prefill_indexer_rows,
@@ -951,6 +1111,7 @@ mod tests {
                 decode_kv_lens,
             },
             &budget(),
+            1,
         )
         .unwrap()
     }
@@ -1122,6 +1283,106 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    /// The verify width must reach both decode-indexer kernel identities and
+    /// the sparse MLA op; the no-spec instance must keep width 1 everywhere so
+    /// its rows (and numbers) are the pre-spec ones.
+    #[test]
+    fn verify_width_keys_the_decode_indexer_and_sparse_mla() {
+        let base = Glm53DsaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(base.spec, Glm53DsaSpecMode::NO_SPEC);
+        assert_eq!(
+            (
+                base.mqa_logits_decode.next_n,
+                base.topk_decode.next_n,
+                base.sparse_mla.decode_next_n
+            ),
+            (1, 1, 1)
+        );
+        for width in [2, 4, 6, 8] {
+            let r = Glm53DsaAttnLocalWorklet::resolve_config_for(
+                &cfg(),
+                Glm53DsaSpecMode::verify(width),
+            );
+            assert_eq!(
+                (
+                    r.mqa_logits_decode.next_n,
+                    r.topk_decode.next_n,
+                    r.sparse_mla.decode_next_n
+                ),
+                (width, width, width)
+            );
+            // Nothing else in the identity moves with the width.
+            assert_eq!(
+                DsaPagedMqaLogitsDecodeKernelConfig {
+                    next_n: 1,
+                    ..r.mqa_logits_decode.clone()
+                },
+                base.mqa_logits_decode
+            );
+            assert_eq!(r.fused_qkv_a, base.fused_qkv_a);
+        }
+    }
+
+    /// Verify rows multiply the per-token work, while the paged logits and
+    /// top-k keep one `[next_n]` row group per request (`batch_size` =
+    /// requests); a prefill's indexer plan is untouched by co-scheduled
+    /// verify rows.
+    #[test]
+    fn verify_rows_scale_tokens_but_not_the_decode_kernel_batch() {
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(2000, 100)],
+            decode_kv_lens: vec![1000, 4003],
+        };
+        let plain = derive_work(&input, &budget(), 1).unwrap();
+        let verify = derive_work(&input, &budget(), 4).unwrap();
+        assert_eq!((verify.decode_requests, verify.decode_rows), (2, 8));
+        assert_eq!(verify.total_tokens, 100 + 8);
+        assert_eq!(verify.decode_pools, plain.decode_pools);
+        assert_eq!(verify.prefill_indexer_chunks, plain.prefill_indexer_chunks);
+        assert_eq!(verify.prefill_indexer_rows, 100);
+        let short = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![3],
+        };
+        assert!(derive_work(&short, &budget(), 4).is_err());
+    }
+
+    /// An index-sharing draft step keeps the slot set (INV-1) but drops the
+    /// indexer's share of the glue launches.
+    #[test]
+    fn index_share_reuse_keeps_slots_and_drops_indexer_glue() {
+        let glue_launches = |spec| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let worklet = Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config_for(&cfg(), spec),
+                &bridge,
+            )
+            .unwrap();
+            let mut builder = CostTreeBuilder::new();
+            let root = worklet.compile(&mut builder);
+            let CostNode::Labeled { child, .. } = &root else {
+                panic!("expected a labeled worklet");
+            };
+            let CostNode::Sum(children) = child.as_ref() else {
+                panic!("expected a sum");
+            };
+            let CostNode::Scale { n, .. } = &children[children.len() - 2] else {
+                panic!("expected the glue scale");
+            };
+            (*n, builder.finish(root).slots.len())
+        };
+        assert_eq!(
+            glue_launches(Glm53DsaSpecMode::NO_SPEC),
+            (GLUE_LAUNCHES, 24 + 4 + 3)
+        );
+        assert_eq!(
+            glue_launches(Glm53DsaSpecMode::index_share_reuse()),
+            (GLUE_LAUNCHES - INDEXER_GLUE_LAUNCHES, 24 + 4 + 3)
+        );
     }
 
     #[test]

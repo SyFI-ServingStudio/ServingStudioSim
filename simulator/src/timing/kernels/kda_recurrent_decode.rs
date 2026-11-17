@@ -1,14 +1,16 @@
-//! GLM-5.3-Flash KDA plain-decode `fused_recurrent_kda` call.
+//! GLM-5.3-Flash KDA `fused_recurrent_kda` call: plain decode or spec verify.
 //!
-//! One semantic call: 4 `.contiguous()` copies of q/k/v/beta plus the KDA-mode
-//! fused recurrent kernel (5 launches) for batch >= 2, and a single launch at
-//! batch 1 where every view is already contiguous. Head geometry and dtype are
-//! static identity; decode batch size is the only runtime interpolation axis.
-//! The fp32 recurrent state is fixed by the model, so it is not a key.
+//! One semantic call. Head geometry and dtype are static identity, and so is a
+//! speculative step's tokens per request (`tokens_per_request`, q = accepted
+//! token + drafts: the spec branch of `kda.py`, with `[B, q]` state slots and
+//! `num_accepted_tokens`). Decode batch size (requests) is the only runtime
+//! interpolation axis. The fp32 recurrent state is fixed by the model, so it is
+//! not a key.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::gdn_recurrent_decode::{verify_batch_axis, verify_tokens_per_request};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -21,6 +23,11 @@ pub struct KdaRecurrentDecodeKernelConfig {
     pub head_dim: Dim,
     #[compute_dtype]
     pub dtype: DType,
+    /// Tokens per request of a speculative verify step. Unset, or 1, is
+    /// one-token decode and keys the rows it keyed before the field existed;
+    /// q > 1 adds the profile arg `num_tokens = q · batch_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_request: Option<Dim>,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -36,9 +43,17 @@ impl KernelSpec for KdaRecurrentDecodeSpec {
 
     const KIND: KernelKind = "kda_recurrent_decode";
 
-    /// Batch 1..512 in powers of two. Batch 1 stays a measured point because
-    /// it has no copy launches and so sits off the batch >= 2 line.
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    /// One-token decode: batch 1..512 in powers of two plus 12 and 24. Batch 1
+    /// stays a measured point because it sits off the batch >= 2 line. A verify
+    /// step (q > 1): the shared verify axis (1..8 dense, then pow2 to 256, the
+    /// deployment's max_num_seqs) plus 12 and 24.
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if verify_tokens_per_request(config.tokens_per_request.as_ref()).is_some() {
+            let mut batches = verify_batch_axis();
+            batches.extend([12.0, 24.0]);
+            batches.sort_by(f64::total_cmp);
+            return SweepGrid::new(vec![batches]);
+        }
         // Powers of two plus 12 and 24: the batch-8..32 curve is concave (the
         // four copy launches and the recurrent kernel fill the SMs at different
         // batch sizes; B200 job 1138), so pow2 alone misses batch 12/24 by
@@ -58,13 +73,18 @@ impl KernelSpec for KdaRecurrentDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        let per_request = verify_tokens_per_request(config.tokens_per_request.as_ref());
         grid.expand_1d(|batch_size| {
-            ArgsPayload::new()
+            let payload = ArgsPayload::new()
                 .with("backend", backend)
                 .with("batch_size", batch_size as u32)
                 .with("num_heads", config.num_heads.get())
                 .with("head_dim", config.head_dim.get())
-                .with("dtype", config.dtype.as_str())
+                .with("dtype", config.dtype.as_str());
+            match per_request {
+                Some(q) => payload.with("num_tokens", batch_size as u32 * q),
+                None => payload,
+            }
         })
     }
 }
@@ -89,6 +109,7 @@ mod tests {
             num_heads: 16.into(),
             head_dim: 128.into(),
             dtype: DType::Bf16,
+            tokens_per_request: None,
         }
     }
 
@@ -161,5 +182,35 @@ mod tests {
             serde_json::to_value(slot).unwrap(),
             serde_json::json!({"batch_size": 24})
         );
+    }
+
+    /// A verify config must reach the profiler as `num_tokens = q · batch_size`
+    /// over the verify axis; q = 1 must keep the one-token rows' keys and grid.
+    #[test]
+    fn verify_tokens_per_request_emits_num_tokens_and_q1_keeps_old_keys() {
+        let mut cfg = config();
+        cfg.tokens_per_request = Some(4.into());
+        let grid = KdaRecurrentDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(
+            grid.axes()[0],
+            [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0, 128.0,
+                256.0
+            ]
+        );
+        let payloads = KdaRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton");
+        assert_eq!(payloads.len(), 15);
+        assert_eq!(payloads[2].fields()["batch_size"], Value::from(3_u32));
+        assert_eq!(payloads[2].fields()["num_tokens"], Value::from(12_u32));
+
+        cfg.tokens_per_request = Some(1.into());
+        let one_grid = KdaRecurrentDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(one_grid.axes(), KdaRecurrentDecodeSpec::sweep_grid(&config()).axes());
+        let one = KdaRecurrentDecodeSpec::enumerate(&cfg, &one_grid, "vllm_triton");
+        assert!(one.iter().all(|p| !p.fields().contains_key("num_tokens")));
+        // Unset serializes without the field, so the q = 1 config's identity
+        // (and its cache key) is the one it had before the field existed.
+        let encoded = serde_json::to_value(config()).unwrap();
+        assert!(encoded.get("tokens_per_request").is_none());
     }
 }

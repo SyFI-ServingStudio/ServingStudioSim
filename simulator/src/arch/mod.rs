@@ -17,6 +17,7 @@ pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod glm52_vllm_nvfp4_pp_dsa_moe;
 pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
+pub mod glm53_flash_vllm_fp8_kda_dsa_moe_speculative;
 pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
 pub mod inkling_model_cfg;
 pub mod inkling_vllm_nvfp4_rel_attn_moe;
