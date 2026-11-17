@@ -1,0 +1,252 @@
+schema_version: 1
+pack: glm53_nvfp4_b200_mtp
+description: 'GLM-5.3 NVFP4 with its own MTP layer as proposer (K=3 and K=5) on B200, EP4/TP4/DP1. Token-corpus
+  capture only: records body and MTP-layer expert routes for routing: corpus, on the same enwik9 workload (case
+  07) as the GLM-5.3 DFlash2 corpus, so both drafters replay with equally sourced routing.'
+recorded_on:
+  host: cayenne
+  gpu: NVIDIA B200
+  checkpoint_snapshots:
+    glm53_nvfp4: models--incoai--GLM-5.3-NVFP4/snapshots/54e52520606f96b3d9fc84088ad22882a61648ac
+  device_roles:
+    primary: 0,1,2,3
+variants:
+  ep4_tp4_dp1_mtp3:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_mtp3
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2048
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe_speculative
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: uniform
+      mtp_mode: index_share
+      draft_tokens: 3
+    worker:
+      type: speculative
+      max_batch_tokens: 2048
+      batch_policy: mix
+      draft_tokens: 3
+      acceptance_seed: 73
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 4
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 3
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+  ep4_tp4_dp1_mtp5:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_mtp5
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2052
+      max_cudagraph_capture_size: 2052
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":5}'
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe_speculative
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: uniform
+      mtp_mode: index_share
+      draft_tokens: 5
+    worker:
+      type: speculative
+      max_batch_tokens: 2052
+      batch_policy: mix
+      draft_tokens: 5
+      acceptance_seed: 73
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 6
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 5
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: quadrant_interference_c48_mtp3
+  variant: ep4_tp4_dp1_mtp3
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 16384
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_quadrant_interference_c48_mtp3.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 7936
+      - 128
+    - - 8192
+      - 4096
+    - - 8256
+      - 128
+    - - 12288
+      - 1024
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 30.0
+    status: provisional
+    derived_from: 'Placeholder: this pack only runs token_corpus passes; calibrate from a workload pass before any
+      simulation phase.'
+  provenance:
+    workload_source: 'glm53_nvfp4_b200_dflash2 case 07 (itself glm52 spec5 case 07): same shapes and repeats'
+  speculative_acceptance:
+    value:
+    - 0.821967
+    - 0.802519
+    - 0.792036
+    status: provisional
+    derived_from: 'Borrowed from specbench AIME 2024-26 MTP K=3 (vLLM 0.30, SLURM job 2566): conditional ratios
+      position 0 / num_drafts, then position i / position i-1. Not measured on this enwik9 workload; only the simulator
+      trace uses it, and this pack runs token_corpus capture only.'
+    evidence: specbench/runs/glm53/aime24-26_mtp_slurm/summary.json
+- index: 2
+  name: quadrant_interference_c48_mtp5
+  variant: ep4_tp4_dp1_mtp5
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 16384
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/02_quadrant_interference_c48_mtp5.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 7936
+      - 128
+    - - 8192
+      - 4096
+    - - 8256
+      - 128
+    - - 12288
+      - 1024
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 30.0
+    status: provisional
+    derived_from: 'Placeholder: this pack only runs token_corpus passes; calibrate from a workload pass before any
+      simulation phase.'
+  provenance:
+    workload_source: 'glm53_nvfp4_b200_dflash2 case 07 (itself glm52 spec5 case 07): same shapes and repeats'
+  speculative_acceptance:
+    value:
+    - 0.799961
+    - 0.78132
+    - 0.777315
+    - 0.780215
+    - 0.781285
+    status: provisional
+    derived_from: 'Borrowed from specbench AIME 2024-26 MTP K=5 (vLLM 0.30, SLURM job 2566): conditional ratios
+      position 0 / num_drafts, then position i / position i-1. Not measured on this enwik9 workload; only the simulator
+      trace uses it, and this pack runs token_corpus capture only.'
+    evidence: specbench/runs/glm53/aime24-26_mtp_k5_slurm/summary.json

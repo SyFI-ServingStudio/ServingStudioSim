@@ -1,0 +1,809 @@
+{
+  "schema_version": 1,
+  "note": "Target-side rules that began as the GLM-5.2 spec-5 pack's set (same target family, identical slot suffixes; `mtp.*` rules dropped because GLM-5.3 + DFlash2 runs no MTP layer). On the eight v0.28 captures of this pack they were then corrected and pruned: rules that only ever claimed positions another rule labeled differently were removed or narrowed, the v0.28 NCCL all-reduce fallback (`ncclDevKernel_AllReduce_Sum` + `fused_add_rms_norm_kernel`), the `tss` router GEMM and the filtered decode top-k were added, and every rule that matched no position in any of the eight cases was deleted. DFlash2's own draft-phase rules live beside this file; this one is target-only.",
+  "rules": [
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used. Narrowed to the reduction of its own producer; the otherwise identical reduction after the router belongs to the router.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "after_name": "<none>",
+      "before": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "moe.tp_allreduce",
+      "before": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "attention.fused_qkv_a_proj"
+      ],
+      "note": "Producer half of the next-layer Q/KV split-K assembly after a sparse boundary.",
+      "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "attention.indexer.prefill_cache_gather",
+      "name": "cp_gather_indexer_k_quant_cache_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "DSA prefill cache gather",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_cache_gather",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_cache_gather"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "name": "topKPerRowPrefill",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "DSA prefill top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "name": "topKPerRowPrefill",
+      "type": "model",
+      "role": "DSA prefill top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.v_up",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "nvjet_sm100_tst_",
+      "after": "attention.v_up",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.q_absorb",
+      "name": "_NNT",
+      "type": "model",
+      "role": "MLA query absorb projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_absorb",
+        "body.sparse_cycle_full_index.attention.q_absorb",
+        "body.sparse_cycle_index_share.attention.q_absorb",
+        "body.sparse_initial_index_share.attention.q_absorb"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.sparse_mla",
+      "name": "fmhaSm100fKernel",
+      "type": "model",
+      "role": "sparse MLA attention",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.decode",
+        "body.dense_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_full_index.attention.sparse_mla.decode",
+        "body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_index_share.attention.sparse_mla.decode",
+        "body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+        "body.sparse_initial_index_share.attention.sparse_mla.decode",
+        "body.sparse_initial_index_share.attention.sparse_mla.prefill"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.v_up",
+      "name": "nvjet_sm100_tst_",
+      "after_name": "fmhaSm100fKernel",
+      "type": "model",
+      "role": "MLA value up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.v_up",
+        "body.sparse_cycle_full_index.attention.v_up",
+        "body.sparse_cycle_index_share.attention.v_up",
+        "body.sparse_initial_index_share.attention.v_up"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "bmm_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Migrate the reviewed gate/up and down BMM launches from retired component slots to the whole fused-MoE slot emitted by the current cost manifest.",
+      "source_experiment": "20260825_2_glm52_nvfp4_b200_ep4_serial_shared_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "bmm_",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::finalize",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Migrate the reviewed finalize launches from retired component slots to the whole fused-MoE slot emitted by the current cost manifest.",
+      "source_experiment": "20260825_2_glm52_nvfp4_b200_ep4_serial_shared_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::finalize",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::routing",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Migrate the reviewed routing launches from retired component slots to the whole fused-MoE slot emitted by the current cost manifest.",
+      "source_experiment": "20260825_2_glm52_nvfp4_b200_ep4_serial_shared_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::routing",
+      "type": "model",
+      "role": "fused routed-expert MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.input_quant",
+      "name": "cvt_fp16_to_fp4_sf_major",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "routed-expert NVFP4 activation quantization",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.input_quant",
+        "body.sparse_cycle_index_share.moe.routed_experts.input_quant",
+        "body.sparse_initial_index_share.moe.routed_experts.input_quant"
+      ],
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.routed_experts.input_quant",
+      "name": "cvt_fp16_to_fp4_sf_major",
+      "type": "model",
+      "role": "routed-expert NVFP4 activation quantization",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.input_quant",
+        "body.sparse_cycle_index_share.moe.routed_experts.input_quant",
+        "body.sparse_initial_index_share.moe.routed_experts.input_quant"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before_name": "cvt_fp16_to_fp4_sf_major",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "before": "moe.shared_expert.gate_up_proj",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "GLM computes router logits before the no-overlap shared-expert path; this split-K reduction immediately precedes the reviewed shared gate/up producer.",
+      "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "moe.shared_expert.gate_up_proj",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "after": "moe.router",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "after": "moe.router",
+      "before": "moe.shared_expert.gate_up_proj",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "Split-K reduction tail of the router projection selected by its producer and following shared-expert projection.",
+      "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "before_name": "cvt_fp16_to_fp4_sf_major",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "before": "moe.routed_experts.input_quant",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
+      ],
+      "note": "Serialized shared-expert down projection immediately precedes routed-expert input quantization.",
+      "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "note": "Final serialized shared gate/up reduction feeding the reviewed activation.",
+      "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "after": "moe.router",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "moe.router",
+      "before": "moe.shared_expert.gate_up_proj",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "note": "Serialized split-K producer feeding a reviewed shared gate/up reduction. Narrowed to the GEMM after the router: the one before it is the router's own split-K producer.",
+      "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "moe.router",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "note": "Mixed sparse bodies use one direct shared-expert gate/up GEMM after the router assembly.",
+      "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ]
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Run-linked 420377e79d range2731_8196 subgraph6 executes QKV K6144/N2624 before WK K6144/N160, followed by combined normalization. The adjacent WK tile distinguishes this QKV tile from the identically named query projections."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_96x64_64x15_2x2_2cta_h_bz_TNN",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Run-linked dadff0e06b large-range subgraph6 executes K6144/N2624 QKV then K6144/N160 indexer WK before their combined normalization. Exact adjacent tiles plus the input-normalization predecessor identify this order."
+    },
+    {
+      "status": "unmapped",
+      "operation": "mtp.logits.tp_allgather",
+      "cross_rank": "synchronizing",
+      "name": "ncclDevKernel_AllGather_RING_LL",
+      "phase": "draft",
+      "stream_role": "primary",
+      "note": "The MTP shared head uses LogitsProcessor's TP gather on every draft round. The collective has no simulated gather slot; synchronization classification must not depend on mapping coverage."
+    },
+    {
+      "operation": "main.embedding.allreduce_fallback",
+      "type": "collective",
+      "role": "main.embedding.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "phase": "forward",
+      "name": "ncclDevKernel_AllReduce_Sum",
+      "after_name": "vocab_parallel_embedding_kernel",
+      "note": "The embedding's reduction on the NCCL path: the only one after the vocabulary gather."
+    },
+    {
+      "operation": "attention.allreduce_fallback",
+      "type": "collective",
+      "role": "attention.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce"
+      ],
+      "phase": "forward",
+      "name": "ncclDevKernel_AllReduce_Sum",
+      "after": "attention.o_proj",
+      "note": "The attention output reduction on the NCCL path, keyed on the projection it reduces."
+    },
+    {
+      "operation": "ffn.allreduce_fallback",
+      "type": "collective",
+      "role": "ffn.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback"
+      ],
+      "phase": "forward",
+      "name": "ncclDevKernel_AllReduce_Sum",
+      "after": "moe.shared_expert.down_proj",
+      "note": "A dense layer's FFN reduction: in the sparse layers the shared-expert down projection feeds the routed-expert quantization, never a reduction."
+    },
+    {
+      "operation": "moe.allreduce_fallback",
+      "type": "collective",
+      "role": "moe.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback"
+      ],
+      "phase": "forward",
+      "name": "ncclDevKernel_AllReduce_Sum",
+      "after_name": "void at::native::vectorized_elementwise_kernel",
+      "note": "The expert block's reduction, after the shared + routed combine add."
+    },
+    {
+      "operation": "moe.allreduce_fallback",
+      "type": "collective",
+      "role": "moe.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback"
+      ],
+      "phase": "forward",
+      "name": "ncclDevKernel_AllReduce_Sum",
+      "after": "<none>",
+      "before_name": "fused_add_rms_norm_kernel",
+      "note": "The reduction that opens a folded body. Bodies open on the layer-closing reduction (never on the attention one, whose o_proj is always in the same body); in the first expansion of the dense-to-sparse fold it is the last dense layer's FFN reduction."
+    },
+    {
+      "operation": "moe.post_attention_norm_fallback",
+      "type": "model",
+      "role": "moe.post_attention_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm"
+      ],
+      "phase": "forward",
+      "name": "fused_add_rms_norm_kernel",
+      "after": "attention.allreduce_fallback",
+      "before_name": "nvjet_sm100_tss_",
+      "note": "The post-attention residual norm of a sparse layer: the router GEMM (`tss`) follows."
+    },
+    {
+      "operation": "ffn.post_attention_norm_fallback",
+      "type": "model",
+      "role": "ffn.post_attention_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm"
+      ],
+      "phase": "forward",
+      "name": "fused_add_rms_norm_kernel",
+      "after": "attention.allreduce_fallback",
+      "before_name": "nvjet_sm100_tst_",
+      "note": "The post-attention residual norm of a dense layer: its FFN gate/up GEMM (`tst`) follows."
+    },
+    {
+      "operation": "attention.input_norm_fallback",
+      "type": "model",
+      "role": "attention.input_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm"
+      ],
+      "phase": "forward",
+      "name": "fused_add_rms_norm_kernel",
+      "after": "moe.allreduce_fallback",
+      "note": "The next layer's input residual norm, after the expert block's reduction."
+    },
+    {
+      "operation": "attention.input_norm_fallback",
+      "type": "model",
+      "role": "attention.input_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm"
+      ],
+      "phase": "forward",
+      "name": "fused_add_rms_norm_kernel",
+      "after": "ffn.allreduce_fallback",
+      "note": "The next layer's input residual norm, after a dense layer's FFN reduction."
+    },
+    {
+      "operation": "moe.router",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "phase": "forward",
+      "name": "nvjet_sm100_tss_",
+      "note": "The router GEMM, identified by its FP32-output `tss` nvjet variant on either stream."
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "type": "model",
+      "role": "DSA decode top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "phase": "forward",
+      "name": "vllm::filtered_topk::FilteredTopKUnifiedKernel",
+      "after": "attention.indexer.decode_logits",
+      "note": "v0.28's filtered decode top-k, which replaces `cooperative_topk` at some shapes."
+    }
+  ]
+}

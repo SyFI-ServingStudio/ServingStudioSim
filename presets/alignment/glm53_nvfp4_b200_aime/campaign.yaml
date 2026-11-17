@@ -1,0 +1,865 @@
+schema_version: 1
+pack: glm53_nvfp4_b200_aime
+description: 'GLM-5.3 NVFP4 on B200, EP4/TP4/DP1, AIME-shaped: the 90 measured AIME 2024-26 prompt/completion lengths
+  as one saturated batch. Variants: DFlash2 K=7, MTP K=5, MTP K=3 (index_share), no speculation. Prompts are enwik9
+  (req-frontend).'
+recorded_on:
+  host: cayenne
+  gpu: NVIDIA B200
+  checkpoint_snapshots:
+    glm53_nvfp4: models--incoai--GLM-5.3-NVFP4/snapshots/54e52520606f96b3d9fc84088ad22882a61648ac
+    glm53_dflash2: models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c
+  nsys_version: 2025.5.2
+  device_roles:
+    primary: 0,1,2,3
+variants:
+  dflash_k7:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    draft_checkpoint: glm53_dflash2
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_aime_dflash_k7
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2048
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"dflash","num_speculative_tokens":7}'
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm53_vllm_nvfp4_dsa_moe_dflash2
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: corpus
+      token_corpus_file: ../../../../../specbench/runs/glm53/aime_align/01_aime24_26_dflash_k7/profile_corpus/token_corpus/manifest.json
+      draft_tokens: 7
+      draft_sliding_window: 2048
+    worker:
+      type: speculative
+      max_batch_tokens: 2048
+      batch_policy: mix
+      draft_tokens: 7
+      acceptance_seed: 73
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 8
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 7
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/dflash_k7/manifest.json
+  mtp_k5:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_aime_mtp_k5
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2052
+      max_cudagraph_capture_size: 2052
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":5}'
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe_speculative
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: corpus
+      mtp_mode: index_share
+      draft_tokens: 5
+      token_corpus_file: ../../../../../specbench/runs/glm53/aime_align/02_aime24_26_mtp_k5/profile_corpus/token_corpus/manifest.json
+    worker:
+      type: speculative
+      max_batch_tokens: 2052
+      batch_policy: mix
+      draft_tokens: 5
+      acceptance_seed: 73
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 6
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 5
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/mtp_k5/manifest.json
+  mtp_k3:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_aime_mtp_k3
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2048
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe_speculative
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: corpus
+      mtp_mode: index_share
+      draft_tokens: 3
+      token_corpus_file: ../../../../../specbench/runs/glm53/aime_align/03_aime24_26_mtp_k3/profile_corpus/token_corpus/manifest.json
+    worker:
+      type: speculative
+      max_batch_tokens: 2048
+      batch_policy: mix
+      draft_tokens: 3
+      acceptance_seed: 73
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 4
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 3
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/mtp_k3/manifest.json
+  none:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_aime_none
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2048
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: corpus
+      token_corpus_file: ../../../../../specbench/runs/glm53/aime_align/04_aime24_26_none/profile_corpus/token_corpus/manifest.json
+      mtp_mode: 'off'
+    worker:
+      type: chunked_prefill
+      max_batch_tokens: 2048
+      batch_policy: mix
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 1
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: engine_text
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/none/manifest.json
+cases:
+- index: 1
+  name: aime24_26_dflash_k7
+  variant: dflash_k7
+  purpose: AIME 2024-26 lengths as one saturated batch (90 requests, cap 96), as in the grounding runs.
+  coverage:
+  - full_batch
+  - long_decode
+  - kv_pressure
+  max_model_len: 131072
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_aime24_26_dflash_k7.csv
+    shapes: &id001
+    - - 160
+      - 1198
+    - - 368
+      - 50027
+    - - 103
+      - 19586
+    - - 108
+      - 65536
+    - - 92
+      - 11738
+    - - 176
+      - 6523
+    - - 123
+      - 33028
+    - - 76
+      - 2400
+    - - 123
+      - 2360
+    - - 151
+      - 819
+    - - 98
+      - 27985
+    - - 80
+      - 3282
+    - - 70
+      - 2316
+    - - 118
+      - 65536
+    - - 108
+      - 12911
+    - - 129
+      - 960
+    - - 79
+      - 59736
+    - - 93
+      - 16448
+    - - 206
+      - 23007
+    - - 85
+      - 3291
+    - - 145
+      - 13938
+    - - 79
+      - 65536
+    - - 97
+      - 6566
+    - - 158
+      - 4593
+    - - 174
+      - 1209
+    - - 83
+      - 56764
+    - - 86
+      - 2184
+    - - 96
+      - 9003
+    - - 187
+      - 65536
+    - - 124
+      - 15377
+    - - 54
+      - 752
+    - - 322
+      - 48395
+    - - 506
+      - 33627
+    - - 137
+      - 29948
+    - - 104
+      - 30801
+    - - 155
+      - 65536
+    - - 100
+      - 65536
+    - - 635
+      - 44511
+    - - 137
+      - 1170
+    - - 78
+      - 1542
+    - - 100
+      - 5829
+    - - 107
+      - 1212
+    - - 170
+      - 30364
+    - - 138
+      - 9820
+    - - 131
+      - 24543
+    - - 120
+      - 1025
+    - - 91
+      - 14320
+    - - 80
+      - 6998
+    - - 277
+      - 20225
+    - - 161
+      - 33644
+    - - 117
+      - 21711
+    - - 105
+      - 25107
+    - - 60
+      - 925
+    - - 292
+      - 10279
+    - - 216
+      - 7021
+    - - 624
+      - 22619
+    - - 779
+      - 5659
+    - - 114
+      - 2474
+    - - 308
+      - 18890
+    - - 118
+      - 9463
+    - - 176
+      - 1304
+    - - 127
+      - 39262
+    - - 179
+      - 65536
+    - - 205
+      - 18741
+    - - 180
+      - 22092
+    - - 112
+      - 46251
+    - - 273
+      - 65536
+    - - 91
+      - 4794
+    - - 142
+      - 1239
+    - - 60
+      - 5220
+    - - 162
+      - 1169
+    - - 74
+      - 4137
+    - - 94
+      - 6492
+    - - 75
+      - 2383
+    - - 202
+      - 11650
+    - - 65
+      - 1877
+    - - 174
+      - 25539
+    - - 128
+      - 27717
+    - - 170
+      - 26176
+    - - 156
+      - 51360
+    - - 204
+      - 58220
+    - - 195
+      - 65536
+    - - 372
+      - 37136
+    - - 153
+      - 59050
+    - - 146
+      - 39088
+    - - 115
+      - 4364
+    - - 86
+      - 15381
+    - - 135
+      - 8836
+    - - 99
+      - 8345
+    - - 108
+      - 65536
+    repeats: 1
+  attn_gpu_memory_gb:
+    value: 28.329057792
+    status: measured
+    derived_from: Workload GPU KV cache capacity 485952 tokens x 58296 bytes/token/rank (glm53_vllm_nvfp4_dsa_moe_dflash2)
+      / 1e9.
+    evidence: ../../specbench/runs/glm53/aime_align/01_aime24_26_dflash_k7/profile_workload/vllm/glm53_b200_ep4_aime_dflash_k7_01_aime24_26_dflash_k7_workload_server.log
+  provenance:
+    workload_source: 'specbench aime24-26_none: measured prompt/completion token counts, trace order'
+  speculative_acceptance:
+    value:
+    - 0.942781
+    - 0.943766
+    - 0.953696
+    - 0.967817
+    - 0.979377
+    - 0.972166
+    - 0.985561
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position 0 / num_drafts
+      (296457 drafts), then position i / position i-1.'
+    evidence: ../../specbench/runs/glm53/aime_align/01_aime24_26_dflash_k7/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.328755
+      - 0.305579
+      - 0.174249
+      - 0.078112
+      - 0.044635
+      - 0.023176
+      - 0.009442
+      - 0.036052
+    - from: 32
+      p:
+      - 0.359012
+      - 0.278742
+      - 0.153484
+      - 0.079976
+      - 0.042929
+      - 0.019994
+      - 0.015584
+      - 0.050279
+    - from: 128
+      p:
+      - 0.309534
+      - 0.254179
+      - 0.160689
+      - 0.090802
+      - 0.052583
+      - 0.028895
+      - 0.019152
+      - 0.084166
+    - from: 512
+      p:
+      - 0.238659
+      - 0.227924
+      - 0.158975
+      - 0.092847
+      - 0.048813
+      - 0.031497
+      - 0.022487
+      - 0.178798
+    - from: 1024
+      p:
+      - 0.176567
+      - 0.172385
+      - 0.1231
+      - 0.084666
+      - 0.043972
+      - 0.03182
+      - 0.025321
+      - 0.342169
+    - from: 2048
+      p:
+      - 0.112518
+      - 0.10273
+      - 0.082224
+      - 0.053751
+      - 0.030859
+      - 0.02544
+      - 0.017472
+      - 0.575006
+    - from: 4096
+      p:
+      - 0.036364
+      - 0.0328
+      - 0.037399
+      - 0.027855
+      - 0.018541
+      - 0.018369
+      - 0.016817
+      - 0.811855
+    - from: 8192
+      p:
+      - 0.019451
+      - 0.018956
+      - 0.016009
+      - 0.014564
+      - 0.011465
+      - 0.011503
+      - 0.010362
+      - 0.89769
+    - from: 16384
+      p:
+      - 0.005026
+      - 0.006545
+      - 0.009399
+      - 0.007923
+      - 0.006403
+      - 0.033323
+      - 0.00602
+      - 0.925361
+    - from: 32768
+      p:
+      - 0.001194
+      - 0.004314
+      - 0.007926
+      - 0.00518
+      - 0.004986
+      - 0.015121
+      - 0.004986
+      - 0.956293
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass decode_request_progress,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768]; buckets under
+      50 rounds merged into the previous one.
+    evidence: ../../specbench/runs/glm53/aime_align/01_aime24_26_dflash_k7/profile_workload/vllm/glm53_b200_ep4_aime_dflash_k7_01_aime24_26_dflash_k7_workload_metrics.jsonl
+- index: 2
+  name: aime24_26_mtp_k5
+  variant: mtp_k5
+  purpose: AIME 2024-26 lengths as one saturated batch (90 requests, cap 96), as in the grounding runs.
+  coverage:
+  - full_batch
+  - long_decode
+  - kv_pressure
+  max_model_len: 131072
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/02_aime24_26_mtp_k5.csv
+    shapes: *id001
+    repeats: 1
+  attn_gpu_memory_gb:
+    value: 35.3048832
+    status: measured
+    derived_from: Workload GPU KV cache capacity 632704 tokens x 55800 bytes/token/rank (glm52_vllm_nvfp4_dsa_moe_speculative)
+      / 1e9.
+    evidence: ../../specbench/runs/glm53/aime_align/02_aime24_26_mtp_k5/profile_workload/vllm/glm53_b200_ep4_aime_mtp_k5_02_aime24_26_mtp_k5_workload_server.log
+  provenance:
+    workload_source: 'specbench aime24-26_none: measured prompt/completion token counts, trace order'
+  speculative_acceptance:
+    value:
+    - 0.970216
+    - 0.95398
+    - 0.96249
+    - 0.972776
+    - 0.97447
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position 0 / num_drafts
+      (369862 drafts), then position i / position i-1.'
+    evidence: ../../specbench/runs/glm53/aime_align/02_aime24_26_mtp_k5/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.196307
+      - 0.324587
+      - 0.208941
+      - 0.112731
+      - 0.040816
+      - 0.116618
+    - from: 32
+      p:
+      - 0.230343
+      - 0.300489
+      - 0.186297
+      - 0.107667
+      - 0.054486
+      - 0.120718
+    - from: 128
+      p:
+      - 0.197421
+      - 0.272094
+      - 0.185513
+      - 0.103948
+      - 0.063479
+      - 0.177545
+    - from: 512
+      p:
+      - 0.167509
+      - 0.240776
+      - 0.169018
+      - 0.100883
+      - 0.060062
+      - 0.261752
+    - from: 1024
+      p:
+      - 0.131175
+      - 0.184622
+      - 0.133791
+      - 0.08666
+      - 0.055372
+      - 0.40838
+    - from: 2048
+      p:
+      - 0.053816
+      - 0.093597
+      - 0.074905
+      - 0.052079
+      - 0.038425
+      - 0.687178
+    - from: 4096
+      p:
+      - 0.021098
+      - 0.034547
+      - 0.028477
+      - 0.023378
+      - 0.019068
+      - 0.873432
+    - from: 8192
+      p:
+      - 0.00507
+      - 0.008095
+      - 0.009044
+      - 0.009577
+      - 0.012394
+      - 0.95582
+    - from: 16384
+      p:
+      - 0.000871
+      - 0.002341
+      - 0.006695
+      - 0.004561
+      - 0.011692
+      - 0.97384
+    - from: 32768
+      p:
+      - 0.001342
+      - 0.003406
+      - 0.004387
+      - 0.007556
+      - 0.016758
+      - 0.966551
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass decode_request_progress,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768]; buckets under
+      50 rounds merged into the previous one.
+    evidence: ../../specbench/runs/glm53/aime_align/02_aime24_26_mtp_k5/profile_workload/vllm/glm53_b200_ep4_aime_mtp_k5_02_aime24_26_mtp_k5_workload_metrics.jsonl
+- index: 3
+  name: aime24_26_mtp_k3
+  variant: mtp_k3
+  purpose: AIME 2024-26 lengths as one saturated batch (90 requests, cap 96), as in the grounding runs.
+  coverage:
+  - full_batch
+  - long_decode
+  - kv_pressure
+  max_model_len: 131072
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/03_aime24_26_mtp_k3.csv
+    shapes: *id001
+    repeats: 1
+  attn_gpu_memory_gb:
+    value: 37.3583232
+    status: measured
+    derived_from: Workload GPU KV cache capacity 669504 tokens x 55800 bytes/token/rank (glm52_vllm_nvfp4_dsa_moe_speculative)
+      / 1e9.
+    evidence: ../../specbench/runs/glm53/aime_align/03_aime24_26_mtp_k3/profile_workload/vllm/glm53_b200_ep4_aime_mtp_k3_03_aime24_26_mtp_k3_workload_server.log
+  provenance:
+    workload_source: 'specbench aime24-26_none: measured prompt/completion token counts, trace order'
+  speculative_acceptance:
+    value:
+    - 0.982111
+    - 0.969978
+    - 0.974773
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position 0 / num_drafts
+      (526307 drafts), then position i / position i-1.'
+    evidence: ../../specbench/runs/glm53/aime_align/03_aime24_26_mtp_k3/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.196942
+      - 0.313849
+      - 0.179856
+      - 0.309353
+    - from: 32
+      p:
+      - 0.201283
+      - 0.286805
+      - 0.186622
+      - 0.32529
+    - from: 128
+      p:
+      - 0.161729
+      - 0.235001
+      - 0.175421
+      - 0.427849
+    - from: 512
+      p:
+      - 0.119131
+      - 0.183799
+      - 0.142916
+      - 0.554154
+    - from: 1024
+      p:
+      - 0.086291
+      - 0.140836
+      - 0.10855
+      - 0.664323
+    - from: 2048
+      p:
+      - 0.038751
+      - 0.063562
+      - 0.050292
+      - 0.847395
+    - from: 4096
+      p:
+      - 0.015202
+      - 0.030637
+      - 0.027712
+      - 0.926449
+    - from: 8192
+      p:
+      - 0.002543
+      - 0.005628
+      - 0.00759
+      - 0.984239
+    - from: 16384
+      p:
+      - 0.000249
+      - 0.002324
+      - 0.002376
+      - 0.995051
+    - from: 32768
+      p:
+      - 0.000152
+      - 0.000273
+      - 0.001739
+      - 0.997836
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass decode_request_progress,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768]; buckets under
+      50 rounds merged into the previous one.
+    evidence: ../../specbench/runs/glm53/aime_align/03_aime24_26_mtp_k3/profile_workload/vllm/glm53_b200_ep4_aime_mtp_k3_03_aime24_26_mtp_k3_workload_metrics.jsonl
+- index: 4
+  name: aime24_26_none
+  variant: none
+  purpose: AIME 2024-26 lengths as one saturated batch (90 requests, cap 96), as in the grounding runs.
+  coverage:
+  - full_batch
+  - long_decode
+  - kv_pressure
+  max_model_len: 131072
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/04_aime24_26_none.csv
+    shapes: *id001
+    repeats: 1
+  attn_gpu_memory_gb:
+    value: 46.798142976
+    status: measured
+    derived_from: Workload GPU KV cache capacity 847424 tokens x 55224 bytes/token/rank (glm52_vllm_nvfp4_dsa_moe)
+      / 1e9.
+    evidence: ../../specbench/runs/glm53/aime_align/04_aime24_26_none/profile_workload/vllm/glm53_b200_ep4_aime_none_04_aime24_26_none_workload_server.log
+  provenance:
+    workload_source: 'specbench aime24-26_none: measured prompt/completion token counts, trace order'

@@ -1,0 +1,410 @@
+{
+  "schema_version": 1,
+  "note": "Draft-phase GEMMs identified by position rather than by tile name.\n\n`draft_rules.json` names one `nvjet_*` variant per operation, which is what the first pass through this capture found. It is not enough: cuBLAS picks a different tile per draft-layer shape, and the six draft layers plus the context-KV block and the selector show more than twenty variants. The predicate here is the *operation* of an immediate neighbour, which comes from the cost manifest's slot order and does not move when the tile does.\n\nThe draft phase keeps four kernels deliberately unmapped, and no rule below should be extended to cover them. They are the four places where the capture runs work the model has no leaf for: the `CatArrayBatchedCopy` that opens the phase, the draft's own input embedding and its reduction, the per-layer `reshape_and_cache_flash_kernel` that runs in addition to the six context appends, and the ATen launches behind each grouped-convolution half. Labeling those would compare measured time against a slot that does not exist; they belong in a model decomposition instead.",
+  "rules": [
+    {
+      "operation": "dflash2.layer.attn.o_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.layer.attn.attention",
+      "type": "model",
+      "role": "draft attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.o_proj"
+      ],
+      "note": "The projection the attention feeds."
+    },
+    {
+      "operation": "dflash2.layer.ffn.down_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "draft FFN down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.down_proj"
+      ],
+      "note": "The projection the activation feeds."
+    },
+    {
+      "operation": "dflash2.context_kv.fused_kv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.context_kv.hidden_norm",
+      "type": "model",
+      "role": "one GEMM emitting K and V for all six draft layers",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.context_kv.fused_kv_proj"
+      ],
+      "note": "The context-KV block's only GEMM, between its hidden norm and its grouped key norm."
+    },
+    {
+      "operation": "dflash2.selector.lm_head",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.selector.candidate_topk",
+      "type": "model",
+      "role": "draft vocabulary projection feeding the candidate selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.selector.lm_head"
+      ],
+      "note": "The selector's vocabulary projection. Its split-K variant puts a reduction between this GEMM and the selection, which the rule below picks up instead."
+    },
+    {
+      "operation": "dflash2.selector.lm_head",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.selector.candidate_topk",
+      "type": "model",
+      "role": "draft vocabulary projection feeding the candidate selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.selector.lm_head"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "dflash2.layer.attn.o_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft attention output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.attn_allreduce"
+      ],
+      "note": "Keyed on the projection it reduces. This separates the draft layers' own reductions, which the model does have leaves for, from the draft's input-embedding reduction, which it does not: that one opens a segment body and so has no mapped predecessor at all, which is exactly what this predicate excludes."
+    },
+    {
+      "operation": "dflash2.layer.ffn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "dflash2.layer.ffn.down_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft FFN output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.ffn_allreduce"
+      ],
+      "note": "Keyed on the projection it reduces. This separates the draft layers' own reductions, which the model does have leaves for, from the draft's input-embedding reduction, which it does not: that one opens a segment body and so has no mapped predecessor at all, which is exactly what this predicate excludes."
+    },
+    {
+      "operation": "dflash2.layer.attn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "dflash2.layer.attn.o_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft attention output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.attn_allreduce"
+      ],
+      "note": "The one-shot variant of the rule above; which path runs is a size decision inside FlashInfer."
+    },
+    {
+      "operation": "dflash2.layer.ffn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "dflash2.layer.ffn.down_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft FFN output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.ffn_allreduce"
+      ],
+      "note": "The one-shot variant of the rule above; which path runs is a size decision inside FlashInfer."
+    },
+    {
+      "operation": "dflash2.layer.ffn.attn_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.attn_allreduce",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.attn_conv_finish"
+      ],
+      "note": "The model prices this half of the grouped convolution as one `elementwise` leaf and the capture runs a run of ATen launches for it, so one operation covers the run. That gap is a fidelity question about the leaf, which is exactly what labeling it makes measurable; leaving it unmapped would hide it instead. The run is bracketed by the reduction it follows and the end of the layer body."
+    },
+    {
+      "operation": "dflash2.layer.ffn.attn_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn.attn_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.attn_conv_finish"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.mlp_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn_allreduce",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft FFN path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.mlp_conv_finish"
+      ],
+      "note": "The model prices this half of the grouped convolution as one `elementwise` leaf and the capture runs a run of ATen launches for it, so one operation covers the run. That gap is a fidelity question about the leaf, which is exactly what labeling it makes measurable; leaving it unmapped would hide it instead. The run is bracketed by the reduction it follows and the end of the layer body."
+    },
+    {
+      "operation": "dflash2.layer.ffn.mlp_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn.mlp_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft FFN path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.mlp_conv_finish"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.k_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.rope",
+      "type": "model",
+      "role": "draft attention key norm",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.k_norm"
+      ],
+      "note": "The manifest runs q_norm, then k_norm, then the rope, so the norm immediately before the rope is the key's."
+    },
+    {
+      "operation": "dflash2.layer.attn.q_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.k_norm",
+      "type": "model",
+      "role": "draft attention query norm",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.q_norm"
+      ],
+      "note": "And the one behind the key norm is the query's."
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.attn.q_norm",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ],
+      "note": "The split-K reduction of the projection the two norms consume."
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.q_norm",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "fused_add_rms_norm_kernel",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "after": "dflash2.layer.ffn.attn_conv_finish",
+      "note": "The residual add + RMSNorm after the attention convolution finishes: the `post_attn_add_rms_norm` leaf. (`vllm::_typeConvert` in the demangled name is the kernel's SFINAE guard, not a separate dtype conversion.)"
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "fused_add_rms_norm_kernel",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "after": "dflash2.layer.ffn.mlp_conv_finish",
+      "note": "The residual add + RMSNorm after the FFN convolution finishes is the next layer's `input_add_rms_norm`. It closes the folded layer body, so the last expansion is the draft's final norm, which the model does not price; one of seven launches."
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ],
+      "note": "The projection the activation consumes."
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "after_name": "AUnaryFunctor",
+      "note": "The first draft layer's input norm: a plain RMSNorm (no residual yet) after the input embedding is scaled. The later layers' input norms are the fused form above."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "name": "nvjet_",
+      "after": "<none>",
+      "note": "The convolution projection that opens every folded draft layer body (the input norm closes the previous body). In these captures every six-fold draft body opens on this GEMM and no other draft segment opens on a GEMM."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "name": "nvjet_",
+      "after": "dflash2.layer.ffn.conv_and_norm",
+      "after_name": "fused_add_rms_norm_kernel",
+      "note": "The FFN-side convolution projection, directly after the post-attention norm."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "name": "cublasLt::splitKreduce_kernel",
+      "after": "dflash2.layer.attn.conv_and_input",
+      "note": "Chains forward from the projection through the convolution prepare run. It stops at the next GEMM (qkv_proj or gate_up_proj), which no fragment here matches."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.attn.conv_and_input",
+      "note": "Chains forward from the projection through the convolution prepare run. It stops at the next GEMM (qkv_proj or gate_up_proj), which no fragment here matches."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "name": "cublasLt::splitKreduce_kernel",
+      "after": "dflash2.layer.ffn.conv_and_norm",
+      "note": "Chains forward from the projection through the convolution prepare run. It stops at the next GEMM (qkv_proj or gate_up_proj), which no fragment here matches."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn.conv_and_norm",
+      "note": "Chains forward from the projection through the convolution prepare run. It stops at the next GEMM (qkv_proj or gate_up_proj), which no fragment here matches."
+    }
+  ]
+}

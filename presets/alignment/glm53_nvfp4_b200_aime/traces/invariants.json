@@ -1,0 +1,54 @@
+{
+  "note": "The traces themselves are not committed: they are `shapes` x `repeats` from campaign.yaml, and `alignment-campaign check` regenerates and compares against this record. Written by `check --update-invariants`, which only ever ADDS a trace. Re-recording an existing one means deleting its entry here first, on purpose, in a reviewable diff.",
+  "schema_version": 1,
+  "traces": {
+    "traces/01_aime24_26_dflash_k7.csv": {
+      "arrival_span_ms": 89000.0,
+      "distinct_request_ids": 90,
+      "distinct_shapes": 89,
+      "input_tokens": 14569,
+      "max_input_len": 779,
+      "max_output_len": 65536,
+      "max_total_len": 65809,
+      "output_tokens": 2033306,
+      "request_count": 90,
+      "sha256": "1a9bfbab5f5fae26974dd33dd62ed05cf002b511ab3e98d1200363850ac7e6b6"
+    },
+    "traces/02_aime24_26_mtp_k5.csv": {
+      "arrival_span_ms": 89000.0,
+      "distinct_request_ids": 90,
+      "distinct_shapes": 89,
+      "input_tokens": 14569,
+      "max_input_len": 779,
+      "max_output_len": 65536,
+      "max_total_len": 65809,
+      "output_tokens": 2033306,
+      "request_count": 90,
+      "sha256": "e33a9accf0b9f2961a26e0fcebf0bed70c1c19091f0f82f982232cb980965564"
+    },
+    "traces/03_aime24_26_mtp_k3.csv": {
+      "arrival_span_ms": 89000.0,
+      "distinct_request_ids": 90,
+      "distinct_shapes": 89,
+      "input_tokens": 14569,
+      "max_input_len": 779,
+      "max_output_len": 65536,
+      "max_total_len": 65809,
+      "output_tokens": 2033306,
+      "request_count": 90,
+      "sha256": "ed482cd05d4b184f18643ede934b815595aaba67e7c56d8307a0c23de34f5438"
+    },
+    "traces/04_aime24_26_none.csv": {
+      "arrival_span_ms": 89000.0,
+      "distinct_request_ids": 90,
+      "distinct_shapes": 89,
+      "input_tokens": 14569,
+      "max_input_len": 779,
+      "max_output_len": 65536,
+      "max_total_len": 65809,
+      "output_tokens": 2033306,
+      "request_count": 90,
+      "sha256": "931b7153d2f069cd7d3275d687dc4e8b841da92937d49a5f45e1087cdee4c30e"
+    }
+  }
+}

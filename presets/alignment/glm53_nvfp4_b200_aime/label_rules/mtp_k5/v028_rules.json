@@ -1,0 +1,1903 @@
+{
+  "schema_version": 1,
+  "note": "GLM-5.2 spec-5 rules for the converged v0.28 fork (servingstudio-alignment), ported from rules.json and written against the v0.28 capture of spec5 case 1. The labeler keeps one body per operation, so a reused operation must carry its rules.json body unchanged.",
+  "rules": [
+    {
+      "operation": "main.embedding",
+      "name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "phase": "forward",
+      "type": "model",
+      "role": "distributed token embedding lookup",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.embedding"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "main.embedding.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "forward",
+      "after_name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "type": "collective",
+      "role": "vocabulary-parallel embedding output all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce_fallback",
+        "main.embedding.tp_allreduce"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "main.embedding.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "forward",
+      "after_name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "type": "collective",
+      "role": "vocabulary-parallel embedding output all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce_fallback",
+        "main.embedding.tp_allreduce"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after_name": "vllm::rms_norm_kernel",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "moe.tp_allreduce",
+      "after_name": "trtllm_mnnvl_allreduce::",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "ffn.tp_allreduce",
+      "after_name": "trtllm_mnnvl_allreduce::",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Index-share layers: no indexer projection follows.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Indexer layers run wk_weights_proj on the same hidden state right after the A-projection; its follower keeps it apart from the A-line q_b_proj rule.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Indexer layers run wk_weights_proj on the same hidden state right after the A-projection; its follower keeps it apart from the A-line q_b_proj rule.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "after": "attention.indexer.wk_weights_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_norm_rope",
+      "name": "_fused_norm_rope_kernel",
+      "phase": "forward",
+      "type": "model",
+      "role": "fused Q-A/KV-A RMSNorm, main RoPE, indexer K LayerNorm, MLA and indexer K cache writes and top-k buffer reset (_fused_norm_rope_kernel)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "attention.q_a_rms_norm",
+        "attention.kv_a_rms_norm",
+        "attention.main_rope",
+        "attention.indexer.k_layernorm",
+        "attention.indexer.index_cache_append",
+        "attention.indexer.topk_buffer_fill",
+        "attention.sparse_mla.mla_cache_append"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.fused_norm_rope",
+      "type": "model",
+      "role": "query up projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_b_proj",
+        "body.sparse_cycle_full_index.attention.q_b_proj",
+        "body.sparse_cycle_index_share.attention.q_b_proj",
+        "body.sparse_initial_index_share.attention.q_b_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.q_absorb",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.q_b_proj",
+      "before_name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "MLA query absorb projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_absorb",
+        "body.sparse_cycle_full_index.attention.q_absorb",
+        "body.sparse_cycle_index_share.attention.q_absorb",
+        "body.sparse_initial_index_share.attention.q_absorb"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.q_absorb",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.q_b_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "MLA query absorb projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_absorb",
+        "body.sparse_cycle_full_index.attention.q_absorb",
+        "body.sparse_cycle_index_share.attention.q_absorb",
+        "body.sparse_initial_index_share.attention.q_absorb"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after": "attention.q_absorb",
+      "before_name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "DSA indexer query projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.q_proj",
+        "body.sparse_cycle_full_index.attention.indexer.q_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "indexer.wq_b runs between q_absorb and fused_q on indexer layers.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.fused_q",
+      "name": "fused_q_cutedsl",
+      "phase": "forward",
+      "type": "model",
+      "role": "fused indexer Q RoPE, FP8 quant and weight scale, and MLA query assembly (CuTe-DSL fused_q)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "attention.indexer.rope",
+        "attention.indexer.q_quant",
+        "attention.indexer.weight_scale",
+        "attention.sparse_mla.query_concat"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.prefill_cache_gather",
+      "name": "cp_gather_indexer_k_quant_cache_kernel",
+      "phase": "forward",
+      "after_name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "DSA prefill cache gather",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_cache_gather",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_cache_gather"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.prefill_logits",
+      "name": "deep_gemm::sm100_mqa_logits",
+      "phase": "forward",
+      "type": "model",
+      "role": "DSA prefill index logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_logits",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_logits"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "name": "topKPerRowPrefill",
+      "phase": "forward",
+      "after_name": "deep_gemm::sm100_mqa_logits",
+      "type": "model",
+      "role": "DSA prefill top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.decode_logits",
+      "name": "deep_gemm::sm100_paged_mqa_logits",
+      "phase": "forward",
+      "type": "model",
+      "role": "DSA decode index logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_logits",
+        "body.sparse_cycle_full_index.attention.indexer.decode_logits"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "name": "filtered_topk::FilteredTopKUnifiedKernel",
+      "phase": "forward",
+      "type": "model",
+      "role": "DSA decode top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "name": "cooperative::cooperative_topk",
+      "phase": "forward",
+      "type": "model",
+      "role": "DSA decode top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "FillFunctor<unsigned char>",
+      "phase": "forward",
+      "before_name": "fmhaSm100",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "kernel",
+      "phase": "forward",
+      "after_name": "FillFunctor<int>",
+      "before_name": "FillFunctor<unsigned char>",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "The conversion kernel is named just `kernel`; its fill neighbours identify it.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "kernel",
+      "phase": "forward",
+      "after_name": "<none>",
+      "before_name": "FillFunctor<unsigned char>",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "kernel",
+      "phase": "forward",
+      "after_name": "FillFunctor<int>",
+      "before_name": "<none>",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "forward",
+      "after_name": "fused_q_cutedsl",
+      "before": "attention.sparse_mla.index_remap",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "forward",
+      "after_name": "topKPerRowPrefill",
+      "before": "attention.sparse_mla.index_remap",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "forward",
+      "after_name": "filtered_topk::FilteredTopKUnifiedKernel",
+      "before": "attention.sparse_mla.index_remap",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "forward",
+      "after_name": "cooperative::cooperative_topk",
+      "before": "attention.sparse_mla.index_remap",
+      "type": "model",
+      "role": "sparse MLA request-index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.sparse_mla",
+      "name": "fmhaSm100",
+      "phase": "forward",
+      "after": "attention.sparse_mla.index_remap",
+      "type": "model",
+      "role": "sparse MLA attention",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.decode",
+        "body.dense_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_full_index.attention.sparse_mla.decode",
+        "body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_index_share.attention.sparse_mla.decode",
+        "body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+        "body.sparse_initial_index_share.attention.sparse_mla.decode",
+        "body.sparse_initial_index_share.attention.sparse_mla.prefill"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "forward",
+      "after": "attention.o_proj",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "forward",
+      "after": "attention.o_proj",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "phase": "forward",
+      "after": "attention.tp_allreduce",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after_name": "vllm::act_and_mul_kernel",
+      "before_name": "trtllm_mnnvl_allreduce::",
+      "type": "model",
+      "role": "dense FFN down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.down_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after_name": "vllm::act_and_mul_kernel",
+      "before_name": "vectorized_elementwise_kernel",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after_name": "vllm::act_and_mul_kernel",
+      "before_name": "cvt_fp16_to_fp4",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "after_name": "vllm::act_and_mul_kernel",
+      "before_name": "moe::dev::routing",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.silu_and_mul",
+      "name": "vllm::act_and_mul_kernel",
+      "phase": "forward",
+      "before": "ffn.down_proj",
+      "type": "model",
+      "role": "dense FFN SiLU and multiply",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.silu_and_mul"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "before": "ffn.silu_and_mul",
+      "type": "model",
+      "role": "dense FFN gate and up projection",
+      "slot_suffixes": [
+        "ffn.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.gate_up_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "before": "ffn.silu_and_mul",
+      "type": "model",
+      "role": "dense FFN gate and up projection",
+      "slot_suffixes": [
+        "ffn.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "before": "ffn.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "dense FFN gate and up projection",
+      "slot_suffixes": [
+        "ffn.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.silu_and_mul",
+      "name": "vllm::act_and_mul_kernel",
+      "phase": "forward",
+      "before": "moe.shared_expert.down_proj",
+      "type": "model",
+      "role": "shared-expert SiLU and multiply",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.silu_and_mul",
+        "body.sparse_cycle_index_share.moe.shared_expert.silu_and_mul",
+        "body.sparse_initial_index_share.moe.shared_expert.silu_and_mul"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "slot_suffixes": [
+        "moe.shared_expert.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "slot_suffixes": [
+        "moe.shared_expert.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "before": "moe.shared_expert.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "slot_suffixes": [
+        "moe.shared_expert.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.router",
+      "name": "nvjet_sm100_tss_",
+      "phase": "forward",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "moe.router.router_gemm_bf16_proxy"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "The router is the only FP32-output GEMM (tss).",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "forward",
+      "after_name": "nvjet_sm100_tss_",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "moe.router.router_gemm_bf16_proxy"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.router",
+      "name": "linearcute_dsl_ll_bf16_splitk",
+      "phase": "forward",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "moe.router.router_gemm_bf16_proxy"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "forward",
+      "after": "ffn.down_proj",
+      "type": "collective",
+      "role": "dense FFN TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "forward",
+      "after_name": "vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Follows the shared + routed combine add, which has no simulated leaf.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "forward",
+      "after": "ffn.down_proj",
+      "type": "collective",
+      "role": "dense FFN TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "forward",
+      "after_name": "vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "Follows the shared + routed combine add, which has no simulated leaf.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "ffn.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "phase": "forward",
+      "after": "ffn.tp_allreduce",
+      "type": "collective",
+      "role": "dense FFN TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "phase": "forward",
+      "after": "moe.tp_allreduce",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "sample",
+      "after_name": "vectorized_gather_kernel",
+      "type": "model",
+      "role": "tensor-parallel language-model head projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "v0.28 runs the LM head in the sample phase, not postprocess.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "sample",
+      "after_name": "index_elementwise_kernel",
+      "type": "model",
+      "role": "tensor-parallel language-model head projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "note": "v0.28 runs the LM head in the sample phase, not postprocess.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "sample",
+      "after": "main.lm_head",
+      "type": "model",
+      "role": "tensor-parallel language-model head projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "logits.tp_allgather",
+      "name": "ncclDevKernel_AllGather",
+      "phase": "sample",
+      "cross_rank": "synchronizing",
+      "status": "unmapped",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.prelude.token_embedding",
+      "name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "MTP vocabulary-parallel token embedding",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.prelude.token_embedding",
+        "mtp.recurrent.prelude.token_embedding"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.embedding.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "draft",
+      "after_name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "cross_rank": "synchronizing",
+      "status": "unmapped",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.embedding.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "draft",
+      "after_name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "cross_rank": "synchronizing",
+      "status": "unmapped",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.prelude.eh_norm",
+      "name": "_fused_eh_norm_kernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "fused position-0 mask, embedding and hidden RMSNorm and concat (_fused_eh_norm_kernel)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.prelude.position_zero_mask",
+        "mtp.recurrent.prelude.position_zero_mask",
+        "mtp.step_0.prelude.embedding_rms_norm",
+        "mtp.recurrent.prelude.embedding_rms_norm",
+        "mtp.step_0.prelude.previous_hidden_rms_norm",
+        "mtp.recurrent.prelude.previous_hidden_rms_norm",
+        "mtp.step_0.prelude.concat_embedding_hidden",
+        "mtp.recurrent.prelude.concat_embedding_hidden"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.prelude.eh_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.prelude.eh_norm",
+      "type": "model",
+      "role": "MTP embedding-hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.prelude.eh_proj",
+        "mtp.recurrent.prelude.eh_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.prelude.eh_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "after": "mtp.prelude.eh_proj",
+      "before_name": "vllm::rms_norm_kernel",
+      "type": "model",
+      "role": "MTP embedding-hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.prelude.eh_proj",
+        "mtp.recurrent.prelude.eh_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.input_add_rms_norm",
+      "name": "vllm::rms_norm_kernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "MTP decoder input RMSNorm",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.input_add_rms_norm",
+        "mtp.recurrent.decoder_sparse.attention.input_add_rms_norm"
+      ],
+      "note": "First MTP decoder layer: residual is None, so the input norm is a plain RMSNorm.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.input_add_rms_norm",
+      "after_name": "vllm::rms_norm_kernel",
+      "type": "model",
+      "role": "MTP fused Q and latent KV projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.fused_qkv_a_proj",
+        "mtp.recurrent.decoder_sparse.attention.fused_qkv_a_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.fused_qkv_a_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "MTP fused Q and latent KV projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.fused_qkv_a_proj",
+        "mtp.recurrent.decoder_sparse.attention.fused_qkv_a_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.fused_qkv_a_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "MTP fused Q and latent KV projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.fused_qkv_a_proj",
+        "mtp.recurrent.decoder_sparse.attention.fused_qkv_a_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.fused_qkv_a_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP indexer key-weight projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj",
+        "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.fused_qkv_a_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "MTP indexer key-weight projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj",
+        "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "before_name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "MTP indexer key-weight projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj",
+        "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_norm_rope",
+      "name": "_fused_norm_rope_kernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "MTP fused Q-A/KV-A RMSNorm, main RoPE, indexer K LayerNorm, cache writes and top-k reset",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.q_a_rms_norm",
+        "mtp.recurrent.decoder_sparse.attention.q_a_rms_norm",
+        "mtp.step_0.decoder_sparse.attention.kv_a_rms_norm",
+        "mtp.recurrent.decoder_sparse.attention.kv_a_rms_norm",
+        "mtp.step_0.decoder_sparse.attention.main_rope",
+        "mtp.recurrent.decoder_sparse.attention.main_rope",
+        "mtp.step_0.decoder_sparse.attention.indexer.k_layernorm",
+        "mtp.recurrent.decoder_sparse.attention.indexer.k_layernorm",
+        "mtp.step_0.decoder_sparse.attention.indexer.index_cache_append",
+        "mtp.recurrent.decoder_sparse.attention.indexer.index_cache_append",
+        "mtp.step_0.decoder_sparse.attention.indexer.topk_buffer_fill",
+        "mtp.recurrent.decoder_sparse.attention.indexer.topk_buffer_fill",
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.mla_cache_append",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.mla_cache_append"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.q_b_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.fused_norm_rope",
+      "type": "model",
+      "role": "MTP query up projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.q_b_proj",
+        "mtp.recurrent.decoder_sparse.attention.q_b_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.q_absorb",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.q_b_proj",
+      "type": "model",
+      "role": "MTP decoder query absorb projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.q_absorb",
+        "mtp.recurrent.decoder_sparse.attention.q_absorb"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.q_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.q_absorb",
+      "before_name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "MTP indexer query projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.q_proj",
+        "mtp.recurrent.decoder_sparse.attention.indexer.q_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_q",
+      "name": "fused_q_cutedsl",
+      "phase": "draft",
+      "type": "model",
+      "role": "MTP fused indexer Q RoPE, FP8 quant and weight scale, and MLA query assembly",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.rope",
+        "mtp.recurrent.decoder_sparse.attention.indexer.rope",
+        "mtp.step_0.decoder_sparse.attention.indexer.q_quant",
+        "mtp.recurrent.decoder_sparse.attention.indexer.q_quant",
+        "mtp.step_0.decoder_sparse.attention.indexer.weight_scale",
+        "mtp.recurrent.decoder_sparse.attention.indexer.weight_scale",
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.query_concat",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.query_concat"
+      ],
+      "note": "Recurrent draft steps skip the indexer (index_share_for_mtp_iteration) but still run fused_q.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_cache_gather",
+      "name": "cp_gather_indexer_k_quant_cache_kernel",
+      "phase": "draft",
+      "after_name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_cache_gather",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_cache_gather",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_cache_gather"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_logits",
+      "name": "deep_gemm::sm100_mqa_logits",
+      "phase": "draft",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_logits",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_logits"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_topk",
+      "name": "topKPerRowPrefill",
+      "phase": "draft",
+      "after_name": "deep_gemm::sm100_mqa_logits",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_topk",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_topk",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_topk"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.decode_logits",
+      "name": "deep_gemm::sm100_paged_mqa_logits",
+      "phase": "draft",
+      "type": "model",
+      "role": "mtp.decoder.indexer.decode_logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.decode_logits",
+        "mtp.recurrent.decoder_sparse.attention.indexer.decode_logits"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.decode_topk",
+      "name": "filtered_topk::FilteredTopKUnifiedKernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "mtp.decoder.indexer.decode_topk",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.decode_topk",
+        "mtp.recurrent.decoder_sparse.attention.indexer.decode_topk"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.indexer.decode_topk",
+      "name": "cooperative::cooperative_topk",
+      "phase": "draft",
+      "type": "model",
+      "role": "mtp.decoder.indexer.decode_topk",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.decode_topk",
+        "mtp.recurrent.decoder_sparse.attention.indexer.decode_topk"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "FillFunctor<unsigned char>",
+      "phase": "draft",
+      "before_name": "fmhaSm100",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "kernel",
+      "phase": "draft",
+      "after_name": "FillFunctor<int>",
+      "before_name": "FillFunctor<unsigned char>",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "kernel",
+      "phase": "draft",
+      "after_name": "<none>",
+      "before_name": "FillFunctor<unsigned char>",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "kernel",
+      "phase": "draft",
+      "after_name": "FillFunctor<int>",
+      "before_name": "<none>",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "draft",
+      "after_name": "fused_q_cutedsl",
+      "before": "mtp.decoder.attention.index_remap",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "draft",
+      "after_name": "topKPerRowPrefill",
+      "before": "mtp.decoder.attention.index_remap",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "draft",
+      "after_name": "filtered_topk::FilteredTopKUnifiedKernel",
+      "before": "mtp.decoder.attention.index_remap",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.index_remap",
+      "name": "FillFunctor<int>",
+      "phase": "draft",
+      "after_name": "cooperative::cooperative_topk",
+      "before": "mtp.decoder.attention.index_remap",
+      "type": "model",
+      "role": "MTP decoder sparse-MLA request-index remap",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.sparse_mla.index_remap",
+        "mtp.recurrent.decoder_sparse.attention.sparse_mla.index_remap"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.o_proj",
+      "type": "collective",
+      "role": "MTP decoder attention all-reduce fused with residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.tp_allreduce_residual_norm",
+        "mtp.recurrent.decoder_sparse.attention.tp_allreduce_residual_norm"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.o_proj",
+      "type": "collective",
+      "role": "MTP decoder attention all-reduce fused with residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.tp_allreduce_residual_norm",
+        "mtp.recurrent.decoder_sparse.attention.tp_allreduce_residual_norm"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.attention.tp_allreduce",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "phase": "draft",
+      "after": "mtp.decoder.attention.tp_allreduce",
+      "type": "collective",
+      "role": "MTP decoder attention all-reduce fused with residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.tp_allreduce_residual_norm",
+        "mtp.recurrent.decoder_sparse.attention.tp_allreduce_residual_norm"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.shared_expert.silu_and_mul",
+      "name": "vllm::act_and_mul_kernel",
+      "phase": "draft",
+      "type": "model",
+      "role": "MTP decoder shared-expert SiLU and multiply",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.shared_expert.silu_and_mul",
+        "mtp.recurrent.decoder_sparse.moe.shared_expert.silu_and_mul"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "before_name": "vllm::act_and_mul_kernel",
+      "type": "model",
+      "role": "MTP decoder shared-expert gate/up projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.shared_expert.gate_up_proj",
+        "mtp.recurrent.decoder_sparse.moe.shared_expert.gate_up_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "before_name": "vllm::act_and_mul_kernel",
+      "type": "model",
+      "role": "MTP decoder shared-expert gate/up projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.shared_expert.gate_up_proj",
+        "mtp.recurrent.decoder_sparse.moe.shared_expert.gate_up_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "before": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP decoder shared-expert gate/up projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.shared_expert.gate_up_proj",
+        "mtp.recurrent.decoder_sparse.moe.shared_expert.gate_up_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after_name": "vllm::act_and_mul_kernel",
+      "type": "model",
+      "role": "MTP decoder shared-expert down projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.shared_expert.down_proj",
+        "mtp.recurrent.decoder_sparse.moe.shared_expert.down_proj"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "before": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "after_name": "trtllm_mnnvl_allreduce::",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "before": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "before": "mtp.decoder.moe.router",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "after_name": "trtllm_mnnvl_allreduce::",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "before_name": "moe::dev::routing",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "before": "mtp.decoder.moe.router",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.router",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "after_name": "<none>",
+      "before_name": "moe::dev::routing",
+      "type": "model",
+      "role": "MTP decoder routed-expert router projection",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
+        "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.routed_experts.fused_moe",
+      "name": "moe::dev::routing",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "type": "model",
+      "role": "MTP decoder BF16 fused routed-expert MoE",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.routed_experts.fused_moe",
+        "mtp.recurrent.decoder_sparse.moe.routed_experts.fused_moe"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.routed_experts.fused_moe",
+      "name": "bmm_Bfloat16_Bfloat16Bfloat16_",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "type": "model",
+      "role": "MTP decoder BF16 fused routed-expert MoE",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.routed_experts.fused_moe",
+        "mtp.recurrent.decoder_sparse.moe.routed_experts.fused_moe"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.routed_experts.fused_moe",
+      "name": "moe::dev::finalize",
+      "phase": "draft",
+      "stream_role": "concurrent",
+      "type": "model",
+      "role": "MTP decoder BF16 fused routed-expert MoE",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.routed_experts.fused_moe",
+        "mtp.recurrent.decoder_sparse.moe.routed_experts.fused_moe"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "phase": "draft",
+      "after_name": "vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MTP MoE TP all-reduce fused with the head residual add and shared-head RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce",
+        "mtp.step_0.head.residual_add",
+        "mtp.recurrent.head.residual_add",
+        "mtp.step_0.head.shared_head_rms_norm",
+        "mtp.recurrent.head.shared_head_rms_norm"
+      ],
+      "note": "fused_allreduce_rms_norm(hidden, residual, shared_head.norm) in DeepseekV32 MTP.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "phase": "draft",
+      "after_name": "vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MTP MoE TP all-reduce fused with the head residual add and shared-head RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce",
+        "mtp.step_0.head.residual_add",
+        "mtp.recurrent.head.residual_add",
+        "mtp.step_0.head.shared_head_rms_norm",
+        "mtp.recurrent.head.shared_head_rms_norm"
+      ],
+      "note": "fused_allreduce_rms_norm(hidden, residual, shared_head.norm) in DeepseekV32 MTP.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "phase": "draft",
+      "after": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "type": "collective",
+      "role": "MTP MoE TP all-reduce fused with the head residual add and shared-head RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce",
+        "mtp.step_0.head.residual_add",
+        "mtp.recurrent.head.residual_add",
+        "mtp.step_0.head.shared_head_rms_norm",
+        "mtp.recurrent.head.shared_head_rms_norm"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "before_name": "ncclDevKernel_AllGather",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after_name": "index_elementwise_kernel",
+      "before_name": "ncclDevKernel_AllGather",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "note": "Draft steps that keep only some rows gather them before the LM head.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after_name": "vectorized_gather_kernel",
+      "before_name": "ncclDevKernel_AllGather",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "note": "Draft steps that keep only some rows gather them before the LM head.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after": "mtp.decoder.moe.tp_allreduce_head_norm",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after_name": "index_elementwise_kernel",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "note": "Draft steps that keep only some rows gather them before the LM head.",
+      "source_experiment": "20260923_1_fork_v028"
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "after_name": "vectorized_gather_kernel",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.head.lm_head",
+        "mtp.recurrent.head.lm_head"
+      ],
+      "note": "Draft steps that keep only some rows gather them before the LM head.",
+      "source_experiment": "20260923_1_fork_v028"
+    }
+  ]
+}
