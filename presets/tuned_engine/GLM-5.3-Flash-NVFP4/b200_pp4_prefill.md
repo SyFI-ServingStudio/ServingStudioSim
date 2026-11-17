@@ -3,8 +3,8 @@
 `b200_pp4_prefill.yaml` is the simulator configuration of SSEngine as built (pp-impl `lanes/release`, commit 831a02a): what
 `ssengine serve` runs (`ssengine/serve/launch.py` `design_config` + `DESIGN_TIERS`), except that it keeps one state
 per context, as the measured evaluation engine (a78dc6f) did, where the release keeps two
-(`recurrent_state_checkpoints` below). The workload is the long steady state: a closed loop of 2,000 TraceLab v3
-sessions for 8 hours, with DRAM 150 GB and SSD 8 TB per GPU. Each mechanism is its own key. An ablation is this preset
+(`recurrent_state_checkpoints` below). The workload is long-running: a closed loop of 2,000 TraceLab v3 sessions,
+started in the renewal equilibrium, for 8 hours, with DRAM 150 GB and SSD 8 TB per GPU. Each mechanism is its own key. An ablation is this preset
 with the key(s) in the last column changed, nothing else.
 
 No real engine run of this configuration exists. The runs compared with the measured engine are a variant with a
@@ -93,6 +93,9 @@ emitted skeleton lists for it).
   a check of the steady state's throughput, hit mix or tier occupancy. In particular the SSD channel and DRAM/SSD
   write volume at this scale, and the warm-start assumption (a joining session's context sits in SSD), are untested
   against hardware.
+- Not stationary: in the 8 h and 24 h runs below, r/s declines and recompute rises hour by hour (cause 未验证), and
+  SSD occupancy grows the whole time. A single "steady-state" number from this preset depends on the window; the
+  results give the whole run and its second half. Past about 24.8 h the SSD would start evicting: not run.
 - Not trusted: HBM only (no DRAM or SSD tier) at high concurrency. At N = 400 the simulator gives 22.95 r/s
   against the engine's measured 12.97 (+76.9%) with recompute/new 0.692 against 1.757; at N = 300, 30.44 against
   27.24 (+11.7%) (`logs/20261114_9_pp_u7_equiv/anchors/report.md` §6, `k1`). The cause is 未验证.
@@ -179,7 +182,54 @@ v2 and eval_m6, 2026-11-14, when an HBM take still counted one added state): on 
 at its context's end, where a tier read moves no earlier state under either count (`StateRetention::survivors`). At k = 1 no earlier state is kept at all; the
 `ed_off` pairs were not rerun at k = 1 (未跑).
 
-## 8 h steady state (this preset)
+## 8 h and 24 h runs of this preset
 
-Runs of this preset at the current code go in `logs/20261116_1_pp_tuned_8h/` (not committed). Results: pending, to be
-filled in from that run's outputs.
+This preset at `a1b7020d` (simulator code as of the merge of main 28034ced), and the same with only
+`duration_ms: 86400000` (24 h). Outputs, `run.sh`, `analyze.py` and the metrics JSON:
+`logs/20261116_1_pp_tuned_8h/` (not committed). Every number below comes from those two runs' outputs. The 24 h run's
+first 8 hours match the 8 h run hour for hour, as expected of a deterministic run.
+
+A request counts in a window when its first token falls in it. New tokens are its `fresh_prompt_tokens`; recompute
+is (computed − new) / new. H/D/S/(L): of the requests that declared a prefix, the share whose last tier read came
+from DRAM (D) or SSD (S), else that hit in HBM (H), else nothing reused (L). This is the eval_m6 comparison's
+definition (`logs/20261114_10_pp_u8_preset/analyze.py`).
+
+| Window | r/s | new tok/s | TTFT p50 / p90 / p99 (s) | recompute / new | H / D / S % (L) |
+| --- | --- | --- | --- | --- | --- |
+| 8 h run, hours 0-8 | 50.55 | 110.3k | 3.69 / 63.1 / 78.9 | 0.194 | 13.8 / 48.4 / 37.6 (0.18) |
+| 8 h run, hours 4-8 | 48.36 | 109.8k | 4.13 / 64.1 / 82.9 | 0.197 | 13.6 / 47.7 / 38.5 (0.19) |
+| 24 h run, hours 0-24 | 42.05 | 96.5k | 4.87 / 75.3 / 112.7 | 0.341 | 12.9 / 46.8 / 40.1 (0.26) |
+| 24 h run, hours 12-24 | 36.06 | 85.7k | 8.24 / 89.7 / 123.1 | 0.492 | 12.1 / 45.6 / 41.9 (0.34) |
+
+Tier writes and occupancy per GPU. Write bytes are the tiers' counters: written tokens × 1,499 B (the stages' mean
+per-token bytes, `prefix_tier_balanced_load`) plus written states × 36,904,960 B. Peaks are the maximum over each
+tier's `prefix_cache_event` rows. DRAM holds 135 GB: 150 GB less its 10% loading area.
+
+| | 8 h run | 24 h run |
+| --- | --- | --- |
+| DRAM written | 403,470 GB (1,210 TB/day, 14.0 GB/s) | 1,018,658 GB (1,019 TB/day, 11.8 GB/s) |
+| SSD written | 28,267 GB (84.8 TB/day, 0.98 GB/s) | 75,469 GB (75.5 TB/day, 0.87 GB/s) |
+| DRAM peak | 135.0 GB (full from 0.87 h on) | 135.0 GB (full from 0.87 h on) |
+| SSD peak | 3,432 GB (43% of 8 TB, at 7.98 h, still rising) | 7,775 GB (97% of 8 TB, at 24.0 h, still rising; no SSD eviction yet) |
+| HBM KV (`active_kv`) | peak 99.99%, mean 89.2% of 100.18 GB | peak 99.99%, mean 90.0% |
+| sessions started | 13,797 of 42,000 | 31,698 of 42,000 |
+| warm-start reads | 1,789 | 1,882 |
+
+Neither run reaches a steady state on these metrics. By hour of the 24 h run, r/s falls from 50-56 (hours 0-5) to
+32-37 (hours 16-23), and recompute/new rises from 0.14-0.25 to 0.48-0.71. The SSD share of reads rises from 36% to
+40.6-42.5%, and SSD occupancy grows for the whole run. The cause of the decline is 未验证. Two candidates are that the
+sessions in the slots grow longer contexts as they age, and that the run's own state drifts. To check, compare
+each hour's declared-prefix distribution with the trace's.
+
+The simulator charges no tier write time (eval_m6.md item 5), so the DRAM write rate above (12-14 GB/s per GPU, from
+exclusive-victim writes of whole contexts) does not slow the run. Whether a host sustains that rate beside the reads
+is outside what the simulator checks.
+
+Trace coverage. `trace/closed_c2000_v3.csv` has 42,000 sessions and 7,547,561 rows. With zero service time its last
+session would start at 13.66 h (`logs/20261116_1_pp_tuned_8h/trace_coverage.py`). In the 24 h run, sessions start
+at 952-1,386 per hour in hours 8-23, and 31,698 have started by 24 h (trace row 6,260,963). So the trace covers
+24 h, and 24 h is this preset with only `duration_ms: 86400000` changed. At the last hours' rate, the remaining
+10,302 sessions would start within about 10 more hours: a run much past 34 h would exhaust the trace and needs a
+larger one, made by `trace/session_closed_loop.py` with a larger `--after`. That figure is extrapolated, not run.
+With 225 GB left at 24 h and growth of about 270 GB/h (3,432 to 7,775 GB over hours 8-24), the 8 TB SSD
+starts evicting at about 24.8 h; no run here covers that regime.

@@ -1,5 +1,5 @@
 # SSEngine as built (pp-impl lanes/release, `ssengine serve` design config): GLM-5.3-Flash NVFP4 prefill on one B200
-# PP4 pipeline in its long steady state: a closed loop of 2,000 TraceLab v3 sessions for 8 hours, HBM 100.18 GB +
+# PP4 pipeline on a long run: a closed loop of 2,000 TraceLab v3 sessions for 8 hours, HBM 100.18 GB +
 # DRAM 150 GB + SSD 8 TB per GPU. Every mechanism is its own key, so an ablation is this preset with one key changed;
 # b200_pp4_prefill.md beside this file gives each key's source in the engine, the key each ablation changes, and the
 # variant compared with the real engine (20 minutes of the v3 M6 sessions, DRAM 50 GB + SSD 128 GB).
