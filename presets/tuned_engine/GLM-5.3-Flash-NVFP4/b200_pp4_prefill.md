@@ -1,10 +1,16 @@
 # `b200_pp4_prefill.yaml`: SSEngine, GLM-5.3-Flash NVFP4 prefill on B200 PP4
 
 `b200_pp4_prefill.yaml` is the simulator configuration of SSEngine as built (pp-impl `lanes/release`, commit 831a02a): what
-`ssengine serve` runs (`ssengine/serve/launch.py` `design_config` + `DESIGN_TIERS`), with the tier sizes of the M6
-evaluation's full setting (`docs/results/eval_m6.md`), except that it keeps one state per context, as the measured
-evaluation engine (a78dc6f) did, where the release keeps two (`recurrent_state_checkpoints` below). Each mechanism is
-its own key. An ablation is this preset with the key(s) in the last column changed, nothing else.
+`ssengine serve` runs (`ssengine/serve/launch.py` `design_config` + `DESIGN_TIERS`), except that it keeps one state
+per context, as the measured evaluation engine (a78dc6f) did, where the release keeps two
+(`recurrent_state_checkpoints` below). The workload is the long steady state: a closed loop of 2,000 TraceLab v3
+sessions for 8 hours, with DRAM 150 GB and SSD 8 TB per GPU. Each mechanism is its own key. An ablation is this preset
+with the key(s) in the last column changed, nothing else.
+
+No real engine run of this configuration exists. The runs compared with the measured engine are a variant with a
+20-minute session workload and the M6 evaluation's tier sizes (DRAM 50 GB, SSD 128 GB), four keys away from this
+preset ([Variant compared with the real engine](#variant-compared-with-the-real-engine)); every anchor number below
+was obtained on that variant.
 
 Paths below are relative to `pp-impl/lanes/release`. "未验证" marks a value whose engine source was not found or that
 the simulator models differently; the right column says how to check it.
@@ -30,17 +36,33 @@ the simulator models differently; the right column says how to check it.
 | `kv_part_padding` | `[kda=66969600, kpool_tail=0]` | `docs/design/kept_states.md` "compact": a state is c = 64 x R = 5 = 320 pages of every KV tensor on a stage, the kpool tails inside it. A page on the binding 3-DSA stage is 128 x 1,635 B = 209,280 B, so 320 pages = 66,969,600 B (notes.md unit 2) | absent (vLLM padding: kda 5 blocks + kpool tail 1 block) |
 | `prefix_resume_points` | `context_end` | a kept context keeps its end state (`kept_states.md` k1/k2). The simulator requires it only above one kept state (`kv_accounting.rs`: "recurrent_state_checkpoints > 1 … need prefix_resume_points: context_end"), but it also sets where a round resumes at k = 1: absent, it follows `kv_overhead: vllm` to `prompt_end`, the prompt minus one floored to a 128-token page, so a next round would not resume at the context's end. Kept | – |
 | `recurrent_state_checkpoints` | 1 | the measured evaluation engine (eval_m6.md "Real code: commit a78dc6f") kept one state per context. The release's `config.py` `RunConfig.kept_states = 2` (k2: also the state its round resumed from) is the variant: no measured run of it exists here, and whether the simulator's `Latest{k: 2}` charges HBM as the engine's k2 (copy-on-resume, `drop_stale`) does is 未验证: compare per-session kept states on a short session trace | 2 (the release's k2) |
-| `dram_tier_gb` | 50 | `serve/launch.py` `--dram-gb` help: "the evaluation's full setting: 50" (the `TierConfig` default is 150) | 0 (with `dram_tier_writes: every-context`, `ssd_tier_writes: every-context`) |
+| `dram_tier_gb` | 150 | `TierConfig` default 150 (the long-run setting; `serve/launch.py` `--dram-gb` help gives 50 as "the evaluation's full setting", which the comparison variant uses) | 0 (with `dram_tier_writes: every-context`, `ssd_tier_writes: every-context`) |
 | `dram_tier_gb_per_s` | 50 | `TierConfig.dram_read_gb_s = 50.0` | – |
 | `dram_tier_writes` | `hbm-evictions-exclusive` | `DESIGN_TIERS["dram_writes"]`; `TierConfig` comment: a DRAM read releases the entry, HBM writes a context when it evicts it | `hbm-evictions` (inclusive victim) |
-| `ssd_tier_gb` | 128 | `TierConfig.ssd_gb = 128.0` ("128 GB per GPU (user, 2026-10-16)"); `--ssd-gb` help "(128)" | 0 (with `ssd_tier_writes: every-context`) |
+| `ssd_tier_gb` | 8,000 | the long-run setting the user chose for this preset (whether 8 TB holds every steady-state context is in the 8 h results below). The engine's default is `TierConfig.ssd_gb = 128.0` ("128 GB per GPU (user, 2026-10-16)"; `--ssd-gb` help "(128)"), which the comparison variant uses | 0 (with `ssd_tier_writes: every-context`) |
 | `ssd_tier_gb_per_s` | 10 | `TierConfig.ssd_read_gb_s = 10.0` | – |
 | `ssd_tier_writes` | `dram-evictions` | `TierConfig` comment: "the victim chain HBM -> DRAM -> SSD … a tier takes only what the level above evicts"; SSD stays inclusive | `every-context` |
 | `prefix_tier_balanced_load` | `true` | the server's slot accounting: a slot is one GPU's share of one KV block on all stages (balanced storage; `TierConfig.slot_bytes` comment, `kvpool/manager.py`) | `false` |
 | `prefix_tier_loading_area` | 0.1 | `DESIGN_TIERS["loading_area"] = 0.1` | 0 (the engine then uses its 1 s read-wait bound: also set `prefix_tier_max_read_wait_ms: 1000`) |
 | `prefix_tier_max_read_wait_ms` | absent (0) | `engine/scheduler.py` docstring, staged loading: "The read-wait bound is not used". The simulator rejects the bound with a loading area | – |
-| `prefix_tier_warm_start` | `false` | the evaluation starts empty (handoff `7_offloading.md` §5 "Start state") | – |
-| `max_concurrency`, trace | 300, `sessions_2ps_v3.csv` (not committed; `sessions_2ps_v3.manifest.json` beside this file gives its source and sha256) | eval_m6.md: `benchmarks/run.py` sched_good_nN, trace `data/tracelab-v3/m6/sessions_2ps_v3.csv` | – |
+| `prefix_tier_warm_start` | `true` | the closed-loop trace joins its first 2,000 sessions mid-life; a declared prefix longer than anything the run stored is a pre-run context, read from the slowest tier, as a long-lived session's would be in steady state. The evaluation started empty (handoff `7_offloading.md` §5 "Start state"): `false` in the comparison variant | `false` |
+| workload | `trace/closed_c2000_v3.csv`, `arrival_mode: saturated`, `max_concurrency: 2000`, `duration_ms: 28800000` (8 h) | a closed loop: 2,000 sessions active, each finished one lets in the next. Not committed (~540 MB); `closed_c2000_v3.manifest.json` beside this file gives the generator (`trace/session_closed_loop.py --concurrency 2000 --after 40000 --seed 0`), its source and sha256. No engine run of it exists | – |
+
+## Variant compared with the real engine
+
+The measured engine runs (eval_m6.md) are 20 minutes of the v3 M6 sessions at the evaluation's full tier setting.
+From this preset, change only:
+
+| Key | This preset | Comparison variant |
+| --- | --- | --- |
+| `workload` block | `trace/closed_c2000_v3.csv`, `arrival_mode: saturated`, `max_concurrency: 2000`, `duration_ms: 28800000` | `trace/sessions_2ps_v3.csv` (not committed; `sessions_2ps_v3.manifest.json` beside this file gives its source and sha256), `arrival_mode: trace_timed`, `request_rate: 1.0`, `max_concurrency: 300` (or 400), `duration_ms: 1200000` |
+| `dram_tier_gb` | 150 | 50 |
+| `ssd_tier_gb` | 8,000 | 128 |
+| `prefix_tier_warm_start` | `true` | `false` |
+
+Source of the variant: eval_m6.md `benchmarks/run.py` sched_good_nN, trace `data/tracelab-v3/m6/sessions_2ps_v3.csv`.
+The anchor table and the scope limits below were all obtained on this variant (the bring-up checks on their own
+traces), not on the 8 h configuration.
 
 ## Backends that differ from the vLLM defaults
 
@@ -63,15 +85,21 @@ emitted skeleton lists for it).
 
 - Model and hardware: GLM-5.3-Flash NVFP4 on one B200 PP4 pipeline, layers [12, 11, 11, 11].
 - Workload: prefill only (`external_decode`: a round completes at its first token), coding-agent multi-round
-  sessions (TraceLab v3 M6, `sessions_2ps_v3.csv`) and the bring-up checks below. Decode, other session shapes and
-  other models are outside what the anchors cover.
+  sessions. The anchors cover the comparison variant (TraceLab v3 M6, `sessions_2ps_v3.csv`, 20 minutes, DRAM 50 GB
+  + SSD 128 GB) and the bring-up checks below. Decode, other session shapes and other models are outside what the
+  anchors cover.
+- Not compared with a real engine: this preset itself. The 8 h closed loop of 2,000 sessions, DRAM 150 GB, SSD 8 TB
+  and warm start have no measured run; what carries over from the variant is the per-mechanism agreement below, not
+  a check of the steady state's throughput, hit mix or tier occupancy. In particular the SSD channel and DRAM/SSD
+  write volume at this scale, and the warm-start assumption (a joining session's context sits in SSD), are untested
+  against hardware.
 - Not trusted: HBM only (no DRAM or SSD tier) at high concurrency. At N = 400 the simulator gives 22.95 r/s
   against the engine's measured 12.97 (+76.9%) with recompute/new 0.692 against 1.757; at N = 300, 30.44 against
   27.24 (+11.7%) (`logs/20261114_9_pp_u7_equiv/anchors/report.md` §6, `k1`). The cause is 未验证.
 - Not trusted: exclusive DRAM without a loading area (`excl tiers`), where the simulator charges no tier write time
-  (eval_m6.md item 5); at k = 2 it read +7.0% at N = 400 (report.md §5), at this preset 未跑.
-- Tiered settings (full, tiers, ssdheavy) at N = 300 / 400 are within -2.0..+1.4% of the measured rows (anchors
-  below).
+  (eval_m6.md item 5); at k = 2 it read +7.0% at N = 400 (report.md §5), at k = 1 未跑.
+- Tiered settings (full, tiers, ssdheavy) at N = 300 / 400 of the comparison variant are within -2.0..+1.4% of the
+  measured rows (anchors below).
 
 ## What the simulator does not model, or models differently
 
@@ -104,18 +132,19 @@ one state. To reproduce the eval engine's KV form exactly, also remove `kv_block
 
 ## Anchors (nothing tuned)
 
-Each anchor run is this preset with only the anchor's workload, memory and named tier mode changed (rendered from
-it at its earlier name, `ssengine.yaml`, with the same keys). The bring-up checks (scheduling, force, tier
+Each anchor run is the comparison variant (this preset's engine keys with the variant's workload and tier sizes; at
+the time the preset itself, at its earlier name `ssengine.yaml`) with only the anchor's workload, memory and named
+tier mode changed. The bring-up checks (scheduling, force, tier
 bring-up) use the bring-up traces and presets of the local branch `artifact-glm-5.3-flash-prefill`
 (`presets/glm53_flash_prefill/`, generator `bringup/make_bringup.py`); they are not on this branch. T = the
 v2-realistic targets the engine was built against (`pp-impl/third_party/handoff_v2_realistic/data`, simulator outputs
 of wt-pp-hitrule 5153041a); real = eval_m6.md's measured rows (engine a78dc6f). Scripts and full tables (logs are not
 committed):
 
-- scheduling, force, tier bring-up and v2 sessions at this preset (k = 1): `logs/20261114_10_pp_u8_preset/`
+- scheduling, force, tier bring-up and v2 sessions at the comparison variant's engine keys (k = 1): `logs/20261114_10_pp_u8_preset/`
   (`gen.py`, `analyze.py`, `report.md`, `sched_check_blocks.md`; 2026-11-16);
-- eval_m6 at this preset: the `k1` runs of `logs/20261114_9_pp_u7_equiv/anchors/` (report.md §6: the 2026-11-14
-  preset with only `recurrent_state_checkpoints: 1`, i.e. this preset); the k = 2 column and `evaleng` come from
+- eval_m6 at the comparison variant: the `k1` runs of `logs/20261114_9_pp_u7_equiv/anchors/` (report.md §6: the 2026-11-14
+  preset with only `recurrent_state_checkpoints: 1`, i.e. the comparison variant); the k = 2 column and `evaleng` come from
   the same report (§3, §5, §6). eval_m6 deviations are computed from report.md's two-decimal r/s.
 
 The k = 2 numbers predate the unified state count (an HBM take then counted one added state under
@@ -124,7 +153,7 @@ not what k = 2 gives now (未跑 at the current code). The k = 1 numbers are una
 earlier state, and the unit-8 regression's `external_decode` k = 1 runs are byte-identical across the change
 (`logs/20261114_10_pp_u8_preset/regress/compare.txt`).
 
-| Anchor | This preset (k = 1) | Target | Deviation and where it comes from |
+| Anchor | Comparison variant (k = 1) | Target | Deviation and where it comes from |
 | --- | --- | --- | --- |
 | Scheduling check, `good` | 58 microbatches, all 58 chunk for chunk; 128k TTFT 1,875.1 ms | 58; 1,862.8 ms | +0.66% worst TTFT. Every microbatch's compute is 0.0-0.9% above T (41 of 58 above); the order is exact. The per-kernel source of the 0.9% (profile.db rows vs T's 20261016 profile.db.new) is 未验证: compare the two runs' cost_log kernel times. k = 2 gives the same request table byte for byte |
 | Force check, `good` | 32k TTFT 60.90 s; 1k p50 / p99 17.93 / 33.45 s; 1,300 microbatches | 61.02 s; 17.73 / 33.18 s; 1,303 | -0.2% / +1.1% / +0.8%; 3 fewer microbatches. k = 2: byte-identical request table |
@@ -149,3 +178,8 @@ less recompute than measured), whose cause is 未验证. No measured run of the 
 v2 and eval_m6, 2026-11-14, when an HBM take still counted one added state): on these traces every round resumes
 at its context's end, where a tier read moves no earlier state under either count (`StateRetention::survivors`). At k = 1 no earlier state is kept at all; the
 `ed_off` pairs were not rerun at k = 1 (未跑).
+
+## 8 h steady state (this preset)
+
+Runs of this preset at the current code go in `logs/20261116_1_pp_tuned_8h/` (not committed). Results: pending, to be
+filled in from that run's outputs.

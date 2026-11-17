@@ -1,22 +1,24 @@
 # SSEngine as built (pp-impl lanes/release, `ssengine serve` design config): GLM-5.3-Flash NVFP4 prefill on one B200
-# PP4 pipeline, the v3 M6 sessions at N = 300 with the evaluation's full setting (HBM 100.18 GB + DRAM 50 GB + SSD
-# 128 GB per GPU), 20 minutes. Every mechanism is its own key, so an ablation is this preset with one key changed;
-# b200_pp4_prefill.md beside this file gives each key's source in the engine and the key each ablation changes.
+# PP4 pipeline in its long steady state: a closed loop of 2,000 TraceLab v3 sessions for 8 hours, HBM 100.18 GB +
+# DRAM 150 GB + SSD 8 TB per GPU. Every mechanism is its own key, so an ablation is this preset with one key changed;
+# b200_pp4_prefill.md beside this file gives each key's source in the engine, the key each ablation changes, and the
+# variant compared with the real engine (20 minutes of the v3 M6 sessions, DRAM 50 GB + SSD 128 GB).
 #
-# Workload: TraceLab v3 coding-agent sessions arriving at 2 per second (2,457 sessions, 260,801 rounds). The trace
-# CSV is not committed (~19 MB); copy it into trace/ by hand. Its manifest (sessions_2ps_v3.manifest.json beside
-# this preset) gives the source and the sha256.
+# Workload: the first 2,000 sessions start in the renewal equilibrium (length-biased, joined mid-life with their
+# pre-run context in the slowest tier, hence prefix_tier_warm_start) and each finished session lets in the next; a
+# round follows its predecessor by its tool wait plus its decode time. The trace CSV is not committed (~540 MB);
+# copy or link it into trace/ by hand. Its manifest (closed_c2000_v3.manifest.json beside this preset) gives the
+# generator, the source and the sha256.
 deployment: pp
 
 workload:
   trace_files:
-    - trace/sessions_2ps_v3.csv
+    - trace/closed_c2000_v3.csv
   input_file_format: text-generation-session-execution-v2
-  arrival_mode: trace_timed
-  request_rate: 1.0
-  max_concurrency: 300
+  arrival_mode: saturated
+  max_concurrency: 2000
   run_to_end: false
-  duration_ms: 1200000.0
+  duration_ms: 28800000.0
 
 io:
   log_dir: logs/tuned_engine/glm53_flash_nvfp4_b200_pp4_prefill
@@ -64,14 +66,14 @@ pools:
           load_budget_backlog_hi_tokens: 3000000
           force_schedule_after_ms: 60000.0
           # Tiers: HBM -> DRAM (exclusive victim) -> SSD (victim), balanced storage, a 10% staged loading area.
-          dram_tier_gb: 50.0
+          dram_tier_gb: 150.0
           dram_tier_gb_per_s: 50.0
           dram_tier_writes: hbm-evictions-exclusive
-          ssd_tier_gb: 128.0
+          ssd_tier_gb: 8000.0
           ssd_tier_gb_per_s: 10.0
           ssd_tier_writes: dram-evictions
           prefix_tier_balanced_load: true
           prefix_tier_loading_area: 0.1
-          prefix_tier_warm_start: false
+          prefix_tier_warm_start: true
 
 backends_file: b200_pp4_prefill.backends.yaml
