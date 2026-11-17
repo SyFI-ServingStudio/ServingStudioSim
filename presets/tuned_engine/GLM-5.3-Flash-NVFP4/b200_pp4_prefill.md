@@ -14,7 +14,7 @@ the simulator models differently; the right column says how to check it.
 | Key | Value | SSEngine behavior and source | Ablation |
 | --- | --- | --- | --- |
 | `deployment: pp`, `pp_size: 4`, `layer_partition` | 4 stages, [12, 11, 11, 11] | `ssengine/config.py` `LAYER_SPLIT = [12, 11, 11, 11]`, one B200 per stage | – |
-| arch keys | no MLA layout copies, indexer logits cap 512 MB, measured per-token MoE routes (TP4/EP4 capture), as `presets/glm53_flash_prefill/` | the engine's model path | – |
+| arch keys | no MLA layout copies, indexer logits cap 512 MB, measured per-token MoE routes (TP4/EP4 capture) | the engine's model path | – |
 | `backends_file` | `b200_pp4_prefill.backends.yaml` | the engine's kernels; the roles that differ from the vLLM defaults are listed below | – |
 | `external_decode` | `true` | README L14: "Prefill and one output token only … the prefill side of a deployment whose decode runs elsewhere" | `false` |
 | `max_batch_tokens` | 32,768 | `SCHEDULER_STEPS["good"]`: `mb_tokens=32768` | – |
@@ -40,7 +40,7 @@ the simulator models differently; the right column says how to check it.
 | `prefix_tier_loading_area` | 0.1 | `DESIGN_TIERS["loading_area"] = 0.1` | 0 (the engine then uses its 1 s read-wait bound: also set `prefix_tier_max_read_wait_ms: 1000`) |
 | `prefix_tier_max_read_wait_ms` | absent (0) | `engine/scheduler.py` docstring, staged loading: "The read-wait bound is not used". The simulator rejects the bound with a loading area | – |
 | `prefix_tier_warm_start` | `false` | the evaluation starts empty (handoff `7_offloading.md` §5 "Start state") | – |
-| `max_concurrency`, trace | 300, `sessions_2ps_v3.csv` | eval_m6.md: `benchmarks/run.py` sched_good_nN, trace `data/tracelab-v3/m6/sessions_2ps_v3.csv` | – |
+| `max_concurrency`, trace | 300, `sessions_2ps_v3.csv` (not committed; `sessions_2ps_v3.manifest.json` beside this file gives its source and sha256) | eval_m6.md: `benchmarks/run.py` sched_good_nN, trace `data/tracelab-v3/m6/sessions_2ps_v3.csv` | – |
 
 ## Backends that differ from the vLLM defaults
 
@@ -63,7 +63,7 @@ emitted skeleton lists for it).
 
 - Model and hardware: GLM-5.3-Flash NVFP4 on one B200 PP4 pipeline, layers [12, 11, 11, 11].
 - Workload: prefill only (`external_decode`: a round completes at its first token), coding-agent multi-round
-  sessions (TraceLab v3 M6, `sessions_2ps_v3.csv`) and the bring-up traces below. Decode, other session shapes and
+  sessions (TraceLab v3 M6, `sessions_2ps_v3.csv`) and the bring-up checks below. Decode, other session shapes and
   other models are outside what the anchors cover.
 - Not trusted: HBM only (no DRAM or SSD tier) at high concurrency. At N = 400 the simulator gives 22.95 r/s
   against the engine's measured 12.97 (+76.9%) with recompute/new 0.692 against 1.757; at N = 300, 30.44 against
@@ -105,7 +105,9 @@ one state. To reproduce the eval engine's KV form exactly, also remove `kv_block
 ## Anchors (nothing tuned)
 
 Each anchor run is this preset with only the anchor's workload, memory and named tier mode changed (rendered from
-it at its earlier path, `presets/glm53_flash_prefill/ssengine.yaml`, with the same keys). T = the
+it at its earlier name, `ssengine.yaml`, with the same keys). The bring-up checks (scheduling, force, tier
+bring-up) use the bring-up traces and presets of the local branch `artifact-glm-5.3-flash-prefill`
+(`presets/glm53_flash_prefill/`, generator `bringup/make_bringup.py`); they are not on this branch. T = the
 v2-realistic targets the engine was built against (`pp-impl/third_party/handoff_v2_realistic/data`, simulator outputs
 of wt-pp-hitrule 5153041a); real = eval_m6.md's measured rows (engine a78dc6f). Scripts and full tables (logs are not
 committed):

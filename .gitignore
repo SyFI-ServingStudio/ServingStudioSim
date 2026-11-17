@@ -22,10 +22,6 @@ trace/aime_long.csv
 # a run checks itself against.
 trace/tracelab_*
 !trace/tracelab_*.manifest.json
-# GLM-5.3-Flash prefill bring-up traces: deterministic output of make_bringup.py
-# beside them (the presets read them there; the preset test regenerates them).
-presets/glm53_flash_prefill/bringup/*.csv
-presets/glm53_flash_prefill/bringup/.gen-*/
 
 # Editor / OS
 .vscode/

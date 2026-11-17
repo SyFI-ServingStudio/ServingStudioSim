@@ -1,19 +1,11 @@
-"""The GLM-5.3-Flash PP4 prefill presets (`presets/glm53_flash_prefill/`) and the
-tuned-engine presets (`presets/tuned_engine/`, the SSEngine replica among them): every
-member expands against the simulator's schema and builds its deployment
-through the binary's ``dry-run`` (the flow is built, nothing simulated).
-
-The bring-up CSVs the ``check_*`` presets read are not committed: a session
-fixture regenerates them in place with ``bringup/make_bringup.py`` (they are
-git-ignored there), so the presets' repo-relative trace paths resolve."""
+"""The tuned-engine presets (`presets/tuned_engine/<model>/<deployment>.yaml`):
+every member expands against the simulator's schema and builds its deployment
+through the binary's ``dry-run`` (the flow is built, nothing simulated)."""
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,15 +18,11 @@ from launcher.schema.argv import build_cli_command
 from launcher.schema.loader import _load_preset, load_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PRESET_DIR = REPO_ROOT / "presets/glm53_flash_prefill"
-BRINGUP_DIR = PRESET_DIR / "bringup"
 TUNED_DIR = REPO_ROOT / "presets/tuned_engine"
 PRESETS = sorted(
-    path
-    for path in [*PRESET_DIR.glob("*.yaml"), *TUNED_DIR.glob("*/*.yaml")]
-    if not path.stem.startswith("backends") and not path.name.endswith(".backends.yaml")
+    path for path in TUNED_DIR.glob("*/*.yaml") if not path.name.endswith(".backends.yaml")
 )
-IDS = [str(path.relative_to(REPO_ROOT / "presets").with_suffix("")) for path in PRESETS]
+IDS = [str(path.relative_to(TUNED_DIR).with_suffix("")) for path in PRESETS]
 JOBS = min(32, os.cpu_count() or 8)
 
 
@@ -50,39 +38,21 @@ def _missing_traces(member: dict) -> list[str]:
     ]
 
 
-@pytest.fixture(scope="session")
-def bringup_traces() -> None:
-    """Regenerate the bring-up CSVs beside their generator. Each file is written
-    in a scratch directory on the same filesystem and moved into place, so a
-    concurrent reader (another xdist worker) sees a whole file, never a partial one."""
-    scratch = Path(tempfile.mkdtemp(prefix=".gen-", dir=BRINGUP_DIR))
-    try:
-        subprocess.run([sys.executable, str(BRINGUP_DIR / "make_bringup.py"), str(scratch)], check=True)
-        for csv in scratch.glob("*.csv"):
-            os.replace(csv, BRINGUP_DIR / csv.name)
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
 def test_the_presets_are_there():
-    names = set(IDS)
-    assert {
-        "tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill",
-        "glm53_flash_prefill/check_scheduler_order",
-        "glm53_flash_prefill/check_tier_read",
-        "glm53_flash_prefill/v3_m6_full",
-    } <= names
+    assert "GLM-5.3-Flash-NVFP4/b200_pp4_prefill" in IDS
+    for path in PRESETS:
+        assert path.with_suffix(".md").is_file(), f"{path.name} has no .md beside it"
 
 
 @pytest.mark.presets
 @pytest.mark.needs_binary
 @pytest.mark.parametrize("path", PRESETS, ids=IDS)
-def test_every_member_builds(path, sim_bin, tmp_path, bringup_traces):
+def test_every_member_builds(path, sim_bin, tmp_path):
     members = _members(path)
     assert members
     runnable = [member for member in members if not _missing_traces(member)]
     if not runnable:
-        # The v3 session traces are not committed (their manifests are).
+        # Session traces are not committed (their manifests are).
         pytest.skip(f"trace not provisioned: {_missing_traces(members[0])}")
     env = {**_build_subprocess_env(), "RUST_LOG": "warn"}
 

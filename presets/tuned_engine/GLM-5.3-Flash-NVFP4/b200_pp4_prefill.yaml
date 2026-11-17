@@ -4,8 +4,8 @@
 # b200_pp4_prefill.md beside this file gives each key's source in the engine and the key each ablation changes.
 #
 # Workload: TraceLab v3 coding-agent sessions arriving at 2 per second (2,457 sessions, 260,801 rounds). The trace
-# CSV is not committed (~19 MB); copy it into trace/ by hand. Its manifest
-# (presets/glm53_flash_prefill/traces/sessions_2ps_v3.manifest.json) gives the source and the sha256.
+# CSV is not committed (~19 MB); copy it into trace/ by hand. Its manifest (sessions_2ps_v3.manifest.json beside
+# this preset) gives the source and the sha256.
 deployment: pp
 
 workload:
