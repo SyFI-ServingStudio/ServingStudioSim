@@ -542,6 +542,8 @@ pub struct WorkerConfig {
     /// throttle). Larger = fewer rows / coarser occupancy series; `1` logs every
     /// iteration.
     pub kv_log_stride: u32,
+    /// Mirror of `io.cost_log_mode`: which iterations write a `cost_log` row.
+    pub cost_log: crate::log::CostLogPolicy,
     /// GPU wall / kernel time multiplier (≥ 1.0): the worker advances its clock by
     /// `kernel_time * gpu_time_multiplier`, modeling inter-kernel overhead not
     /// attributed to any single kernel. 1.0 = no overhead. From the worker
@@ -657,6 +659,7 @@ impl Default for WorkerConfig {
             log_output_token_times: false,
             log_stage_transitions: true,
             kv_log_stride: 8,
+            cost_log: crate::log::CostLogPolicy::Full,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,

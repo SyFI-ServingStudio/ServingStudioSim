@@ -56,6 +56,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, TooLong, WorkerId};
 use crate::deployment::BackendOverrides;
+use crate::log::CostLogPolicy;
 use crate::timing::bridge::{
     dry_run_document, fill_missing_profiles, print_dry_run, write_dry_run_report,
 };
@@ -605,6 +606,7 @@ fn run_iter_cases(model: &dyn IterwiseUnifiedModel, inputs: Vec<UnifiedArchInput
     // case runs `eval_iter_with_inputs` and writes one byte-identical parquet row.
     let mut cost = CostBuffers::new_iter(
         Some(log_dir.to_path_buf()),
+        CostLogPolicy::Full,
         PREDICT_POOL_TAG,
         WorkerId(0),
         model,
@@ -666,6 +668,7 @@ fn run_speculative_iter_cases(
 ) {
     let mut cost = CostBuffers::new(
         Some(log_dir.to_path_buf()),
+        CostLogPolicy::Full,
         PREDICT_POOL_TAG,
         WorkerId(0),
         &CostManifestDoc::single("iter", model.cost_log_manifest()),
@@ -705,6 +708,7 @@ fn run_attn_cases(model: &dyn AttnLayerwiseModel, inputs: Vec<AttnArchInput>, lo
     let manifest = model.cost_log_manifest();
     let mut cost = CostBuffers::new(
         Some(log_dir.to_path_buf()),
+        CostLogPolicy::Full,
         PREDICT_POOL_TAG,
         WorkerId(0),
         &manifest,
@@ -747,6 +751,7 @@ fn run_ffn_cases(model: &dyn FfnLayerwiseModel, cases: Vec<FfnArchInput>, log_di
     let manifest = model.cost_log_manifest();
     let mut cost = CostBuffers::new(
         Some(log_dir.to_path_buf()),
+        CostLogPolicy::Full,
         PREDICT_POOL_TAG,
         WorkerId(0),
         &manifest,

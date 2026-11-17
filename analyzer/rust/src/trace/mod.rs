@@ -149,14 +149,18 @@ pub async fn run(
     max_slices: usize,
     expanded: bool,
 ) -> Result<()> {
-    let manifests = crate::io::read_cost_manifests(log_dir)?;
-
+    let coverage = crate::io::read_cost_log_coverage(log_dir);
+    if let Some(note) = coverage.sampling_note() {
+        eprintln!("[analyze] {}", note["caveat"].as_str().unwrap_or_default());
+    }
     // Cost log is one parquet per worker under `raw/cost_log/` (a single shared
     // file would race when 32+ decode workers all open it). DataFusion takes
     // the directory and unions every `*.parquet` inside.
     if !register_cost_log(ctx, log_dir).await? {
-        bail!("cost_log/ dir not found under {}", log_dir.display());
+        bail!("{} under {}", coverage.absent_reason(), log_dir.display());
     }
+
+    let manifests = crate::io::read_cost_manifests(log_dir)?;
     require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
     // Global time span via a cheap aggregate — the anchors below need it, but

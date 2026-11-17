@@ -240,7 +240,7 @@ impl SectionPlan {
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
@@ -258,7 +258,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         }
     };
 
-    let worker_scans = plan_worker_scans(ctx).await?;
+    let worker_scans = plan_worker_scans(ctx, crate::io::read_cost_log_coverage(log_dir)).await?;
     if worker_scans.is_empty() {
         let reason = "cost_log has no rows";
         return Ok((
@@ -383,7 +383,13 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     Ok((report, payload))
 }
 
-async fn plan_worker_scans(ctx: &SessionContext) -> Result<BTreeMap<(String, u16), WorkerScan>> {
+/// Each worker's scan stride and exact kernel time. Under a sampled cost log
+/// (`coverage`), the stride counts logged iterations and the exact time is the
+/// logged sum weighted to the whole run.
+async fn plan_worker_scans(
+    ctx: &SessionContext,
+    coverage: crate::io::CostLogCoverage,
+) -> Result<BTreeMap<(String, u16), WorkerScan>> {
     let batches = collect(
         ctx,
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, COUNT(*) AS raw_rows, \
@@ -413,13 +419,13 @@ async fn plan_worker_scans(ctx: &SessionContext) -> Result<BTreeMap<(String, u16
     Ok(counts
         .into_iter()
         .map(|(pool_tag, worker_id, raw_rows, exact_kernel_time_ms)| {
-            let stride = raw_rows.div_ceil(target_per_worker).max(1);
+            let stride = coverage.logged_stride(raw_rows.div_ceil(target_per_worker).max(1));
             (
                 (pool_tag, worker_id),
                 WorkerScan {
                     raw_rows,
                     stride,
-                    exact_kernel_time_ms,
+                    exact_kernel_time_ms: exact_kernel_time_ms * coverage.weight(),
                 },
             )
         })

@@ -61,7 +61,7 @@ struct SampledInvocations {
 
 pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
@@ -72,7 +72,8 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
     // True per-pool invocation counts via a cheap COUNT(*) GROUP BY (no `groups`
     // decode), so `num_calls` stays exact even though the distribution + scatter
     // below are computed over a time-uniform iteration sample.
-    let true_counts = collect_invocation_counts(ctx).await?;
+    let coverage = crate::io::read_cost_log_coverage(log_dir);
+    let true_counts = collect_invocation_counts(ctx, coverage.every() as usize).await?;
     if true_counts.by_pool.is_empty() {
         let reason = "cost_log has no invocations";
         return Ok((
@@ -85,7 +86,7 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
     // Sample every `stride`-th iteration (all its rows) so we decode `groups` + sort
     // over a small representative subset, not the whole multi-million-row cost_log
     // (mirrors `kernel_throughput`'s `iter_id % stride` pushdown).
-    let stride = choose_stride(ctx).await?;
+    let stride = coverage.align_run_stride(choose_stride(ctx).await?);
     let sampled = collect_sampled_batches(ctx, stride).await?;
 
     let mut report_pools = Vec::new();
@@ -219,7 +220,8 @@ fn mean(s: &MetricStats) -> Value {
 
 /// True per-pool invocation count via `COUNT(*) GROUP BY pool_tag` — an aggregate
 /// pushed into DataFusion (no `groups` decode, no row materialization).
-async fn collect_invocation_counts(ctx: &SessionContext) -> Result<InvocationCounts> {
+/// `every` is the iterations each logged row stands for (the cost-log stride).
+async fn collect_invocation_counts(ctx: &SessionContext, every: usize) -> Result<InvocationCounts> {
     let batches = collect(
         ctx,
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, COUNT(*) AS c \
@@ -237,7 +239,7 @@ async fn collect_invocation_counts(ctx: &SessionContext) -> Result<InvocationCou
         let worker_ids = column_f64(col(batch, "worker_id")?)?;
         for i in 0..batch.num_rows() {
             let pool_tag = pool_arr.value(i).to_string();
-            let count = c[i] as usize;
+            let count = c[i] as usize * every;
             *by_pool.entry(pool_tag.clone()).or_insert(0) += count;
             by_worker.insert((pool_tag, worker_ids[i] as u64), count);
         }
@@ -358,7 +360,8 @@ fn definitions() -> Value {
                   slice), the ffn pool is the aggregator (summed batch)",
         "workers": "worker rows retain the exact (pool_tag, worker_id) identity; pool rows are \
                     aggregate context across those workers",
-        "stats_vs_scatter": "num_calls is exact; report metrics use the regular iter_id-stride \
+        "stats_vs_scatter": "num_calls counts every logged iteration (exact for a full cost_log; \
+                             logged rows x the stride under io.cost_log_mode: stride); report metrics use the regular iter_id-stride \
                              sample; payload scatter is then evenly downsampled to <=4000 points \
                              per pool or worker",
     })

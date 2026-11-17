@@ -46,7 +46,7 @@ pub async fn run_optimality(
     lock_batch_size: bool,
 ) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason, lock_batch_size),
             unavailable_payload(log_dir, reason, lock_batch_size),
@@ -168,6 +168,14 @@ pub async fn run_optimality(
 
     // Exact per-worker busy + span (all rows).
     let mut workers = fold::read_exact_worker_totals(ctx, &gpu_count_by_worker).await?;
+    // A sampled cost log holds 1 in N iterations: each logged row's busy time
+    // stands for N. The span is the logged first-to-last wall, already run-wide
+    // to within N iterations, so the estimate is capped at it: a worker busy
+    // throughout would otherwise read busier than its own span.
+    let coverage = crate::io::read_cost_log_coverage(log_dir);
+    for worker in &mut workers {
+        worker.busy_ms = (worker.busy_ms * coverage.weight()).min(worker.span_ms);
+    }
     if workers.is_empty() {
         let reason = "cost_log has no (pool_tag, worker_id) rows";
         return Ok((
@@ -205,7 +213,8 @@ pub async fn run_optimality(
     let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 6]> = HashMap::new();
     let sampled_row_count = fold::accumulate_fold(
         ctx,
-        sample_stride,
+        // Under a sampled cost log, sample only logged iterations.
+        coverage.align_run_stride(sample_stride),
         hardware_bandwidth_gbps,
         lock_batch_size,
         &section_fold_plan_by_key,
@@ -367,7 +376,7 @@ pub async fn run_optimality(
         "peaks_source": grid_peak_catalog.source,
         "achievable_peaks": achievable_peaks.meta_json(),
         "sustained_rates_available": gpu_spec.has_sustained(),
-        "sample_stride": sample_stride,
+        "sample_stride": coverage.align_run_stride(sample_stride),
         "sampled_rows": sampled_row_count,
         "gpu_counts_available": has_worker_gpu_counts,
         "num_workers": workers.len(),

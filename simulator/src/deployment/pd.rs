@@ -77,6 +77,7 @@ impl Deployment for PdDeployment {
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
+            cfg.io.cost_log_policy()?,
         )?;
         let decode_wc = worker_config(
             &dg.worker,
@@ -85,6 +86,7 @@ impl Deployment for PdDeployment {
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
+            cfg.io.cost_log_policy()?,
         )?;
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
@@ -229,6 +231,7 @@ fn worker_config(
     log_output_token_times: bool,
     log_stage_transitions: bool,
     kv_log_stride: u32,
+    cost_log: crate::log::CostLogPolicy,
 ) -> anyhow::Result<WorkerConfig> {
     let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache) = match worker {
         IterWorkerSel::PdPrefill {
@@ -282,6 +285,7 @@ fn worker_config(
         log_output_token_times,
         log_stage_transitions,
         kv_log_stride,
+        cost_log,
         gpu_time_multiplier,
         prefix_cache,
         max_model_len,

@@ -287,7 +287,10 @@ async fn analyze_exact_iteration(
 ) -> Result<ExactIterationAnalysis> {
     let context = build_session();
     if !register_cost_log(&context, log_dir).await? {
-        bail!("cost_log/ dir not found");
+        bail!(
+            "{}",
+            crate::io::read_cost_log_coverage(log_dir).absent_reason()
+        );
     }
     require_columns(&context, COST_LOG_TABLE, COST_COLS).await?;
     let exact = fold_exact_iteration(

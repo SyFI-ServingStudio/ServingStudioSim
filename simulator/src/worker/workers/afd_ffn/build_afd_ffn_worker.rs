@@ -33,6 +33,7 @@ pub(crate) fn build_afd_ffn_worker<M: FfnLayerwiseModel>(
     };
     let cost = CostBuffers::new(
         cost_log_dir,
+        config.cost_log,
         pool_tag,
         id,
         &model.cost_log_manifest(),

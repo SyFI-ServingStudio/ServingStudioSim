@@ -57,7 +57,7 @@ struct WorkerUsage {
 
 pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
@@ -105,7 +105,8 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
     // millions of rows to num_workers × n_bins. Each iteration's whole duration
     // lands in the bin of its start time (no cross-bin interval spread; negligible
     // at ~run/200 bins vs ms-scale iterations).
-    let worker_bins = collect_worker_bins(ctx, t_min, bin_width, n_bins).await?;
+    let weight = crate::io::read_cost_log_coverage(log_dir).weight();
+    let worker_bins = collect_worker_bins(ctx, t_min, bin_width, n_bins, weight).await?;
 
     // Seed from run_meta so a pool's idle worker still counts toward capacity,
     // then union the composite worker identities observed in cost_log. Pool tags
@@ -367,11 +368,14 @@ async fn query_span(ctx: &SessionContext) -> Result<Option<(f64, f64)>> {
 /// bin index of the iteration's start time (`CAST(... AS BIGINT)` = floor for a
 /// non-negative offset), `busy` = `SUM(total_time_ms)`. Returns num_workers ×
 /// n_bins rows at most, with bin indices clamped into `[0, n_bins)`.
+/// `weight` is the iterations each logged row stands for (the cost-log stride),
+/// so a sampled log still reports run-wide busy time.
 async fn collect_worker_bins(
     ctx: &SessionContext,
     t_min: f64,
     bin_width: f64,
     n_bins: usize,
+    weight: f64,
 ) -> Result<Vec<WorkerBin>> {
     let sql = format!(
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, \
@@ -393,7 +397,7 @@ async fn collect_worker_bins(
                 pool_tag: value_string(pool_tag, row)?,
                 worker_id: w[row] as u64,
                 bin: bi,
-                busy_ms: busy[row],
+                busy_ms: busy[row] * weight,
             });
         }
     }

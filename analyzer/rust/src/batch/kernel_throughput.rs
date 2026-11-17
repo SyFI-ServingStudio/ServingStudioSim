@@ -67,7 +67,7 @@ struct Loc {
 
 pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
-        let reason = "cost_log/ dir not found";
+        let reason = crate::io::read_cost_log_coverage(log_dir).absent_reason();
         return Ok((
             unavailable(log_dir, reason),
             unavailable_payload(log_dir, reason),
@@ -117,7 +117,8 @@ pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Resu
         }
     }
 
-    let stride = choose_stride(ctx).await?;
+    let stride =
+        crate::io::read_cost_log_coverage(log_dir).align_run_stride(choose_stride(ctx).await?);
     let sampled_rows = accumulate(ctx, stride, &slot_loc, &mut locs).await?;
 
     // A location contributes iff it saw ≥1 sampled slot with a rate.

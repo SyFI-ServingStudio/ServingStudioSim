@@ -1134,27 +1134,25 @@ impl KvCacheStore {
     }
 
     pub(crate) fn advance(&mut self, scope: AdvanceScope<'_>, steps: u32) {
+        // One jump per decode: nothing reads the partition between the tokens
+        // of one advance, and its charge depends only on the final length.
         let partition = match scope {
-            AdvanceScope::WholePartition(partition)
-            | AdvanceScope::RequestSubset { partition, .. } => partition,
-        };
-        for _ in 0..steps {
-            match scope {
-                AdvanceScope::WholePartition(partition) => {
-                    self.partitions[partition as usize].advance_decodes();
-                }
-                AdvanceScope::RequestSubset {
-                    partition,
-                    request_ids,
-                } => {
-                    debug_assert!(
-                        self.ledger.all_placed_on(partition, request_ids),
-                        "advance scope contains a request outside KV partition {partition}"
-                    );
-                    self.partitions[partition as usize].advance_subset(request_ids);
-                }
+            AdvanceScope::WholePartition(partition) => {
+                self.partitions[partition as usize].advance_decodes(steps);
+                partition
             }
-        }
+            AdvanceScope::RequestSubset {
+                partition,
+                request_ids,
+            } => {
+                debug_assert!(
+                    self.ledger.all_placed_on(partition, request_ids),
+                    "advance scope contains a request outside KV partition {partition}"
+                );
+                self.partitions[partition as usize].advance_subset(request_ids, steps);
+                partition
+            }
+        };
         // Admission must have claimed every step's tokens before the step ran;
         // advancing never checks capacity itself.
         let state = &self.partitions[partition as usize];
@@ -3060,5 +3058,182 @@ mod tests {
         let footprint = kv_store.footprint(RequestId(1), 8_600, 10);
         kv_store.reserve_prefill_context(RequestId(1), 0, resolved, footprint, Time::ZERO);
         assert_eq!(kv_store.prefix_caches[0].used_units(), 0);
+    }
+
+    // ── multi-token advance ─────────────────────────────────────────────────
+
+    /// What any later decision can read from partition 0: the hard and soft
+    /// tiers, the retained-prefix budget, usage, the projected peak, each live
+    /// decode's length and charge, and whether a large admission still fits —
+    /// plus the partition's whole state, so a counter the partition gains
+    /// later (and keeps per advance call rather than per token) fails here too.
+    fn observe(
+        kv_store: &KvCacheStore,
+    ) -> (Vec<u64>, f64, Vec<(RequestId, u64, Option<u64>)>, bool, String) {
+        let partition = &kv_store.partitions[0];
+        let members = kv_store
+            .decode_members(0)
+            .map(|(request, kv)| (request, kv, partition.decode_charge(request)))
+            .collect();
+        (
+            vec![
+                partition.resident_units(),
+                partition.live_checkpoint_units(),
+                partition.projected_peak_units(),
+                kv_store.soft_slack(0),
+                kv_store.clamped_live_checkpoint_units(0),
+                kv_store.prefix_cache_physical_limit(0),
+                kv_store.prefix_caches[0].used_units(),
+            ],
+            kv_store.kv_usage(0),
+            members,
+            kv_store.fits(0, &kv_store.footprint(RequestId(99), 1_000, 0)),
+            format!("{partition:?}"),
+        )
+    }
+
+    /// Two decodes that straddle 512-token block (checkpoint) boundaries, one
+    /// with fewer tokens left than the advance asks for, on a partition whose
+    /// capacity their admission claims to the unit.
+    fn full_checkpointing_store() -> KvCacheStore {
+        let probe = state_store(
+            1 << 30,
+            300,
+            Some(512),
+            Some(PrefixResumePoints::EveryBlock),
+        );
+        let claimed = probe.footprint(RequestId(0), 1_020, 9).reserved_units()
+            + probe.footprint(RequestId(1), 2_045, 3).reserved_units();
+        let mut kv_store = state_store(
+            claimed,
+            300,
+            Some(512),
+            Some(PrefixResumePoints::EveryBlock),
+        );
+        for (request, context, budget) in [(0, 1_020_u32, 9), (1, 2_045, 3)] {
+            let footprint = kv_store.footprint(RequestId(request), context, budget);
+            kv_store.reserve(RequestId(request), 0, footprint, Time::ZERO);
+            kv_store.drain_ready();
+            kv_store.commit_resident(RequestId(request), 0, context.into(), budget);
+        }
+        assert!(
+            !kv_store.fits(0, &kv_store.footprint(RequestId(2), 1, 0)),
+            "the admissions must claim the whole partition for this to test a full pool",
+        );
+        kv_store
+    }
+
+    #[test]
+    fn a_multi_token_advance_equals_that_many_one_token_advances() {
+        for steps in [1, 2, 5, 8, 12] {
+            let mut stepped = full_checkpointing_store();
+            let mut jumped = full_checkpointing_store();
+            for _ in 0..steps {
+                stepped.advance(AdvanceScope::WholePartition(0), 1);
+            }
+            jumped.advance(AdvanceScope::WholePartition(0), steps);
+            assert_eq!(
+                observe(&stepped),
+                observe(&jumped),
+                "whole partition, {steps} steps"
+            );
+            if steps >= 5 {
+                // Request 0 has crossed 1024: the jump passed a checkpoint.
+                assert!(jumped.partitions[0].live_checkpoint_units() > 0);
+            }
+
+            // A named subset: only request 1, whose budget (3) caps the advance.
+            let mut stepped = full_checkpointing_store();
+            let mut jumped = full_checkpointing_store();
+            let subset = [RequestId(1)];
+            for _ in 0..steps {
+                stepped.advance(
+                    AdvanceScope::RequestSubset {
+                        partition: 0,
+                        request_ids: &subset,
+                    },
+                    1,
+                );
+            }
+            jumped.advance(
+                AdvanceScope::RequestSubset {
+                    partition: 0,
+                    request_ids: &subset,
+                },
+                steps,
+            );
+            assert_eq!(observe(&stepped), observe(&jumped), "subset, {steps} steps");
+
+            // Releasing afterwards (checkpoints fall, the peak is recomputed)
+            // also sees the same state.
+            stepped.release(RequestId(0), 0);
+            jumped.release(RequestId(0), 0);
+            assert_eq!(
+                observe(&stepped),
+                observe(&jumped),
+                "after release, {steps} steps"
+            );
+        }
+    }
+
+    /// A sliding window that fills while the decode advances, then a retained
+    /// prefix that the next admission evicts: the jump must leave the same
+    /// retained entry and evict the same units.
+    #[test]
+    fn a_multi_token_advance_retains_and_evicts_like_one_token_advances() {
+        let run = |chunks: &[u32]| {
+            let layout = KvCacheLayout::new()
+                .with_part(KvCachePart::per_token("global", 1))
+                .with_part(KvCachePart::sliding_window("swa", 64, 4));
+            let accounting = Arc::new(
+                KvAccounting::resolve(
+                    &layout,
+                    KvAccountingOptions {
+                        max_in_flight_tokens: Some(16),
+                        ..KvAccountingOptions::default()
+                    },
+                    200_000,
+                )
+                .unwrap(),
+            );
+            let mut kv_store = KvCacheStore::new(
+                1,
+                accounting,
+                capped_prefix_cache(200_000, PrefixCachePolicy::Lru),
+                None,
+                None,
+            );
+            let session = |prefix| SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: prefix,
+            };
+            // Starts inside the window so the first tokens grow it.
+            let resolved = kv_store.preview_prefill_context(0, 40, session(0));
+            let footprint = kv_store.footprint(RequestId(0), 40, 100);
+            kv_store.reserve_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+            kv_store.drain_ready();
+            kv_store.commit_resident(RequestId(0), 0, 40, 100);
+            let mut seen = Vec::new();
+            for &steps in chunks {
+                kv_store.advance(AdvanceScope::WholePartition(0), steps);
+            }
+            seen.push(observe(&kv_store));
+            kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+            seen.push(observe(&kv_store));
+            let resolved = kv_store.preview_prefill_context(0, 10, session(140));
+            let footprint = kv_store.footprint(RequestId(1), 150, 10);
+            kv_store.reserve_prefill_context(RequestId(1), 0, resolved, footprint, Time::ZERO);
+            seen.push(observe(&kv_store));
+            seen
+        };
+        let one_token = run(&[1; 100]);
+        assert_eq!(one_token, run(&[100]));
+        assert_eq!(one_token, run(&[7, 7, 7, 7, 7, 7, 7, 51]));
+        assert_eq!(
+            one_token,
+            run(&[150]),
+            "a jump past the budget stops at the budget"
+        );
     }
 }

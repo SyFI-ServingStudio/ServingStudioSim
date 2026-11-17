@@ -21,11 +21,13 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use schema_derive::ParamStruct;
 
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
+use crate::log::CostLogPolicy;
 use crate::orchestrator::PoolSpec;
 use crate::worker::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel};
 
@@ -164,6 +166,64 @@ pub struct IoSpec {
     #[serde(default = "default_kv_log_stride")]
     #[param(default = 8)]
     pub kv_log_stride: u32,
+    /// How many iterations write a `raw/cost_log` row (the per-kernel slot
+    /// breakdown behind the analyzer's kernel subjects): `full` logs every
+    /// iteration, `stride` logs one iteration in `cost_log_stride_iterations`,
+    /// `off` writes no `cost_log`. The cost log is the largest output of a
+    /// long run (~1 GB per simulated hour at high concurrency) and writing it
+    /// is a large share of sim wall time, so sweeps that read only request
+    /// metrics can sample or drop it. The simulated timeline is the same in
+    /// every mode. Absent = `full`.
+    #[serde(default)]
+    #[param(string, default = "full", choices = COST_LOG_MODE_CHOICES)]
+    pub cost_log_mode: CostLogMode,
+    /// Under `cost_log_mode: stride`, log the iterations whose `iter_id` is a
+    /// multiple of this (required there, ≥ 1); must be absent otherwise.
+    #[serde(default)]
+    pub cost_log_stride_iterations: Option<u32>,
+}
+
+/// Which iterations write a `cost_log` row. Closed set → serde enum; the
+/// stride width lives in [`IoSpec::cost_log_stride_iterations`] and the
+/// validated pair in [`CostLogPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostLogMode {
+    #[default]
+    Full,
+    Stride,
+    Off,
+}
+
+impl IoSpec {
+    /// The validated cost-log policy: `stride` needs a positive
+    /// `cost_log_stride_iterations`, and the other modes must not set one.
+    pub fn cost_log_policy(&self) -> anyhow::Result<CostLogPolicy> {
+        match (self.cost_log_mode, self.cost_log_stride_iterations) {
+            (CostLogMode::Full, None) => Ok(CostLogPolicy::Full),
+            (CostLogMode::Off, None) => Ok(CostLogPolicy::Off),
+            (CostLogMode::Stride, Some(iterations)) => NonZeroU32::new(iterations)
+                .map(|iterations| CostLogPolicy::Stride { iterations })
+                .ok_or_else(|| anyhow::anyhow!("io.cost_log_stride_iterations must be at least 1")),
+            (CostLogMode::Stride, None) => Err(anyhow::anyhow!(
+                "io.cost_log_mode: stride needs io.cost_log_stride_iterations"
+            )),
+            (mode, Some(_)) => Err(anyhow::anyhow!(
+                "io.cost_log_stride_iterations applies only to cost_log_mode: stride, not {}",
+                mode.as_str()
+            )),
+        }
+    }
+}
+
+impl CostLogMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CostLogMode::Full => "full",
+            CostLogMode::Stride => "stride",
+            CostLogMode::Off => "off",
+        }
+    }
 }
 
 /// Top-level config, dispatched on the `deployment` tag.
@@ -291,6 +351,7 @@ pub struct AfdPools {
 // ── launcher schema choices (closed-set enums; the rest is field-derived) ────
 
 const LOG_LEVEL_CHOICES: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+const COST_LOG_MODE_CHOICES: [&str; 3] = ["full", "stride", "off"];
 
 #[cfg(test)]
 mod tests {
@@ -412,6 +473,35 @@ pools:
         };
         assert_eq!(u.backends["main"]["unified.attn.qkv"], vec!["fa2", "fa3"]);
         assert_eq!(u.backends["main"]["unified.mlp.down"], vec!["torch"]);
+    }
+
+    fn io_with(extra: &str) -> anyhow::Result<CostLogPolicy> {
+        let yaml = UNIFIED_YAML.replace(
+            "log_output_token_times: false }",
+            &format!("log_output_token_times: false{extra} }}"),
+        );
+        let cfg: RunConfig = serde_yaml::from_str(&yaml).expect("parse io");
+        cfg.io().cost_log_policy()
+    }
+
+    #[test]
+    fn cost_log_mode_defaults_to_full_and_validates_the_stride() {
+        assert_eq!(io_with("").unwrap(), CostLogPolicy::Full);
+        assert_eq!(io_with(", cost_log_mode: off").unwrap(), CostLogPolicy::Off);
+        assert_eq!(
+            io_with(", cost_log_mode: stride, cost_log_stride_iterations: 16").unwrap(),
+            CostLogPolicy::Stride {
+                iterations: NonZeroU32::new(16).unwrap()
+            }
+        );
+        for bad in [
+            ", cost_log_mode: stride",
+            ", cost_log_mode: stride, cost_log_stride_iterations: 0",
+            ", cost_log_mode: full, cost_log_stride_iterations: 8",
+            ", cost_log_mode: off, cost_log_stride_iterations: 8",
+        ] {
+            assert!(io_with(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]

@@ -153,7 +153,12 @@ pub(super) async fn compute_saturated_run_labels(
     if replication_factor == 0 {
         return Err(anyhow!("worker replication factor must be positive"));
     }
-    let by_worker = collect_workload_by_worker(ctx).await?;
+    let mut by_worker = collect_workload_by_worker(ctx).await?;
+    // A sampled cost log's work totals cover 1 in N iterations.
+    let coverage_weight = crate::io::read_cost_log_coverage(log_dir).weight();
+    for totals in by_worker.values_mut() {
+        totals.scale(coverage_weight);
+    }
     if by_worker.is_empty() {
         return Err(anyhow!("no cost_log workload rows to aggregate"));
     }
@@ -226,6 +231,7 @@ pub(super) async fn compute_batch_locked_run_labels(
 ) -> Result<RunLabels> {
     let samples_by_worker = collect_workload_shapes_by_worker(
         ctx,
+        crate::io::read_cost_log_coverage(log_dir).every(),
         target_sampled_decode_iterations,
         target_sampled_prefill_iterations,
     )

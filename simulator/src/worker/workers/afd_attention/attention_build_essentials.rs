@@ -64,6 +64,7 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let cost = CostBuffers::new(
         cost_log_dir,
+        config.cost_log,
         pool_tag,
         id,
         &model.cost_log_manifest(),
