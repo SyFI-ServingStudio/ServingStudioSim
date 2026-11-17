@@ -51,7 +51,7 @@ use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::{MicrobatchBudget, PrefillSplit};
 use super::policy::{ForceSchedule, Queued};
 use super::read_wait::ReadWait;
-use super::started_order::{FreshGate, PrefillFill, StartedOrder};
+use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
@@ -520,7 +520,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     }
 }
 
-impl<P, D, K> PrefillFill<K> for ChunkedPrefillAdmission<P, D>
+impl<P, D, K> FillPrefillBudget<K> for ChunkedPrefillAdmission<P, D>
 where
     P: PendingOrderPolicy,
     D: DecodeCompletion<K>,

@@ -68,7 +68,7 @@ use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::MicrobatchBudget;
 use super::policy::{ForceSchedule, Queued};
 use super::read_wait::ReadWait;
-use super::started_order::{FreshGate, PrefillFill, StartedOrder};
+use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy,
 };
@@ -232,7 +232,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     }
 }
 
-impl<P, K> PrefillFill<K> for PipelinedChunkedPrefillAdmission<P>
+impl<P, K> FillPrefillBudget<K> for PipelinedChunkedPrefillAdmission<P>
 where
     P: PendingOrderPolicy,
     K: TieredPrefixKv,

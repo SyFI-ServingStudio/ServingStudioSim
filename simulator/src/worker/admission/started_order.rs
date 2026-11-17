@@ -11,12 +11,12 @@
 //! Requests past the force-schedule bound (`Deadline`) go before all: queued
 //! ones, then started ones by arrival. While the queue splits by cost class
 //! (`HitsFirst`), srpt runs that order once per class, hits (a context held in
-//! HBM or a tier) before misses ([`PrefillFill::fill_prefill_by_class`]).
+//! HBM or a tier) before misses ([`FillPrefillBudget::fill_prefill_by_class`]).
 //!
 //! One partition at a time. The pipeline head (one partition) and the
 //! whole-iteration chunked-prefill lifecycle (one per attention DP rank, each
 //! rank an engine with its own scheduler) supply the primitives through
-//! [`PrefillFill`] and share [`PrefillFill::fill_prefill`].
+//! [`FillPrefillBudget`] and share [`FillPrefillBudget::fill_prefill`].
 
 use crate::common::Time;
 use crate::worker::kv::ChunkedPrefillKv;
@@ -77,7 +77,7 @@ impl FreshGate {
 }
 
 /// How a chunked-prefill lifecycle fills one partition's prefill budget.
-pub(super) trait PrefillFill<K: ChunkedPrefillKv> {
+pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
     /// Per-formation admission state the lifecycle threads through its
     /// fresh-prompt pass (whatever gates admission beyond budget and KV).
     type Step;

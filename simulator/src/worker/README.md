@@ -446,7 +446,7 @@ pipeline head) take the same scheduling options, all off by default (vLLM):
   start of each formation. `force_schedule_hits_first` (with the bound and
   `srpt`) splits the overdue requests by cost class (`HitsFirst`): those whose
   context HBM or a tier holds go first, and the srpt fill runs once per class
-  (`PrefillFill::fill_prefill_by_class`). `force_schedule_hits_first_when_at_risk`
+  (`FillPrefillBudget::fill_prefill_by_class`). `force_schedule_hits_first_when_at_risk`
   splits only while the pipeline head (or a `chunked_prefill` rank) finds a
   queued request's tier context at risk from the overdue misses' compute tokens
   (`TieredPrefixKv::tier_sessions_at_risk`); without tiers it never splits.
