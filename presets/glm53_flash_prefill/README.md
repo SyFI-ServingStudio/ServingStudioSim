@@ -5,7 +5,8 @@ One B200 PP4 pipeline (layers split [12, 11, 11, 11]) serving prefill only: deco
 uses the same engine choices over the PP arch's vLLM defaults:
 
 - arch: no MLA layout copies, indexer logits cap 512 MB, measured per-token MoE routes (TP4/EP4 capture);
-- backends: `backends_ssengine.yaml` (FlashInfer persistent KDA prefill, Dao channel-last short conv, DeepGEMM
+- backends: `../tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.backends.yaml`, shared with the SSEngine
+  preset (FlashInfer persistent KDA prefill, Dao channel-last short conv, DeepGEMM
   mega mHC, top-k the faster of DeepSelect and vLLM);
 - scheduler (`good`): even microbatch split (floor 512 tokens), shortest remaining prefill first across started
   and queued prompts, load-following budget (4,096 tokens up to 1M tokens of backlog, max_batch_tokens 32,768 at
@@ -14,9 +15,9 @@ uses the same engine choices over the PP arch's vLLM defaults:
   loading area of 10% of HBM (`st10`). Staged reads take no read-wait bound (the engine does not use it either,
   `engine/scheduler.py`); the bound applies only to the unstaged reads of `check_tier_read.yaml`.
 
-`ssengine.yaml` is SSEngine as built (128-token pages, the compact KDA state) with one kept state, the measured
-eval engine's (the release's two kept states are a one-key variant without a measured run), and every mechanism
-its own key; `ssengine.md` gives each key's engine source and the key an ablation changes. The other presets keep
+The SSEngine preset itself (128-token pages, the compact KDA state, one kept state, every mechanism its own key)
+is `presets/tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.yaml`; `b200_pp4_prefill.md` beside it gives each
+key's engine source, the key an ablation changes, and the comparison with the measured engine. The presets here keep
 the simulator's default KV accounting (`kv_overhead: vllm`: 8,576-token blocks, the KDA state padded to whole
 blocks, one kept state), as in the evaluation (eval_m6.md, engine a78dc6f).
 
@@ -27,7 +28,6 @@ otherwise. Run any preset from the repository root:
 
 | Preset | What it runs |
 | --- | --- |
-| `ssengine.yaml` | SSEngine as built, v3 M6 sessions, N = 300, full setting: the one preset each ablation changes |
 | `iteration_predict.json` | One iteration of fresh prefill, 1k-32k tokens, and the four 32k chunks of a 128k prompt |
 | `check_single_request.yaml` | One request alone, 1k-128k tokens, five per length |
 | `check_saturated.yaml` | A batch of same-length requests all at t = 0, 1k-128k tokens |

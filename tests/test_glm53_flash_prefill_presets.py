@@ -1,4 +1,5 @@
-"""The GLM-5.3-Flash PP4 prefill presets (`presets/glm53_flash_prefill/`): every
+"""The GLM-5.3-Flash PP4 prefill presets (`presets/glm53_flash_prefill/`) and the
+tuned-engine presets (`presets/tuned_engine/`, the SSEngine replica among them): every
 member expands against the simulator's schema and builds its deployment
 through the binary's ``dry-run`` (the flow is built, nothing simulated).
 
@@ -27,7 +28,13 @@ from launcher.schema.loader import _load_preset, load_schema
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PRESET_DIR = REPO_ROOT / "presets/glm53_flash_prefill"
 BRINGUP_DIR = PRESET_DIR / "bringup"
-PRESETS = sorted(path for path in PRESET_DIR.glob("*.yaml") if not path.stem.startswith("backends"))
+TUNED_DIR = REPO_ROOT / "presets/tuned_engine"
+PRESETS = sorted(
+    path
+    for path in [*PRESET_DIR.glob("*.yaml"), *TUNED_DIR.glob("*/*.yaml")]
+    if not path.stem.startswith("backends") and not path.name.endswith(".backends.yaml")
+)
+IDS = [str(path.relative_to(REPO_ROOT / "presets").with_suffix("")) for path in PRESETS]
 JOBS = min(32, os.cpu_count() or 8)
 
 
@@ -58,13 +65,18 @@ def bringup_traces() -> None:
 
 
 def test_the_presets_are_there():
-    names = {path.stem for path in PRESETS}
-    assert {"ssengine", "check_scheduler_order", "check_tier_read", "v3_m6_full"} <= names
+    names = set(IDS)
+    assert {
+        "tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill",
+        "glm53_flash_prefill/check_scheduler_order",
+        "glm53_flash_prefill/check_tier_read",
+        "glm53_flash_prefill/v3_m6_full",
+    } <= names
 
 
 @pytest.mark.presets
 @pytest.mark.needs_binary
-@pytest.mark.parametrize("path", PRESETS, ids=[path.stem for path in PRESETS])
+@pytest.mark.parametrize("path", PRESETS, ids=IDS)
 def test_every_member_builds(path, sim_bin, tmp_path, bringup_traces):
     members = _members(path)
     assert members

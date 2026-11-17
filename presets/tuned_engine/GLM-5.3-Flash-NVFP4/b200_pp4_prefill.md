@@ -1,6 +1,6 @@
-# `ssengine.yaml`: SSEngine as one preset
+# `b200_pp4_prefill.yaml`: SSEngine, GLM-5.3-Flash NVFP4 prefill on B200 PP4
 
-`ssengine.yaml` is the simulator configuration of SSEngine as built (pp-impl `lanes/release`, commit 831a02a): what
+`b200_pp4_prefill.yaml` is the simulator configuration of SSEngine as built (pp-impl `lanes/release`, commit 831a02a): what
 `ssengine serve` runs (`ssengine/serve/launch.py` `design_config` + `DESIGN_TIERS`), with the tier sizes of the M6
 evaluation's full setting (`docs/results/eval_m6.md`), except that it keeps one state per context, as the measured
 evaluation engine (a78dc6f) did, where the release keeps two (`recurrent_state_checkpoints` below). Each mechanism is
@@ -14,7 +14,8 @@ the simulator models differently; the right column says how to check it.
 | Key | Value | SSEngine behavior and source | Ablation |
 | --- | --- | --- | --- |
 | `deployment: pp`, `pp_size: 4`, `layer_partition` | 4 stages, [12, 11, 11, 11] | `ssengine/config.py` `LAYER_SPLIT = [12, 11, 11, 11]`, one B200 per stage | – |
-| arch keys, `backends_file` | as the other presets (README.md) | the engine's kernels; see `backends_ssengine.yaml` | – |
+| arch keys | no MLA layout copies, indexer logits cap 512 MB, measured per-token MoE routes (TP4/EP4 capture), as `presets/glm53_flash_prefill/` | the engine's model path | – |
+| `backends_file` | `b200_pp4_prefill.backends.yaml` | the engine's kernels; the roles that differ from the vLLM defaults are listed below | – |
 | `external_decode` | `true` | README L14: "Prefill and one output token only … the prefill side of a deployment whose decode runs elsewhere" | `false` |
 | `max_batch_tokens` | 32,768 | `SCHEDULER_STEPS["good"]`: `mb_tokens=32768` | – |
 | `pending_order`, `srpt` | `shortest-prefill-first`, `true` | `good`: `order="srpt"` (started and waiting prompts by remaining compute; `engine/scheduler.py` docstring) | `fifo`, `false` |
@@ -40,6 +41,37 @@ the simulator models differently; the right column says how to check it.
 | `prefix_tier_max_read_wait_ms` | absent (0) | `engine/scheduler.py` docstring, staged loading: "The read-wait bound is not used". The simulator rejects the bound with a loading area | – |
 | `prefix_tier_warm_start` | `false` | the evaluation starts empty (handoff `7_offloading.md` §5 "Start state") | – |
 | `max_concurrency`, trace | 300, `sessions_2ps_v3.csv` | eval_m6.md: `benchmarks/run.py` sched_good_nN, trace `data/tracelab-v3/m6/sessions_2ps_v3.csv` | – |
+
+## Backends that differ from the vLLM defaults
+
+`b200_pp4_prefill.backends.yaml` sets all 111 kernel roles of the PP arch. Against the defaults the launcher emits
+for this preset (`uv run python -m launcher presets/tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.yaml --no-gpu
+--emit-backends FILE`, which ignores `backends_file`), 14 roles differ, the same on every layer kind that has them:
+
+| Role (layer kinds) | vLLM default | This preset |
+| --- | --- | --- |
+| `kda.chunk_prefill` (first_kda_dense, kda_dense, kda_moe) | `vllm_triton` | `flashinfer_cute_persistent` |
+| `kda.short_conv_prefill` (first_kda_dense, kda_dense, kda_moe) | `vllm_triton` | `dao_channellast` |
+| `attn_mhc_post_pre` (kda_dense, kda_moe, dsa_moe) | `vllm_tilelang` | `deepgemm_mega_nonshifted` |
+| `ffn_mhc_post_pre` (first_kda_dense, kda_dense, kda_moe, dsa_moe) | `vllm_tilelang` | `deepgemm_mega_nonshifted` |
+| `dsa.indexer.topk_prefill` (dsa_moe) | `vllm_cuda` | `[deep_select, vllm_cuda]` (the faster per launch) |
+
+The other 97 roles are at their defaults (`first_kda_dense.attn_mhc_pre` stays `vllm_tilelang`, the only option the
+emitted skeleton lists for it).
+
+## Scope, and where the simulation is not trusted
+
+- Model and hardware: GLM-5.3-Flash NVFP4 on one B200 PP4 pipeline, layers [12, 11, 11, 11].
+- Workload: prefill only (`external_decode`: a round completes at its first token), coding-agent multi-round
+  sessions (TraceLab v3 M6, `sessions_2ps_v3.csv`) and the bring-up traces below. Decode, other session shapes and
+  other models are outside what the anchors cover.
+- Not trusted: HBM only (no DRAM or SSD tier) at high concurrency. At N = 400 the simulator gives 22.95 r/s
+  against the engine's measured 12.97 (+76.9%) with recompute/new 0.692 against 1.757; at N = 300, 30.44 against
+  27.24 (+11.7%) (`logs/20261114_9_pp_u7_equiv/anchors/report.md` §6, `k1`). The cause is 未验证.
+- Not trusted: exclusive DRAM without a loading area (`excl tiers`), where the simulator charges no tier write time
+  (eval_m6.md item 5); at k = 2 it read +7.0% at N = 400 (report.md §5), at this preset 未跑.
+- Tiered settings (full, tiers, ssdheavy) at N = 300 / 400 are within -2.0..+1.4% of the measured rows (anchors
+  below).
 
 ## What the simulator does not model, or models differently
 
@@ -72,7 +104,8 @@ one state. To reproduce the eval engine's KV form exactly, also remove `kv_block
 
 ## Anchors (nothing tuned)
 
-Each anchor run is this preset with only the anchor's workload, memory and named tier mode changed. T = the
+Each anchor run is this preset with only the anchor's workload, memory and named tier mode changed (rendered from
+it at its earlier path, `presets/glm53_flash_prefill/ssengine.yaml`, with the same keys). T = the
 v2-realistic targets the engine was built against (`pp-impl/third_party/handoff_v2_realistic/data`, simulator outputs
 of wt-pp-hitrule 5153041a); real = eval_m6.md's measured rows (engine a78dc6f). Scripts and full tables (logs are not
 committed):

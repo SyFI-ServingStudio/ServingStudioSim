@@ -79,4 +79,4 @@ compound:
   sched:
     good: {max_batch_tokens: 32768, split: even, min_mb: 512, order: shortest-prefill-first, bl_low: 4096, bl_lo: 1000000, bl_hi: 3000000, srpt: true, force_ms: 60000.0}
 
-backends_file: backends_ssengine.yaml
+backends_file: ../tuned_engine/GLM-5.3-Flash-NVFP4/b200_pp4_prefill.backends.yaml

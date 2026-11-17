@@ -1,11 +1,11 @@
 # SSEngine as built (pp-impl lanes/release, `ssengine serve` design config): GLM-5.3-Flash NVFP4 prefill on one B200
 # PP4 pipeline, the v3 M6 sessions at N = 300 with the evaluation's full setting (HBM 100.18 GB + DRAM 50 GB + SSD
 # 128 GB per GPU), 20 minutes. Every mechanism is its own key, so an ablation is this preset with one key changed;
-# ssengine.md beside this file gives each key's source in the engine and the key each ablation changes.
+# b200_pp4_prefill.md beside this file gives each key's source in the engine and the key each ablation changes.
 #
 # Workload: TraceLab v3 coding-agent sessions arriving at 2 per second (2,457 sessions, 260,801 rounds). The trace
-# CSV is not committed (~19 MB); copy it into trace/ by hand. Its manifest (traces/sessions_2ps_v3.manifest.json
-# beside this preset) gives the source and the sha256.
+# CSV is not committed (~19 MB); copy it into trace/ by hand. Its manifest
+# (presets/glm53_flash_prefill/traces/sessions_2ps_v3.manifest.json) gives the source and the sha256.
 deployment: pp
 
 workload:
@@ -19,7 +19,7 @@ workload:
   duration_ms: 1200000.0
 
 io:
-  log_dir: logs/glm53_flash_prefill/ssengine
+  log_dir: logs/tuned_engine/glm53_flash_nvfp4_b200_pp4_prefill
 
 pools:
   stage:
@@ -74,4 +74,4 @@ pools:
           prefix_tier_loading_area: 0.1
           prefix_tier_warm_start: false
 
-backends_file: backends_ssengine.yaml
+backends_file: b200_pp4_prefill.backends.yaml
