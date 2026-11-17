@@ -138,3 +138,56 @@ measured requests in order):
 Residuals: decode +0.5% (run-to-run spread of the decode step is about +-1.5%: 97.1-101.4 ms
 for the same shapes across the service warm-up, the in-service mean and the probe); TTFT
 depends on which requests wait for a draining replica (random output lengths), +-15%.
+
+## Re-alignment on the round-3 service (official measurement, 2026-11-17)
+
+**Source.** The official round-3 measure of the glm5-trn2 R3 service (`ddac04a`,
+`campaigns/glm8k1k/round3/evidence/measure-20261117-135039-*`). It runs the R1 waves plus three
+decode changes: an NKI decode-MoE kernel over FP8 experts (M <= 64), a DSA pooled-key cache, and
+lockstep first token. A start-up cap probe measured the 16-row step at 92 ms, so the run served 8
+rows per group, C = 64.
+
+Measured: 312.0 tok/s/chip, median TPOT 66.29 ms (15.09 tok/s/user), median TTFT 44.5 s,
+in-service decode step 63.9 ms, prefill step 1236 ms. A second official measure of the same code
+gave 312.22 / 66.21.
+
+**Device evidence** (glm5-trn2 `campaigns/glm8k1k/round3/probe/`, one replica, rank-0 NRT profile
+per region):
+
+- The decode forward takes 62.0 ms at 8 rows and 91.0 ms at 16 (ctx 8192), against 96.2 ms for
+  the round-1 engine.
+- Op benches, new against old:
+
+  | op | 8 rows | 16 rows | 32 rows |
+  |---|---|---|---|
+  | MoE, M = 4 x rows | 0.491 / 1.163 (M 8) | 0.505 / 1.195 (M 32) | 1.115 / 1.314 (M 64) |
+  | DSA decode, B = rows, ctx 8192 | 0.878 / 1.041 | 1.247 / 1.597 | 1.840 / 2.568 |
+
+- A KDA layer's non-MoE time is flat from 8 to 16 rows (0.69 -> 0.66 ms), so mHC and KDA decode do
+  not grow with rows on device.
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r3.yaml`):
+
+- The measured kernel ratios are `kind_time_scale` entries (`moe_partial`, `dsa`).
+- mHC and KDA are held flat between 8 and 16 rows.
+- `region_gap_ms` is 0.05: the measured TPOT is the device step + ~4.4 ms, and 0.10 overshot by
+  ~2.4 ms per forward.
+- `prefill_device_factor` is 1.88, fitted to the in-service prefill step. The round-1 value of
+  1.78 was fitted to single warm-up shapes, and the sim's prefill step was then 5.5% short of
+  the in-service mean.
+
+| | measured (official) | Sim |
+|---|---|---|
+| tok/s per chip | 312.0 | 310.9 |
+| median TPOT (ms) | 66.29 | 66.38 |
+| interactivity | 15.09 | 15.07 |
+| median TTFT (s) | 44.5 | 44.95 |
+| prefill step (ms) | 1236 | 1227 |
+| 16-row step (ms) | 92.0-92.7 (cap probe), 91.0 device | 94.9 |
+
+Disagreements recorded:
+
+- Tick 3's prediction at 16 rows (75-81 ms) assumed the MoE kernel at 0.35x for every decode M.
+  On device it is 0.85x at M 64: per-expert cost grows with M, and the kernel multiplies all M
+  rows for every active expert.
+- Before the mHC/KDA calibration, the sim was 5-8% pessimistic at 16 rows.
