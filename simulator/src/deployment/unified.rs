@@ -185,6 +185,10 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
+            max_prefill_chunks_per_partition: g.worker.max_prefill_chunks_per_partition(),
+            max_prefill_chunk_tokens: g.worker.max_prefill_chunk_tokens(),
+            max_requests_per_partition: g.worker.max_requests_per_partition(),
+            wave: g.worker.wave_admission(),
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
@@ -849,6 +853,46 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53FlashNeuronFp8 { neuron, .. } => {
+                ensure_chunked_prefill_worker("GLM-5.3-Flash FP8 on Trainium2", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_neuron_fp8(
+                    model_spec, neuron, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                assemble_barebone_or_chunked_flow(
+                    "GLM-5.3-Flash FP8 on Trainium2",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Glm53FlashNeuronFp8Speculative {
+                neuron,
+                draft_tokens,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_flash_neuron_fp8_speculative(
+                    model_spec,
+                    neuron,
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
                 max_model_len,
                 draft_tokens,
@@ -1334,6 +1378,7 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::LeastLoaded => DpPlacementPolicy::LeastLoaded,
     }
 }
 
@@ -1385,6 +1430,13 @@ mod tests {
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
+            wave_admission: false,
+            wave_quiet_ms: 0.0,
+            wave_cap_ms: 0.0,
+            wave_first_token_from_decode: false,
             kv_accounting: Default::default(),
         }
     }
@@ -1552,6 +1604,9 @@ pools:
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
+            max_prefill_chunk_tokens: None,
+            max_requests_per_partition: None,
             dp_placement: DpPlacement::RoundRobin,
         }
     }

@@ -50,6 +50,12 @@ use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
+    AllGatherKernelInput, DenseFfnPartialKernelInput, DsaDecodeKernelInput, DsaPrefillKernelInput,
+    EmbedKernelInput, KdaDecodeKernelInput, KdaPrefillKernelInput, LmHeadKernelInput,
+    MhcPostKernelInput, MhcPreKernelInput, MoePartialKernelInput, MoeRouterKernelInput,
+    ReduceScatterKernelInput,
+};
+use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
     SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
@@ -132,6 +138,14 @@ pub struct SparseIndexerTopkLog {
 #[derive(Clone, Serialize)]
 pub struct DsaIndexerPrefillLog {
     pub prefill_query_key_pairs: Vec<(u32, u32)>,
+}
+
+/// A Neuron forward's launch leaf: the regions it dispatched (`forward` =
+/// `u32::MAX` for the per-step host leaf).
+#[derive(Clone, Serialize)]
+pub struct NeuronLaunchLog {
+    pub regions: u32,
+    pub forward: u32,
 }
 
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
@@ -252,4 +266,18 @@ log_inputs! {
     RsSconvAgResidualRmsNorm => RsSconvAgResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,
+    NeuronLaunch => NeuronLaunchLog,
+    NeuronAllGather => AllGatherKernelInput,
+    NeuronDenseFfnPartial => DenseFfnPartialKernelInput,
+    NeuronDsaDecode => DsaDecodeKernelInput,
+    NeuronDsaPrefill => DsaPrefillKernelInput,
+    NeuronEmbed => EmbedKernelInput,
+    NeuronKdaDecode => KdaDecodeKernelInput,
+    NeuronKdaPrefill => KdaPrefillKernelInput,
+    NeuronLmHead => LmHeadKernelInput,
+    NeuronMhcPost => MhcPostKernelInput,
+    NeuronMhcPre => MhcPreKernelInput,
+    NeuronMoePartial => MoePartialKernelInput,
+    NeuronMoeRouter => MoeRouterKernelInput,
+    NeuronReduceScatter => ReduceScatterKernelInput,
 }

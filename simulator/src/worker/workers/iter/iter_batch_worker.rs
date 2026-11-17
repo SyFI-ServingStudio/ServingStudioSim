@@ -938,6 +938,200 @@ mod tests {
         );
     }
 
+    fn wave_worker(
+        store: SharedRequests,
+        dp_groups: u16,
+        first_token_from_decode: bool,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::with_dp_groups(1.0, dp_groups)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(4),
+                max_prefill_chunks_per_partition: Some(1),
+                max_prefill_chunk_tokens: Some(4),
+                max_requests_per_partition: Some(2),
+                wave: Some(crate::worker::admission::WaveAdmission::from_ms(
+                    0.0,
+                    0.0,
+                    first_token_from_decode,
+                )),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Catches the wave scheduler drifting from the glm5-trn2 service: chunks
+    /// rotate over the wave's prompts in admission order, nobody decodes while
+    /// a prompt of the wave is unfinished, and a request arriving mid-wave
+    /// waits for the worker to drain.
+    #[test]
+    fn a_wave_round_robins_its_prompts_decodes_together_and_holds_late_arrivals() {
+        let store = shared_with(&[(0, 10, 3), (1, 6, 2), (2, 4, 2)]);
+        let mut worker = wave_worker(Rc::clone(&store), 1, false);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let mut t = 0.0;
+        // req0 (0,4), req1 (0,4), req0 (4,4), req1 (4,2) done, req0 (8,2) done.
+        for chunk in [(0, 4), (0, 4), (4, 4), (4, 2), (8, 2)] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(t));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [chunk]);
+            assert_eq!(
+                input.groups[0].decode_tokens, 0,
+                "no decode while the wave prefills"
+            );
+            complete_chunked_iteration(&mut worker, Time::from_ms(t + 1.0));
+            t += 1.0;
+            if t == 1.0 {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+            }
+        }
+        assert_eq!(
+            store.borrow()[RequestId(1)].progress.output_tokens_emitted,
+            1
+        );
+        // Both decode together; request 2 is held until the wave drains.
+        for (decoding, done) in [(2, 1), (1, 0)] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(t));
+            assert!(input.groups[0].prefill_chunk_pairs.is_empty());
+            assert_eq!(input.groups[0].decode_tokens, decoding);
+            complete_chunked_iteration(&mut worker, Time::from_ms(t + 1.0));
+            t += 1.0;
+            assert!(store.borrow()[RequestId(done)].is_complete());
+        }
+        let input = form_chunked_input(&mut worker, Time::from_ms(t));
+        assert_eq!(
+            input.groups[0].prefill_chunk_pairs,
+            [(0, 4)],
+            "the next wave"
+        );
+    }
+
+    /// Catches the lockstep first token: a finished prompt emits nothing, and
+    /// every request of the wave gets its first token from the same decode step.
+    #[test]
+    fn a_lockstep_wave_takes_every_first_token_from_its_first_decode_step() {
+        let store = shared_with(&[(0, 8, 2), (1, 4, 2)]);
+        let mut worker = wave_worker(Rc::clone(&store), 2, true);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        // One chunk per partition: request 0 on partition 0, request 1 on 1.
+        for t in [0.0, 1.0] {
+            form_chunked_input(&mut worker, Time::from_ms(t));
+            complete_chunked_iteration(&mut worker, Time::from_ms(t + 1.0));
+        }
+        assert_eq!(
+            store.borrow()[RequestId(1)].progress.output_tokens_emitted,
+            0
+        );
+        let input = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(
+            input.groups[0].decode_tokens + input.groups[1].decode_tokens,
+            2
+        );
+        complete_chunked_iteration(&mut worker, Time::from_ms(3.0));
+        for id in [0, 1] {
+            let record = &store.borrow()[RequestId(id)];
+            assert_eq!(record.progress.output_tokens_emitted, 1);
+            assert_eq!(record.telemetry.first_output_time, Some(Time::from_ms(3.0)));
+        }
+    }
+
+    fn capped_worker(
+        store: SharedRequests,
+        budget: u32,
+        chunks: Option<u32>,
+        chunk_tokens: Option<u32>,
+        requests: Option<u32>,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(budget),
+                max_prefill_chunks_per_partition: chunks,
+                max_prefill_chunk_tokens: chunk_tokens,
+                max_requests_per_partition: requests,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Catches the per-partition chunk cap admitting a second prompt into the
+    /// same iteration: two 4-token prompts fit an 8-token budget, but the
+    /// Neuron engines schedule one prefill chunk per DP group per step.
+    #[test]
+    fn prefill_chunk_cap_defers_a_second_prompt_to_the_next_iteration() {
+        for (cap, chunks) in [(None, vec![(0, 4), (0, 4)]), (Some(1), vec![(0, 4)])] {
+            let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+            let mut worker = capped_worker(Rc::clone(&store), 8, cap, None, None);
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            let first = form_chunked_input(&mut worker, Time::ZERO);
+            assert_eq!(first.groups[0].prefill_chunk_pairs, chunks, "cap {cap:?}");
+            if cap.is_some() {
+                complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+                let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
+                assert_eq!(second.groups[0].prefill_chunk_pairs, [(0, 4)]);
+                assert_eq!(second.groups[0].decode_tokens, 1, "request 0 decodes");
+            }
+        }
+    }
+
+    /// Catches the chunk-token cap leaking the decode rows' unused budget into
+    /// a chunk: the engine compiles one chunk size, so a 20-token prompt runs
+    /// as chunks of 8 even with a 16-token budget.
+    #[test]
+    fn prefill_chunk_tokens_cap_fixes_the_chunk_size() {
+        let store = shared_with(&[(0, 20, 2)]);
+        let mut worker = capped_worker(Rc::clone(&store), 16, Some(1), Some(8), None);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for (step, chunk) in [(0, (0, 8)), (1, (8, 8)), (2, (16, 4))] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(step as f64));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [chunk]);
+            complete_chunked_iteration(&mut worker, Time::from_ms(step as f64 + 1.0));
+        }
+    }
+
+    /// Catches the request cap: with room for one request per partition, a
+    /// second prompt waits until the first finishes, even though the budget
+    /// and the KV would take it.
+    #[test]
+    fn request_cap_holds_a_prompt_until_a_slot_frees() {
+        let store = shared_with(&[(0, 4, 2), (1, 4, 2)]);
+        let mut worker = capped_worker(Rc::clone(&store), 64, None, None, Some(1));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let first = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(first.groups[0].prefill_chunk_pairs, [(0, 4)]);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
+        assert!(
+            second.groups[0].prefill_chunk_pairs.is_empty(),
+            "request 1 waits"
+        );
+        assert_eq!(second.groups[0].decode_tokens, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(2.0));
+        let third = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(
+            third.groups[0].prefill_chunk_pairs,
+            [(0, 4)],
+            "request 0 finished"
+        );
+    }
+
     #[test]
     fn mix_preserves_shared_prefill_decode_budget_and_progress() {
         let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);

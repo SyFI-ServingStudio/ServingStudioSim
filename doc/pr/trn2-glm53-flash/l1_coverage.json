@@ -1,0 +1,81 @@
+{
+ "gpu_name": "AWS Trainium2 LNC2",
+ "bench_dir": "/home/ec2-user/glm5-trn2/logs/bench",
+ "sources": [
+  "dsa.jsonl",
+  "kda.jsonl",
+  "mhc_embed.jsonl",
+  "mhc_lm_head.jsonl",
+  "mhc_mhc_post.jsonl",
+  "mhc_mhc_pre.jsonl",
+  "mhc_smoke.jsonl",
+  "moe.jsonl",
+  "trn2-flashnext"
+ ],
+ "kinds": {
+  "all_gather:neuron_cc": {
+   "measured": 40,
+   "derived": 0
+  },
+  "dense_ffn_partial:neuron_dense": {
+   "measured": 24,
+   "derived": 2
+  },
+  "dsa_decode:neuron_radix": {
+   "measured": 48,
+   "derived": 177
+  },
+  "dsa_prefill:neuron_radix": {
+   "measured": 38,
+   "derived": 122
+  },
+  "embed:neuron_torch": {
+   "measured": 70,
+   "derived": 0
+  },
+  "kda_decode:neuron_torch": {
+   "measured": 24,
+   "derived": 21
+  },
+  "kda_decode:neuron_torch_nobarrier": {
+   "measured": 24,
+   "derived": 21
+  },
+  "kda_prefill:neuron_torch": {
+   "measured": 18,
+   "derived": 17
+  },
+  "kda_prefill:neuron_torch_nobarrier": {
+   "measured": 18,
+   "derived": 17
+  },
+  "lm_head:neuron_torch": {
+   "measured": 45,
+   "derived": 10
+  },
+  "mhc_post:neuron_torch": {
+   "measured": 14,
+   "derived": 0
+  },
+  "mhc_pre:neuron_torch_bf16": {
+   "measured": 14,
+   "derived": 0
+  },
+  "moe_partial:neuron_cte_hybrid": {
+   "measured": 24,
+   "derived": 2
+  },
+  "moe_partial:neuron_dense_local": {
+   "measured": 24,
+   "derived": 2
+  },
+  "moe_router:neuron_fp32": {
+   "measured": 12,
+   "derived": 2
+  },
+  "reduce_scatter:neuron_cc": {
+   "measured": 40,
+   "derived": 0
+  }
+ }
+}

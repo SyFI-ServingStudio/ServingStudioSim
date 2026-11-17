@@ -1,0 +1,101 @@
+{
+ "fit": {
+  "region_host_ms": 1.1,
+  "region_gap_ms": 0.1,
+  "forward_overhead_ms": 19.0,
+  "decode_device_factor": 1.0,
+  "prefill_device_factor": 1.78,
+  "step_overhead_ms": 0.12000000003601485
+ },
+ "cases": [
+  {
+   "case": [
+    "decode",
+    8,
+    8192
+   ],
+   "n": 249,
+   "measured_ms": 99.25,
+   "device_ms": 91.55541215464473,
+   "predicted_default_ms": 103.70126039586961,
+   "predicted_fit_ms": 99.56126039586961
+  },
+  {
+   "case": [
+    "decode",
+    8,
+    9216
+   ],
+   "n": 3865,
+   "measured_ms": 100.77,
+   "device_ms": 92.74207375571132,
+   "predicted_default_ms": 104.8879219969362,
+   "predicted_fit_ms": 100.7479219969362
+  },
+  {
+   "case": [
+    "prefill",
+    2048,
+    2048,
+    0
+   ],
+   "n": 15,
+   "measured_ms": 1172.16,
+   "device_ms": 631.1376553382725,
+   "predicted_default_ms": 641.7378338307142,
+   "predicted_fit_ms": 1129.5343442186713
+  },
+  {
+   "case": [
+    "prefill",
+    2048,
+    4096,
+    2048
+   ],
+   "n": 15,
+   "measured_ms": 1210.18,
+   "device_ms": 671.505694469437,
+   "predicted_default_ms": 682.1058729618787,
+   "predicted_fit_ms": 1201.3894538721443
+  },
+  {
+   "case": [
+    "prefill",
+    2048,
+    8192,
+    4096
+   ],
+   "n": 15,
+   "measured_ms": 1269.58,
+   "device_ms": 725.2812214698642,
+   "predicted_default_ms": 735.881399962306,
+   "predicted_fit_ms": 1297.1098919329047
+  },
+  {
+   "case": [
+    "prefill",
+    2048,
+    8192,
+    6144
+   ],
+   "n": 16,
+   "measured_ms": 1285.5900000000001,
+   "device_ms": 725.2812214698642,
+   "predicted_default_ms": 735.881399962306,
+   "predicted_fit_ms": 1297.1098919329047
+  }
+ ],
+ "summary": {
+  "kind": "summary",
+  "requests": 48,
+  "window_s": 371.3451690673828,
+  "total_tok_s": 1099.114877473843,
+  "output_tok_s": 132.36202890007456,
+  "median_tpot_ms": 114.05199678762217,
+  "median_intvty": 8.76793066466091,
+  "median_ttft_s": 6.631133675575256,
+  "median_e2e_s": 123.12326741218567,
+  "total_tok_s_per_chip_replica": 137.38935968423039
+ },
+ "step_gap_ms": 0.12000000003601485
+}

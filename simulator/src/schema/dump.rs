@@ -25,7 +25,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+use crate::arch::config::{AttnArchSel, FfnArchSel, Glm53NeuronSpec, IterArchSel, ModelSpec};
 use crate::arch::contract::FfnArchInput;
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
@@ -76,7 +76,13 @@ pub fn list_params() -> Value {
         },
         "providers": {
             "arch": {
-                "iter_wise":       providers(IterArchSel::SCHEMA),
+                "iter_wise":       providers_with_flattened(
+                    IterArchSel::SCHEMA,
+                    &[
+                        ("glm53_flash_neuron_fp8", Glm53NeuronSpec::PARAMS),
+                        ("glm53_flash_neuron_fp8_speculative", Glm53NeuronSpec::PARAMS),
+                    ],
+                ),
                 "layer_wise_attn": providers(AttnArchSel::SCHEMA),
                 "layer_wise_ffn":  providers(FfnArchSel::SCHEMA),
             },

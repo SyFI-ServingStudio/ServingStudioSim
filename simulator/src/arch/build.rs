@@ -12,11 +12,17 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
-use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::config::{
+    AttnArchSel, FfnArchSel, Glm53NeuronSpec, IterArchSel, ModelSpec, RoutingKind,
+};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::glm53_flash_neuron_fp8::{
+    Glm53FlashNeuronFp8Model, Glm53FlashNeuronFp8SpeculativeModel, Glm53NeuronCore,
+    Glm53NeuronImpls, Glm53NeuronParallel, KindTimeScale as Glm53NeuronKindTimeScale,
+};
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -2321,6 +2327,119 @@ pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
     }
 }
 
+/// The glm5-trn2 seed engine layout and knobs a `glm53_flash_neuron_fp8*`
+/// selector names.
+fn glm53_neuron_parallel(
+    spec: &Glm53NeuronSpec,
+    draft_tokens: u32,
+    gpu: &str,
+) -> Result<Glm53NeuronParallel> {
+    ensure!(
+        spec.host_time_scale > 0.0 && spec.host_time_scale.is_finite(),
+        "host_time_scale must be positive"
+    );
+    let host = spec.host_time_scale as f32;
+    let kind_time_scale = spec
+        .kind_time_scale
+        .iter()
+        .map(|e| Glm53NeuronKindTimeScale::parse(e))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Glm53NeuronParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: spec.max_model_len,
+        world: spec.world,
+        attn_tp: spec.attn_tp,
+        moe_ep: spec.moe_ep.unwrap_or(spec.world),
+        draft_tokens,
+        region_granularity: spec.region_granularity,
+        block_layers: spec.block_layers,
+        spmd_padding: spec.spmd_padding,
+        prefill_buckets: spec.prefill_buckets.clone(),
+        decode_buckets: spec.decode_buckets.clone(),
+        context_buckets: spec.context_buckets.clone(),
+        region_device_factor: spec.region_device_factor.map_or(1.0, |f| f as f32),
+        prefill_device_factor: spec.prefill_device_factor.map_or(
+            crate::arch::glm53_flash_neuron_fp8::PREFILL_DEVICE_FACTOR,
+            |f| f as f32,
+        ),
+        region_host_ms: host
+            * spec
+                .region_host_ms
+                .map_or(spec.region_granularity.region_host_ms(), |x| x as f32),
+        region_gap_ms: spec.region_gap_ms as f32,
+        forward_overhead_ms: host * spec.forward_overhead_ms as f32,
+        mtp_forward_overhead_ms: host * spec.mtp_forward_overhead_ms as f32,
+        step_overhead_ms: host * spec.step_overhead_ms as f32,
+        hbm_per_core_gb: spec.hbm_per_core_gb,
+        hbm_reserve_gb: spec.hbm_reserve_gb,
+        slots: spec.slots,
+        cmax: spec.cmax,
+        impls: Glm53NeuronImpls {
+            kda_prefill: spec.kda_prefill_impls.clone(),
+            kda_decode: spec.kda_decode_impls.clone(),
+            dsa: spec.dsa_impls.clone(),
+            moe: spec.moe_impls.clone(),
+            dense_ffn: spec.dense_ffn_impls.clone(),
+            mhc_pre: spec.mhc_pre_impls.clone(),
+            mhc_post: spec.mhc_post_impls.clone(),
+            lm_head: spec.lm_head_impls.clone(),
+            embed: spec.embed_impls.clone(),
+        },
+        kind_time_scale,
+    })
+}
+
+fn glm53_neuron_core(
+    model_spec: &ModelSpec,
+    spec: &Glm53NeuronSpec,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53NeuronCore> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!("glm53_flash_neuron_fp8 rejects num_layers/sim_num_layers overrides");
+    }
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading the GLM-5.3-Flash config")?;
+    let parallel = glm53_neuron_parallel(spec, draft_tokens, gpu)?;
+    Glm53NeuronCore::build(name.to_string(), &model_cfg, parallel, bridge).context(
+        "building GLM-5.3-Flash FP8 on Trainium2 (often a missing Neuron profile.db row: \
+         run tools/neuron-bench-import)",
+    )
+}
+
+/// GLM-5.3-Flash FP8 on Trainium2 (glm5-trn2 seed engine), no MTP.
+pub fn glm53_flash_neuron_fp8(
+    model_spec: &ModelSpec,
+    spec: &Glm53NeuronSpec,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashNeuronFp8Model> {
+    Ok(Glm53FlashNeuronFp8Model {
+        core: glm53_neuron_core(model_spec, spec, 0, gpu, name, bridge)?,
+    })
+}
+
+/// GLM-5.3-Flash FP8 on Trainium2 with the MTP placeholder drafting.
+pub fn glm53_flash_neuron_fp8_speculative(
+    model_spec: &ModelSpec,
+    spec: &Glm53NeuronSpec,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashNeuronFp8SpeculativeModel> {
+    ensure!(
+        draft_tokens > 0,
+        "glm53_flash_neuron_fp8_speculative needs draft_tokens >= 1"
+    );
+    Ok(Glm53FlashNeuronFp8SpeculativeModel {
+        core: glm53_neuron_core(model_spec, spec, draft_tokens, gpu, name, bridge)?,
+    })
+}
+
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
 /// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
 /// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
@@ -2822,8 +2941,12 @@ pub fn build_iter_model(
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
         | IterArchSel::DeepseekV41VllmDspark { .. }
         | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
-        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+        | IterArchSel::Glm53FlashNeuronFp8Speculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
+        }
+        IterArchSel::Glm53FlashNeuronFp8 { model, neuron } => {
+            Box::new(glm53_flash_neuron_fp8(model, neuron, gpu, name, bridge)?)
         }
     })
 }
@@ -2946,6 +3069,21 @@ pub fn build_speculative_iter_model(
                 *decoder_swa_bounded_replay,
                 *max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashNeuronFp8Speculative {
+            model,
+            neuron,
+            draft_tokens,
+        } => Ok((
+            Box::new(glm53_flash_neuron_fp8_speculative(
+                model,
+                neuron,
+                *draft_tokens,
                 gpu,
                 name,
                 bridge,
@@ -3260,7 +3398,8 @@ fn build_arch(
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
                     | IterArchSel::DeepseekV41VllmDspark { .. }
                     | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
-                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+                    | IterArchSel::Glm53FlashNeuronFp8Speculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,

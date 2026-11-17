@@ -19,6 +19,8 @@ const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
 pub enum DpPlacementPolicy {
     LeastQueued,
     RoundRobin,
+    /// Fewest `queued + active` requests, ties to the lowest index.
+    LeastLoaded,
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
@@ -108,7 +110,20 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         match self.placement {
             DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),
             DpPlacementPolicy::RoundRobin => self.choose_round_robin_idx(),
+            DpPlacementPolicy::LeastLoaded => self.choose_least_loaded_idx(),
         }
+    }
+
+    fn choose_least_loaded_idx(&self) -> usize {
+        self.workers
+            .iter()
+            .enumerate()
+            .min_by_key(|(idx, w)| {
+                let s = w.status();
+                (s.queued_requests + s.active_requests, *idx)
+            })
+            .map(|(idx, _)| idx)
+            .expect("simple_dp has at least one worker")
     }
 
     fn choose_least_queued_idx(&self) -> usize {

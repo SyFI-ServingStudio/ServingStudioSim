@@ -27,9 +27,12 @@ use schema_derive::ParamStruct;
 pub enum PlacementPolicy {
     LeastQueued,
     RoundRobin,
+    /// Fewest queued + active requests, ties to the lowest index (a frontend
+    /// that counts every request it routed to a replica until it finishes).
+    LeastLoaded,
 }
 
-const PLACEMENT_CHOICES: [&str; 2] = ["least-queued", "round-robin"];
+const PLACEMENT_CHOICES: [&str; 3] = ["least-queued", "round-robin", "least-loaded"];
 
 /// One pool: a placement policy plus one-or-more homogeneous groups.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]

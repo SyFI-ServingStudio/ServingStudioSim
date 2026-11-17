@@ -1,0 +1,43 @@
+# Alignment replay of the glm5-trn2 seed engine's measured run (doc/pr/trn2-glm53-flash/ALIGNMENT.md):
+# ONE replica (32 ranks, dp4 x tp8, EP32), closed loop at C = 16 over the engine's own 64 requests
+# (results/seed/serve_c16_replica0.jsonl: input lengths as served, output 1024; warm-up 16, measured
+# 48). Compare with `inferencex.py <run> --conc 16 --warmup 1` against the run's summary row
+# (1099 tok/s, median TPOT 114 ms, intvty 8.77, TTFT 6.6 s).
+deployment: unified
+
+workload:
+  trace_files: [presets/trn2/seed_serve_c16_replica0.csv]
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: 16
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_align_seed_c16"
+
+pools:
+  main:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 1
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: [8, 16]
+          context_buckets: [2048, 4096, 8192, 9216]
+          slots: 17
+          cmax: 9216
+          max_model_len: 9216
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2064
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: 16
+          dp_placement: vllm-least-loaded
+

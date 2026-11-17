@@ -1,5 +1,19 @@
 //! Per-kind L1 kernel structs.
 
+pub mod all_gather;
+pub mod dense_ffn_partial;
+pub mod dsa_decode;
+pub mod dsa_prefill;
+pub mod embed;
+pub mod kda_decode;
+pub mod kda_prefill;
+pub mod lm_head;
+pub mod mhc_post;
+pub mod mhc_pre;
+pub mod moe_partial;
+pub mod moe_router;
+pub mod neuron_grid;
+pub mod reduce_scatter;
 pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
@@ -105,6 +119,19 @@ pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
 
+pub use all_gather::{AllGatherKernel, AllGatherKernelConfig, AllGatherKernelInput, AllGatherSpec};
+pub use dense_ffn_partial::{DenseFfnPartialKernel, DenseFfnPartialKernelConfig, DenseFfnPartialKernelInput, DenseFfnPartialSpec};
+pub use dsa_decode::{DsaDecodeKernel, DsaDecodeKernelConfig, DsaDecodeKernelInput, DsaDecodeSpec};
+pub use dsa_prefill::{DsaPrefillKernel, DsaPrefillKernelConfig, DsaPrefillKernelInput, DsaPrefillSpec};
+pub use embed::{EmbedKernel, EmbedKernelConfig, EmbedKernelInput, EmbedSpec};
+pub use kda_decode::{KdaDecodeKernel, KdaDecodeKernelConfig, KdaDecodeKernelInput, KdaDecodeSpec};
+pub use kda_prefill::{KdaPrefillKernel, KdaPrefillKernelConfig, KdaPrefillKernelInput, KdaPrefillSpec};
+pub use lm_head::{LmHeadKernel, LmHeadKernelConfig, LmHeadKernelInput, LmHeadSpec};
+pub use mhc_post::{MhcPostKernel, MhcPostKernelConfig, MhcPostKernelInput, MhcPostSpec};
+pub use mhc_pre::{MhcPreKernel, MhcPreKernelConfig, MhcPreKernelInput, MhcPreSpec};
+pub use moe_partial::{MoePartialKernel, MoePartialKernelConfig, MoePartialKernelInput, MoePartialSpec};
+pub use moe_router::{MoeRouterKernel, MoeRouterKernelConfig, MoeRouterKernelInput, MoeRouterSpec};
+pub use reduce_scatter::{ReduceScatterKernel, ReduceScatterKernelConfig, ReduceScatterKernelInput, ReduceScatterSpec};
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
 pub use all_reduce_fusion::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,

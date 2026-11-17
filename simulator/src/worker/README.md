@@ -401,6 +401,21 @@ chooses where a cold request lands. `round-robin` (default) rotates blindly;
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
 rotated per placement. Retained-prefix affinity still wins over both.
 
+`wave_admission: true` replaces continuous admission with decode-protected
+waves (`WaveAdmission`; the glm5-trn2 service scheduler,
+`glmflash/service/scheduler.py`). Waiting requests start only when the worker
+holds no request and no request arrived for `wave_quiet_ms` (at most
+`wave_cap_ms` after the wave could first start); then every waiting request is
+reserved at once, up to `max_requests_per_partition` and KV. While any of them
+has prompt left the iteration is prefill-only for every partition, one chunk
+per partition, round-robin over that partition's prompts in admission order;
+then decode-only iterations run until the wave drains. Placement is fixed at
+arrival on the partition with the fewest waiting requests. With
+`wave_first_token_from_decode` a finished prompt emits nothing and every
+request takes its first token from the wave's first decode step (lockstep
+first token). Requests left over by the caps join the next wave after its
+quiet window (the engine admits them as soon as the replica empties).
+
 KV admission is a separate selector component (`kv_admission_policy`), shared
 by `chunked_prefill` and `speculative`:
 

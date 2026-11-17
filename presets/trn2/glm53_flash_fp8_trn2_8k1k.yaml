@@ -1,0 +1,62 @@
+# GLM-5.3-Flash FP8 on one trn2.48xlarge (16 Trainium2 chips = 64 LNC2 cores) as the glm5-trn2
+# seed engine serves it (simulator/src/arch/glm53_flash_neuron_fp8.rs): two replicas of 32 ranks,
+# each 4 attention-DP groups of TP8 (KDA / MLA heads over TP, indexer and latent KV replicated),
+# FFN EP32 over the replica, one compiled region per layer, the engine's serve.py buckets
+# (prefill chunk 2048, decode 8/16, context 2048/4096/8192/9216), one prefill chunk per DP group
+# per step, at most 16 requests per DP group (17 slots, slot 0 scratch).
+#
+# Workload: InferenceX 8k1k closed loop (trace/generate_inferencex.py): input uniform in
+# [0.8 * 8192, 8192], output exactly 1024, C requests in flight (arrival_mode saturated +
+# max_concurrency C), 2C warm-up + 10C measured requests over the whole instance.
+# tools/trn2-config-search/inferencex.py turns a run into the InferenceX point (tok/s per chip,
+# median interactivity, TTFT, E2E) after dropping the first 2C completions.
+#
+# Ranks are logical cores (4 per chip); one core has 24 GiB of HBM, which the arch charges with
+# the FP8 weights and the engine's preallocated pools (attn_gpu_memory_gb is the whole core).
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_8k1k/{point}"
+
+pools:
+  main:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: [8, 16]
+          context_buckets: [2048, 4096, 8192, 9216]
+          slots: 17
+          cmax: 9216
+          max_model_len: 9216
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2064
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: 16
+          dp_placement: vllm-least-loaded
+
+compound:
+  point:
+    c4: {conc: 4, traces: [presets/trn2/inferencex_8k1k_c4.csv]}
+    c8: {conc: 8, traces: [presets/trn2/inferencex_8k1k_c8.csv]}
+    c16: {conc: 16, traces: [presets/trn2/inferencex_8k1k_c16.csv]}
+    c32: {conc: 32, traces: [presets/trn2/inferencex_8k1k_c32.csv]}
+    c64: {conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv]}
+    c128: {conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv]}
+    c256: {conc: 256, traces: [presets/trn2/inferencex_8k1k_c256.csv]}
