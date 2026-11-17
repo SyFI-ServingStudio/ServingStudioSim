@@ -9,6 +9,7 @@ import pytest
 
 from profiling.exec.env import ContainerProfileEnv
 from profiling.exec.local import (
+    CONTAINER_ROOTLESS_ENV,
     IMEX_CHANNEL_CDI_DEVICE,
     _container_worker_command,
     gpu_uuids_for_indices,
@@ -46,6 +47,8 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     )
 
     assert '"device=GPU-fake-3,GPU-fake-1"' in command
+    # Podman's Docker API does not honour `--gpus device=`; CUDA does honour UUIDs.
+    assert "CUDA_VISIBLE_DEVICES=GPU-fake-3,GPU-fake-1" in command
     assert "HOME=/cache/home" in command
     assert "USER=vibesim" in command
     assert "LOGNAME=vibesim" in command
@@ -235,3 +238,22 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
         ("all_reduce_fusion", "flashinfer_mnnvl"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
     }
+
+
+@pytest.mark.parametrize("rootless", ["0", "1"])
+def test_container_worker_passes_the_host_user_only_to_a_rootful_engine(
+    tmp_path: Path, monkeypatch, rootless: str
+) -> None:
+    """A rootless engine maps the host user to the container's root; `--user`
+    with the host uid would then be an unmapped id locked out of /cache."""
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv(CONTAINER_ROOTLESS_ENV, rootless)
+
+    command, _env = _container_worker_command(
+        ContainerProfileEnv("vllm_env", "profiler:test"), [0], tmp_path
+    )
+
+    assert ("--user" in command) == (rootless == "0")
+    if rootless == "0":
+        import os
+        assert command[command.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"

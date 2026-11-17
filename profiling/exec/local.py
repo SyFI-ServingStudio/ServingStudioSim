@@ -202,6 +202,43 @@ def _host_worker_command(
 # A cache an image tag has not used for this long belongs to a superseded tag.
 STALE_CACHE_SECONDS = 30 * 24 * 3600
 
+# Overrides the rootless-engine probe: "1" treats the engine as rootless, "0"
+# as rootful. Unset, `docker info` decides, once per process.
+CONTAINER_ROOTLESS_ENV = "VIBESIM_CONTAINER_ROOTLESS"
+_rootless_engine_probe: bool | None = None
+
+
+def _rootless_engine() -> bool:
+    """Whether `docker` talks to a rootless engine (rootless Docker or Podman).
+
+    A rootless engine maps the invoking host user to the container's root, so
+    `--user <host uid>` would name an unmapped subordinate id: the worker then
+    cannot even traverse /cache (host-owned, HOME under it is mode 700) and
+    dies at import with PermissionError. On such an engine the worker runs as
+    container root, which is the host user on disk, so the files it writes to
+    the bind mounts belong to the host user exactly as under a rootful engine.
+    """
+    global _rootless_engine_probe
+    override = os.environ.get(CONTAINER_ROOTLESS_ENV, "").strip()
+    if override:
+        return override == "1"
+    if _rootless_engine_probe is None:
+        try:
+            result = subprocess.run(
+                ["docker", "info", "--format", "{{json .SecurityOptions}}"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            options = json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            options = None
+        _rootless_engine_probe = isinstance(options, list) and any(
+            str(option).startswith("name=rootless") for option in options
+        )
+    return _rootless_engine_probe
+
 
 def _image_cache_dir(image: str) -> Path:
     """The JIT cache directory for ``image``, pruning the stale ones of its name.
@@ -238,7 +275,15 @@ def _container_worker_command(
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = _image_cache_dir(profiler_env.image)
     # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
-    gpu_request = f'"device={",".join(gpu_uuids_for_indices(gpus))}"'
+    gpu_uuids = gpu_uuids_for_indices(gpus)
+    gpu_request = f'"device={",".join(gpu_uuids)}"'
+    # `--gpus device=...` is advisory under rootless Podman's Docker API: the
+    # container gets every GPU of the allocation, and a worker that then takes
+    # device 0 shares one card with every other worker (job 22664 measured the
+    # NVFP4 fused MoE 4-5x too slow that way). CUDA honours UUIDs in
+    # CUDA_VISIBLE_DEVICES, so pin the worker to its cards inside the container
+    # too; under Docker the two agree.
+    gpu_env_args = ["--env", f"CUDA_VISIBLE_DEVICES={','.join(gpu_uuids)}"]
     # A container does not inherit this process's environment, so measurement
     # policy has to be handed over explicitly; the host worker gets it for free
     # through os.environ.copy(). Anything here that changes what a number MEANS
@@ -305,8 +350,9 @@ def _container_worker_command(
             gpu_request,
             # Only backends that allocate fabric memory ask for the channel.
             *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
-            "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            # Rootless engines already run the container as the host user.
+            *([] if _rootless_engine() else ["--user", f"{os.getuid()}:{os.getgid()}"]),
+            *gpu_env_args,
             "--env",
             "HOME=/cache/home",
             "--env",
