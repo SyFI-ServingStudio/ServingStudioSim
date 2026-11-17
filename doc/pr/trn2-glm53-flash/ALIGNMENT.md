@@ -191,3 +191,39 @@ Disagreements recorded:
   On device it is 0.85x at M 64: per-expert cost grows with M, and the kernel multiplies all M
   rows for every active expert.
 - Before the mHC/KDA calibration, the sim was 5-8% pessimistic at 16 rows.
+
+## Re-alignment on the round-4 service (official measurement, 2026-11-17)
+
+**Source.** The official round-4 measure of the R4 service (`6ce3143`,
+`campaigns/glm8k1k/round4/evidence/measure-20261117-180112-*`): 339.0 tok/s/chip, median TPOT 57.63 ms
+(17.35 tok/s/user), C 64. The 16-row cap probe measured 82 ms. Round 4 added a routed-row decode-MoE kernel and
+fused decode mHC.
+
+**Device evidence** (round-4 probe):
+
+- Decode forward: 52.7 ms at 8 rows and 78.9 ms at 16.
+- MoE new / `dense_local`: 0.504 / 1.194 ms at M 32, 0.890 / 1.317 ms at M 64.
+- mHC isolated, fused / torch at 1 row per rank: pre 0.061 / 0.126 ms, post 0.025 / 0.055 ms.
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r4.yaml`): the measured MoE ratios. Fused mHC is 0.45x in the
+composed region, fitted to the official measure; that matches the isolated benches.
+
+| | measured (official) | Sim |
+|---|---|---|
+| tok/s per chip | 339.0 | 338.1 |
+| median TPOT (ms) | 57.63 | 57.88 |
+| interactivity | 17.35 | 17.28 |
+| 16-row step (ms) | 78.9 device, 82.0-82.7 cap probe | 77.5 |
+
+Disagreement: at 16 rows the model is now ~4 ms optimistic. Before round 4's kernels it was 4-5 ms pessimistic,
+so the 16-row composition is not yet captured beyond about +-5%.
+
+**Prefill device profile** (glm5-trn2 `campaigns/glm8k1k/round5/tick5/prefill_devprof_summary.json`): one prefill
+forward of rank 0, 1.27 s.
+
+- 46.7 GB of SBUF spill traffic (24.8 GB saved, 21.9 GB reloaded) out of 84 GB of HBM traffic.
+- Collectives active 0.21 s.
+- TensorE active 0.18 s, VectorE 0.33 s, DMA 0.49 s.
+
+This is the first direct evidence for the prefill composition excess, which `prefill_device_factor` 1.88 absorbs.
+The likely causes are spills and collective time in the composed region, not the isolated op rows.

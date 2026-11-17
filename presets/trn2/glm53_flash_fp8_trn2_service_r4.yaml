@@ -1,0 +1,63 @@
+# The glm5-trn2 R4 service (round 4 retained, `6ce3143`): the R3 service
+# (presets/trn2/glm53_flash_fp8_trn2_service_r3.yaml) with round 4's decode changes, as measured on device:
+#   - a routed-row decode-MoE NKI kernel: 0.42x of `dense_local` at M 32 and 0.68x at M 64 (`moe_partial` scales);
+#   - fused mHC pre/post NKI kernels at decode: 0.45x in the composed region, fitted to the official measure (isolated
+#     benches: 0.48x pre / 0.45x post).
+# The cap probe (16 rows only if <= 62 ms) measured 82 ms, so the official run served 8 rows, C 64.
+# `r4_official` replays the official C 64 request list. It reproduces the official round-4 measure (339.0 tok/s/chip,
+# TPOT 57.63 ms) within 0.4% (doc/pr/trn2-glm53-flash/ALIGNMENT.md). At 16 rows the model reads ~4 ms faster than
+# the device (77.5 vs 78.9 ms device, cap probe 82.4 ms).
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_service_r4/{point}"
+
+pools:
+  main:
+    placement: least-loaded
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: ${decode_buckets}
+          context_buckets: [2048, 4096, 6144, 6656, 7168, 7680, 8192, 8704, 9216]
+          slots: ${slots}
+          cmax: 9216
+          max_model_len: 9216
+          kind_time_scale: ["moe_partial=0.4222", "moe_partial@33=1.6011", "moe_partial@65=1.4793",
+                            "dsa=0.8435", "dsa@9=0.9256", "dsa@17=0.9168", "dsa@512=1.3966",
+                            "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735",
+                            "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543",
+                            "kda@9=0.79", "kda@129=1.2658"]
+          region_gap_ms: 0.05
+          prefill_device_factor: 1.88
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: ${mbt}
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: ${maxreq}
+          dp_placement: vllm-least-loaded
+          wave_admission: true
+          wave_quiet_ms: 100
+          wave_cap_ms: 2000
+          wave_first_token_from_decode: true
+
+compound:
+  point:
+    r4_official: {conc: 64,  traces: [presets/trn2/inferencex_8k1k_c64.csv],  decode_buckets: [8, 16], maxreq: 8,  slots: 17, mbt: 2056}
+    c128_cap16:  {conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 2064}
