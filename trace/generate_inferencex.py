@@ -17,9 +17,15 @@ comes from the workload, not the trace:
       max_concurrency: C          # at most C in flight; the next starts when one completes
 
 `tools/trn2-config-search/inferencex.py --warmup W` drops the first `W * C` completions (0 by
-default). `--fixed-output` restores the old exact-OSL completions. `--accept-rate` adds the
-`accept_rate` column a `speculative`-tagged trace needs (per-position conditional draft
-acceptance).
+default). `--fixed-output` restores the old exact-OSL completions.
+
+`--sampler inferencex` (the default) reproduces the client's own draw exactly: it seeds numpy with
+`--seed` (the client's default 0) and draws `randint(lo, hi + 1, size=N)` for the inputs, then the
+outputs, as `sample_random_requests` does after `np.random.seed(args.seed)`. The lists then equal
+the official run's `input_lens` / `output_lens` at the same C (checked against the round-1 and
+round-2 C = 8 measures). `--sampler python` keeps the previous `random.Random(seed)` draw.
+`--accept-rate` adds the `accept_rate` column a `speculative`-tagged trace needs (per-position
+conditional draft acceptance).
 """
 
 from __future__ import annotations
@@ -38,9 +44,10 @@ def write_inferencex_trace(
     ratio: float = 0.8,
     warmup: int = 0,
     measure: int = 10,
-    seed: int = 42,
+    seed: int = 0,
     accept_rate: float | None = None,
     fixed_output: bool = False,
+    sampler: str = "inferencex",
 ) -> int:
     if concurrency <= 0 or isl <= 0 or osl <= 0:
         raise ValueError("concurrency, isl and osl must be positive")
@@ -48,16 +55,30 @@ def write_inferencex_trace(
         raise ValueError("ratio must be in (0, 1]")
     if accept_rate is not None and not 0.0 <= accept_rate <= 1.0:
         raise ValueError("accept_rate must be in [0, 1]")
-    rnd = random.Random(seed)
     n = (warmup + measure) * concurrency
     lo = int(isl * ratio)
     lo_out = osl if fixed_output else int(osl * ratio)
+    if sampler == "inferencex":
+        import numpy as np
+
+        np.random.seed(seed)  # noqa: NPY002 - the client's global numpy stream
+        np.random.randint(0, 2, size=0)  # noqa: NPY002 - the client's empty prefix draw
+        inputs = np.random.randint(lo, isl + 1, size=n).tolist()  # noqa: NPY002
+        outputs = np.random.randint(lo_out, osl + 1, size=n).tolist()  # noqa: NPY002
+    elif sampler == "python":
+        rnd = random.Random(seed)
+        inputs, outputs = [], []
+        for _ in range(n):
+            inputs.append(rnd.randint(lo, isl))
+            outputs.append(rnd.randint(lo_out, osl))
+    else:
+        raise ValueError(f"unknown sampler {sampler!r}")
     header = "id,input_len,output_len,arrival_time" + (
         ",accept_rate" if accept_rate is not None else ""
     )
     lines = [header]
     for i in range(n):
-        row = f"{i},{rnd.randint(lo, isl)},{rnd.randint(lo_out, osl)},0.0"
+        row = f"{i},{inputs[i]},{outputs[i]},0.0"
         if accept_rate is not None:
             row += f",{accept_rate}"
         lines.append(row)
@@ -77,9 +98,10 @@ def main() -> None:
     ap.add_argument("--ratio", type=float, default=0.8)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--measure", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--accept-rate", type=float, default=None)
     ap.add_argument("--fixed-output", action="store_true")
+    ap.add_argument("--sampler", choices=["inferencex", "python"], default="inferencex")
     a = ap.parse_args()
     write_inferencex_trace(
         a.output,
@@ -92,6 +114,7 @@ def main() -> None:
         seed=a.seed,
         accept_rate=a.accept_rate,
         fixed_output=a.fixed_output,
+        sampler=a.sampler,
     )
 
 

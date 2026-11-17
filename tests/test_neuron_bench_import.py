@@ -185,6 +185,21 @@ def test_inferencex_trace_shape(tmp_path):
     assert all(ln.split(",")[2] == "1024" for ln in out.read_text().splitlines()[1:])
 
 
+def test_inferencex_sampler_reproduces_the_official_request_list(tmp_path):
+    """Catches the default sampler drifting from the InferenceX client: seed 0 must give the
+    official run's lengths (round-1 / round-2 measures at C = 8 sent exactly these requests)."""
+    spec = importlib.util.spec_from_file_location(
+        "generate_inferencex", ROOT / "trace" / "generate_inferencex.py"
+    )
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    out = tmp_path / "t.csv"
+    gen.write_inferencex_trace(out, concurrency=8)
+    rows = [ln.split(",") for ln in out.read_text().splitlines()[1:6]]
+    assert [int(r[1]) for r in rows] == [7237, 7112, 7769, 7388, 7316]
+    assert [int(r[2]) for r in rows] == [959, 940, 989, 903, 1022]
+
+
 def test_engine_align_reads_a_service_measurement(tmp_path):
     """Catches the service evidence (evaluator metrics.json) mapped to the wrong shapes: warm-up
     forwards per (kind, bucket, context), both replicas pooled, prefill chunks at the bucket's
