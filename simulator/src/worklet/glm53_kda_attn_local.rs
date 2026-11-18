@@ -18,7 +18,12 @@
 //! instead launches once per prefill sequence and runs the iteration's
 //! decode tokens through `causal_conv1d_update`, so its short conv is the sum of
 //! the `(1, L_i)` rows plus one decode launch.
-//! Only prefill-bearing iterations gather and scatter the fp32 SSM state.
+//! Only prefill-bearing iterations gather and scatter the SSM state.
+//!
+//! The state pool is fp32 (vLLM's default) or bf16 (`--mamba-ssm-cache-dtype
+//! bfloat16`). The pool dtype sizes the per-request state and its gather and
+//! scatter, and keys the recurrent-decode rows. The chunked-prefill rows carry
+//! no state-dtype axis and stay fp32-pool measurements.
 //!
 //! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
 //! scratch fills run inside the call `kda_chunk_prefill` times, so they have no
@@ -76,6 +81,8 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
     pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// Element type of the recurrent state pool (fp32 or bf16).
+    pub ssm_state_dtype: DType,
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +100,8 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
     pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
-    /// fp32 `[H, K, V]` recurrent state of one request on this rank.
+    /// `[H, K, V]` recurrent state of one request on this rank, at the pool
+    /// dtype.
     pub ssm_state_bytes_per_request: u32,
     /// bf16 `(kernel_size - 1)`-token conv window of one request on this rank.
     pub conv_state_bytes_per_request: u32,
@@ -153,7 +161,13 @@ impl Glm53KdaAttnLocalWorklet {
             elementwise(&cfg.elementwise_backends, &cfg.gpu_name, input, output)
         };
         let per_head_bytes = value_width * bpe;
-        let ssm_state_bytes_per_request = heads * head_dim * head_dim * DType::Fp32.size_bytes();
+        assert!(
+            matches!(cfg.ssm_state_dtype, DType::Fp32 | DType::Bf16),
+            "KDA state pool must be fp32 or bf16, got {:?}",
+            cfg.ssm_state_dtype
+        );
+        let ssm_state_bytes_per_request =
+            heads * head_dim * head_dim * cfg.ssm_state_dtype.size_bytes();
         assert_eq!(
             ssm_state_bytes_per_request % STATE_TRANSFER_UNIT_BYTES,
             0,
@@ -198,6 +212,8 @@ impl Glm53KdaAttnLocalWorklet {
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
+                tokens_per_request: None,
             },
             state_scatter: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
             // rmsnorm(o) * w * sigmoid(g): reads o and g, writes the gated o.
@@ -484,6 +500,7 @@ mod tests {
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
+            ssm_state_dtype: DType::Fp32,
         }
     }
 
@@ -574,6 +591,20 @@ mod tests {
         assert_eq!(r.conv_prefill.channels.get(), 6144);
         assert_eq!(r.ssm_state_bytes_per_request, 1 << 20);
         assert_eq!(r.conv_state_bytes_per_request, 6144 * 3 * 2);
+    }
+
+    /// Catches a bf16 pool sized or keyed as the fp32 one: the state a
+    /// prefill gathers and scatters halves, and the recurrent call reads the
+    /// bf16-pool rows.
+    #[test]
+    fn a_bf16_pool_halves_the_state_and_keys_the_recurrent_rows() {
+        let mut bf16 = cfg();
+        bf16.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&bf16);
+        assert_eq!(r.ssm_state_bytes_per_request, 1 << 19);
+        assert_eq!(r.recurrent_decode.state_dtype, DType::Bf16);
+        let fp32 = Glm53KdaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(fp32.recurrent_decode.state_dtype, DType::Fp32);
     }
 
     #[test]
