@@ -68,15 +68,7 @@ use crate::timing::{
     PerfApiBridge, Probe, SlotInput,
 };
 
-const HIDDEN_DIM: u32 = 6144;
-const INTERMEDIATE_DIM: u32 = 12288;
-const HEAD_DIM: u32 = 128;
-const NUM_QO_HEADS: u32 = 64;
-const NUM_KV_HEADS: u32 = 8;
-/// `dflash_config.conv_kernel_size` — the convolution reaches back one position.
-const CONV_TAPS: u32 = 2;
-/// `dflash_config.conv_group_size`.
-const CONV_GROUP_SIZE: u32 = 16;
+use super::dflash2_checkpoint::validate_against_checkpoints;
 
 /// Shared identity for both halves of one draft layer.
 #[derive(Clone, Debug)]
@@ -662,23 +654,21 @@ impl Dflash2DraftFfnLocalWorklet {
 // ------------------------------------------------------------------ shared --
 
 fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), String> {
-    for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        (
-            "intermediate_dim",
-            cfg.intermediate_dim.get(),
-            INTERMEDIATE_DIM,
-        ),
-        ("head_dim", cfg.head_dim.get(), HEAD_DIM),
-        ("num_qo_heads", cfg.num_qo_heads.get(), NUM_QO_HEADS),
-        ("num_kv_heads", cfg.num_kv_heads.get(), NUM_KV_HEADS),
-        ("conv_taps", cfg.conv_taps, CONV_TAPS),
-        ("conv_group_size", cfg.conv_group_size, CONV_GROUP_SIZE),
-    ] {
-        if actual != required {
-            return Err(format!("{name} must be {required}, got {actual}"));
-        }
-    }
+    validate_against_checkpoints(|c| {
+        vec![
+            ("hidden_dim", cfg.hidden_dim.get(), c.hidden_dim),
+            (
+                "intermediate_dim",
+                cfg.intermediate_dim.get(),
+                c.intermediate_dim,
+            ),
+            ("head_dim", cfg.head_dim.get(), c.head_dim),
+            ("num_qo_heads", cfg.num_qo_heads.get(), c.num_qo_heads),
+            ("num_kv_heads", cfg.num_kv_heads.get(), c.num_kv_heads),
+            ("conv_taps", cfg.conv_taps, c.conv_taps),
+            ("conv_group_size", cfg.conv_group_size, c.conv_group_size),
+        ]
+    })?;
     if cfg.dtype != DType::Bf16 {
         return Err(format!(
             "dtype must be {}, got {}",
@@ -803,6 +793,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklet::dflash2_checkpoint::GLM53_DFLASH2 as CKPT;
+
+    const HIDDEN_DIM: u32 = CKPT.hidden_dim;
+    const INTERMEDIATE_DIM: u32 = CKPT.intermediate_dim;
+    const HEAD_DIM: u32 = CKPT.head_dim;
+    const NUM_QO_HEADS: u32 = CKPT.num_qo_heads;
+    const NUM_KV_HEADS: u32 = CKPT.num_kv_heads;
+    const CONV_TAPS: u32 = CKPT.conv_taps;
+    const CONV_GROUP_SIZE: u32 = CKPT.conv_group_size;
 
     fn cfg() -> Dflash2DraftLayerLocalWorkletConfig {
         Dflash2DraftLayerLocalWorkletConfig {

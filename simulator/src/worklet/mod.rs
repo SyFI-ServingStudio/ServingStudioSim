@@ -28,6 +28,7 @@ mod deepseek_v41_iteration_tests;
 pub mod deepseek_v41_moe_ffn_dp_ep;
 pub mod deepseek_v41_moe_ffn_ep;
 pub mod deepseek_v41_prologue_tp;
+pub mod dflash2_checkpoint;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
 pub mod dflash2_selector_local;
