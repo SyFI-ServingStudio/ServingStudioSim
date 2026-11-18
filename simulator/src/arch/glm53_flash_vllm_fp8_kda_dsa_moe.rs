@@ -748,6 +748,7 @@ pub fn build_configs(
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
                 * 1024
                 * 1024,
+            decode_next_n: 1,
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
