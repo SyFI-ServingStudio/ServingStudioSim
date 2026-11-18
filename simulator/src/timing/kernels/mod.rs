@@ -50,6 +50,7 @@ pub mod hc_gate_mix;
 pub mod indexed_row_copy;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
+pub mod kda_recoverssm_verify;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
 pub mod kv_compress_store;
@@ -273,6 +274,10 @@ pub use inv_rope_fp8_quant::{
 pub use kda_chunk_prefill::{
     KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
     KdaChunkPrefillSpec,
+};
+pub use kda_recoverssm_verify::{
+    KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput,
+    KdaRecoverSSMVerifySpec,
 };
 pub use kda_recurrent_decode::{
     KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
