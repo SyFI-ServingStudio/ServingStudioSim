@@ -2159,15 +2159,11 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         kda.spec_verify = *kda_spec_verify;
     }
     // The vLLM fork's decode-indexer path at verify widths: its cooperative
-    // top-k, Triton Hadamard quant, CUDA static FP8 quant and fork kpool
-    // update, each request's indexer priced by its own context.
+    // top-k, each request's indexer priced by its own context.
     let dsa = &mut configs.local.dsa;
     dsa.decode_next_n = verify_width;
     dsa.decode_indexer = DsaDecodeIndexer::PerRequest;
     dsa.cooperative_topk_backends = vec!["vllm_cuda_cooperative"];
-    dsa.hadamard_quant_backends = vec!["vllm_triton"];
-    dsa.static_quant_backends = vec!["vllm_cuda"];
-    dsa.pooled_index_update_backends = vec!["vllm_fork_triton"];
     dsa.glue = match dsa_glue {
         DsaGluePricing::Placeholder => DsaGlue::Placeholder,
         DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
