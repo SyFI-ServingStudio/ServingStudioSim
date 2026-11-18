@@ -60,7 +60,8 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, FlashinferAttnRectKernel,
     FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, KvCacheAppendKernel,
-    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, ResidualRmsNormKernel,
+    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, QkNormRopeFp8KvWriteKernel,
+    QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput, ResidualRmsNormKernel,
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -104,6 +105,12 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     /// same insert the context-KV section runs over the context rows. `None`
     /// leaves the insert unpriced.
     pub query_kv_append: Option<KvCacheAppendKernelConfig>,
+    /// `Some((backends, page_size))`: one launch normalizes and rotates q and
+    /// k, quantizes q to the attention's fp8 and writes the block's K/V into
+    /// the paged cache of `page_size` tokens (`qk_norm_rope_fp8_kv_write`),
+    /// replacing q_norm, k_norm, RoPE and the query-block insert. Needs fp8
+    /// attention.
+    pub qk_norm_rope_kv_write: Option<(Vec<&'static str>, u32)>,
 }
 
 /// One grouped convolution's byte rates. `prepare` also runs a projection; both
@@ -157,6 +164,7 @@ pub struct Dflash2DraftAttnLocalWorkletResolved {
     pub k_norm: RmsNormKernelConfig,
     pub rope: ElementwiseKernelConfig,
     pub query_kv_append: Option<KvCacheAppendKernelConfig>,
+    pub qk_norm_rope_kv_write: Option<QkNormRopeFp8KvWriteKernelConfig>,
     pub attention: FlashinferAttnRectKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
 }
@@ -170,16 +178,24 @@ pub struct Dflash2DraftAttnLocalWorkletInput {
     pub rectangles: Vec<(u32, u32)>,
 }
 
+/// q/k norm, RoPE and the query-block insert: separate launches, or one.
+pub enum QkPrep {
+    Separate {
+        q_norm: Op<RmsNormKernel>,
+        k_norm: Op<RmsNormKernel>,
+        rope: Op<ElementwiseKernel>,
+        query_kv_append: Option<Op<KvCacheAppendKernel>>,
+    },
+    Fused(Op<QkNormRopeFp8KvWriteKernel>),
+}
+
 pub struct Dflash2DraftAttnLocalWorklet {
     pub name: String,
     pub input_add_rms_norm: Op<ResidualRmsNormKernel>,
     pub attn_conv_projection: Op<SingleGemmKernel>,
     pub attn_conv_prepare: Op<ElementwiseKernel>,
     pub qkv_proj: Op<SingleGemmKernel>,
-    pub q_norm: Op<RmsNormKernel>,
-    pub k_norm: Op<RmsNormKernel>,
-    pub rope: Op<ElementwiseKernel>,
-    pub query_kv_append: Option<Op<KvCacheAppendKernel>>,
+    pub qk_prep: QkPrep,
     pub attention: Op<FlashinferAttnRectKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: Dflash2DraftAttnLocalWorkletResolved,
@@ -254,6 +270,18 @@ impl Dflash2DraftAttnLocalWorklet {
                 output_bytes_per_token: rope_output_bytes.into(),
             },
             query_kv_append: cfg.query_kv_append.clone(),
+            qk_norm_rope_kv_write: cfg.qk_norm_rope_kv_write.as_ref().map(
+                |(backends, page_size)| QkNormRopeFp8KvWriteKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_qo_heads: qo_heads_per_rank.clone(),
+                    num_kv_heads: kv_heads_per_rank.clone(),
+                    head_dim: cfg.head_dim.clone(),
+                    page_size: *page_size,
+                    input_dtype: cfg.dtype,
+                    kv_dtype: cfg.attn_kv_dtype,
+                },
+            ),
             attention: FlashinferAttnRectKernelConfig {
                 backends: cfg.attention_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -280,7 +308,53 @@ impl Dflash2DraftAttnLocalWorklet {
         resolved: Dflash2DraftAttnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        let qk_prep = match &resolved.qk_norm_rope_kv_write {
+            Some(cfg) => QkPrep::Fused(build_atomic(
+                &name,
+                "qk_norm_rope_kv_write",
+                cfg.clone(),
+                QkNormRopeFp8KvWriteKernel::build,
+                bridge,
+            )?),
+            None => QkPrep::Separate {
+                q_norm: build_atomic(
+                    &name,
+                    "q_norm",
+                    resolved.q_norm.clone(),
+                    RmsNormKernel::build,
+                    bridge,
+                )?,
+                k_norm: build_atomic(
+                    &name,
+                    "k_norm",
+                    resolved.k_norm.clone(),
+                    RmsNormKernel::build,
+                    bridge,
+                )?,
+                rope: build_atomic(
+                    &name,
+                    "rope",
+                    resolved.rope.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                query_kv_append: resolved
+                    .query_kv_append
+                    .as_ref()
+                    .map(|cfg| {
+                        build_atomic(
+                            &name,
+                            "query_kv_append",
+                            cfg.clone(),
+                            KvCacheAppendKernel::build,
+                            bridge,
+                        )
+                    })
+                    .transpose()?,
+            },
+        };
         Ok(Self {
+            qk_prep,
             input_add_rms_norm: build_atomic(
                 &name,
                 "input_add_rms_norm",
@@ -309,40 +383,6 @@ impl Dflash2DraftAttnLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
-            q_norm: build_atomic(
-                &name,
-                "q_norm",
-                resolved.q_norm.clone(),
-                RmsNormKernel::build,
-                bridge,
-            )?,
-            k_norm: build_atomic(
-                &name,
-                "k_norm",
-                resolved.k_norm.clone(),
-                RmsNormKernel::build,
-                bridge,
-            )?,
-            rope: build_atomic(
-                &name,
-                "rope",
-                resolved.rope.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
-            query_kv_append: resolved
-                .query_kv_append
-                .as_ref()
-                .map(|cfg| {
-                    build_atomic(
-                        &name,
-                        "query_kv_append",
-                        cfg.clone(),
-                        KvCacheAppendKernel::build,
-                        bridge,
-                    )
-                })
-                .transpose()?,
             attention: build_atomic(
                 &name,
                 "attention",
@@ -371,12 +411,22 @@ impl Dflash2DraftAttnLocalWorklet {
                     self.attn_conv_projection.compile(builder),
                     self.attn_conv_prepare.compile(builder),
                     self.qkv_proj.compile(builder),
-                    self.q_norm.compile(builder),
-                    self.k_norm.compile(builder),
-                    self.rope.compile(builder),
                 ];
-                if let Some(op) = &self.query_kv_append {
-                    nodes.push(op.compile(builder));
+                match &self.qk_prep {
+                    QkPrep::Separate {
+                        q_norm,
+                        k_norm,
+                        rope,
+                        query_kv_append,
+                    } => {
+                        nodes.push(q_norm.compile(builder));
+                        nodes.push(k_norm.compile(builder));
+                        nodes.push(rope.compile(builder));
+                        if let Some(op) = query_kv_append {
+                            nodes.push(op.compile(builder));
+                        }
+                    }
+                    QkPrep::Fused(op) => nodes.push(op.compile(builder)),
                 }
                 nodes.push(self.attention.compile(builder));
                 nodes.push(self.o_proj.compile(builder));
@@ -415,35 +465,50 @@ impl Dflash2DraftAttnLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(
-            &self.q_norm,
-            RmsNormKernelInput {
-                m: tokens.saturating_mul(qo_heads),
-            },
-            zero,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.k_norm,
-            RmsNormKernelInput {
-                m: tokens.saturating_mul(kv_heads),
-            },
-            zero,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.rope,
-            ElementwiseKernelInput { num_tokens: tokens },
-            zero,
-            ev,
-        );
-        if let Some(op) = &self.query_kv_append {
-            eval_atomic_or_zero(
+        match &self.qk_prep {
+            QkPrep::Separate {
+                q_norm,
+                k_norm,
+                rope,
+                query_kv_append,
+            } => {
+                eval_atomic_or_zero(
+                    q_norm,
+                    RmsNormKernelInput {
+                        m: tokens.saturating_mul(qo_heads),
+                    },
+                    zero,
+                    ev,
+                );
+                eval_atomic_or_zero(
+                    k_norm,
+                    RmsNormKernelInput {
+                        m: tokens.saturating_mul(kv_heads),
+                    },
+                    zero,
+                    ev,
+                );
+                eval_atomic_or_zero(
+                    rope,
+                    ElementwiseKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+                if let Some(op) = query_kv_append {
+                    eval_atomic_or_zero(
+                        op,
+                        KvCacheAppendKernelInput { num_tokens: tokens },
+                        zero,
+                        ev,
+                    );
+                }
+            }
+            QkPrep::Fused(op) => eval_atomic_or_zero(
                 op,
-                KvCacheAppendKernelInput { num_tokens: tokens },
+                QkNormRopeFp8KvWriteKernelInput { num_tokens: tokens },
                 zero,
                 ev,
-            );
+            ),
         }
 
         // One aggregating slot, priced as ONE launch over every request's
@@ -715,6 +780,13 @@ fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), Stri
     if cfg.tp_size == 0 {
         return Err("tp_size must be positive".to_string());
     }
+    if cfg.qk_norm_rope_kv_write.is_some() && cfg.attn_q_dtype != DType::Fp8E4m3 {
+        return Err(format!(
+            "qk_norm_rope_kv_write emits an fp8 query for fp8 attention, but the draft \
+             attention reads {} queries",
+            cfg.attn_q_dtype.as_str()
+        ));
+    }
     // The ragged rect path requires one compute dtype for both operands.
     if cfg.attn_q_dtype != cfg.attn_kv_dtype {
         return Err(format!(
@@ -860,6 +932,7 @@ mod tests {
             attn_q_dtype: DType::Bf16,
             attn_kv_dtype: DType::Bf16,
             query_kv_append: None,
+            qk_norm_rope_kv_write: None,
         }
     }
 
@@ -918,6 +991,32 @@ mod tests {
         assert_eq!(batched_rectangle(&[(8, 100)]), Some((8, 100)));
         // 8*100 + 8*301 = 3208 query-key pairs over 16 rows: 200.5, rounded up.
         assert_eq!(batched_rectangle(&[(8, 100), (8, 301)]), Some((16, 201)));
+    }
+
+    /// Catches the fused launch standing beside the four it replaces, or
+    /// running against a bf16 attention it cannot feed.
+    #[test]
+    fn the_fused_qk_write_replaces_norms_rope_and_insert() {
+        let mut fused = cfg();
+        fused.query_kv_append = Some(query_kv_append());
+        fused.qk_norm_rope_kv_write = Some((vec!["triton"], 16));
+        assert!(validate_config(&fused).is_err());
+        fused.attn_q_dtype = DType::Fp8E4m3;
+        fused.attn_kv_dtype = DType::Fp8E4m3;
+        let leaves = attn_leaves(&fused);
+        for gone in ["q_norm", "k_norm", "rope", "query_kv_append"] {
+            assert!(!leaves.iter().any(|l| l == gone), "{gone} still priced");
+        }
+        let write = leaves
+            .iter()
+            .position(|l| l == "qk_norm_rope_kv_write")
+            .unwrap();
+        assert_eq!(leaves[write + 1], "attention");
+        let resolved = Dflash2DraftAttnLocalWorklet::resolve_config(&fused);
+        let write = resolved.qk_norm_rope_kv_write.unwrap();
+        assert_eq!(write.num_qo_heads.get(), 16);
+        assert_eq!(write.num_kv_heads.get(), 2);
+        assert_eq!(write.page_size, 16);
     }
 
     #[test]
