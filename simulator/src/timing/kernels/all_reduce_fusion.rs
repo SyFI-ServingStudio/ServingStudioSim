@@ -151,6 +151,15 @@ pub(crate) fn mnnvl_max_oneshot_tokens(hidden_dim: u32, num_gpus: u32, dtype: DT
     (MNNVL_ONE_SHOT_BYTES / bytes_per_token) as u32
 }
 
+/// Rows per rank (`num_tokens / num_gpus`) of the `flashinfer_mnnvl_unbudgeted_*`
+/// grid: 16..256, a power-of-two ladder above the MNNVL budget at 8 GPUs
+/// (1..16 MiB at hidden 4096). Larger calls are extrapolated by the cache.
+pub const UNBUDGETED_ROWS_PER_RANK: [u32; 5] = [16, 32, 64, 128, 256];
+
+fn is_unbudgeted(backend: &str) -> bool {
+    backend.starts_with("flashinfer_mnnvl_unbudgeted")
+}
+
 impl KernelSpec for AllReduceFusionSpec {
     type Config = AllReduceFusionKernelConfig;
     type Input = AllReduceFusionKernelInput;
@@ -158,6 +167,11 @@ impl KernelSpec for AllReduceFusionSpec {
     const KIND: KernelKind = "all_reduce_fusion";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if !config.backends.is_empty() && config.backends.iter().all(|b| is_unbudgeted(b)) {
+            return SweepGrid::new(vec![Axis::values(
+                UNBUDGETED_ROWS_PER_RANK.map(|rows| rows * config.num_gpus),
+            )]);
+        }
         let max_fused_tokens = Self::max_fused_tokens(config);
         let mut boundaries = vec![max_fused_tokens];
         // Only MNNVL has the in-call one-shot/two-shot switch; keeping it off
@@ -218,6 +232,30 @@ mod tests {
             fabric: Fabric::Nvlink,
             fused_token_limit: None,
         }
+    }
+
+    /// Catches the unbudgeted MNNVL grid drifting off the measured ladder
+    /// (16..256 rows per rank), which would send `--no-gpu` runs to profiling.
+    #[test]
+    fn the_unbudgeted_grid_is_the_measured_rows_per_rank_ladder() {
+        let unbudgeted = AllReduceFusionKernelConfig {
+            backends: vec!["flashinfer_mnnvl_unbudgeted_twoshot"],
+            hidden_dim: 4096,
+            fused_token_limit: Some(2048),
+            ..config(8)
+        };
+        assert_eq!(
+            AllReduceFusionSpec::sweep_grid(&unbudgeted).axes()[0],
+            vec![128.0, 256.0, 512.0, 1024.0, 2048.0]
+        );
+        let four = AllReduceFusionKernelConfig {
+            num_gpus: 4,
+            ..unbudgeted
+        };
+        assert_eq!(
+            AllReduceFusionSpec::sweep_grid(&four).axes()[0],
+            vec![64.0, 128.0, 256.0, 512.0, 1024.0]
+        );
     }
 
     #[test]
