@@ -716,6 +716,7 @@ pub fn build_configs(
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             ssm_state_dtype: DType::Fp32,
             decode_query_len: 1,
+            spec_verify: crate::worklet::KdaSpecVerify::Recoverssm,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),

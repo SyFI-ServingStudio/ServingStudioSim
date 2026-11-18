@@ -210,7 +210,7 @@ pub use glm53_dsa_attn_local::{
 };
 pub use glm53_kda_attn_local::{
     Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
-    Glm53KdaAttnLocalWorkletResolved,
+    Glm53KdaAttnLocalWorkletResolved, KdaSpecVerify,
 };
 pub use glm53_mlp_local::{
     Glm53MlpLocalWorklet, Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput,
