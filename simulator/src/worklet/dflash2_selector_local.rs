@@ -90,7 +90,9 @@ pub struct Dflash2SelectorLocalWorklet {
     pub candidate_topk: Op<LogitsTopkKernel>,
     /// Its own slot, so the cost log shows which launches took it.
     pub candidate_topk_small_rows: Option<(u32, Op<LogitsTopkKernel>)>,
-    pub candidate_topk_merge: Op<LogitsTopkKernel>,
+    /// `None` on one rank: with nothing gathered there is no second selection
+    /// (`get_top_k_tokens` all-gathers only when `tp_size > 1`).
+    pub candidate_topk_merge: Option<Op<LogitsTopkKernel>>,
     pub hidden_projection: Op<SingleGemmKernel>,
     pub codebook_gather: Op<ElementwiseKernel>,
     pub edge_scores: Op<SingleGemmKernel>,
@@ -224,13 +226,17 @@ impl Dflash2SelectorLocalWorklet {
                     .map(|op| (*max_rows, op))
                 })
                 .transpose()?,
-            candidate_topk_merge: build_atomic(
-                &name,
-                "candidate_topk_merge",
-                resolved.candidate_topk_merge.clone(),
-                LogitsTopkKernel::build,
-                bridge,
-            )?,
+            candidate_topk_merge: (resolved.raw_cfg.tp_size > 1)
+                .then(|| {
+                    build_atomic(
+                        &name,
+                        "candidate_topk_merge",
+                        resolved.candidate_topk_merge.clone(),
+                        LogitsTopkKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             hidden_projection: build_atomic(
                 &name,
                 "hidden_projection",
@@ -268,7 +274,9 @@ impl Dflash2SelectorLocalWorklet {
                 if let Some((_, op)) = &self.candidate_topk_small_rows {
                     nodes.push(op.compile(builder));
                 }
-                nodes.push(self.candidate_topk_merge.compile(builder));
+                if let Some(op) = &self.candidate_topk_merge {
+                    nodes.push(op.compile(builder));
+                }
                 nodes.push(self.hidden_projection.compile(builder));
                 nodes.push(self.codebook_gather.compile(builder));
                 nodes.push(self.edge_scores.compile(builder));
@@ -294,7 +302,9 @@ impl Dflash2SelectorLocalWorklet {
         if let Some((_, op)) = &self.candidate_topk_small_rows {
             eval_atomic_or_zero(op, selected.clone(), zero || !small, ev);
         }
-        eval_atomic_or_zero(&self.candidate_topk_merge, selected, zero, ev);
+        if let Some(op) = &self.candidate_topk_merge {
+            eval_atomic_or_zero(op, selected, zero, ev);
+        }
         eval_atomic_or_zero(
             &self.hidden_projection,
             SingleGemmKernelInput { m: rows },
@@ -477,6 +487,17 @@ mod tests {
                 vec!["triton_threshold".into()]
             )
         );
+    }
+
+    /// Catches a single-rank draft paying for a merge over candidates it
+    /// never gathered.
+    #[test]
+    fn one_rank_selects_once() {
+        let mut one_rank = cfg();
+        one_rank.tp_size = 1;
+        assert!(leaves(&one_rank)
+            .iter()
+            .all(|(name, _)| name != "candidate_topk_merge"));
     }
 
     #[test]
