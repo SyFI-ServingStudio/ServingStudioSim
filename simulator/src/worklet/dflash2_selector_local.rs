@@ -42,18 +42,17 @@ use crate::timing::{
     SlotInput,
 };
 
-const HIDDEN_DIM: u32 = 6144;
-const VOCAB_SIZE: u32 = 154880;
-/// `dflash_config.selector_rank`.
-const SELECTOR_RANK: u32 = 256;
-/// `dflash_config.selector_top_k`.
-const SELECTOR_TOP_K: u32 = 16;
+use super::dflash2_checkpoint::validate_against_checkpoints;
 
 #[derive(Clone, Debug)]
 pub struct Dflash2SelectorLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    /// `Some((max_rows, backends))`: a `candidate_topk` launch of at most
+    /// `max_rows` rows runs these backends instead; larger launches keep
+    /// `topk_backends`.
+    pub topk_small_rows: Option<(u32, Vec<&'static str>)>,
     pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
@@ -70,6 +69,8 @@ pub struct Dflash2SelectorLocalWorkletResolved {
     pub lm_head: SingleGemmKernelConfig,
     pub candidate_topk: LogitsTopkKernelConfig,
     pub candidate_topk_merge: LogitsTopkKernelConfig,
+    /// `candidate_topk` at the small-row backends, up to `max_rows` rows.
+    pub candidate_topk_small_rows: Option<(u32, LogitsTopkKernelConfig)>,
     pub hidden_projection: SingleGemmKernelConfig,
     pub codebook_gather: ElementwiseKernelConfig,
     pub edge_scores: SingleGemmKernelConfig,
@@ -87,7 +88,11 @@ pub struct Dflash2SelectorLocalWorklet {
     pub name: String,
     pub lm_head: Op<SingleGemmKernel>,
     pub candidate_topk: Op<LogitsTopkKernel>,
-    pub candidate_topk_merge: Op<LogitsTopkKernel>,
+    /// Its own slot, so the cost log shows which launches took it.
+    pub candidate_topk_small_rows: Option<(u32, Op<LogitsTopkKernel>)>,
+    /// `None` on one rank: with nothing gathered there is no second selection
+    /// (`get_top_k_tokens` all-gathers only when `tp_size > 1`).
+    pub candidate_topk_merge: Option<Op<LogitsTopkKernel>>,
     pub hidden_projection: Op<SingleGemmKernel>,
     pub codebook_gather: Op<ElementwiseKernel>,
     pub edge_scores: Op<SingleGemmKernel>,
@@ -121,6 +126,17 @@ impl Dflash2SelectorLocalWorklet {
         )
         .expect("validated DFlash2 codebook gather byte rate must fit u32");
 
+        // The selection reads this rank's own vocabulary shard. `lm_head`
+        // emits it in `gemm_dtype`, and the top-k templates on the value type
+        // it is handed, so the two dtypes are the same one.
+        let candidate_topk = LogitsTopkKernelConfig {
+            backends: cfg.topk_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            num_columns: vocab_per_rank.clone(),
+            top_k: cfg.selector_top_k,
+            dtype: cfg.gemm_dtype,
+        };
+
         Dflash2SelectorLocalWorkletResolved {
             lm_head: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
@@ -129,16 +145,12 @@ impl Dflash2SelectorLocalWorklet {
                 k: cfg.hidden_dim.clone(),
                 dtype: cfg.gemm_dtype,
             },
-            // The selection reads this rank's own vocabulary shard. `lm_head`
-            // emits it in `gemm_dtype`, and the top-k templates on the value
-            // type it is handed, so the two dtypes are the same one.
-            candidate_topk: LogitsTopkKernelConfig {
-                backends: cfg.topk_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_columns: vocab_per_rank.clone(),
-                top_k: cfg.selector_top_k,
-                dtype: cfg.gemm_dtype,
-            },
+            candidate_topk_small_rows: cfg.topk_small_rows.as_ref().map(|(max_rows, backends)| {
+                let mut small = candidate_topk.clone();
+                small.backends = backends.clone();
+                (*max_rows, small)
+            }),
+            candidate_topk,
             candidate_topk_merge: LogitsTopkKernelConfig {
                 backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -200,13 +212,31 @@ impl Dflash2SelectorLocalWorklet {
                 LogitsTopkKernel::build,
                 bridge,
             )?,
-            candidate_topk_merge: build_atomic(
-                &name,
-                "candidate_topk_merge",
-                resolved.candidate_topk_merge.clone(),
-                LogitsTopkKernel::build,
-                bridge,
-            )?,
+            candidate_topk_small_rows: resolved
+                .candidate_topk_small_rows
+                .as_ref()
+                .map(|(max_rows, cfg)| {
+                    build_atomic(
+                        &name,
+                        "candidate_topk_small_rows",
+                        cfg.clone(),
+                        LogitsTopkKernel::build,
+                        bridge,
+                    )
+                    .map(|op| (*max_rows, op))
+                })
+                .transpose()?,
+            candidate_topk_merge: (resolved.raw_cfg.tp_size > 1)
+                .then(|| {
+                    build_atomic(
+                        &name,
+                        "candidate_topk_merge",
+                        resolved.candidate_topk_merge.clone(),
+                        LogitsTopkKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             hidden_projection: build_atomic(
                 &name,
                 "hidden_projection",
@@ -236,14 +266,22 @@ impl Dflash2SelectorLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: worklet_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.lm_head.compile(builder),
-                self.candidate_topk.compile(builder),
-                self.candidate_topk_merge.compile(builder),
-                self.hidden_projection.compile(builder),
-                self.codebook_gather.compile(builder),
-                self.edge_scores.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = vec![
+                    self.lm_head.compile(builder),
+                    self.candidate_topk.compile(builder),
+                ];
+                if let Some((_, op)) = &self.candidate_topk_small_rows {
+                    nodes.push(op.compile(builder));
+                }
+                if let Some(op) = &self.candidate_topk_merge {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.hidden_projection.compile(builder));
+                nodes.push(self.codebook_gather.compile(builder));
+                nodes.push(self.edge_scores.compile(builder));
+                nodes
+            })),
         }
     }
 
@@ -256,8 +294,17 @@ impl Dflash2SelectorLocalWorklet {
         let selected = LogitsTopkKernelInput { num_rows: rows };
 
         eval_atomic_or_zero(&self.lm_head, SingleGemmKernelInput { m: rows }, zero, ev);
-        eval_atomic_or_zero(&self.candidate_topk, selected.clone(), zero, ev);
-        eval_atomic_or_zero(&self.candidate_topk_merge, selected, zero, ev);
+        // Under `topk_small_rows` the launch goes to exactly one of the two
+        // slots by its row count; the other reads ZERO.
+        let small =
+            matches!(&self.candidate_topk_small_rows, Some((max_rows, _)) if rows <= *max_rows);
+        eval_atomic_or_zero(&self.candidate_topk, selected.clone(), zero || small, ev);
+        if let Some((_, op)) = &self.candidate_topk_small_rows {
+            eval_atomic_or_zero(op, selected.clone(), zero || !small, ev);
+        }
+        if let Some(op) = &self.candidate_topk_merge {
+            eval_atomic_or_zero(op, selected, zero, ev);
+        }
         eval_atomic_or_zero(
             &self.hidden_projection,
             SingleGemmKernelInput { m: rows },
@@ -278,16 +325,14 @@ impl Dflash2SelectorLocalWorklet {
 }
 
 fn validate_config(cfg: &Dflash2SelectorLocalWorkletConfig) -> Result<(), String> {
-    for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        ("vocab_size", cfg.vocab_size.get(), VOCAB_SIZE),
-        ("selector_rank", cfg.selector_rank, SELECTOR_RANK),
-        ("selector_top_k", cfg.selector_top_k, SELECTOR_TOP_K),
-    ] {
-        if actual != required {
-            return Err(format!("{name} must be {required}, got {actual}"));
-        }
-    }
+    validate_against_checkpoints(|c| {
+        vec![
+            ("hidden_dim", cfg.hidden_dim.get(), c.hidden_dim),
+            ("vocab_size", cfg.vocab_size.get(), c.vocab_size),
+            ("selector_rank", cfg.selector_rank, c.selector_rank),
+            ("selector_top_k", cfg.selector_top_k, c.selector_top_k),
+        ]
+    })?;
     if cfg.tp_size == 0 || cfg.vocab_size.get() % u32::from(cfg.tp_size) != 0 {
         return Err(format!(
             "vocab_size {} must be divisible by positive tp_size {}",
@@ -350,12 +395,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklet::dflash2_checkpoint::GLM53_DFLASH2 as CKPT;
+
+    const HIDDEN_DIM: u32 = CKPT.hidden_dim;
+    const VOCAB_SIZE: u32 = CKPT.vocab_size;
+    const SELECTOR_RANK: u32 = CKPT.selector_rank;
+    const SELECTOR_TOP_K: u32 = CKPT.selector_top_k;
 
     fn cfg() -> Dflash2SelectorLocalWorkletConfig {
         Dflash2SelectorLocalWorkletConfig {
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
             topk_backends: vec!["flashinfer", "torch"],
+            topk_small_rows: None,
             tp_size: 4,
             gpu_name: "NVIDIA B200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
@@ -374,6 +426,78 @@ mod tests {
         // `hidden_projection` is a ReplicatedLinear onto the selector rank.
         assert_eq!(resolved.hidden_projection.n.get(), SELECTOR_RANK);
         assert_eq!(resolved.hidden_projection.k.get(), HIDDEN_DIM);
+    }
+
+    /// Each leaf's name under the worklet and the backends it offers.
+    fn leaves(cfg: &Dflash2SelectorLocalWorkletConfig) -> Vec<(String, Vec<String>)> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2SelectorLocalWorklet::build(
+            "sel".into(),
+            Dflash2SelectorLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| {
+                let backends = serde_json::from_value(slot.kernel_config["backends"].clone());
+                (slot.name["sel.".len()..].to_string(), backends.unwrap())
+            })
+            .collect()
+    }
+
+    /// Catches the gate replacing the large-launch top-k instead of standing
+    /// beside it, or changing the selector when it is off.
+    #[test]
+    fn the_small_row_gate_adds_one_topk_leaf_at_its_own_backends() {
+        let names = |cfg: &Dflash2SelectorLocalWorkletConfig| -> Vec<String> {
+            leaves(cfg).into_iter().map(|(name, _)| name).collect()
+        };
+        assert_eq!(
+            names(&cfg()),
+            [
+                "lm_head",
+                "candidate_topk",
+                "candidate_topk_merge",
+                "hidden_projection",
+                "codebook_gather",
+                "edge_scores"
+            ]
+        );
+        let mut gated = cfg();
+        gated.topk_small_rows = Some((560, vec!["triton_threshold"]));
+        let gated = leaves(&gated);
+        assert_eq!(gated.len(), 7);
+        assert_eq!(
+            gated[1],
+            (
+                "candidate_topk".into(),
+                vec!["flashinfer".into(), "torch".into()]
+            )
+        );
+        assert_eq!(
+            gated[2],
+            (
+                "candidate_topk_small_rows".into(),
+                vec!["triton_threshold".into()]
+            )
+        );
+    }
+
+    /// Catches a single-rank draft paying for a merge over candidates it
+    /// never gathered.
+    #[test]
+    fn one_rank_selects_once() {
+        let mut one_rank = cfg();
+        one_rank.tp_size = 1;
+        assert!(leaves(&one_rank)
+            .iter()
+            .all(|(name, _)| name != "candidate_topk_merge"));
     }
 
     #[test]

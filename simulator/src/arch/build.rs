@@ -2073,6 +2073,7 @@ fn dflash2_draft_resolved(
         // and it is bf16-only -- see the worklet's note on why the leaf is
         // measured in bf16 while the engine runs fp8.
         attention_backends: vec!["fa2"],
+        attention_large_batch: None,
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", 6144),
@@ -2086,6 +2087,9 @@ fn dflash2_draft_resolved(
         gemm_dtype: DType::Bf16,
         attn_q_dtype: DType::Bf16,
         attn_kv_dtype: DType::Bf16,
+        query_kv_append: None,
+        qk_norm_rope_kv_write: None,
+        conv_residual_norm: None,
     };
     let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
         norm_backends: vec!["flashinfer"],
@@ -2105,6 +2109,7 @@ fn dflash2_draft_resolved(
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
         kv_dtype: DType::Fp8E4m3,
+        layered_store: None,
     };
     let selector_cfg = Dflash2SelectorLocalWorkletConfig {
         gemm_backends: vec!["torch_linear"],
@@ -2114,6 +2119,7 @@ fn dflash2_draft_resolved(
         // is the identity to price against; `torch` stays behind it as the
         // semantic fallback the kernel kind also registers.
         topk_backends: vec!["flashinfer", "torch"],
+        topk_small_rows: None,
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", 6144),
