@@ -715,6 +715,7 @@ pub fn build_configs(
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             ssm_state_dtype: DType::Fp32,
+            decode_query_len: 1,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
