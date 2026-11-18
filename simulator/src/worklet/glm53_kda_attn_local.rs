@@ -44,10 +44,13 @@
 //! leaf here. FLA's chunk-index setup (about 11 small launches, ~17 us) runs
 //! once per step and is cached across layers; it is left out.
 //!
-//! Placeholders (elementwise, byte-sized): the beta sigmoid, the gated
-//! RMSNorm (`gdn_gated_rms_norm` is H200-only and a different entry point),
-//! and the state gather/scatter. State movement is expressed in 4-KiB transfer
-//! units, as in `qwen36_gdn_local`, so one 1-MiB state is 256 units.
+//! The output norm is the fork's `FusedRMSNormGated(activation="sigmoid")`
+//! `forward_cuda`: FLA's `rms_norm_gated`, one launch over tokens x
+//! rank-local heads rows (`sigmoid_gated_rms_norm`).
+//!
+//! Placeholders (elementwise, byte-sized): the beta sigmoid and the state
+//! gather/scatter. State movement is expressed in 4-KiB transfer units, as in
+//! `qwen36_gdn_local`, so one 1-MiB state is 256 units.
 
 use crate::common::gpu::compute_capability;
 use crate::op::Op;
@@ -63,6 +66,7 @@ use crate::timing::kernels::{
     KdaRecoverSSMConvVerifyKernelConfig, KdaRecoverSSMConvVerifyKernelInput,
     KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput,
     KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
+    SigmoidGatedRmsNormKernel, SigmoidGatedRmsNormKernelConfig, SigmoidGatedRmsNormKernelInput,
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
@@ -73,6 +77,8 @@ use crate::timing::{
 use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
+/// `FusedRMSNormGated.forward_cuda`: FLA's `rms_norm_gated` Triton kernel.
+const SIGMOID_GATED_NORM_BACKENDS: &[&str] = &["vllm_fla_triton"];
 /// `f_b` and `g_b` as one `torch.bmm` over their packed low-rank inputs
 /// (`merge_gate_b`).
 const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
@@ -175,7 +181,7 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     /// here it is 1.
     pub recoverssm_commit: Option<KdaRecoverSSMCommitKernelConfig>,
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
-    pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
+    pub gated_norm: SigmoidGatedRmsNormKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     /// `[H, K, V]` recurrent state of one request on this rank, at the pool
     /// dtype.
@@ -217,7 +223,7 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub recoverssm_verify: Option<Op<KdaRecoverSSMVerifyKernel>>,
     pub recoverssm_conv_verify: Option<Op<KdaRecoverSSMConvVerifyKernel>>,
     pub state_scatter: Op<ElementwiseKernel>,
-    pub gated_norm: Op<ElementwiseKernel>,
+    pub gated_norm: Op<SigmoidGatedRmsNormKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     /// The short-conv prefill backends launch once per sequence
     /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
@@ -250,7 +256,6 @@ impl Glm53KdaAttnLocalWorklet {
         let ew = |input: u32, output: u32| {
             elementwise(&cfg.elementwise_backends, &cfg.gpu_name, input, output)
         };
-        let per_head_bytes = value_width * bpe;
         assert!(
             matches!(cfg.ssm_state_dtype, DType::Fp32 | DType::Bf16),
             "KDA state pool must be fp32 or bf16, got {:?}",
@@ -354,8 +359,13 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.ssm_state_dtype,
             }),
             state_scatter: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
-            // rmsnorm(o) * w * sigmoid(g): reads o and g, writes the gated o.
-            gated_norm: ew(2 * per_head_bytes, per_head_bytes),
+            // rmsnorm(o) * w * sigmoid(g) per head row (`o_norm`).
+            gated_norm: SigmoidGatedRmsNormKernelConfig {
+                backends: SIGMOID_GATED_NORM_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden: cfg.head_dim.clone(),
+                dtype: cfg.activation_dtype,
+            },
             o_proj: gemm(cfg.hidden.clone(), value_width.into()),
             ssm_state_bytes_per_request,
             // vLLM `kda_state_shape`: the window grows by the drafted rows.
@@ -475,7 +485,7 @@ impl Glm53KdaAttnLocalWorklet {
                 n,
                 "gated_norm",
                 r.gated_norm,
-                ElementwiseKernel::build,
+                SigmoidGatedRmsNormKernel::build,
                 bridge,
             )?,
             o_proj: atomic(n, "o_proj", r.o_proj, SingleGemmKernel::build, bridge)?,
@@ -555,9 +565,6 @@ impl Glm53KdaAttnLocalWorklet {
         )
         .unwrap_or_else(|reason| panic!("invalid Glm53KdaAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
-        let tokens = ElementwiseKernelInput {
-            num_tokens: w.total_tokens,
-        };
         let no_decodes = input.decode_batch_size == 0;
         // The chunk path runs over every token of a prefill-bearing
         // plain-decode iteration, or over a verify's prefill requests alone.
@@ -655,7 +662,10 @@ impl Glm53KdaAttnLocalWorklet {
             );
         }
         push_or_zero(&self.state_scatter, state, decode_only, ev);
-        push_or_zero(&self.gated_norm, tokens, false, ev);
+        let norm_rows = SigmoidGatedRmsNormKernelInput {
+            m: w.total_tokens * self.resolved.raw_cfg.num_heads.get(),
+        };
+        push_or_zero(&self.gated_norm, norm_rows, false, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
     }
 }
@@ -1066,5 +1076,14 @@ mod tests {
             slots[1..4],
             ["m.kda.f_b_proj", "m.kda.g_b_proj", "m.kda.gate_b_proj"]
         );
+    }
+
+    /// Catches the norm keyed on the hidden width or the token count: the
+    /// fork norms head_dim-wide rows, one per token and rank-local head.
+    #[test]
+    fn the_output_norm_is_one_row_per_token_and_head() {
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(r.gated_norm.hidden.get(), 128);
+        assert_eq!(r.gated_norm.backends, ["vllm_fla_triton"]);
     }
 }
