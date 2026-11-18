@@ -261,6 +261,7 @@ pub fn build(
             recipe.model.num_dsa_layers(),
             recipe.model.kda_layers.len() as u32,
             kda_groups,
+            resolved.stage.kda.state_pages_per_request,
             block_tokens,
             1,
         )
@@ -454,6 +455,7 @@ impl Glm53FlashVllmFp8PpStageModel {
             counts.dsa,
             counts.kda,
             kda_groups,
+            resolved.kda.state_pages_per_request,
             block_tokens,
             1,
         );

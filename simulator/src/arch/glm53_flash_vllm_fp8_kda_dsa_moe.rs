@@ -81,9 +81,9 @@ use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    KdaRecoverSSMCommitKernelConfig, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
+    MhcRmsNormKernelConfig, MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
+    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -1277,6 +1277,7 @@ pub fn build(
         dsa_layers,
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
+        resolved.kda.state_pages_per_request,
         hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
         cfg.parallel.tp_size,
     );
@@ -1360,7 +1361,9 @@ pub fn build(
 /// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
 /// keeps its state in a slot of one of those blocks, padded to an MLA page, and
 /// the KDA layers are dealt over `kda_groups` groups: a request holds one block
-/// per group, `kda_groups` blocks however few KDA layers fill the last one. The
+/// per group, `kda_groups` blocks however few KDA layers fill the last one, and
+/// `kda_state_pages` such sets when each layer keeps that many state pages per
+/// request (a per-position speculative verify keeps `1 + k`). The
 /// kpool tail, the raw index keys of a pool still filling up, takes one more
 /// block per request and is never reused by a prefix hit. vLLM reserves one null
 /// block out of the pool.
@@ -1370,6 +1373,7 @@ pub(crate) fn hybrid_kv_cache_layout(
     dsa_layers: u32,
     kda_layers: u32,
     kda_groups: u32,
+    kda_state_pages: u32,
     block_tokens: u32,
     attn_tp: u16,
 ) -> KvCacheLayout {
@@ -1394,14 +1398,16 @@ pub(crate) fn hybrid_kv_cache_layout(
                 .replicated(tp),
         );
     if kda_layers > 0 {
-        // One rank's slice of every KDA layer's state, times the ranks.
+        // One rank's slice of every KDA layer's state, times the ranks and
+        // the state pages each request keeps per layer.
         let ranks = u64::from(tp);
+        let pages = u64::from(kda_state_pages);
         layout = layout.with_part(
             KvCachePart::per_request(
                 "kda",
-                ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
+                pages * ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
             )
-            .padded_to(ranks * u64::from(kda_groups) * block_bytes)
+            .padded_to(pages * ranks * u64::from(kda_groups) * block_bytes)
             .sharded(tp),
         );
     }
@@ -1418,10 +1424,62 @@ pub(crate) fn hybrid_kv_cache_layout(
         })
 }
 
-/// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
-/// state plus the causal-conv window.
+/// One rank's recurrent state of one KDA layer for one request: the SSM state
+/// at the pool dtype, the causal-conv window, and a verify graph's RecoverSSM
+/// records.
 pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolved) -> u64 {
-    u64::from(resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request)
+    u64::from(resolved.kda.ssm_state_bytes_per_request)
+        + u64::from(resolved.kda.conv_state_bytes_per_request)
+        + u64::from(resolved.kda.verify_cache_bytes_per_request)
+}
+
+/// Whether a verify graph stores a KDA state per position, with no commit.
+pub(crate) fn commitless_verify(resolved: &Glm53FlashVllmResolved) -> bool {
+    let kda = &resolved.kda.raw_cfg;
+    kda.decode_query_len > 1
+        && kda.spec_verify == crate::worklet::KdaSpecVerify::RecurrentPerPosition
+}
+
+/// What a speculative verify's RecoverSSM commit needs from a Flash graph.
+#[derive(Clone, Debug)]
+pub struct KdaCommitPlan {
+    /// The rank-local commit that folds the verify's records, with the
+    /// backends the verify mode selects; `num_layers` is set per group.
+    pub commit: KdaRecoverSSMCommitKernelConfig,
+    /// KDA layers in each of vLLM's KDA KV-cache groups; one commit call
+    /// covers one group.
+    pub cache_group_layers: Vec<u32>,
+}
+
+/// The commit plan of a graph compiled at verify width above 1.
+pub(crate) fn kda_commit_plan(resolved: &Glm53FlashVllmResolved) -> Option<KdaCommitPlan> {
+    let commit = resolved.kda.recoverssm_commit.clone()?;
+    let model = &resolved.raw_cfg.model;
+    Some(KdaCommitPlan {
+        commit,
+        cache_group_layers: kda_cache_group_layers(
+            model.kda_layers.len() as u32,
+            model.num_dsa_layers(),
+        ),
+    })
+}
+
+/// vLLM's split of the KDA layers into KV-cache groups (`kv_cache_utils.py`,
+/// uniform page size): the group size is the smaller layer count of the two
+/// cache types, or the larger when it is under 1.5x the smaller, and group `i`
+/// takes every `num_groups`-th layer from `i`. A DFlash2 draft's window layers
+/// are paged as their own group and take no part. 34 KDA beside 11 DSA layers
+/// make groups of 9, 9, 8 and 8.
+pub(crate) fn kda_cache_group_layers(kda_layers: u32, dsa_layers: u32) -> Vec<u32> {
+    let (fewer, more) = (kda_layers.min(dsa_layers), kda_layers.max(dsa_layers));
+    if fewer == 0 {
+        return vec![kda_layers];
+    }
+    let size = if 2 * more < 3 * fewer { more } else { fewer };
+    let groups = kda_layers.div_ceil(size);
+    (0..groups)
+        .map(|i| (kda_layers - i).div_ceil(groups))
+        .collect()
 }
 
 /// vLLM's hybrid attention block size (`platforms/interface.py`
@@ -1598,6 +1656,61 @@ pub(crate) struct NormalizedBatch {
     pub(crate) request_count: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
+}
+
+/// The verify width both attention sublayers were configured for: 1, or
+/// `k + 1` when the graph verifies a speculative chain.
+pub(crate) fn verify_width(cfg: &Glm53FlashVllmConfigs) -> std::result::Result<u32, BuildError> {
+    let width = cfg.dsa.decode_next_n;
+    if width == 0 || cfg.kda.decode_query_len != width {
+        return Err(fit_failed(format!(
+            "KDA decode_query_len {} and DSA decode_next_n {width} must be one positive \
+             verify width",
+            cfg.kda.decode_query_len
+        )));
+    }
+    if width == 1 && cfg.kda.ssm_state_dtype != DType::Fp32 {
+        return Err(fit_failed(format!(
+            "a {:?} KDA state pool is modeled only for a speculative verify; plain decode's \
+             recurrent rows are fp32-pool",
+            cfg.kda.ssm_state_dtype
+        )));
+    }
+    Ok(width)
+}
+
+/// The KDA and DSA sublayer inputs for one attention group, with each request
+/// classified the way vLLM's attention metadata does.
+///
+/// `split_decodes_and_prefills` (`vllm/v1/attention/backends/utils.py`) calls a
+/// request a decode when it schedules one query token on top of prior state,
+/// so a one-token append after a cached prefix (the step an engine runs after
+/// a full prefix hit or a P/D KV transfer) runs the decode kernels: KDA's
+/// recurrent step instead of `chunk_kda`, and the DSA decode indexer and
+/// sparse MLA.
+pub(crate) fn attention_inputs(
+    prefill_chunk_pairs: &[(u32, u32)],
+    decode_kv_lens: &[u32],
+) -> (Glm53KdaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletInput) {
+    let mut prefills = Vec::with_capacity(prefill_chunk_pairs.len());
+    let mut decodes = decode_kv_lens.to_vec();
+    for &(prefix, append) in prefill_chunk_pairs {
+        if append == 1 && prefix > 0 {
+            decodes.push(prefix + 1);
+        } else {
+            prefills.push((prefix, append));
+        }
+    }
+    (
+        Glm53KdaAttnLocalWorkletInput {
+            prefill_sequence_lengths: prefills.iter().map(|&(_, append)| append).collect(),
+            decode_batch_size: decodes.len() as u32,
+        },
+        Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: prefills,
+            decode_kv_lens: decodes,
+        },
+    )
 }
 
 pub(crate) fn normalize_input(
