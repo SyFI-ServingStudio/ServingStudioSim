@@ -22,8 +22,8 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
-    deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark, deepseek_v41_vllm_dspark,
-    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark,
+    deepseek_v41_vllm_dspark, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
@@ -31,25 +31,25 @@ use crate::arch::{
     mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
-    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
-    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
-    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
-    FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
-    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
-    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
-    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
-    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
-    Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
-    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
-    Qwen4ExpVllmSpeculativeModel,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel,
+    DeepseekV41VllmDsparkModel, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
+    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
+    Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg, FfnLayerwiseModel, Glm52ModelCfg,
+    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
+    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
+    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
+    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
+    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
+    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1972,13 +1972,13 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         num_routed_layers: routed_layers,
     };
     let demand = source.demand(0..routed_layers as usize, 1)?;
-    let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel {
-        dp_size: ep_size,
+    let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel::new(
+        ep_size,
         max_model_len,
-        gpu_name: gpu.to_string(),
-        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        gpu.to_string(),
+        cudagraph_capture_sizes.to_vec(),
         kernel_path,
-    };
+    );
     let configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
             .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
