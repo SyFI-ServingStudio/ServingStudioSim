@@ -749,6 +749,7 @@ pub fn build_configs(
                 * 1024
                 * 1024,
             decode_next_n: 1,
+            decode_indexer: Default::default(),
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,

@@ -205,8 +205,8 @@ pub use glm52_shared_expert_local::{
 };
 pub use glm53_common::{Glm53ActivationQuant, Glm53ActivationQuantConfig, Glm53WeightPrecision};
 pub use glm53_dsa_attn_local::{
-    Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
-    Glm53DsaAttnLocalWorkletResolved,
+    DsaDecodeIndexer, Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig,
+    Glm53DsaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletResolved,
 };
 pub use glm53_kda_attn_local::{
     Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,

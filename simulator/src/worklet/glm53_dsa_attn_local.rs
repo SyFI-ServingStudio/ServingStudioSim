@@ -31,10 +31,15 @@
 //! `[rows, selected_k]` index plumbing (`prefill_glue`).
 //!
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
-//! context (the measured decode grids are uniform in context).
+//! context (the measured decode grids are uniform in context). Under
+//! [`DsaDecodeIndexer::PerRequest`] the indexer follows each request's own
+//! context instead: the MQA logits price at the batch's mean context and the
+//! top-k list-schedules the rows over the SMs.
 
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use crate::common::gpu::sm_count;
 use crate::op::attention::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
 };
@@ -90,6 +95,21 @@ const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
 
+/// How a decode batch of unequal contexts prices its indexer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaDecodeIndexer {
+    /// MQA logits and top-k at the batch's longest context, the top-k on
+    /// uniform-random score rows.
+    #[default]
+    LongestContext,
+    /// Each kernel by how it spreads unequal requests. DeepGEMM's paged MQA
+    /// logits balances the SMs over each request's own context, so it prices
+    /// at the batch's mean pool count. The top-k runs one CTA per row on rows
+    /// drawn from the measured logit distribution: one wave at the longest
+    /// row, and past the GPU's SM count list-scheduled row by row.
+    PerRequest,
+}
+
 #[derive(Clone, Debug)]
 pub struct Glm53DsaAttnLocalWorkletConfig {
     pub hidden: Dim,
@@ -138,6 +158,7 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// index keys) and its top-k selects per row; every other leaf, sparse MLA
     /// included, bills the flattened rows.
     pub decode_next_n: u32,
+    pub decode_indexer: DsaDecodeIndexer,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +228,11 @@ pub struct Glm53DsaAttnLocalWorklet {
     /// backends that take row starts (`dsa_topk_prefill::takes_row_starts`),
     /// when some of them do not. Its time lands in the `topk_prefill` slot.
     topk_prefill_packed: Option<Arc<DsaTopkPrefillKernel>>,
+    /// Rows `topk_decode` runs at once under [`DsaDecodeIndexer::PerRequest`]
+    /// (the GPU's SM count, one CTA per row). `None` prices every batch as one
+    /// wave: the longest-context pricing, or a GPU whose SM count the catalog
+    /// does not record.
+    topk_decode_slots: Option<u32>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
@@ -321,7 +347,14 @@ impl Glm53DsaAttnLocalWorklet {
                 logits_row_stride: max_model_len,
                 logits_dtype: DType::Fp32,
                 index_dtype: "int32".into(),
-                context_mode: "uniform".into(),
+                context_mode: match cfg.decode_indexer {
+                    DsaDecodeIndexer::LongestContext => "uniform",
+                    // Scores drawn from the measured logit distribution: real
+                    // GLM-5.3-Flash rows replay within ~5% of it, against
+                    // 1.1-1.2x for uniform random scores.
+                    DsaDecodeIndexer::PerRequest => "uniform_measured",
+                }
+                .into(),
             },
             // One launch per iteration over every prefill row; each row spans
             // its own pool-granular context (`compress_ratio == index_kpool`).
@@ -407,6 +440,10 @@ impl Glm53DsaAttnLocalWorklet {
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
+        let topk_decode_slots = match r.raw_cfg.decode_indexer {
+            DsaDecodeIndexer::LongestContext => None,
+            DsaDecodeIndexer::PerRequest => sm_count(&r.raw_cfg.gpu_name),
+        };
         let n = name.as_str();
         let ew = |suffix: &str, config| atomic(n, suffix, config, ElementwiseKernel::build, bridge);
         let gemm =
@@ -460,6 +497,7 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?,
             topk_prefill_packed: None,
+            topk_decode_slots,
             topk_prefill: atomic(
                 n,
                 "indexer.topk_prefill",
@@ -613,20 +651,15 @@ impl Glm53DsaAttnLocalWorklet {
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
                 batch_size: w.decode_requests,
-                context_len: w.decode_pools,
+                context_len: match cfg.decode_indexer {
+                    DsaDecodeIndexer::LongestContext => w.decode_pools,
+                    DsaDecodeIndexer::PerRequest => w.decode_mean_pools,
+                },
             },
             no_decode,
             ev,
         );
-        push_or_zero(
-            &self.topk_decode,
-            DsaPersistentTopkDecodeKernelInput {
-                batch_size: w.decode_requests,
-                context_len: w.decode_pools,
-            },
-            no_decode,
-            ev,
-        );
+        self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
         self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
         let expand_rows = w.decode_rows + w.prefill_indexer_rows;
         push_or_zero(
@@ -682,6 +715,53 @@ impl Glm53DsaAttnLocalWorklet {
         }
     }
 
+    /// The decode top-k runs one CTA per row. A batch that fits one wave of
+    /// `topk_decode_slots` rows takes as long as its longest row: the uniform
+    /// grid at the batch's max context. A larger batch is list-scheduled: rows
+    /// go in order to the earliest-free slot, each costing its own context's
+    /// per-row share of a one-wave launch, plus that launch's fixed part once.
+    /// Against real B200 batches of 120-644 rows this lands within +1..+6%
+    /// median and +9% p90, where the max context overprices by up to 2.4x and
+    /// the mean context underprices by 10-43%.
+    fn eval_decode_topk(&self, kv_lens: &[u32], w: &Work, ev: &mut Evaluator) {
+        let input = |batch_size, context_len| DsaPersistentTopkDecodeKernelInput {
+            batch_size,
+            context_len,
+        };
+        let longest = input(w.decode_requests, w.decode_pools);
+        let kernel = &self.topk_decode.kernel;
+        let slots = match self.topk_decode_slots {
+            Some(slots) if w.decode_rows > slots => slots,
+            _ => return push_or_zero(&self.topk_decode, longest, w.decode_rows == 0, ev),
+        };
+        let cfg = &self.resolved.raw_cfg;
+        let next_n = cfg.decode_next_n;
+        // The one-wave launch the per-row costs come from: as many requests as
+        // fill `TOPK_WAVE_ROWS` rows.
+        let wave = (TOPK_WAVE_ROWS / next_n).max(1);
+        let fixed = kernel.eval(&input(wave, cfg.index_topk / cfg.index_kpool));
+        let fixed_ms = f64::from(fixed.m.time_ms);
+        let per_row_ms = |pools| {
+            let one_wave = kernel.eval(&input(wave, pools));
+            (f64::from(one_wave.m.time_ms) - fixed_ms).max(0.0)
+        };
+        let time_ms = fixed_ms
+            + list_schedule_ms(
+                kv_lens.iter().map(|&kv| kv.div_ceil(cfg.index_kpool)),
+                next_n,
+                slots,
+                per_row_ms,
+            );
+        // Bytes and FLOPs follow the batch's total pools.
+        let mut metrics = kernel.eval(&input(w.decode_requests, w.decode_mean_pools));
+        let scale = time_ms as f32 / metrics.m.time_ms;
+        metrics.m.time_ms = time_ms as f32;
+        if scale.is_finite() {
+            metrics.m.energy_j *= scale;
+        }
+        ev.push(metrics, || longest.into());
+    }
+
     /// One MQA-logits and one top-k launch per indexer chunk, each slot summing
     /// its launches. A chunk packing several requests runs its top-k on
     /// `topk_prefill_packed` when the configured backends cannot take it.
@@ -735,6 +815,11 @@ struct Work {
     decode_requests: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
+    /// `ceil(sum of ceil(decode context / index_kpool) / decode_requests)`:
+    /// the uniform context with the batch's total pools. Ragged B200 batches
+    /// of DeepGEMM's paged MQA logits match a uniform batch at this mean
+    /// within a few percent, against 3-5x at the max context.
+    decode_mean_pools: u32,
     /// Every prefill row once any prefill context exceeds `index_topk`, else
     /// 0: vLLM skips the prefill indexer only when every context fits, and
     /// otherwise scores and selects for all prefill rows.
@@ -746,6 +831,48 @@ struct Work {
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
+
+/// Rows of the one-wave uniform launch `eval_decode_topk` prices each row
+/// from: below the SM count, so the measured batch axis does not straddle a
+/// wave edge (next_n 4 at 32 requests, next_n 8 at 16, both grid knots).
+const TOPK_WAVE_ROWS: u32 = 128;
+
+/// Greedy in-order dispatch of each request's `next_n` rows onto `slots`
+/// parallel slots, a row costing `row_ms(pools)`; the makespan.
+fn list_schedule_ms(
+    pools: impl Iterator<Item = u32>,
+    next_n: u32,
+    slots: u32,
+    mut row_ms: impl FnMut(u32) -> f64,
+) -> f64 {
+    /// A slot's free time, ordered so the max-heap yields the earliest.
+    struct Free(f64);
+    impl Ord for Free {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            other.0.total_cmp(&self.0)
+        }
+    }
+    impl PartialOrd for Free {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl PartialEq for Free {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+    impl Eq for Free {}
+    let mut heap: BinaryHeap<Free> = (0..slots).map(|_| Free(0.0)).collect();
+    for pools in pools {
+        let cost = row_ms(pools);
+        for _ in 0..next_n {
+            let mut slot = heap.peek_mut().expect("at least one slot");
+            slot.0 += cost;
+        }
+    }
+    heap.into_iter().map(|free| free.0).fold(0.0, f64::max)
+}
 
 /// What bounds the prefill indexer's launches.
 struct IndexerBudget {
@@ -883,6 +1010,17 @@ fn derive_work(
         .checked_mul(decode_next_n)
         .ok_or("decode row count overflows u32")?;
     let max_decode = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
+    let total_decode_pools: u64 = input
+        .decode_kv_lens
+        .iter()
+        .map(|&context| u64::from(context.div_ceil(index_kpool)))
+        .sum();
+    let decode_mean_pools = if decode_requests == 0 {
+        0
+    } else {
+        u32::try_from(total_decode_pools.div_ceil(u64::from(decode_requests)))
+            .map_err(|_| "decode mean pools overflow u32")?
+    };
     let total_tokens = prefill_tokens
         .checked_add(decode_rows)
         .ok_or("token sum overflows u32")?;
@@ -895,6 +1033,7 @@ fn derive_work(
         decode_rows,
         decode_requests,
         decode_pools: max_decode.div_ceil(index_kpool),
+        decode_mean_pools,
         prefill_indexer_rows,
         prefill_indexer_chunks,
     })
@@ -961,6 +1100,7 @@ mod tests {
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
             decode_next_n: 1,
+            decode_indexer: DsaDecodeIndexer::LongestContext,
         }
     }
 
@@ -1024,6 +1164,8 @@ mod tests {
             (2, 16, 16)
         );
         assert_eq!(w.decode_pools, 1001);
+        // 250 + 1001 pools over two requests.
+        assert_eq!(w.decode_mean_pools, 626);
         assert_eq!(
             decode_row_context_lens(&[10, 50], 4),
             [7, 8, 9, 10, 47, 48, 49, 50]
@@ -1037,6 +1179,53 @@ mod tests {
         config.decode_next_n = 8;
         let r = Glm53DsaAttnLocalWorklet::resolve_config(&config);
         assert_eq!((r.mqa_logits_decode.next_n, r.topk_decode.next_n), (8, 8));
+    }
+
+    /// Catches a decode top-k that prices a batch past one wave at its longest
+    /// row (each slot then holds one row) or at the total work over the slots
+    /// (ignoring that one long row bounds the makespan).
+    #[test]
+    fn decode_topk_list_schedules_rows_onto_slots() {
+        let row_ms = |pools: u32| f64::from(pools);
+        // Two slots, two rows per request: each slot takes 10, 1, 1.
+        assert_eq!(list_schedule_ms([10, 1, 1].into_iter(), 2, 2, row_ms), 12.0);
+        // One long request on its own slot bounds the makespan.
+        assert_eq!(
+            list_schedule_ms([1, 1, 1, 20].into_iter(), 1, 2, row_ms),
+            21.0
+        );
+        assert_eq!(list_schedule_ms(std::iter::empty(), 4, 148, row_ms), 0.0);
+    }
+
+    /// The per-request pricing is opt-in: the default keeps the uniform
+    /// score rows and one wave on every GPU.
+    #[test]
+    fn per_request_indexer_pricing_takes_measured_rows_and_sm_waves() {
+        let build = |decode_indexer, gpu: &str| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let mut config = cfg();
+            config.decode_indexer = decode_indexer;
+            config.gpu_name = gpu.into();
+            Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                &bridge,
+            )
+            .unwrap()
+        };
+        let longest = build(DsaDecodeIndexer::LongestContext, "NVIDIA B200");
+        assert_eq!(longest.resolved.topk_decode.context_mode, "uniform");
+        assert_eq!(longest.topk_decode_slots, None);
+        let per_request = build(DsaDecodeIndexer::PerRequest, "NVIDIA B200");
+        assert_eq!(
+            per_request.resolved.topk_decode.context_mode,
+            "uniform_measured"
+        );
+        assert_eq!(per_request.topk_decode_slots, Some(148));
+        // No SM count in the catalog: one wave.
+        let a100 = build(DsaDecodeIndexer::PerRequest, "A100-SXM4-80GB");
+        assert_eq!(a100.topk_decode_slots, None);
     }
 
     #[test]
