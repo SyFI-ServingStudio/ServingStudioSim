@@ -79,6 +79,34 @@ DOC = KernelDoc(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="cuda_one_launch",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.mhc.mhc_one_launch_cuda",
+            function_name="profile_mhc_fused_sum_post_pre_rms_norm_cuda_one_launch",
+        ),
+        table_name=KIND,
+        args_schema=MhcFusedSumArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # Built for sm_100a: 16-CTA clusters, DSMEM, mma.sync BF16
+        # (csrc/mhc_one_launch_{small,large}.cu).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "The cuda_one_launch kernel of mhc_fused_post_pre_rms_norm reading "
+                "num_partials partial outputs (and the addend) in its post phase."
+            ),
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="vllm_tilelang",
         runner_ref=RunnerRef(
             module_name="profiling.runners.mhc.mhc_fused_post_pre_rms_norm_vllm_tilelang",
