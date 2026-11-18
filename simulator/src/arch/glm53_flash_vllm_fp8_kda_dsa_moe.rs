@@ -142,6 +142,15 @@ const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's `fwht128_quant_fp8` (`glm5next/nvidia/ops/kpool_compress.py`),
+/// one `_fwht_quant_kernel` launch per DSA layer in the TP4 capture.
+const HADAMARD_QUANT_BACKENDS: &[&str] = &["vllm_triton"];
+/// The absorbed query's `_DecodeConcatQuantFP8` (`QuantFP8.forward_cuda`,
+/// per-tensor static): one `scaled_fp8_quant_kernel_strided_group_shape`.
+const STATIC_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+/// The fork's `kpool_decode_update_and_maybe_write_cache_batched`, one
+/// `_kpool_decode_update_batched_kernel` launch per decode step.
+const POOLED_INDEX_UPDATE_BACKENDS: &[&str] = &["vllm_fork_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 /// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
 /// single-group router on both the FP8 block and the NVFP4 MoE path
@@ -748,9 +757,9 @@ pub fn build_configs(
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
-            hadamard_quant_backends: Vec::new(),
-            static_quant_backends: Vec::new(),
-            pooled_index_update_backends: Vec::new(),
+            hadamard_quant_backends: HADAMARD_QUANT_BACKENDS.to_vec(),
+            static_quant_backends: STATIC_QUANT_BACKENDS.to_vec(),
+            pooled_index_update_backends: POOLED_INDEX_UPDATE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)

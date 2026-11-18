@@ -689,6 +689,10 @@
       ]
     },
     {
+      "location": "unified.dflash2.layer.attn.query_kv_append",
+      "semantics": []
+    },
+    {
       "location": "unified.dflash2.layer.attn.rope",
       "semantics": []
     },
