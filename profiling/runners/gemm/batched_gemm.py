@@ -9,7 +9,8 @@ Q-absorption and V-up layout construction mirror vLLM v0.23.0 commit
 construction for an MLA layout with qk_nope 256 and no RoPE part, v_head 256,
 kv_lora 512, and an unpadded attention output (the alignment fork's
 ``mla_attention.py:1170-1252,993-1008,1300-1332``; ``FlashInferMLASparseImpl``
-sets no ``q_pad_num_heads``).
+sets no ``q_pad_num_heads``). Its Q-absorption output is the transposed view of
+a token-major ``(B, N, L)`` buffer, as the fork's ``out=`` launch writes it.
 """
 
 from __future__ import annotations
@@ -361,7 +362,12 @@ def _build_layout_q_absorb_operands(
     packed_view = packed_weight.T.view(layout.kv_lora_rank, num_batches, packed_width)
     w_uk, _w_uv = packed_view.split([layout.qk_nope_head_dim, layout.v_head_dim], dim=-1)
     rhs = w_uk.permute(1, 2, 0)
-    out = torch.empty((num_batches, m, layout.kv_lora_rank), dtype=torch_dtype, device=device)
+    # The fork writes into a token-major (B, N, L) buffer through its
+    # transposed view (``torch.bmm(..., out=mqa_ql_nope.transpose(0, 1))``),
+    # so the GEMM stores strided rows; the result feeds the FP8 quant as-is.
+    out = torch.empty(
+        (m, num_batches, layout.kv_lora_rank), dtype=torch_dtype, device=device
+    ).transpose(0, 1)
     return _QAbsorbOperands(q_base=q_base, lhs=lhs, packed_weight=packed_weight, rhs=rhs, out=out)
 
 
