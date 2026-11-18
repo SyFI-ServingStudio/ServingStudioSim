@@ -2073,6 +2073,7 @@ fn dflash2_draft_resolved(
         // and it is bf16-only -- see the worklet's note on why the leaf is
         // measured in bf16 while the engine runs fp8.
         attention_backends: vec!["fa2"],
+        attention_large_batch: None,
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", 6144),
