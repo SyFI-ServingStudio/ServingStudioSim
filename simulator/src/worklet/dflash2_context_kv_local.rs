@@ -28,8 +28,10 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, KvCacheAppendKernel,
-    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, RmsNormKernel, RmsNormKernelConfig,
-    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, LayeredKvNormRopeCacheWriteKernel,
+    LayeredKvNormRopeCacheWriteKernelConfig, LayeredKvNormRopeCacheWriteKernelInput, RmsNormKernel,
+    RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
+    SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -59,6 +61,12 @@ pub struct Dflash2ContextKvLocalWorkletConfig {
     pub dtype: DType,
     pub gemm_dtype: DType,
     pub kv_dtype: DType,
+    /// `Some((backends, page_size))`: one launch takes the fused K/V projection
+    /// of every layer, K-normalizes and rotates it and writes each layer's
+    /// paged cache of `page_size` tokens (`layered_kv_norm_rope_cache_write`),
+    /// replacing the layer-major transpose, the grouped K-norm, the RoPE call
+    /// and the per-layer insert.
+    pub layered_store: Option<(Vec<&'static str>, u32)>,
 }
 
 /// Pure resolved data with every atomic child config fully baked.
@@ -72,6 +80,7 @@ pub struct Dflash2ContextKvLocalWorkletResolved {
     pub grouped_k_norm: RmsNormKernelConfig,
     pub fused_rope: ElementwiseKernelConfig,
     pub context_kv_append: KvCacheAppendKernelConfig,
+    pub layered_store: Option<LayeredKvNormRopeCacheWriteKernelConfig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,15 +90,23 @@ pub struct Dflash2ContextKvLocalWorkletInput {
     pub context_tokens: u32,
 }
 
+/// What follows the fused K/V projection: the vLLM chain, or one launch.
+pub enum ContextKvStore {
+    Chain {
+        layer_major_transpose: Op<ElementwiseKernel>,
+        grouped_k_norm: Op<RmsNormKernel>,
+        fused_rope: Op<ElementwiseKernel>,
+        context_kv_append: Op<KvCacheAppendKernel>,
+    },
+    Layered(Op<LayeredKvNormRopeCacheWriteKernel>),
+}
+
 pub struct Dflash2ContextKvLocalWorklet {
     pub name: String,
     pub aux_hidden_fc: Op<SingleGemmKernel>,
     pub hidden_norm: Op<RmsNormKernel>,
     pub fused_kv_proj: Op<SingleGemmKernel>,
-    pub layer_major_transpose: Op<ElementwiseKernel>,
-    pub grouped_k_norm: Op<RmsNormKernel>,
-    pub fused_rope: Op<ElementwiseKernel>,
-    pub context_kv_append: Op<KvCacheAppendKernel>,
+    pub store: ContextKvStore,
     resolved: Dflash2ContextKvLocalWorkletResolved,
 }
 
@@ -189,7 +206,7 @@ impl Dflash2ContextKvLocalWorklet {
             context_kv_append: KvCacheAppendKernelConfig {
                 backends: cfg.kv_cache_append_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_kv_heads: kv_heads_per_rank,
+                num_kv_heads: kv_heads_per_rank.clone(),
                 head_dim: cfg.head_dim.clone(),
                 head_dim_v: None,
                 block_size: cfg.kv_cache_block_size,
@@ -198,6 +215,18 @@ impl Dflash2ContextKvLocalWorklet {
                 cache_layout: cfg.kv_cache_layout.clone(),
                 scale_granularity: cfg.kv_scale_granularity.clone(),
             },
+            layered_store: cfg.layered_store.as_ref().map(|(backends, page_size)| {
+                LayeredKvNormRopeCacheWriteKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_layers: cfg.num_draft_layers,
+                    num_kv_heads: kv_heads_per_rank,
+                    head_dim: cfg.head_dim.clone(),
+                    page_size: *page_size,
+                    input_dtype: cfg.dtype,
+                    kv_dtype: cfg.kv_dtype,
+                }
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -228,44 +257,52 @@ impl Dflash2ContextKvLocalWorklet {
             SingleGemmKernel::build,
             bridge,
         )?;
-        let layer_major_transpose = build_atomic(
-            &name,
-            "layer_major_transpose",
-            resolved.layer_major_transpose.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?;
-        let grouped_k_norm = build_atomic(
-            &name,
-            "grouped_k_norm",
-            resolved.grouped_k_norm.clone(),
-            RmsNormKernel::build,
-            bridge,
-        )?;
-        let fused_rope = build_atomic(
-            &name,
-            "fused_rope",
-            resolved.fused_rope.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?;
-        let context_kv_append = build_atomic(
-            &name,
-            "context_kv_append",
-            resolved.context_kv_append.clone(),
-            KvCacheAppendKernel::build,
-            bridge,
-        )?;
+        let store = match &resolved.layered_store {
+            Some(cfg) => ContextKvStore::Layered(build_atomic(
+                &name,
+                "layered_store",
+                cfg.clone(),
+                LayeredKvNormRopeCacheWriteKernel::build,
+                bridge,
+            )?),
+            None => ContextKvStore::Chain {
+                layer_major_transpose: build_atomic(
+                    &name,
+                    "layer_major_transpose",
+                    resolved.layer_major_transpose.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                grouped_k_norm: build_atomic(
+                    &name,
+                    "grouped_k_norm",
+                    resolved.grouped_k_norm.clone(),
+                    RmsNormKernel::build,
+                    bridge,
+                )?,
+                fused_rope: build_atomic(
+                    &name,
+                    "fused_rope",
+                    resolved.fused_rope.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                context_kv_append: build_atomic(
+                    &name,
+                    "context_kv_append",
+                    resolved.context_kv_append.clone(),
+                    KvCacheAppendKernel::build,
+                    bridge,
+                )?,
+            },
+        };
 
         Ok(Self {
             name,
             aux_hidden_fc,
             hidden_norm,
             fused_kv_proj,
-            layer_major_transpose,
-            grouped_k_norm,
-            fused_rope,
-            context_kv_append,
+            store,
             resolved,
         })
     }
@@ -274,26 +311,41 @@ impl Dflash2ContextKvLocalWorklet {
         let layers = self.resolved.raw_cfg.num_draft_layers;
         CostNode::Labeled {
             label: worklet_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.aux_hidden_fc.compile(builder),
-                self.hidden_norm.compile(builder),
-                self.fused_kv_proj.compile(builder),
-                self.layer_major_transpose.compile(builder),
-                self.grouped_k_norm.compile(builder),
-                self.fused_rope.compile(builder),
-                // The only per-layer step: `do_kv_cache_update` runs once per
-                // draft layer, each over the same `context_tokens` rows.
-                CostNode::Labeled {
-                    label: format!(
-                        "{}.context_kv_append [per draft layer; {layers} layers]",
-                        self.name
-                    ),
-                    child: Box::new(CostNode::Scale {
-                        n: layers,
-                        child: Box::new(self.context_kv_append.compile(builder)),
-                    }),
-                },
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = vec![
+                    self.aux_hidden_fc.compile(builder),
+                    self.hidden_norm.compile(builder),
+                    self.fused_kv_proj.compile(builder),
+                ];
+                match &self.store {
+                    ContextKvStore::Chain {
+                        layer_major_transpose,
+                        grouped_k_norm,
+                        fused_rope,
+                        context_kv_append,
+                    } => {
+                        nodes.push(layer_major_transpose.compile(builder));
+                        nodes.push(grouped_k_norm.compile(builder));
+                        nodes.push(fused_rope.compile(builder));
+                        // The only per-layer step: `do_kv_cache_update` runs
+                        // once per draft layer, each over the same
+                        // `context_tokens` rows.
+                        nodes.push(CostNode::Labeled {
+                            label: format!(
+                                "{}.context_kv_append [per draft layer; {layers} layers]",
+                                self.name
+                            ),
+                            child: Box::new(CostNode::Scale {
+                                n: layers,
+                                child: Box::new(context_kv_append.compile(builder)),
+                            }),
+                        });
+                    }
+                    // One launch writes every layer's cache.
+                    ContextKvStore::Layered(op) => nodes.push(op.compile(builder)),
+                }
+                nodes
+            })),
         }
     }
 
@@ -321,41 +373,57 @@ impl Dflash2ContextKvLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(
-            &self.layer_major_transpose,
-            ElementwiseKernelInput { num_tokens: tokens },
-            zero,
-            ev,
-        );
-        // Grouped K-norm walks `[L, num_ctx, nkv, head_dim]`; its row count is
-        // the product of everything left of the reduction width.
-        eval_atomic_or_zero(
-            &self.grouped_k_norm,
-            RmsNormKernelInput {
-                m: tokens
-                    .saturating_mul(layers)
-                    .saturating_mul(kv_heads_per_rank),
-            },
-            zero,
-            ev,
-        );
-        // RoPE sees `[L * num_ctx, kv_size]` as one flat batch.
-        eval_atomic_or_zero(
-            &self.fused_rope,
-            ElementwiseKernelInput {
-                num_tokens: tokens.saturating_mul(layers),
-            },
-            zero,
-            ev,
-        );
-        // Billed `num_draft_layers` times by the folded node above, so it is
-        // evaluated once at the width one layer actually writes.
-        eval_atomic_or_zero(
-            &self.context_kv_append,
-            KvCacheAppendKernelInput { num_tokens: tokens },
-            zero,
-            ev,
-        );
+        match &self.store {
+            ContextKvStore::Chain {
+                layer_major_transpose,
+                grouped_k_norm,
+                fused_rope,
+                context_kv_append,
+            } => {
+                eval_atomic_or_zero(
+                    layer_major_transpose,
+                    ElementwiseKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+                // Grouped K-norm walks `[L, num_ctx, nkv, head_dim]`; its row
+                // count is the product of everything left of the reduction
+                // width.
+                eval_atomic_or_zero(
+                    grouped_k_norm,
+                    RmsNormKernelInput {
+                        m: tokens
+                            .saturating_mul(layers)
+                            .saturating_mul(kv_heads_per_rank),
+                    },
+                    zero,
+                    ev,
+                );
+                // RoPE sees `[L * num_ctx, kv_size]` as one flat batch.
+                eval_atomic_or_zero(
+                    fused_rope,
+                    ElementwiseKernelInput {
+                        num_tokens: tokens.saturating_mul(layers),
+                    },
+                    zero,
+                    ev,
+                );
+                // Billed `num_draft_layers` times by the folded node above, so
+                // it is evaluated once at the width one layer actually writes.
+                eval_atomic_or_zero(
+                    context_kv_append,
+                    KvCacheAppendKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+            }
+            ContextKvStore::Layered(op) => eval_atomic_or_zero(
+                op,
+                LayeredKvNormRopeCacheWriteKernelInput { num_tokens: tokens },
+                zero,
+                ev,
+            ),
+        }
     }
 }
 
@@ -467,7 +535,62 @@ mod tests {
             dtype: DType::Bf16,
             gemm_dtype: DType::Bf16,
             kv_dtype: DType::Fp8E4m3,
+            layered_store: None,
         }
+    }
+
+    fn leaves(cfg: &Dflash2ContextKvLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2ContextKvLocalWorklet::build(
+            "ctx".into(),
+            Dflash2ContextKvLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| slot.name["ctx.".len()..].to_string())
+            .collect()
+    }
+
+    /// Catches the layered store standing beside the chain it replaces, or
+    /// writing one layer's cache instead of all of them.
+    #[test]
+    fn the_layered_store_replaces_the_chain_after_the_projection() {
+        assert_eq!(
+            leaves(&cfg()),
+            [
+                "aux_hidden_fc",
+                "hidden_norm",
+                "fused_kv_proj",
+                "layer_major_transpose",
+                "grouped_k_norm",
+                "fused_rope",
+                "context_kv_append",
+            ]
+        );
+        let mut layered = cfg();
+        layered.layered_store = Some((vec!["vllm_triton"], 16));
+        assert_eq!(
+            leaves(&layered),
+            [
+                "aux_hidden_fc",
+                "hidden_norm",
+                "fused_kv_proj",
+                "layered_store"
+            ]
+        );
+        let store = Dflash2ContextKvLocalWorklet::resolve_config(&layered)
+            .layered_store
+            .unwrap();
+        assert_eq!(store.num_layers, NUM_DRAFT_LAYERS);
+        assert_eq!(store.num_kv_heads.get(), NUM_KV_HEADS / 4);
+        assert_eq!(store.page_size, 16);
     }
 
     #[test]

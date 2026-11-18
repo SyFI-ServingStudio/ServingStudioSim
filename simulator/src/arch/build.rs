@@ -2108,6 +2108,7 @@ fn dflash2_draft_resolved(
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
         kv_dtype: DType::Fp8E4m3,
+        layered_store: None,
     };
     let selector_cfg = Dflash2SelectorLocalWorkletConfig {
         gemm_backends: vec!["torch_linear"],
