@@ -59,11 +59,13 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, FlashinferAttnRectKernel,
-    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, KvCacheAppendKernel,
-    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, QkNormRopeFp8KvWriteKernel,
-    QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput, ResidualRmsNormKernel,
-    ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
-    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, KvCacheAppendKernel, KvCacheAppendKernelConfig,
+    KvCacheAppendKernelInput, QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig,
+    QkNormRopeFp8KvWriteKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
+    ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dflash2DraftAttnLog, Dim, Evaluator, LeafMetrics,
@@ -111,6 +113,14 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     /// replacing q_norm, k_norm, RoPE and the query-block insert. Needs fp8
     /// attention.
     pub qk_norm_rope_kv_write: Option<(Vec<&'static str>, u32)>,
+    /// `Some((backends, query_block_len))`: each grouped convolution's finish
+    /// half runs fused with the residual add + RMSNorm after it
+    /// (`grouped_conv_residual_rms_norm`): `attn_conv_finish` with
+    /// `post_attn_add_rms_norm`, and `mlp_conv_finish` with the next layer's
+    /// `input_add_rms_norm`, which the attention section then drops.
+    /// `query_block_len` is the bonus position plus the drafts; the fused
+    /// kernel keys on it because its taps do not cross a block.
+    pub conv_residual_norm: Option<(Vec<&'static str>, u32)>,
 }
 
 /// One grouped convolution's byte rates. `prepare` also runs a projection; both
@@ -191,7 +201,9 @@ pub enum QkPrep {
 
 pub struct Dflash2DraftAttnLocalWorklet {
     pub name: String,
-    pub input_add_rms_norm: Op<ResidualRmsNormKernel>,
+    /// `None` under `conv_residual_norm`: the previous layer's fused
+    /// `mlp_conv_finish` launch already ran it.
+    pub input_add_rms_norm: Option<Op<ResidualRmsNormKernel>>,
     pub attn_conv_projection: Op<SingleGemmKernel>,
     pub attn_conv_prepare: Op<ElementwiseKernel>,
     pub qkv_proj: Op<SingleGemmKernel>,
@@ -353,15 +365,19 @@ impl Dflash2DraftAttnLocalWorklet {
                     .transpose()?,
             },
         };
-        Ok(Self {
-            qk_prep,
-            input_add_rms_norm: build_atomic(
+        let input_add_rms_norm = match resolved.raw_cfg.conv_residual_norm {
+            Some(_) => None,
+            None => Some(build_atomic(
                 &name,
                 "input_add_rms_norm",
                 resolved.input_add_rms_norm.clone(),
                 ResidualRmsNormKernel::build,
                 bridge,
-            )?,
+            )?),
+        };
+        Ok(Self {
+            qk_prep,
+            input_add_rms_norm,
             attn_conv_projection: build_atomic(
                 &name,
                 "attn_conv_projection",
@@ -406,12 +422,13 @@ impl Dflash2DraftAttnLocalWorklet {
         CostNode::Labeled {
             label: attn_label(&self.name, &self.resolved.raw_cfg),
             child: Box::new(CostNode::Sum({
-                let mut nodes = vec![
-                    self.input_add_rms_norm.compile(builder),
-                    self.attn_conv_projection.compile(builder),
-                    self.attn_conv_prepare.compile(builder),
-                    self.qkv_proj.compile(builder),
-                ];
+                let mut nodes = Vec::with_capacity(10);
+                if let Some(op) = &self.input_add_rms_norm {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.attn_conv_projection.compile(builder));
+                nodes.push(self.attn_conv_prepare.compile(builder));
+                nodes.push(self.qkv_proj.compile(builder));
                 match &self.qk_prep {
                     QkPrep::Separate {
                         q_norm,
@@ -441,12 +458,9 @@ impl Dflash2DraftAttnLocalWorklet {
         let qo_heads = self.resolved.attention.num_qo_heads.get();
         let kv_heads = self.resolved.attention.num_kv_heads.get();
 
-        eval_atomic_or_zero(
-            &self.input_add_rms_norm,
-            ResidualRmsNormKernelInput { m: tokens },
-            zero,
-            ev,
-        );
+        if let Some(op) = &self.input_add_rms_norm {
+            eval_atomic_or_zero(op, ResidualRmsNormKernelInput { m: tokens }, zero, ev);
+        }
         eval_atomic_or_zero(
             &self.attn_conv_projection,
             SingleGemmKernelInput { m: tokens },
@@ -540,6 +554,9 @@ impl Dflash2DraftAttnLocalWorklet {
 #[derive(Clone, Debug)]
 pub struct Dflash2DraftFfnLocalWorkletResolved {
     pub raw_cfg: Dflash2DraftLayerLocalWorkletConfig,
+    /// Set under `conv_residual_norm`: both conv finishes, each fused with the
+    /// residual add + RMSNorm after it.
+    pub conv_residual_norm: Option<GroupedConvResidualRmsNormKernelConfig>,
     pub attn_conv_finish: ElementwiseKernelConfig,
     pub post_attn_add_rms_norm: ResidualRmsNormKernelConfig,
     pub mlp_conv_projection: SingleGemmKernelConfig,
@@ -555,16 +572,71 @@ pub struct Dflash2DraftFfnLocalWorkletInput {
     pub query_tokens: u32,
 }
 
+/// A conv finish and the residual norm after it: two launches, or one.
+pub enum ConvFinish {
+    Separate {
+        conv_finish: Op<ElementwiseKernel>,
+        /// `None` for the MLP finish, whose norm is the next layer's
+        /// `input_add_rms_norm` (priced there).
+        residual_norm: Option<Op<ResidualRmsNormKernel>>,
+    },
+    Fused(Op<GroupedConvResidualRmsNormKernel>),
+}
+
+impl ConvFinish {
+    fn compile(&self, builder: &mut CostTreeBuilder, nodes: &mut Vec<CostNode>) {
+        match self {
+            ConvFinish::Separate {
+                conv_finish,
+                residual_norm,
+            } => {
+                nodes.push(conv_finish.compile(builder));
+                if let Some(op) = residual_norm {
+                    nodes.push(op.compile(builder));
+                }
+            }
+            ConvFinish::Fused(op) => nodes.push(op.compile(builder)),
+        }
+    }
+
+    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+        let zero = tokens == 0;
+        match self {
+            ConvFinish::Separate {
+                conv_finish,
+                residual_norm,
+            } => {
+                eval_atomic_or_zero(
+                    conv_finish,
+                    ElementwiseKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+                if let Some(op) = residual_norm {
+                    eval_atomic_or_zero(op, ResidualRmsNormKernelInput { m: tokens }, zero, ev);
+                }
+            }
+            ConvFinish::Fused(op) => eval_atomic_or_zero(
+                op,
+                GroupedConvResidualRmsNormKernelInput { num_tokens: tokens },
+                zero,
+                ev,
+            ),
+        }
+    }
+}
+
 pub struct Dflash2DraftFfnLocalWorklet {
     pub name: String,
-    pub attn_conv_finish: Op<ElementwiseKernel>,
-    pub post_attn_add_rms_norm: Op<ResidualRmsNormKernel>,
+    /// `attn_conv_finish` + `post_attn_add_rms_norm`.
+    pub attn_conv_finish: ConvFinish,
     pub mlp_conv_projection: Op<SingleGemmKernel>,
     pub mlp_conv_prepare: Op<ElementwiseKernel>,
     pub gate_up_proj: Op<SingleGemmKernel>,
     pub silu_and_mul: Op<ElementwiseKernel>,
     pub down_proj: Op<SingleGemmKernel>,
-    pub mlp_conv_finish: Op<ElementwiseKernel>,
+    /// `mlp_conv_finish` (+ the next layer's `input_add_rms_norm` when fused).
+    pub mlp_conv_finish: ConvFinish,
     resolved: Dflash2DraftFfnLocalWorkletResolved,
 }
 
@@ -595,6 +667,20 @@ impl Dflash2DraftFfnLocalWorklet {
             .expect("validated DFlash2 conv byte rate must fit u32");
 
         Dflash2DraftFfnLocalWorkletResolved {
+            conv_residual_norm: cfg
+                .conv_residual_norm
+                .as_ref()
+                .map(
+                    |(backends, block_len)| GroupedConvResidualRmsNormKernelConfig {
+                        backends: backends.clone(),
+                        gpu_name: cfg.gpu_name.clone(),
+                        hidden: cfg.hidden_dim.clone(),
+                        group_size: cfg.conv_group_size,
+                        taps: cfg.conv_taps,
+                        block_len: *block_len,
+                        dtype: cfg.dtype,
+                    },
+                ),
             attn_conv_finish: conv.clone(),
             post_attn_add_rms_norm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
@@ -635,21 +721,54 @@ impl Dflash2DraftFfnLocalWorklet {
         resolved: Dflash2DraftFfnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        let (attn_conv_finish, mlp_conv_finish) = match &resolved.conv_residual_norm {
+            Some(cfg) => (
+                ConvFinish::Fused(build_atomic(
+                    &name,
+                    "attn_conv_finish_residual_norm",
+                    cfg.clone(),
+                    GroupedConvResidualRmsNormKernel::build,
+                    bridge,
+                )?),
+                ConvFinish::Fused(build_atomic(
+                    &name,
+                    "mlp_conv_finish_residual_norm",
+                    cfg.clone(),
+                    GroupedConvResidualRmsNormKernel::build,
+                    bridge,
+                )?),
+            ),
+            None => (
+                ConvFinish::Separate {
+                    conv_finish: build_atomic(
+                        &name,
+                        "attn_conv_finish",
+                        resolved.attn_conv_finish.clone(),
+                        ElementwiseKernel::build,
+                        bridge,
+                    )?,
+                    residual_norm: Some(build_atomic(
+                        &name,
+                        "post_attn_add_rms_norm",
+                        resolved.post_attn_add_rms_norm.clone(),
+                        ResidualRmsNormKernel::build,
+                        bridge,
+                    )?),
+                },
+                ConvFinish::Separate {
+                    conv_finish: build_atomic(
+                        &name,
+                        "mlp_conv_finish",
+                        resolved.mlp_conv_finish.clone(),
+                        ElementwiseKernel::build,
+                        bridge,
+                    )?,
+                    residual_norm: None,
+                },
+            ),
+        };
         Ok(Self {
-            attn_conv_finish: build_atomic(
-                &name,
-                "attn_conv_finish",
-                resolved.attn_conv_finish.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
-            post_attn_add_rms_norm: build_atomic(
-                &name,
-                "post_attn_add_rms_norm",
-                resolved.post_attn_add_rms_norm.clone(),
-                ResidualRmsNormKernel::build,
-                bridge,
-            )?,
+            attn_conv_finish,
             mlp_conv_projection: build_atomic(
                 &name,
                 "mlp_conv_projection",
@@ -685,13 +804,7 @@ impl Dflash2DraftFfnLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
-            mlp_conv_finish: build_atomic(
-                &name,
-                "mlp_conv_finish",
-                resolved.mlp_conv_finish.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
+            mlp_conv_finish,
             name,
             resolved,
         })
@@ -700,16 +813,17 @@ impl Dflash2DraftFfnLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: ffn_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.attn_conv_finish.compile(builder),
-                self.post_attn_add_rms_norm.compile(builder),
-                self.mlp_conv_projection.compile(builder),
-                self.mlp_conv_prepare.compile(builder),
-                self.gate_up_proj.compile(builder),
-                self.silu_and_mul.compile(builder),
-                self.down_proj.compile(builder),
-                self.mlp_conv_finish.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = Vec::with_capacity(8);
+                self.attn_conv_finish.compile(builder, &mut nodes);
+                nodes.push(self.mlp_conv_projection.compile(builder));
+                nodes.push(self.mlp_conv_prepare.compile(builder));
+                nodes.push(self.gate_up_proj.compile(builder));
+                nodes.push(self.silu_and_mul.compile(builder));
+                nodes.push(self.down_proj.compile(builder));
+                self.mlp_conv_finish.compile(builder, &mut nodes);
+                nodes
+            })),
         }
     }
 
@@ -718,13 +832,7 @@ impl Dflash2DraftFfnLocalWorklet {
         let zero = tokens == 0;
         let whole = ElementwiseKernelInput { num_tokens: tokens };
 
-        eval_atomic_or_zero(&self.attn_conv_finish, whole.clone(), zero, ev);
-        eval_atomic_or_zero(
-            &self.post_attn_add_rms_norm,
-            ResidualRmsNormKernelInput { m: tokens },
-            zero,
-            ev,
-        );
+        self.attn_conv_finish.eval(tokens, ev);
         eval_atomic_or_zero(
             &self.mlp_conv_projection,
             SingleGemmKernelInput { m: tokens },
@@ -738,7 +846,7 @@ impl Dflash2DraftFfnLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(&self.silu_and_mul, whole.clone(), zero, ev);
+        eval_atomic_or_zero(&self.silu_and_mul, whole, zero, ev);
         eval_atomic_or_zero(
             &self.down_proj,
             SingleGemmKernelInput { m: tokens },
@@ -748,7 +856,7 @@ impl Dflash2DraftFfnLocalWorklet {
         // Billed in this section although it runs after the architecture's
         // collective. `CostNode::Sum` is additive, so the total is unchanged;
         // only the cost-log narrative places it one boundary early.
-        eval_atomic_or_zero(&self.mlp_conv_finish, whole, zero, ev);
+        self.mlp_conv_finish.eval(tokens, ev);
     }
 }
 
@@ -933,7 +1041,27 @@ mod tests {
             attn_kv_dtype: DType::Bf16,
             query_kv_append: None,
             qk_norm_rope_kv_write: None,
+            conv_residual_norm: None,
         }
+    }
+
+    fn ffn_leaves(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2DraftFfnLocalWorklet::build(
+            "ffn".into(),
+            Dflash2DraftFfnLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| slot.name["ffn.".len()..].to_string())
+            .collect()
     }
 
     fn query_kv_append() -> KvCacheAppendKernelConfig {
@@ -1017,6 +1145,48 @@ mod tests {
         assert_eq!(write.num_qo_heads.get(), 16);
         assert_eq!(write.num_kv_heads.get(), 2);
         assert_eq!(write.page_size, 16);
+    }
+
+    /// Catches a residual norm priced twice (fused and separate) or not at
+    /// all: per layer, the two fused finishes stand for both conv finishes,
+    /// the post-attention norm and the next layer's input norm.
+    #[test]
+    fn the_fused_conv_finish_absorbs_both_residual_norms() {
+        let plain = cfg();
+        let mut fused = cfg();
+        fused.conv_residual_norm = Some((vec!["vllm_triton"], 8));
+        let (plain_attn, fused_attn) = (attn_leaves(&plain), attn_leaves(&fused));
+        assert_eq!(plain_attn[0], "input_add_rms_norm");
+        assert_eq!(fused_attn, plain_attn[1..].to_vec());
+        assert_eq!(
+            ffn_leaves(&plain),
+            [
+                "attn_conv_finish",
+                "post_attn_add_rms_norm",
+                "mlp_conv_projection",
+                "mlp_conv_prepare",
+                "gate_up_proj",
+                "silu_and_mul",
+                "down_proj",
+                "mlp_conv_finish",
+            ]
+        );
+        assert_eq!(
+            ffn_leaves(&fused),
+            [
+                "attn_conv_finish_residual_norm",
+                "mlp_conv_projection",
+                "mlp_conv_prepare",
+                "gate_up_proj",
+                "silu_and_mul",
+                "down_proj",
+                "mlp_conv_finish_residual_norm",
+            ]
+        );
+        let resolved = Dflash2DraftFfnLocalWorklet::resolve_config(&fused);
+        let conv = resolved.conv_residual_norm.unwrap();
+        assert_eq!(conv.block_len, 8);
+        assert_eq!(conv.hidden.get(), HIDDEN_DIM);
     }
 
     #[test]

@@ -2088,6 +2088,7 @@ fn dflash2_draft_resolved(
         attn_kv_dtype: DType::Bf16,
         query_kv_append: None,
         qk_norm_rope_kv_write: None,
+        conv_residual_norm: None,
     };
     let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
         norm_backends: vec!["flashinfer"],
