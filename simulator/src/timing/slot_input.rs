@@ -49,6 +49,7 @@ use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
+use crate::timing::kernels::SigmoidGatedRmsNormKernelInput;
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
@@ -171,6 +172,7 @@ log_inputs! {
     GdnCausalConvPrefillFanIn => GdnCausalConvPrefillLog,
     GdnChunkDeltaRule => GdnChunkDeltaRuleKernelInput,
     GdnGatedRmsNorm => GdnGatedRmsNormKernelInput,
+    SigmoidGatedRmsNorm => SigmoidGatedRmsNormKernelInput,
     GdnPrefillPostConv => GdnPrefillPostConvKernelInput,
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,

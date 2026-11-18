@@ -93,6 +93,7 @@ pub mod rms_norm;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
+pub mod sigmoid_gated_rms_norm;
 pub mod silu_and_mul;
 pub mod single_gemm;
 pub mod sparse_gqa_paged_attention;
@@ -409,6 +410,10 @@ pub use scaled_silu::{
 };
 pub use sconv_qkvr_prep::{
     SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SconvQkvrPrepSpec,
+};
+pub use sigmoid_gated_rms_norm::{
+    SigmoidGatedRmsNormKernel, SigmoidGatedRmsNormKernelConfig, SigmoidGatedRmsNormKernelInput,
+    SigmoidGatedRmsNormSpec,
 };
 pub use silu_and_mul::{
     SiluAndMulKernel, SiluAndMulKernelConfig, SiluAndMulKernelInput, SiluAndMulSpec,

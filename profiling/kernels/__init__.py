@@ -101,6 +101,7 @@ from profiling.kernels import (
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
     scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401
+    sigmoid_gated_rms_norm,  # noqa: F401
     silu_and_mul,  # noqa: F401
     single_gemm,  # noqa: F401
     sparse_gqa_paged_attention,  # noqa: F401
