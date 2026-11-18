@@ -52,15 +52,20 @@ use crate::timing::kernels::{
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
-    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, QKvRmsNormKernel,
+    DsaPersistentTopkDecodeKernelInput, DsaPooledIndexCacheUpdateKernel,
+    DsaPooledIndexCacheUpdateKernelConfig, DsaPooledIndexCacheUpdateKernelInput,
+    DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
+    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, HadamardFp8QuantKernel,
+    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    SingleGemmKernelInput, StaticFp8QuantKernel, StaticFp8QuantKernelConfig,
+    StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, SlotInput,
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
+    SlotInput,
 };
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
@@ -88,13 +93,88 @@ const Q_CONCAT_EFFECTIVE_FACTOR: u32 = 10;
 ///   (applied as 7/2).
 const OUTPUT_COPY_EFFECTIVE_NUM: u32 = 7;
 const OUTPUT_COPY_EFFECTIVE_DEN: u32 = 2;
-/// * `q_fwht_quant`: the Hadamard-128 + ue8m0 quant is not a streaming kernel;
-///   16.8 us at T = 2048 for 25 MiB of real traffic. The factor matches the
-///   prefill-bearing time; decode (5.5 us at T = 32) stays latency-bound above
-///   any elementwise row and needs a dedicated L1 kind to match.
+/// * the `q_fwht_quant` placeholder: the Hadamard-128 + ue8m0 quant is not a
+///   streaming kernel; 16.8 us at T = 2048 for 25 MiB of real traffic. The
+///   factor matches the prefill-bearing time; decode (5.5 us at T = 32) stays
+///   latency-bound above any elementwise row, which the measured
+///   `hadamard_fp8_quant` kind prices.
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
+
+/// A launch priced by its measured kernel kind, or by a byte-sized elementwise
+/// placeholder when the config names no backend for that kind. The slot keeps
+/// its name either way.
+#[derive(Clone, Debug)]
+pub enum MeasuredOrPlaceholder<M, P> {
+    Measured(M),
+    Placeholder(P),
+}
+
+pub type MeasuredConfig<C> = MeasuredOrPlaceholder<C, ElementwiseKernelConfig>;
+pub type MeasuredOp<K> = MeasuredOrPlaceholder<Op<K>, Op<ElementwiseKernel>>;
+
+impl<C> MeasuredConfig<C> {
+    /// `measured` on `backends`, or `placeholder` when there are none.
+    fn new(
+        backends: &[&'static str],
+        measured: impl FnOnce(Vec<&'static str>) -> C,
+        placeholder: ElementwiseKernelConfig,
+    ) -> Self {
+        if backends.is_empty() {
+            Self::Placeholder(placeholder)
+        } else {
+            Self::Measured(measured(backends.to_vec()))
+        }
+    }
+}
+
+impl<K: Probe> MeasuredOp<K> {
+    fn build<C>(
+        prefix: &str,
+        suffix: &str,
+        config: MeasuredConfig<C>,
+        build_kernel: impl FnOnce(String, C, &PerfApiBridge) -> Result<K, BuildError>,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        Ok(match config {
+            MeasuredOrPlaceholder::Measured(config) => {
+                Self::Measured(atomic(prefix, suffix, config, build_kernel, bridge)?)
+            }
+            MeasuredOrPlaceholder::Placeholder(config) => Self::Placeholder(atomic(
+                prefix,
+                suffix,
+                config,
+                ElementwiseKernel::build,
+                bridge,
+            )?),
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        match self {
+            Self::Measured(op) => op.compile(builder),
+            Self::Placeholder(op) => op.compile(builder),
+        }
+    }
+
+    /// Push the launch at the measured kind's `input`, or at the
+    /// placeholder's `placeholder_tokens`.
+    fn push_or_zero(&self, input: K::Input, placeholder_tokens: u32, zero: bool, ev: &mut Evaluator)
+    where
+        K::Input: Clone + Into<SlotInput>,
+    {
+        match self {
+            Self::Measured(op) => push_or_zero(op, input, zero, ev),
+            Self::Placeholder(op) => {
+                let input = ElementwiseKernelInput {
+                    num_tokens: placeholder_tokens,
+                };
+                push_or_zero(op, input, zero, ev)
+            }
+        }
+    }
+}
 
 /// How a decode batch of unequal contexts prices its indexer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,6 +226,17 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub sparse_attention_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
     pub index_remap_backends: Vec<&'static str>,
+    /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant
+    /// (`hadamard_fp8_quant`). Empty prices `indexer.q_fwht_quant` by its
+    /// elementwise placeholder.
+    pub hadamard_quant_backends: Vec<&'static str>,
+    /// The absorbed query's static per-tensor FP8 quant, one `QuantFP8` launch
+    /// (`static_fp8_quant`). Empty prices `q_fp8_quant` by its placeholder.
+    pub static_quant_backends: Vec<&'static str>,
+    /// The pooled indexer key cache's decode update, one program per request
+    /// (`dsa_pooled_index_cache_update`). Empty prices
+    /// `indexer.kpool_decode_update` by its placeholder.
+    pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
     /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
@@ -176,11 +267,11 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub index_wk_weights: SingleGemmKernelConfig,
     pub index_head_weights: GemmFp32OutputKernelConfig,
     pub index_k_norm: ElementwiseKernelConfig,
-    pub index_q_fwht_quant: ElementwiseKernelConfig,
+    pub index_q_fwht_quant: MeasuredConfig<HadamardFp8QuantKernelConfig>,
     pub index_weight_scale: ElementwiseKernelConfig,
     pub kpool_gate_score: SingleGemmKernelConfig,
     pub prefill_gather: ElementwiseKernelConfig,
-    pub kpool_decode_update: ElementwiseKernelConfig,
+    pub kpool_decode_update: MeasuredConfig<DsaPooledIndexCacheUpdateKernelConfig>,
     pub kpool_prefill_write: ElementwiseKernelConfig,
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
@@ -192,7 +283,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub expand_pools: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub q_concat: ElementwiseKernelConfig,
-    pub q_fp8_quant: ElementwiseKernelConfig,
+    pub q_fp8_quant: MeasuredConfig<StaticFp8QuantKernelConfig>,
     pub sparse_mla: Glm53KpoolSparseMlaConfig,
     pub output_copy: ElementwiseKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
@@ -220,11 +311,11 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub index_wk_weights: Op<SingleGemmKernel>,
     pub index_head_weights: Op<GemmFp32OutputKernel>,
     pub index_k_norm: Op<ElementwiseKernel>,
-    pub index_q_fwht_quant: Op<ElementwiseKernel>,
+    pub index_q_fwht_quant: MeasuredOp<HadamardFp8QuantKernel>,
     pub index_weight_scale: Op<ElementwiseKernel>,
     pub kpool_gate_score: Op<SingleGemmKernel>,
     pub prefill_gather: Op<ElementwiseKernel>,
-    pub kpool_decode_update: Op<ElementwiseKernel>,
+    pub kpool_decode_update: MeasuredOp<DsaPooledIndexCacheUpdateKernel>,
     pub kpool_prefill_write: Op<ElementwiseKernel>,
     pub kpool_tail_seed: Op<ElementwiseKernel>,
     pub mqa_logits_decode: Op<DsaPagedMqaLogitsDecodeKernel>,
@@ -249,7 +340,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
-    pub q_fp8_quant: Op<ElementwiseKernel>,
+    pub q_fp8_quant: MeasuredOp<StaticFp8QuantKernel>,
     pub sparse_mla: Glm53KpoolSparseMlaOp,
     pub output_copy: Op<ElementwiseKernel>,
     pub v_up: Op<BatchedGemmKernel>,
@@ -288,8 +379,7 @@ impl Glm53DsaAttnLocalWorklet {
             dtype: bf16,
         };
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
-        // The per-head latent query, bf16, and its FP8 copy with one fp32
-        // scale per head.
+        // The per-head latent query, bf16.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
         let topk_decode = DsaPersistentTopkDecodeKernelConfig {
@@ -334,19 +424,45 @@ impl Glm53DsaAttnLocalWorklet {
             // Inductor-fused fp32 LayerNorm of the indexer k: reads and writes
             // one bf16 D row per token.
             index_k_norm: ew(2 * index_dim, 2 * index_dim),
-            // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
-            index_q_fwht_quant: ew(
-                FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
-                FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
+            index_q_fwht_quant: MeasuredConfig::new(
+                &cfg.hadamard_quant_backends,
+                |backends| HadamardFp8QuantKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    head_dim: index_dim,
+                    input_dtype: bf16,
+                },
+                // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
+                ew(
+                    FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
+                    FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
+                ),
             ),
             // `weights * q_scale * scale`: two fp32 Hi rows in, one out.
             index_weight_scale: ew(2 * 4 * index_heads, 4 * index_heads),
             kpool_gate_score: gemm(index_dim, cfg.hidden.clone()),
             // 2*P*2D bytes gathered per prefill token, split over two launches.
             prefill_gather: ew(kpool * 2 * index_dim, kpool * 2 * index_dim),
-            // Per decode row: 524 read + 1536 per completed pool (1 in P rows),
-            // 512 stashed + (D+4) per completed pool.
-            kpool_decode_update: ew(524 + 1536 / kpool, 512 + (index_dim + 4) / kpool),
+            kpool_decode_update: MeasuredConfig::new(
+                &cfg.pooled_index_update_backends,
+                // One program per request walks its next_n rows in order; the
+                // tail ring holds one pool (`index_kpool` slots), as the fork's
+                // KpoolTailSpec(block_size = index_kpool).
+                |backends| DsaPooledIndexCacheUpdateKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    pool_size: kpool,
+                    tail_ring: kpool,
+                    index_dim: cfg.index_head_dim.clone(),
+                    block_size: cfg.cache_block_size,
+                    input_dtype: bf16,
+                    cache_dtype: DType::Fp8E4m3,
+                },
+                // Per decode row: 524 read + 1536 per completed pool (1 in P
+                // rows), 512 stashed + (D+4) per completed pool.
+                ew(524 + 1536 / kpool, 512 + (index_dim + 4) / kpool),
+            ),
             // Per prefill token: 9 + P*2*2D/P read, (D+4)/P written.
             kpool_prefill_write: ew(9 + 4 * index_dim, (index_dim + 4) / kpool),
             // Reads each prefill token's position; the < P tail rows are noise.
@@ -412,7 +528,21 @@ impl Glm53DsaAttnLocalWorklet {
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
             ),
-            q_fp8_quant: ew(latent_q_bytes, heads * (latent + 4)),
+            q_fp8_quant: MeasuredConfig::new(
+                &cfg.static_quant_backends,
+                // One static per-tensor quant over the token-major
+                // `[tokens, heads * latent]` query.
+                |backends| StaticFp8QuantKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    hidden_dim: (heads * latent).into(),
+                    gated: false,
+                    dtype: bf16,
+                },
+                // The bf16 query in, its FP8 copy with one fp32 scale per head
+                // out.
+                ew(latent_q_bytes, heads * (latent + 4)),
+            ),
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
                 mla_cache_append_backends: cfg.mla_cache_append_backends.clone(),
@@ -488,11 +618,23 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?,
             index_k_norm: ew("indexer.k_norm", r.index_k_norm)?,
-            index_q_fwht_quant: ew("indexer.q_fwht_quant", r.index_q_fwht_quant)?,
+            index_q_fwht_quant: MeasuredOp::build(
+                n,
+                "indexer.q_fwht_quant",
+                r.index_q_fwht_quant,
+                HadamardFp8QuantKernel::build,
+                bridge,
+            )?,
             index_weight_scale: ew("indexer.weight_scale", r.index_weight_scale)?,
             kpool_gate_score: gemm("indexer.kpool_gate_score", r.kpool_gate_score)?,
             prefill_gather: ew("indexer.prefill_gather", r.prefill_gather)?,
-            kpool_decode_update: ew("indexer.kpool_decode_update", r.kpool_decode_update)?,
+            kpool_decode_update: MeasuredOp::build(
+                n,
+                "indexer.kpool_decode_update",
+                r.kpool_decode_update,
+                DsaPooledIndexCacheUpdateKernel::build,
+                bridge,
+            )?,
             kpool_prefill_write: ew("indexer.kpool_prefill_write", r.kpool_prefill_write)?,
             kpool_tail_seed: ew("indexer.kpool_tail_seed", r.kpool_tail_seed)?,
             mqa_logits_decode: atomic(
@@ -529,7 +671,13 @@ impl Glm53DsaAttnLocalWorklet {
             expand_pools: ew("indexer.expand_pools", r.expand_pools)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             q_concat: ew("q_concat", r.q_concat)?,
-            q_fp8_quant: ew("q_fp8_quant", r.q_fp8_quant)?,
+            q_fp8_quant: MeasuredOp::build(
+                n,
+                "q_fp8_quant",
+                r.q_fp8_quant,
+                StaticFp8QuantKernel::build,
+                bridge,
+            )?,
             sparse_mla: Glm53KpoolSparseMlaOp::build(
                 format!("{n}.sparse_mla"),
                 r.sparse_mla,
@@ -661,7 +809,14 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_k_norm, all.clone(), false, ev);
-        push_or_zero(&self.index_q_fwht_quant, all.clone(), false, ev);
+        self.index_q_fwht_quant.push_or_zero(
+            HadamardFp8QuantKernelInput {
+                num_rows: w.total_tokens * cfg.index_num_heads.get(),
+            },
+            w.total_tokens,
+            false,
+            ev,
+        );
         push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
         push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
         push_or_zero(
@@ -670,9 +825,11 @@ impl Glm53DsaAttnLocalWorklet {
             no_prefill,
             ev,
         );
-        push_or_zero(
-            &self.kpool_decode_update,
-            tokens(w.decode_rows),
+        self.kpool_decode_update.push_or_zero(
+            DsaPooledIndexCacheUpdateKernelInput {
+                num_requests: w.decode_requests,
+            },
+            w.decode_rows,
             no_decode,
             ev,
         );
@@ -716,7 +873,14 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
-        push_or_zero(&self.q_fp8_quant, all.clone(), false, ev);
+        self.q_fp8_quant.push_or_zero(
+            StaticFp8QuantKernelInput {
+                num_tokens: w.total_tokens,
+            },
+            w.total_tokens,
+            false,
+            ev,
+        );
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
                 prefill_query_cache_pairs: input
@@ -1154,6 +1318,9 @@ mod tests {
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             index_remap_backends: vec!["vllm_triton"],
+            hadamard_quant_backends: Vec::new(),
+            static_quant_backends: Vec::new(),
+            pooled_index_update_backends: Vec::new(),
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
@@ -1182,6 +1349,119 @@ mod tests {
             &budget(),
         )
         .unwrap()
+    }
+
+    /// The worklet of `cfg()` after `edit`, under run-config backend
+    /// overrides of `(role, backend)`.
+    fn build_with(
+        edit: impl FnOnce(&mut Glm53DsaAttnLocalWorkletConfig),
+        overrides: &[(&str, &str)],
+    ) -> Result<Glm53DsaAttnLocalWorklet, BuildError> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let map: HashMap<String, Vec<String>> = overrides
+            .iter()
+            .map(|(role, backend)| (role.to_string(), vec![backend.to_string()]))
+            .collect();
+        let _scope = bridge.with_backend_overrides("main", Some(&map));
+        let mut config = cfg();
+        edit(&mut config);
+        Glm53DsaAttnLocalWorklet::build(
+            "m.dsa".into(),
+            Glm53DsaAttnLocalWorklet::resolve_config(&config),
+            &bridge,
+        )
+    }
+
+    /// `(name, kind)` of every compiled slot, in order.
+    fn slots(worklet: &Glm53DsaAttnLocalWorklet) -> Vec<(String, String)> {
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        let tree = builder.finish(root);
+        tree.slots
+            .iter()
+            .map(|slot| (slot.name.clone(), slot.kind.clone()))
+            .collect()
+    }
+
+    /// Each slot's logged input after one eval (structure-only kernels
+    /// answer zero time, so the logged sizes are what a test can read).
+    fn eval_inputs(
+        worklet: &Glm53DsaAttnLocalWorklet,
+        input: &Glm53DsaAttnLocalWorkletInput,
+    ) -> HashMap<String, serde_json::Value> {
+        let names = slots(worklet);
+        let mut metrics = vec![LeafMetrics::MISS; names.len()];
+        let mut inputs = Vec::new();
+        let mut ev = Evaluator::with_inputs(&mut metrics, &mut inputs);
+        worklet.eval(input, &mut ev);
+        assert_eq!(ev.filled(), names.len());
+        names
+            .into_iter()
+            .zip(inputs)
+            .map(|((name, _), input)| (name, serde_json::to_value(input).unwrap()))
+            .collect()
+    }
+
+    /// Catches a measured kind that prices the wrong count: the Hadamard
+    /// quant runs per indexer head row, the pooled index update per request
+    /// (not per verify row), the static quant per token. Without a backend
+    /// each slot keeps its per-token placeholder.
+    #[test]
+    fn measured_kinds_replace_the_placeholders_where_backends_are_named() {
+        const SLOTS: [(&str, &str, &str); 3] = [
+            (
+                "m.dsa.indexer.q_fwht_quant",
+                "hadamard_fp8_quant",
+                "num_rows",
+            ),
+            (
+                "m.dsa.indexer.kpool_decode_update",
+                "dsa_pooled_index_cache_update",
+                "num_requests",
+            ),
+            ("m.dsa.q_fp8_quant", "static_fp8_quant", "num_tokens"),
+        ];
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let placeholder = build_with(|c| c.decode_next_n = 4, &[]).unwrap();
+        let measured = build_with(
+            |c| {
+                c.decode_next_n = 4;
+                c.hadamard_quant_backends = vec!["vllm_triton"];
+                c.static_quant_backends = vec!["vllm_cuda"];
+                c.pooled_index_update_backends = vec!["vllm_fork_triton"];
+            },
+            &[],
+        )
+        .unwrap();
+        let kind = |worklet: &Glm53DsaAttnLocalWorklet, name: &str| {
+            let slots = slots(worklet);
+            assert_eq!(slots.len(), 24 + 4 + 3);
+            slots.into_iter().find(|(n, _)| n == name).unwrap().1
+        };
+        let (placeholder_inputs, measured_inputs) = (
+            eval_inputs(&placeholder, &input),
+            eval_inputs(&measured, &input),
+        );
+        // 5 prefill rows and 2 requests of 4 rows; 32 indexer heads.
+        for ((name, measured_kind, field), (tokens, count)) in
+            SLOTS.into_iter().zip([(13, 13 * 32), (8, 2), (13, 13)])
+        {
+            assert_eq!(kind(&placeholder, name), "elementwise", "{name}");
+            assert_eq!(placeholder_inputs[name]["num_tokens"], tokens, "{name}");
+            assert_eq!(kind(&measured, name), measured_kind, "{name}");
+            assert_eq!(measured_inputs[name][field], count, "{name}");
+        }
+        let MeasuredOrPlaceholder::Measured(update) = &measured.resolved.kpool_decode_update else {
+            panic!("named backend")
+        };
+        assert_eq!(
+            (update.next_n, update.pool_size, update.tail_ring),
+            (4, 4, 4)
+        );
     }
 
     #[test]

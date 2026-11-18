@@ -744,6 +744,9 @@ pub fn build_configs(
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
+            hadamard_quant_backends: Vec::new(),
+            static_quant_backends: Vec::new(),
+            pooled_index_update_backends: Vec::new(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
