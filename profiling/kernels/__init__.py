@@ -28,6 +28,7 @@ from profiling.kernels import (
     dsa_mqa_logits_prefill,  # noqa: F401
     dsa_paged_mqa_logits_decode,  # noqa: F401
     dsa_persistent_topk_decode,  # noqa: F401
+    dsa_pooled_index_cache_update,  # noqa: F401
     dsa_sparse_index_remap,  # noqa: F401
     dsa_sparse_mla_attention,  # noqa: F401
     dsa_sparse_mla_prefill,  # noqa: F401

@@ -18,6 +18,7 @@ pub mod dsa_indexer_q_rope_quant_weight_fold;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
+pub mod dsa_pooled_index_cache_update;
 pub mod dsa_sparse_index_remap;
 pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
@@ -168,6 +169,10 @@ pub use dsa_paged_mqa_logits_decode::{
 pub use dsa_persistent_topk_decode::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPersistentTopkDecodeSpec,
+};
+pub use dsa_pooled_index_cache_update::{
+    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
+    DsaPooledIndexCacheUpdateKernelInput, DsaPooledIndexCacheUpdateSpec,
 };
 pub use dsa_sparse_index_remap::{
     DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,
