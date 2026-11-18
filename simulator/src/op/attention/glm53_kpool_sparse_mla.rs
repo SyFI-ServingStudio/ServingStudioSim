@@ -87,6 +87,12 @@ pub struct Glm53KpoolSparseMlaInput {
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
     /// One KV length per decode request, including the token being decoded.
     pub decode_context_lens: Vec<u32>,
+    /// A fused decode launch outside this op writes the decode rows' cache
+    /// entries: `mla_cache_append` bills only the prefill rows.
+    pub decode_cache_append_elsewhere: bool,
+    /// A fused decode launch outside this op builds the decode rows' page
+    /// table: `index_remap` bills only the prefill rows.
+    pub decode_remap_elsewhere: bool,
 }
 
 pub struct Glm53KpoolSparseMlaOp {
@@ -255,9 +261,9 @@ impl Glm53KpoolSparseMlaOp {
         .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
 
         let cache_append = MlaCacheAppendKernelInput {
-            num_tokens: shape.num_rows,
+            num_tokens: shape.cache_append_rows,
         };
-        let metrics = if shape.num_rows == 0 {
+        let metrics = if shape.cache_append_rows == 0 {
             LeafMetrics::ZERO
         } else {
             self.mla_cache_append.eval(&cache_append)
@@ -314,7 +320,8 @@ impl Glm53KpoolSparseMlaOp {
 }
 
 struct Shape {
-    num_rows: u32,
+    /// Rows `mla_cache_append` writes.
+    cache_append_rows: u32,
     remap: Option<DsaSparseIndexRemapKernelInput>,
     /// The attention launches of a prefill-bearing iteration: all rows, in
     /// order, split at the backend's per-launch row limit.
@@ -458,6 +465,8 @@ fn derive_shape(
         total_valid_count += valid;
         plan.add(1, valid);
     }
+    let decode_rows = num_rows;
+    let decode_valid_count = total_valid_count;
     for (request, &(num_queries, context)) in input.prefill_query_cache_pairs.iter().enumerate() {
         if num_queries == 0 || num_queries > context {
             return Err(format!(
@@ -497,12 +506,21 @@ fn derive_shape(
             num_queries: input.decode_context_lens.len() as u32,
             num_cache_tokens: context,
         });
+    // Rows whose launch runs outside this op leave the slot; `decode_rows`
+    // fits u32 because `num_rows` does.
+    let skip = |elsewhere: bool| if elsewhere { decode_rows as u32 } else { 0 };
+    let remap_rows = num_rows - skip(input.decode_remap_elsewhere);
+    let remap_valid_count = if input.decode_remap_elsewhere {
+        total_valid_count - decode_valid_count
+    } else {
+        total_valid_count
+    };
     Ok(Shape {
-        num_rows,
+        cache_append_rows: num_rows - skip(input.decode_cache_append_elsewhere),
         prefill,
-        remap: (num_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
-            num_queries: num_rows,
-            total_valid_count,
+        remap: (remap_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
+            num_queries: remap_rows,
+            total_valid_count: remap_valid_count,
             workspace_query_rows: 0,
         }),
         decode,
@@ -605,9 +623,10 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(3, 5)],
             decode_context_lens: vec![1000, 4003],
+            ..Default::default()
         };
         let shape = derive_shape(&input, 2048, 4, 2176, None).unwrap();
-        assert_eq!(shape.num_rows, 5);
+        assert_eq!(shape.cache_append_rows, 5);
         let remap = shape.remap.unwrap();
         assert_eq!(remap.num_queries, 5);
         assert_eq!(remap.total_valid_count, 1000 + 2051 + 3 + 4 + 5);
@@ -627,6 +646,7 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: Vec::new(),
             decode_context_lens: vec![1000, 4003],
+            ..Default::default()
         };
         let shape = derive_shape(&input, 2048, 4, 2176, None).unwrap();
         assert!(shape.prefill.is_empty());
@@ -640,6 +660,7 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(1000, 1500)],
             decode_context_lens: Vec::new(),
+            ..Default::default()
         };
         let prefill = derive_shape(&input, 2048, 4, 2176, None).unwrap().prefill;
         assert_eq!(
@@ -660,9 +681,10 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(65536, 65536)],
             decode_context_lens: Vec::new(),
+            ..Default::default()
         };
         let shape = derive_shape(&input, 2048, 4, 2176, Some(32_768)).unwrap();
-        assert_eq!(shape.num_rows, 65536);
+        assert_eq!(shape.cache_append_rows, 65536);
         let launches: Vec<_> = shape
             .prefill
             .iter()
@@ -678,6 +700,7 @@ mod tests {
         let small = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(8192, 8192)],
             decode_context_lens: vec![4000],
+            ..Default::default()
         };
         let shape = derive_shape(&small, 2048, 4, 2176, Some(32_768)).unwrap();
         assert_eq!(shape.prefill.len(), 1);
@@ -691,6 +714,38 @@ mod tests {
         assert_eq!(causal_tail_slots(3, 2177, 2176), 2175 + 2176 + 2176);
     }
 
+    /// A fused decode launch takes the decode rows' cache append and page
+    /// table: both slots keep the prefill rows, and the attention query is
+    /// unchanged.
+    #[test]
+    fn decode_rows_written_elsewhere_leave_the_append_and_remap_slots() {
+        let mut input = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(3, 5)],
+            decode_context_lens: vec![1000, 1001, 4003],
+            ..Default::default()
+        };
+        let all = derive_shape(&input, 2048, 4, 2176, None).unwrap();
+        assert_eq!(all.cache_append_rows, 6);
+        assert_eq!(all.remap.as_ref().unwrap().num_queries, 6);
+        input.decode_cache_append_elsewhere = true;
+        input.decode_remap_elsewhere = true;
+        let shape = derive_shape(&input, 2048, 4, 2176, None).unwrap();
+        assert_eq!(shape.cache_append_rows, 3);
+        let remap = shape.remap.unwrap();
+        assert_eq!((remap.num_queries, remap.total_valid_count), (3, 3 + 4 + 5));
+        assert_eq!(shape.prefill[0].num_queries, all.prefill[0].num_queries);
+        assert_eq!(
+            shape.prefill[0].num_cache_tokens,
+            all.prefill[0].num_cache_tokens
+        );
+        // Decode-only: nothing is left for either slot.
+        input.prefill_query_cache_pairs.clear();
+        let shape = derive_shape(&input, 2048, 4, 2176, None).unwrap();
+        assert_eq!(shape.cache_append_rows, 0);
+        assert!(shape.remap.is_none());
+        assert_eq!(shape.decode.unwrap().num_queries, 3);
+    }
+
     #[test]
     fn empty_batch_has_no_remap_and_bad_pairs_fail() {
         let shape =
@@ -699,6 +754,7 @@ mod tests {
         let bad = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(6, 5)],
             decode_context_lens: Vec::new(),
+            ..Default::default()
         };
         assert!(derive_shape(&bad, 2048, 4, 2176, None).is_err());
     }
