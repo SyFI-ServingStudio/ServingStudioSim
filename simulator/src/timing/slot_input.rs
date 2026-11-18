@@ -42,6 +42,7 @@ use crate::timing::kernels::{
     SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
+use crate::timing::kernels::BatchedGemmStaticFp8QuantKernelInput;
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
 use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
@@ -194,6 +195,7 @@ log_inputs! {
     InvRopeFp8Quant => InvRopeFp8QuantKernelInput,
     HadamardFp8Quant => HadamardFp8QuantKernelInput,
     HadamardFp8QuantWeightScale => HadamardFp8QuantWeightScaleKernelInput,
+    BatchedGemmStaticFp8Quant => BatchedGemmStaticFp8QuantKernelInput,
     QKvRmsNorm => QKvRmsNormKernelInput,
     DsaIndexerQRopeQuantWeightFold => DsaIndexerQRopeQuantWeightFoldKernelInput,
     DsaIndexerQRopeQuant => DsaIndexerQRopeQuantKernelInput,

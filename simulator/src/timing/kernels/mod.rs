@@ -4,6 +4,7 @@ pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
+pub mod batched_gemm_static_fp8_quant;
 pub mod bf16_fused_moe;
 mod causal_rows;
 pub mod clamped_swiglu;
@@ -121,6 +122,10 @@ pub use all_reduce_residual_rms_norm::{
 };
 pub use batched_gemm::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, BatchedGemmSpec,
+};
+pub use batched_gemm_static_fp8_quant::{
+    BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
+    BatchedGemmStaticFp8QuantKernelInput, BatchedGemmStaticFp8QuantSpec,
 };
 pub use bf16_fused_moe::{
     Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec,

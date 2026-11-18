@@ -15,6 +15,7 @@ from profiling.kernels import (
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
     batched_gemm,  # noqa: F401
+    batched_gemm_static_fp8_quant,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     clamped_swiglu,  # noqa: F401
     compressed_sparse_mla_decode,  # noqa: F401
