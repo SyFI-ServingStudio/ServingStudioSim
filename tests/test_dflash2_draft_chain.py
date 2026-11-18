@@ -65,3 +65,10 @@ def test_conv_residual_norm_needs_whole_groups_and_whole_blocks() -> None:
     for overrides in ({"group_size": 24}, {"dtype": "fp16"}):
         with pytest.raises(ProfilerNotImplemented):
             draft_chain.profile_grouped_conv_residual_rms_norm_vllm_triton(**(_CONV | overrides))
+
+
+def test_threshold_topk_is_measured_on_bf16_logits_only() -> None:
+    with pytest.raises(ProfilerNotImplemented):
+        draft_chain.profile_logits_topk_triton_threshold(
+            num_rows=8, num_columns=154880, top_k=16, dtype="fp32"
+        )

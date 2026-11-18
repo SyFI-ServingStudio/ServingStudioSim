@@ -9,6 +9,10 @@ upstream source; the kernel bodies are unchanged from their development copy.
   (static k/v scales); replaces q_norm, k_norm, RoPE, the query QuantFP8 and
   reshape_and_cache_flash. Not bit-exact: about 95% of fp8 codes equal the
   incumbent's, the rest differ by rounding near zero.
+- ``ThresholdTopK``: exact top-K with FlashInfer's deterministic tie order
+  (top_k(sorted=True, deterministic=True)), values fp32 and ids int64 (the
+  fork's casts folded in); ids and values identical to FlashInfer, including
+  ties and an in-kernel overflow fallback.
 """
 import torch
 import triton
@@ -80,3 +84,147 @@ def qk_norm_rope_fp8(qkv, q_weight, k_weight, eps, positions, cos_sin, kv_cache_
         qkv.stride(0), kv_cache_fp8.stride(0), kv_cache_fp8.stride(1), kv_cache_fp8.stride(2), kv_cache_fp8.shape[2],
         tokens, q_heads, k_heads, head_dim, eps, 448.0, rnd, num_warps=warps, enable_fp_fusion=False)
     return out_q
+
+
+# FlashInfer's deterministic tie order (top_k(sorted=True, deterministic=True), multi-CTA radix, topk.cuh): a row
+# is cut into FI_CHUNK-wide CTA chunks; inside a chunk, elements equal to the pivot are taken in thread-strided
+# order (thread tx owns j = tx, tx+1024, ...), and the final stable sort keeps that order among equal values. So
+# the order is (value desc, rank asc) with rank(v) = chunk(v)*FI_CHUNK + (j % 1024) * NJ + j // 1024,
+# j = v % FI_CHUNK.
+@triton.jit
+def _fi_rank(v, FI_CHUNK: tl.constexpr, NJ: tl.constexpr):
+    c = v // FI_CHUNK
+    j = v - c * FI_CHUNK
+    return c * (1024 * NJ) + (j % 1024) * NJ + j // 1024
+
+
+# ------------------------------------------------------------------ threshold top-k (exact, FlashInfer tie order)
+# A: per (row, slice) max.  B: per (row, slice): T = 16th largest slice max of the row (a lower bound of the row's
+# 16th largest value: 16 slices each hold an element >= T); a slice whose max < T exits without reading; otherwise
+# its elements >= T are appended to the row's candidate list (atomic counter).  C: per row, exact top-16 of the
+# candidates under (value desc, FlashInfer rank asc); writes ids int64 / values fp32 and re-zeroes the counter.
+@triton.jit
+def _thr_a(X, SM, N, X_STRIDE, NS: tl.constexpr, SLICE: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    s = tl.program_id(1)
+    offs = s * SLICE + tl.arange(0, SLICE)
+    x = tl.load(X + row * X_STRIDE + offs, mask=offs < N, other=float("-inf")).to(tl.float32)
+    tl.store(SM + row * NS + s, tl.max(x, 0))
+
+
+@triton.jit
+def _thr_t(SM, T, NS: tl.constexpr, NSB: tl.constexpr, K: tl.constexpr):
+    # T = K-th largest slice max (with multiplicity), once per row
+    row = tl.program_id(0).to(tl.int64)
+    so = tl.arange(0, NSB)
+    sm = tl.load(SM + row * NS + so, mask=so < NS, other=float("-inf"))
+    srt = tl.sort(sm, descending=True)
+    tl.store(T + row, tl.max(tl.where(so == K - 1, srt, float("-inf")), 0))
+
+
+@triton.jit
+def _thr_b(X, SM, T, CNT, CV, CI, N, X_STRIDE, NS: tl.constexpr, SLICE: tl.constexpr, CAP: tl.constexpr,
+           ATOMIC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    s = tl.program_id(1)
+    mine = tl.load(SM + row * NS + s)
+    t = tl.load(T + row)
+    if mine >= t:
+        offs = s * SLICE + tl.arange(0, SLICE)
+        x = tl.load(X + row * X_STRIDE + offs, mask=offs < N, other=float("-inf")).to(tl.float32)
+        keep = x >= t
+        if ATOMIC:
+            # few elements pass: one masked atomic per kept element gives its slot, no block-wide scan
+            pos = tl.atomic_add(CNT + row + offs * 0, 1, mask=keep, sem="relaxed")
+        else:
+            n = tl.sum(keep.to(tl.int32), 0)
+            base = tl.atomic_add(CNT + row, n)
+            pos = base + tl.cumsum(keep.to(tl.int32), 0) - 1
+        ok = keep & (pos < CAP)
+        tl.store(CV + row * CAP + pos, x, mask=ok)
+        tl.store(CI + row * CAP + pos, offs, mask=ok)
+
+
+@triton.jit
+def _thr_c(CNT, CV, CI, OV, OI, OVF, X, N, X_STRIDE, CAP: tl.constexpr, K: tl.constexpr, FI_CHUNK: tl.constexpr,
+           NJ: tl.constexpr, FB: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    n = tl.load(CNT + row)
+    offs = tl.arange(0, CAP)
+    m = offs < n
+    x = tl.load(CV + row * CAP + offs, mask=m, other=float("-inf"))
+    ids = tl.load(CI + row * CAP + offs, mask=m, other=0)
+    big = 2147483647
+    rank = tl.where(m, _fi_rank(ids, FI_CHUNK, NJ), big)
+    kk = tl.arange(0, K)
+    outv = tl.full([K], float("-inf"), tl.float32)
+    outi = tl.full([K], 0, tl.int32)
+    for j in tl.static_range(K):
+        mx = tl.max(x, 0)
+        rk = tl.min(tl.where(x == mx, rank, big), 0)
+        sel = rank == rk
+        idx = tl.max(tl.where(sel, ids, -1), 0)
+        outv = tl.where(kk == j, mx, outv)
+        outi = tl.where(kk == j, idx, outi)
+        x = tl.where(sel, float("-inf"), x)
+        rank = tl.where(sel, big, rank)
+    if n > CAP:
+        # Overflow (more than CAP elements tie at or above T): exact fallback, K full-row passes, each picking the
+        # largest (value desc, rank asc) element strictly after the previous pick. Graph-safe; slow only here.
+        prev_v = tl.full([], float("inf"), tl.float32)
+        prev_r = tl.full([], -1, tl.int32)
+        bo = tl.arange(0, FB)
+        for jf in range(K):
+            best_v = tl.full([], float("-inf"), tl.float32)
+            best_r = tl.full([], 2147483647, tl.int32)
+            best_i = tl.full([], 0, tl.int32)
+            for c in range(0, N, FB):
+                o = c + bo
+                valid = o < N
+                xv = tl.load(X + row * X_STRIDE + o, mask=valid, other=float("-inf")).to(tl.float32)
+                rv = _fi_rank(o, FI_CHUNK, NJ)
+                elig = valid & ((xv < prev_v) | ((xv == prev_v) & (rv > prev_r)))
+                xv = tl.where(elig, xv, float("-inf"))
+                cm = tl.max(xv, 0)
+                cr = tl.min(tl.where(elig & (xv == cm), rv, big), 0)
+                ci = tl.max(tl.where(elig & (rv == cr), o, -1), 0)
+                better = (cr < big) & ((cm > best_v) | ((cm == best_v) & (cr < best_r)))
+                best_v = tl.where(better, cm, best_v)
+                best_r = tl.where(better, cr, best_r)
+                best_i = tl.where(better, ci, best_i)
+            outv = tl.where(kk == jf, best_v, outv)
+            outi = tl.where(kk == jf, best_i, outi)
+            prev_v = best_v
+            prev_r = best_r
+    tl.store(OV + row * K + kk, outv)
+    tl.store(OI + row * K + kk, outi.to(tl.int64))
+    tl.store(OVF + row, n)          # candidates seen (overflow if > CAP)
+    tl.store(CNT + row, 0)
+
+
+class ThresholdTopK:
+    def __init__(self, rows, n, k, device, slice_=4096, cap=1024, wa=4, wb=4, wc=4, fi_chunk=77440, atomic=True):
+        self.atomic = atomic
+        self.n, self.k, self.slice, self.cap = n, k, slice_, cap
+        self.ns = triton.cdiv(n, slice_)
+        assert self.ns >= k
+        self.fi_chunk, self.nj = fi_chunk, triton.cdiv(fi_chunk, 1024)
+        self.sm = torch.empty(rows, self.ns, dtype=torch.float32, device=device)
+        self.cnt = torch.zeros(rows, dtype=torch.int32, device=device)
+        self.cv = torch.empty(rows, cap, dtype=torch.float32, device=device)
+        self.ci = torch.empty(rows, cap, dtype=torch.int32, device=device)
+        self.ov = torch.empty(rows, k, dtype=torch.float32, device=device)
+        self.oi = torch.empty(rows, k, dtype=torch.int64, device=device)
+        self.seen = torch.zeros(rows, dtype=torch.int32, device=device)
+        self.t = torch.empty(rows, dtype=torch.float32, device=device)
+        self.w = (wa, wb, wc)
+
+    def __call__(self, logits):
+        r = logits.shape[0]
+        _thr_a[(r, self.ns)](logits, self.sm, self.n, logits.stride(0), self.ns, self.slice, num_warps=self.w[0])
+        _thr_t[(r,)](self.sm, self.t, self.ns, triton.next_power_of_2(self.ns), self.k, num_warps=1)
+        _thr_b[(r, self.ns)](logits, self.sm, self.t, self.cnt, self.cv, self.ci, self.n, logits.stride(0), self.ns,
+                             self.slice, self.cap, self.atomic, num_warps=self.w[1])
+        _thr_c[(r,)](self.cnt, self.cv, self.ci, self.ov, self.oi, self.seen, logits, self.n, logits.stride(0),
+                     self.cap, self.k, self.fi_chunk, self.nj, 4096, num_warps=self.w[2])
+        return self.ov[:r], self.oi[:r]

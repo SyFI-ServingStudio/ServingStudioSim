@@ -15,6 +15,9 @@ vLLM fork's ``qwen3_dflash2`` draft (all incumbent callables are the fork's own:
   bytes equal (99.9999% measured, at most one fp8 code apart).
 - ``grouped_conv_residual_rms_norm:vllm_triton`` -- the fork's Beam
   ``conv_residual_norm`` vs ``dflash2_grouped_conv`` + ``fused_add_rms_norm``.
+- ``logits_topk:triton_threshold`` -- vendored ``ThresholdTopK`` vs
+  ``flashinfer.top_k(sorted=True, deterministic=True)``: ids and values must be
+  identical on every row.
 
 Caches use the fork's FlashAttention layout ``[pages, kv_heads, page, 2*head_dim]``
 (fp8), slots are a shuffled page pool, and the draft's scales are 1.0 (the draft
@@ -340,3 +343,69 @@ def profile_grouped_conv_residual_rms_norm_vllm_triton(
         return _measure(run, flops=m * h * (2 * taps + 4.0), nbytes=nbytes)
 
     return _guard("grouped_conv_residual_rms_norm", "vllm_triton", body)
+
+
+# ----------------------------------------------------------- vocabulary top-k --
+_TOPK_ID_EXACT_ROWS = 560
+
+
+def profile_logits_topk_triton_threshold(
+    num_rows: int, num_columns: int, top_k: int, dtype: Any
+) -> ComputeMetrics:
+    _positive(num_rows=num_rows, num_columns=num_columns, top_k=top_k)
+    if str(dtype) != "bf16":
+        raise ProfilerNotImplemented("threshold top-k is measured on bf16 logits")
+
+    def body(torch):
+        import flashinfer
+
+        from profiling.runners.dflash2.draft_chain_vendor import ThresholdTopK
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        gen = torch.Generator(device=dev).manual_seed(0)
+        scores = torch.randn(num_rows, num_columns, device=dev, generator=gen).to(torch.bfloat16)
+        if -(-num_columns // 2048) < top_k:
+            raise ProfilerNotImplemented("threshold top-k needs at least top_k 2048-wide slices")
+        # The setting the rows are measured with: 2048-wide slices, 128 candidates
+        # per row, warps 2/2/1.
+        topk = ThresholdTopK(
+            num_rows, num_columns, top_k, dev, slice_=2048, cap=128, wa=2, wb=2, wc=1
+        )
+
+        def run():
+            return topk(scores)
+
+        vals, ids = run()
+        ref_v, ref_i = flashinfer.top_k(scores, top_k, sorted=True, deterministic=True)
+        tie = (scores.float() * 2).round().div(2).to(torch.bfloat16)
+        tv, ti = ThresholdTopK(
+            num_rows, num_columns, top_k, dev, slice_=2048, cap=128, wa=2, wb=2, wc=1
+        )(tie)
+        rv2, ri2 = flashinfer.top_k(tie, top_k, sorted=True, deterministic=True)
+        torch.cuda.synchronize(dev)
+        rows = float((ids == ref_i.long()).all(-1).float().mean())
+        tie_rows = float((ti == ri2.long()).all(-1).float().mean())
+        values_ok = torch.equal(vals, ref_v.float()) and torch.equal(tv, rv2.float())
+        # The ids must point at the values they report (a valid top-k).
+        picks_ok = torch.equal(scores.gather(1, ids).float(), vals) and torch.equal(
+            tie.gather(1, ti).float(), tv
+        )
+        # Up to _TOPK_ID_EXACT_ROWS rows FlashInfer's deterministic order is the
+        # one the kernel reproduces, so ids must match it exactly; past that
+        # FlashInfer breaks bf16 ties in another order (measured: all rows
+        # identical up to 576, 31% at 640 and 768) and only values + valid
+        # picks are required.
+        ids_required = num_rows <= _TOPK_ID_EXACT_ROWS
+        if not values_ok or not picks_ok or (ids_required and (rows < 1.0 or tie_rows < 1.0)):
+            raise KernelLaunchFailed(
+                f"threshold top-k vs FlashInfer deterministic: values {values_ok} picks "
+                f"{picks_ok} ids rows {rows} tie rows {tie_rows}"
+            )
+        print(
+            f"[logits_topk:triton_threshold] rows={num_rows} values identical, ids identical "
+            f"{rows} (tie-heavy {tie_rows})"
+        )
+        nbytes = num_rows * (num_columns * 2 + top_k * 12)
+        return _measure(run, flops=float(num_rows * num_columns), nbytes=nbytes)
+
+    return _guard("logits_topk", "triton_threshold", body)

@@ -13,7 +13,7 @@ from profiling.kernels.logits_topk import KIND, LogitsTopkArgs
 from profiling.runners.sampling.logits_topk import _validate_args
 
 
-def test_both_backends_share_one_args_schema_and_table() -> None:
+def test_backends_share_one_args_schema_and_table() -> None:
     # The Rust payload names these fields; a rename strands every profiled row.
     assert [field.name for field in fields(LogitsTopkArgs)] == [
         "num_rows",
@@ -25,8 +25,8 @@ def test_both_backends_share_one_args_schema_and_table() -> None:
         LogitsTopkArgs, {"num_rows": "8", "num_columns": "38720", "top_k": "16", "dtype": "bf16"}
     )
     assert args == LogitsTopkArgs(8, 38720, 16, DType.BF16)
-    assert sorted(known_backends(KIND)) == ["flashinfer", "torch"]
-    for backend in ("flashinfer", "torch"):
+    assert sorted(known_backends(KIND)) == ["flashinfer", "torch", "triton_threshold"]
+    for backend in ("flashinfer", "torch", "triton_threshold"):
         spec = find_kernel_profiler_spec(KIND, backend)
         assert spec.args_schema is LogitsTopkArgs
         assert spec.table_name == KIND
