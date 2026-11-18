@@ -755,6 +755,7 @@ pub fn build_configs(
             decode_next_n: 1,
             decode_indexer: Default::default(),
             glue: Default::default(),
+            front: Default::default(),
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,

@@ -48,7 +48,9 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::dsa_topk_prefill::takes_row_starts;
 use crate::timing::kernels::sparse_indexer_topk::COOPERATIVE_MAX_ROWS;
 use crate::timing::kernels::{
-    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
+    BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
+    BatchedGemmStaticFp8QuantKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
@@ -190,6 +192,17 @@ pub enum DsaGlue {
     ForkLaunchList,
 }
 
+/// Fused launches that replace groups of the fork's DSA launches, each priced
+/// only by rows of the backend it names (a run-config override of its slot to
+/// another backend fails the build). The default is the fork's launches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glm53DsaFront {
+    /// `q_absorb`'s batched GEMM with the static FP8 quant of its output in
+    /// the epilogue (`batched_gemm_static_fp8_quant`, slot `q_absorb_fp8`).
+    /// Absorbs `q_absorb` and `q_fp8_quant`.
+    pub q_absorb_fp8: Option<&'static str>,
+}
+
 /// How a decode batch of unequal contexts prices its indexer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DsaDecodeIndexer {
@@ -270,6 +283,7 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub decode_next_n: u32,
     pub decode_indexer: DsaDecodeIndexer,
     pub glue: DsaGlue,
+    pub front: Glm53DsaFront,
 }
 
 /// The fork's decode glue launches ([`DsaGlue::ForkLaunchList`]).
@@ -325,6 +339,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub prefill_glue: ElementwiseKernelConfig,
     /// `raw_cfg.glue == ForkLaunchList`.
     pub fork_glue: Option<DsaForkGlueConfigs>,
+    pub q_absorb_fp8: Option<BatchedGemmStaticFp8QuantKernelConfig>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -383,6 +398,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
     pub fork_glue: Option<DsaForkGlue>,
+    pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
 
@@ -449,6 +465,12 @@ impl Glm53DsaAttnLocalWorklet {
             }
             .into(),
         };
+        let q_absorb = bmm(
+            &cfg.mla_bmm_q_absorb_backends,
+            cfg.kv_lora_rank.clone(),
+            cfg.qk_nope_head_dim.clone(),
+        );
+        let front = cfg.front;
         Glm53DsaAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
             q_kv_norm: QKvRmsNormKernelConfig {
@@ -568,11 +590,6 @@ impl Glm53DsaAttnLocalWorklet {
             },
             // Per row: int64 pool ids in, `index_topk + P - 1` int32 slots out.
             expand_pools: ew(8 * cfg.index_topk / kpool + 4, 4 * window),
-            q_absorb: bmm(
-                &cfg.mla_bmm_q_absorb_backends,
-                cfg.kv_lora_rank.clone(),
-                cfg.qk_nope_head_dim.clone(),
-            ),
             q_concat: ew(
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
@@ -637,6 +654,18 @@ impl Glm53DsaAttnLocalWorklet {
                 seq_lens_plus_one: ew(4, 4),
                 topk_buffer_copy: ew(4 * window, 4 * window),
             }),
+            // `q_absorb`'s shape, its output quantized in the epilogue.
+            q_absorb_fp8: front
+                .q_absorb_fp8
+                .map(|backend| BatchedGemmStaticFp8QuantKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: q_absorb.gpu_name.clone(),
+                    num_batches: q_absorb.num_batches.clone(),
+                    n: q_absorb.n.clone(),
+                    k: q_absorb.k.clone(),
+                    dtype: q_absorb.dtype,
+                }),
+            q_absorb,
             raw_cfg: cfg.clone(),
         }
     }
@@ -758,9 +787,22 @@ impl Glm53DsaAttnLocalWorklet {
                     })
                 })
                 .transpose()?,
+            q_absorb_fp8: r
+                .q_absorb_fp8
+                .map(|c| {
+                    atomic(
+                        n,
+                        "q_absorb_fp8",
+                        c,
+                        BatchedGemmStaticFp8QuantKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             name,
             resolved,
         };
+        worklet.check_front_backends()?;
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
         let backends = topk.kernel.config.backends.clone();
@@ -822,8 +864,9 @@ impl Glm53DsaAttnLocalWorklet {
         }
     }
 
-    /// The fork's launches, then the fork's glue launch list when it replaces
-    /// the placeholder (`glue` then bills zero in `eval`).
+    /// The fork's launches, then each enabled [`Glm53DsaFront`] fusion (the
+    /// launches it replaces bill zero in `eval`), then the fork's glue launch
+    /// list when it replaces the placeholder (`glue` then bills zero).
     fn compile_slots(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
         let mut slots = vec![
             self.fused_qkv_a.compile(builder),
@@ -855,6 +898,7 @@ impl Glm53DsaAttnLocalWorklet {
             repeated(&self.glue, GLUE_LAUNCHES, builder),
             repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
         ];
+        slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
         if let Some(g) = &self.fork_glue {
             slots.extend([
                 g.hidden_fp32_cast.compile(builder),
@@ -877,6 +921,8 @@ impl Glm53DsaAttnLocalWorklet {
         let all = tokens(w.total_tokens);
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
+        let front = cfg.front;
+        let absorb_fused = front.q_absorb_fp8.is_some();
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
             &self.q_kv_norm,
@@ -956,7 +1002,7 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.q_absorb,
             BatchedGemmKernelInput { m: w.total_tokens },
-            false,
+            absorb_fused,
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
@@ -965,7 +1011,7 @@ impl Glm53DsaAttnLocalWorklet {
                 num_tokens: w.total_tokens,
             },
             w.total_tokens,
-            false,
+            absorb_fused,
             ev,
         );
         self.sparse_mla.eval(
@@ -993,6 +1039,10 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(&self.o_proj, rows, false, ev);
         push_or_zero(&self.glue, all.clone(), self.fork_glue.is_some(), ev);
         push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(op) = &self.q_absorb_fp8 {
+            let input = BatchedGemmStaticFp8QuantKernelInput { m: w.total_tokens };
+            push_or_zero(op, input, false, ev);
+        }
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
             push_or_zero(&g.hidden_fp32_cast, all, false, ev);
@@ -1006,6 +1056,32 @@ impl Glm53DsaAttnLocalWorklet {
 }
 
 impl Glm53DsaAttnLocalWorklet {
+    /// Each [`Glm53DsaFront`] fusion is priced by its named backend's rows or
+    /// not at all: a run-config override would price another kernel under
+    /// its name.
+    fn check_front_backends(&self) -> Result<(), BuildError> {
+        let front = self.resolved.raw_cfg.front;
+        let pinned = [(
+            front.q_absorb_fp8,
+            self.q_absorb_fp8
+                .as_ref()
+                .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+        )];
+        for (backend, op) in pinned {
+            if let (Some(backend), Some((role, built, kind))) = (backend, op) {
+                if built.as_slice() != [backend] {
+                    return Err(BuildError::NoBackendForLaunch {
+                        kind,
+                        role: role.clone(),
+                        backends: built.clone(),
+                        launch: "a fused DSA launch, which only its configured backend prices",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn indexer_budget(&self) -> IndexerBudget {
         let cfg = &self.resolved.raw_cfg;
         IndexerBudget {
@@ -1383,6 +1459,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::timing::CoverageFlags;
 
     pub(crate) fn cfg() -> Glm53DsaAttnLocalWorkletConfig {
         Glm53DsaAttnLocalWorkletConfig {
@@ -1423,6 +1500,7 @@ mod tests {
             decode_next_n: 1,
             decode_indexer: DsaDecodeIndexer::LongestContext,
             glue: DsaGlue::Placeholder,
+            front: Glm53DsaFront::default(),
         }
     }
 
@@ -1497,6 +1575,31 @@ mod tests {
             .into_iter()
             .zip(inputs)
             .map(|((name, _), input)| (name, serde_json::to_value(input).unwrap()))
+            .collect()
+    }
+
+    /// Slots `worklet` bills zero on `input` that the default worklet bills
+    /// (a structure-only kernel answers a miss, a zeroed slot answers zero).
+    fn newly_zeroed(
+        worklet: &Glm53DsaAttnLocalWorklet,
+        input: &Glm53DsaAttnLocalWorkletInput,
+    ) -> Vec<String> {
+        let zeroed = |w: &Glm53DsaAttnLocalWorklet| -> Vec<String> {
+            let names = slots(w);
+            let mut metrics = vec![LeafMetrics::MISS; names.len()];
+            let mut ev = Evaluator::new(&mut metrics);
+            w.eval(input, &mut ev);
+            names
+                .into_iter()
+                .zip(metrics)
+                .filter(|(_, m)| m.coverage == CoverageFlags::EMPTY)
+                .map(|((name, _), _)| name)
+                .collect()
+        };
+        let base = zeroed(&build_with(|_| {}, &[]).unwrap());
+        zeroed(worklet)
+            .into_iter()
+            .filter(|name| !base.contains(name))
             .collect()
     }
 
@@ -1842,6 +1945,53 @@ mod tests {
         );
         assert_eq!(inputs["m.dsa.glue.hidden_fp32_cast"]["num_tokens"], 7);
         assert_eq!(inputs["m.dsa.glue.topk_buffer_copy"]["num_tokens"], 2);
+    }
+
+    /// Catches a fused q_absorb priced as the bf16 `batched_gemm` (no FP8
+    /// output), at another width than `q_absorb`, alongside the launches it
+    /// replaces, or on another backend than the one named.
+    #[test]
+    fn q_absorb_fp8_is_the_static_fp8_quant_kind_at_q_absorb_width() {
+        let front = Glm53DsaFront {
+            q_absorb_fp8: Some("tc_kernel"),
+        };
+        let w = build_with(|c| c.front = front, &[]).unwrap();
+        let c = w.resolved.q_absorb_fp8.as_ref().unwrap();
+        let a = &w.resolved.q_absorb;
+        assert_eq!(
+            (c.num_batches.get(), c.n.get(), c.k.get(), c.dtype),
+            (16, 512, 256, DType::Bf16)
+        );
+        assert_eq!(
+            (a.num_batches.get(), a.n.get(), a.k.get(), a.dtype),
+            (16, 512, 256, DType::Bf16)
+        );
+        let base = slots(&build_with(|_| {}, &[]).unwrap());
+        let added: Vec<_> = slots(&w)
+            .into_iter()
+            .filter(|slot| !base.contains(slot))
+            .collect();
+        assert_eq!(
+            added,
+            [(
+                "m.dsa.q_absorb_fp8".to_string(),
+                "batched_gemm_static_fp8_quant".to_string()
+            )]
+        );
+        assert_eq!(
+            w.q_absorb_fp8.as_ref().unwrap().kernel.config.backends,
+            ["tc_kernel"]
+        );
+        let replaced = ["m.dsa.q_absorb", "m.dsa.q_fp8_quant"];
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        assert_eq!(newly_zeroed(&w, &input), replaced);
+        assert!(matches!(
+            build_with(|c| c.front = front, &[("m.dsa.q_absorb_fp8", "torch")]),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
     }
 
     #[test]
