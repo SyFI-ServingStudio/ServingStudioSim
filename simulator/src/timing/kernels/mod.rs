@@ -12,6 +12,7 @@ pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
+pub mod dsa_fp32_split_state_update;
 pub mod dsa_index_cache_append;
 pub mod dsa_indexer_q_rope_quant;
 pub mod dsa_indexer_q_rope_quant_weight_fold;
@@ -146,6 +147,10 @@ pub use dsa_compressed_mqa_logits_prefill::{
 pub use dsa_compressed_topk_prefill::{
     DsaCompressedTopkPrefillKernel, DsaCompressedTopkPrefillKernelConfig,
     DsaCompressedTopkPrefillSpec,
+};
+pub use dsa_fp32_split_state_update::{
+    DsaFp32SplitStateUpdateKernel, DsaFp32SplitStateUpdateKernelConfig,
+    DsaFp32SplitStateUpdateKernelInput, DsaFp32SplitStateUpdateSpec,
 };
 pub use dsa_index_cache_append::{
     DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,

@@ -22,6 +22,7 @@ from profiling.kernels import (
     compressed_sparse_mla_rope_cast,  # noqa: F401
     dsa_compressed_mqa_logits_prefill,  # noqa: F401
     dsa_compressed_topk_prefill,  # noqa: F401
+    dsa_fp32_split_state_update,  # noqa: F401
     dsa_index_cache_append,  # noqa: F401
     dsa_indexer_q_rope_quant,  # noqa: F401
     dsa_indexer_q_rope_quant_weight_fold,  # noqa: F401
