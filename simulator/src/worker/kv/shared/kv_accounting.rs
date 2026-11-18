@@ -19,7 +19,8 @@
 //! `kv_overhead` picks the byte counts. `vllm` charges what vLLM allocates:
 //! padded entries, extra state copies, whole engine blocks, and a sliding window
 //! that holds `W - 1` tokens plus the tokens in flight. `none` charges only what
-//! the model itself must keep.
+//! the model itself must keep. `part_padding` overrides one part's entry bytes
+//! and leaves every other rule of the mode in place.
 //!
 //! [`KvAccounting::report`] restates one resolved pool as a
 //! [`KvCacheReport`](super::kv_cache_report::KvCacheReport), built once per
@@ -31,6 +32,8 @@ use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart, KvGrowth};
+
+use super::state_retention::StateRetention;
 
 /// Whether KV charges include what the serving engine allocates on top of the
 /// model's own state.
@@ -81,6 +84,11 @@ pub enum PrefixResumePoints {
     PromptAndResponseEnd,
     /// Every engine block (vLLM's `prefix_cache_retention_interval = None`).
     EveryBlock,
+    /// The end of the request's context, not floored to the engine block: an
+    /// engine that saves the state where its pass ended, so a later prompt
+    /// resumes from the whole context when it extends it, else from nothing.
+    /// Not vLLM.
+    ContextEnd,
 }
 
 impl PrefixResumePoints {
@@ -89,6 +97,7 @@ impl PrefixResumePoints {
         "response_end",
         "prompt_and_response_end",
         "every_block",
+        "context_end",
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -97,19 +106,72 @@ impl PrefixResumePoints {
             Self::ResponseEnd => "response_end",
             Self::PromptAndResponseEnd => "prompt_and_response_end",
             Self::EveryBlock => "every_block",
+            Self::ContextEnd => "context_end",
         }
     }
 }
 
+/// The entry bytes one part is charged instead of what `kv_overhead` gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartCharge {
+    /// The engine's padded entry, where the layout declares one.
+    Padded,
+    /// The model's own entry.
+    Unpadded,
+    /// This many bytes per entry, such as an engine that packs a state more
+    /// tightly than either.
+    Bytes(u64),
+}
+
+/// `<part>=<charge>`: one part's [`PartCharge`], `<charge>` being `padded`,
+/// `unpadded` or a byte count per entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PartPadding {
+    pub part: String,
+    pub charge: PartCharge,
+}
+
+impl std::str::FromStr for PartPadding {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        let Some((part, charge)) = value.split_once('=') else {
+            anyhow::bail!("`{value}` is not `<part>=<padded|unpadded|bytes per entry>`");
+        };
+        let charge = match charge.trim() {
+            "padded" => PartCharge::Padded,
+            "unpadded" => PartCharge::Unpadded,
+            bytes => PartCharge::Bytes(bytes.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "`{value}`: the charge is `padded`, `unpadded` or a byte count per entry"
+                )
+            })?),
+        };
+        Ok(Self {
+            part: part.trim().to_string(),
+            charge,
+        })
+    }
+}
+
 /// Worker options that shape the charges.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KvAccountingOptions {
     pub overhead: KvOverhead,
+    /// Parts charged other entry bytes than `overhead` gives them; each names
+    /// a part of the layout at most once.
+    pub part_padding: Vec<PartPadding>,
+    /// The engine block in tokens instead of the layout's
+    /// ([`crate::arch::kv_layout::EngineOverhead::with_block_tokens`]).
+    pub block_tokens: Option<u32>,
     /// `None` follows the overhead mode: `prompt_end` under `vllm`,
     /// `response_end` under `none`.
     pub resume_points: Option<PrefixResumePoints>,
     /// Also resume at every multiple of this many tokens.
     pub resume_interval: Option<u32>,
+    /// Which round-end states a retained entry keeps below its end.
+    pub state_retention: StateRetention,
     /// Tokens one step may have in flight across the batch (vLLM:
     /// `max_concurrent_batches × max_num_batched_tokens`). It caps what
     /// admission charges a sliding window; `None` charges the whole prompt.
@@ -199,13 +261,40 @@ impl KvAccounting {
         options: KvAccountingOptions,
         budget_bytes: u64,
     ) -> anyhow::Result<Self> {
+        let overridden;
+        let layout = match options.block_tokens {
+            Some(block_tokens) => {
+                overridden = layout
+                    .clone()
+                    .with_engine(layout.engine.with_block_tokens(block_tokens));
+                &overridden
+            }
+            None => layout,
+        };
         layout.validate()?;
+        for padding in &options.part_padding {
+            ensure!(
+                layout.parts.iter().any(|part| part.name == padding.part),
+                "kv_part_padding names part `{}`, which the layout does not have (its parts: {})",
+                padding.part,
+                layout
+                    .parts
+                    .iter()
+                    .map(|part| part.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let with_overhead = options.overhead == KvOverhead::Vllm;
         let bytes_per_unit = layout
             .parts
             .iter()
-            .map(|part| charged_bytes_per_entry(part, options.overhead))
+            .map(|part| charged_bytes_per_entry(part, &options))
             .fold(0, gcd);
+        ensure!(
+            bytes_per_unit > 0,
+            "kv_part_padding charges every part zero bytes"
+        );
 
         let mut per_token = Vec::new();
         let mut windows = Vec::new();
@@ -213,7 +302,7 @@ impl KvAccounting {
         let mut align_estimate_units = 0;
         let mut reusable_state_units = 0;
         for part in &layout.parts {
-            let units = charged_bytes_per_entry(part, options.overhead) / bytes_per_unit;
+            let units = charged_bytes_per_entry(part, &options) / bytes_per_unit;
             match part.growth {
                 KvGrowth::PerToken { tokens_per_entry } => per_token.push(PerTokenCharge {
                     units_per_entry: units,
@@ -225,7 +314,7 @@ impl KvAccounting {
                     prefix_reusable: part.prefix_reusable,
                 }),
                 KvGrowth::PerRequest => {
-                    let (copies, aligns) = state_copies(part, layout, options);
+                    let (copies, aligns) = state_copies(part, layout, &options);
                     state_units += units * u64::from(copies);
                     align_estimate_units += units * u64::from(aligns);
                     if part.prefix_reusable {
@@ -262,14 +351,29 @@ impl KvAccounting {
                 "prefix_resume_interval {interval} must be a positive multiple of the engine block ({block_tokens} tokens)"
             );
         }
+        if options.state_retention.keeps_earlier() {
+            ensure!(
+                resume_points == PrefixResumePoints::ContextEnd && resume_interval.is_none(),
+                "recurrent_state_checkpoints > 1 or recurrent_state_anchors keep states left at \
+                 earlier context ends: they need prefix_resume_points: context_end and no \
+                 prefix_resume_interval"
+            );
+            ensure!(
+                windows.iter().all(|part| !part.prefix_reusable),
+                "recurrent_state_checkpoints > 1 or recurrent_state_anchors do not charge a \
+                 reusable sliding window's tail at an earlier state"
+            );
+        }
 
         Ok(Self {
             layout: layout.clone(),
+            overhead: options.overhead,
+            checkpoint_block_tokens: layout.engine.block_tokens,
+            max_in_flight_tokens: options.max_in_flight_tokens.map(u64::from),
             options,
             budget_bytes,
             attention_shards: 1,
             reserved_units: 0,
-            overhead: options.overhead,
             bytes_per_unit,
             capacity_units,
             per_token,
@@ -278,8 +382,6 @@ impl KvAccounting {
             align_estimate_units,
             reusable_state_units,
             block_tokens,
-            checkpoint_block_tokens: layout.engine.block_tokens,
-            max_in_flight_tokens: options.max_in_flight_tokens.map(u64::from),
             linear_units_per_token,
             resume_points,
             resume_interval,
@@ -333,8 +435,8 @@ impl KvAccounting {
         &self.layout
     }
 
-    pub(super) fn options(&self) -> KvAccountingOptions {
-        self.options
+    pub(super) fn options(&self) -> &KvAccountingOptions {
+        &self.options
     }
 
     pub(super) fn budget_bytes(&self) -> u64 {
@@ -352,6 +454,15 @@ impl KvAccounting {
 
     pub(super) fn resume_points(&self) -> PrefixResumePoints {
         self.resume_points
+    }
+
+    pub(crate) fn state_retention(&self) -> StateRetention {
+        self.options.state_retention
+    }
+
+    /// Units of one reusable state, what each kept round-end state costs.
+    pub(crate) fn reusable_state_units(&self) -> u64 {
+        self.reusable_state_units
     }
 
     /// The longest context whose running charge fits `units`.
@@ -452,7 +563,7 @@ impl KvAccounting {
             .iter()
             .map(|part| {
                 let units_per_entry =
-                    charged_bytes_per_entry(part, self.overhead) / self.bytes_per_unit;
+                    charged_bytes_per_entry(part, &self.options) / self.bytes_per_unit;
                 let (tokens_held, entries) = match part.growth {
                     KvGrowth::PerToken { tokens_per_entry } => {
                         let tokens = if prompt_tokens == 0 { 0 } else { allocated };
@@ -468,7 +579,7 @@ impl KvAccounting {
                         (Some(tokens), tokens)
                     }
                     KvGrowth::PerRequest => {
-                        let (copies, aligns) = state_copies(part, &self.layout, self.options);
+                        let (copies, aligns) = state_copies(part, &self.layout, &self.options);
                         (None, u64::from(copies + u32::from(aligns)))
                     }
                 };
@@ -543,6 +654,7 @@ impl KvAccounting {
                 ([Some(prompt_end), Some(response_end)], self.resume_interval)
             }
             PrefixResumePoints::EveryBlock => ([None, None], Some(block)),
+            PrefixResumePoints::ContextEnd => ([Some(context_tokens), None], self.resume_interval),
         };
         ResumePositions::new(explicit, every, context_tokens)
     }
@@ -633,6 +745,11 @@ impl ResumePositions {
         }
     }
 
+    /// An entry resumable only at `at`, where a kept state sits.
+    pub(crate) fn at_state(at: u64) -> Self {
+        Self::new([Some(at), None], None, at)
+    }
+
     /// Context tokens the entry keeps; also its last position.
     pub(crate) fn end(&self) -> u64 {
         self.end
@@ -718,15 +835,23 @@ impl ResumePositions {
     }
 }
 
-/// Bytes one entry of `part` is charged: the engine's padded entry under
-/// `vllm`, the model's own under `none`.
-pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) -> u64 {
-    match overhead {
-        KvOverhead::Vllm => part
-            .overhead
-            .padded_bytes_per_entry
-            .unwrap_or(part.bytes_per_entry),
-        KvOverhead::None => part.bytes_per_entry,
+/// Bytes one entry of `part` is charged: its `part_padding` when the options
+/// name it, else the engine's padded entry under `vllm` and the model's own
+/// under `none`.
+pub(super) fn charged_bytes_per_entry(part: &KvCachePart, options: &KvAccountingOptions) -> u64 {
+    let padded = part
+        .overhead
+        .padded_bytes_per_entry
+        .unwrap_or(part.bytes_per_entry);
+    let charge = options
+        .part_padding
+        .iter()
+        .find(|padding| padding.part == part.name)
+        .map(|padding| padding.charge);
+    match (charge, options.overhead) {
+        (Some(PartCharge::Padded), _) | (None, KvOverhead::Vllm) => padded,
+        (Some(PartCharge::Unpadded), _) | (None, KvOverhead::None) => part.bytes_per_entry,
+        (Some(PartCharge::Bytes(bytes)), _) => bytes,
     }
 }
 
@@ -744,7 +869,7 @@ pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) 
 pub(super) fn state_copies(
     part: &KvCachePart,
     layout: &KvCacheLayout,
-    options: KvAccountingOptions,
+    options: &KvAccountingOptions,
 ) -> (u32, bool) {
     if options.overhead == KvOverhead::None {
         return (1, false);
@@ -955,6 +1080,67 @@ mod tests {
     }
 
     #[test]
+    fn a_block_override_drives_rounding_resume_points_checkpoints_and_the_null_block() {
+        let layout = gdn_layout().with_engine(EngineOverhead {
+            block_tokens: Some(1_056),
+            fixed_device_bytes: 1_056 * 100,
+        });
+        let resolve = |block_tokens| {
+            KvAccounting::resolve(
+                &layout,
+                KvAccountingOptions {
+                    block_tokens,
+                    ..options(KvOverhead::Vllm)
+                },
+                1_000_000,
+            )
+            .unwrap()
+        };
+        let arch = resolve(None);
+        let paged = resolve(Some(128));
+        assert_eq!(arch.capacity_units(), (1_000_000 - 105_600) / 100);
+        assert_eq!(paged.capacity_units(), (1_000_000 - 12_800) / 100);
+        // 2000 tokens take sixteen 128-token blocks; the padded state keeps
+        // its declared bytes.
+        assert_eq!(paged.held_while_running(2_000, 1), 2_048 + 3_168);
+        assert_eq!(paged.resume_positions(8_000, 8_500).floor(8_500), 7_936);
+        assert_eq!(paged.checkpoint_block_tokens(), Some(128));
+        assert_eq!(paged.layout().engine.block_tokens, Some(128));
+        assert_eq!(
+            resolve(None).resume_positions(8_000, 8_500).floor(8_500),
+            7_392
+        );
+    }
+
+    #[test]
+    fn resume_points_bound_what_a_shorter_prompt_reuses() {
+        let resolve = |layout: &KvCacheLayout, points| {
+            KvAccounting::resolve(
+                layout,
+                KvAccountingOptions {
+                    resume_points: Some(points),
+                    ..options(KvOverhead::Vllm)
+                },
+                1 << 40,
+            )
+            .unwrap()
+        };
+        let any = resolve(&full_only(8), PrefixResumePoints::ContextEnd);
+        let every_block = resolve(&gdn_layout(), PrefixResumePoints::EveryBlock);
+        let context_end = resolve(&gdn_layout(), PrefixResumePoints::ContextEnd);
+        let hit = |accounting: &KvAccounting, declared| {
+            accounting.resume_positions(5_000, 5_000).floor(declared)
+        };
+        assert_eq!(hit(&any, 3_210), 3_210);
+        assert_eq!(hit(&every_block, 3_210), 3_168);
+        assert_eq!(hit(&context_end, 3_210), 0, "no state inside the context");
+        // The context end is not floored to the 1056-token block.
+        assert_eq!(hit(&context_end, 5_000), 5_000);
+        assert_eq!(hit(&context_end, 5_001), 5_000);
+        assert_eq!(context_end.checkpoint_units(5_000, 4_999), 0);
+    }
+
+    #[test]
     fn entry_charge_counts_tails_once_and_one_state_per_position() {
         let accounting = KvAccounting::resolve(
             &swa_layout(),
@@ -1035,5 +1221,72 @@ mod tests {
             1 << 40,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn part_padding_overrides_one_parts_entry_bytes_only() {
+        let resolve = |overhead, padding: &[&str]| {
+            KvAccounting::resolve(
+                &gdn_layout(),
+                KvAccountingOptions {
+                    part_padding: padding.iter().map(|value| value.parse().unwrap()).collect(),
+                    ..options(overhead)
+                },
+                1 << 40,
+            )
+        };
+        // The 300_000-byte state unpadded under vllm: blocks still round the
+        // 2000 tokens up to 2112.
+        let unpadded = resolve(KvOverhead::Vllm, &["gdn=unpadded"]).unwrap();
+        assert_eq!(unpadded.held_while_running(2_000, 1), 2_112 + 3_000);
+        let bytes = resolve(KvOverhead::Vllm, &["gdn=250000"]).unwrap();
+        assert_eq!(bytes.held_while_running(2_000, 1), 2_112 + 2_500);
+        // Padded under none: the padding only, no block rounding.
+        let padded = resolve(KvOverhead::None, &["gdn=padded"]).unwrap();
+        assert_eq!(padded.held_while_running(2_000, 1), 2_000 + 3_168);
+
+        let unknown = resolve(KvOverhead::Vllm, &["mamba=unpadded"]).unwrap_err();
+        assert!(format!("{unknown:#}").contains("gqa, gdn"), "{unknown:#}");
+        assert!(resolve(KvOverhead::Vllm, &["gqa=0", "gdn=0"]).is_err());
+    }
+
+    #[test]
+    fn part_padding_parses_a_name_and_a_charge() {
+        let parse = |value: &str| value.parse::<PartPadding>();
+        assert_eq!(
+            parse("kda=unpadded").unwrap(),
+            PartPadding {
+                part: "kda".to_string(),
+                charge: PartCharge::Unpadded
+            }
+        );
+        assert_eq!(parse("kda=padded").unwrap().charge, PartCharge::Padded);
+        assert_eq!(
+            parse("kda=66969600").unwrap().charge,
+            PartCharge::Bytes(66_969_600)
+        );
+        for malformed in ["kda", "kda=compact", "kda=-1"] {
+            assert!(parse(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn earlier_states_need_context_end_positions_only() {
+        let resolve = |layout: &KvCacheLayout, points, interval| {
+            KvAccounting::resolve(
+                layout,
+                KvAccountingOptions {
+                    resume_points: Some(points),
+                    resume_interval: interval,
+                    state_retention: StateRetention::Latest { k: 2 },
+                    ..options(KvOverhead::Vllm)
+                },
+                1 << 40,
+            )
+        };
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::ContextEnd, None).is_ok());
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::PromptEnd, None).is_err());
+        assert!(resolve(&gdn_layout(), PrefixResumePoints::ContextEnd, Some(1_056)).is_err());
+        assert!(resolve(&swa_layout(), PrefixResumePoints::ContextEnd, None).is_err());
     }
 }

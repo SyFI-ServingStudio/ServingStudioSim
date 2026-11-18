@@ -179,8 +179,16 @@ where
     fn next_wakeup(&self, now: Time) -> Option<Time> {
         match self.iteration_fsm.worker_state {
             WorkerFsmState::Idle => {
+                // A request whose host-tier read runs can do nothing before
+                // its read lands.
                 let status = self.status();
-                (status.queued_requests > 0 || status.active_requests > 0).then_some(now)
+                if status.active_requests > 0
+                    || status.queued_requests > self.admission.reading_requests()
+                {
+                    Some(now)
+                } else {
+                    self.admission.next_read_landing(&self.kv_store)
+                }
             }
             WorkerFsmState::Active => match self.iteration_fsm.batch_state.cursor {
                 IterCursor::NotStarted | IterCursor::Done => Some(now),
@@ -246,9 +254,12 @@ mod tests {
     use crate::arch::contract::IterwiseUnifiedModel;
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
-    use crate::worker::admission::{FifoOrder, ShortestJobFirst};
+    use crate::worker::admission::{
+        FifoOrder, ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind,
+        ReadWait, ReadWaitPolicy, ShortestJobFirst, StartedOrder,
+    };
     use crate::worker::config::{BoundedFutureKvAdmissionConfig, DpPlacement};
-    use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
+    use crate::worker::kv::{PrefixCacheConfig, PrefixKv, TieredPrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
         build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
@@ -638,6 +649,192 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    fn chunked_worker_with(
+        store: SharedRequests,
+        model: FakeModel,
+        config: WorkerConfig,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(model),
+            store,
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Form one iteration at `now`, then complete it 1 ms later.
+    fn run_iteration(worker: &mut ChunkedPrefillWorker<FakeModel>, now: Time) {
+        assert!(worker.form_batch(now));
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            now + Time::from_ms(1.0),
+        );
+    }
+
+    /// Form one iteration at `now`; returns each DP group's prefill chunks.
+    fn formed_chunk_pairs(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        now: Time,
+    ) -> Vec<Vec<(u32, u32)>> {
+        assert!(worker.form_batch(now));
+        let mut input: crate::arch::UnifiedArchInput = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        input
+            .groups
+            .into_iter()
+            .map(|group| group.prefill_chunk_pairs)
+            .collect()
+    }
+
+    /// A 5000-token prompt queued at 0 ms behind one 1000-token prompt arriving
+    /// every ms, each filling an iteration under shortest-prefill-first;
+    /// returns the long prompt's prefill tokens processed after 8 iterations.
+    fn starved_spf_progress(force_schedule_after: Option<Time>) -> u32 {
+        let mut requests = vec![(0, 5_000, 1)];
+        requests.extend((1..=8).map(|id| (id, 1_000, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=8 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(1_000),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                force_schedule: force_schedule_after.map(|after| ForceSchedule {
+                    after,
+                    hits_first: HitsFirst::Off,
+                }),
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for step in 0..8_u32 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(step + 1)));
+            run_iteration(&mut worker, Time::from_ms(f64::from(step)));
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_leaves_the_spf_queue_first() {
+        assert_eq!(starved_spf_progress(None), 0, "SPF alone starves it");
+        // Overdue at 3 ms: it starts then and, started, keeps its place.
+        assert_eq!(starved_spf_progress(Some(Time::from_ms(3.0))), 5_000);
+    }
+
+    /// A 5000-token prompt starts alone under a 2048-token budget; a 500-token
+    /// prompt then queues. Returns the next iteration's prefill chunks.
+    fn chunks_after_a_short_prompt_queues_behind_a_long_one(
+        started_order: StartedOrder,
+    ) -> Vec<(u32, u32)> {
+        let store = shared_with(&[(0, 5_000, 1), (1, 500, 1)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                started_order,
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        run_iteration(&mut worker, Time::ZERO);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let mut chunks = formed_chunk_pairs(&mut worker, Time::from_ms(1.0)).remove(0);
+        chunks.sort_unstable();
+        chunks
+    }
+
+    #[test]
+    fn srpt_runs_a_queued_prompt_shorter_than_the_started_one_first() {
+        // vLLM order: the started prompt's 2952 tokens left fill the budget.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(StartedOrder::StartOrder),
+            [(2_048, 2_048)]
+        );
+        // srpt: the queued 500 go first; the started prompt takes the rest.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(StartedOrder::ShortestRemaining),
+            [(0, 500), (2_048, 1_548)]
+        );
+    }
+
+    #[test]
+    fn a_load_budget_follows_each_dp_rank_own_backlog() {
+        // Round-robin: rank 0 queues 3000 tokens, rank 1 800.
+        let store = shared_with(&[(0, 3_000, 1), (1, 800, 1)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::with_dp_groups(1.0, 2),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                dp_placement: DpPlacement::RoundRobin,
+                microbatch_budget: MicrobatchBudget {
+                    load: Some(LoadBudget {
+                        low_tokens: 512,
+                        backlog_lo_tokens: 1_000,
+                        backlog_hi_tokens: 5_000,
+                    }),
+                    ..MicrobatchBudget::default()
+                },
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        // Rank 0's backlog is halfway from 1000 to 5000: halfway from 512 to
+        // 2048. Rank 1's is below 1000: the floor. One shared backlog (3800)
+        // would give both ranks 1459.
+        assert_eq!(
+            formed_chunk_pairs(&mut worker, Time::ZERO),
+            [vec![(0, 1_280)], vec![(0, 512)]]
+        );
+    }
+
+    #[test]
+    fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
+        let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);
+        let mut worker = chunked_worker_with(
+            store,
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                microbatch_budget: MicrobatchBudget {
+                    long_prefill_token_threshold: Some(4_096),
+                    ..MicrobatchBudget::default()
+                },
+                ..WorkerConfig::default()
+            },
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        // Uncapped, the long prompt would take all 8192 and the short one wait.
+        assert_eq!(
+            formed_chunk_pairs(&mut worker, Time::ZERO),
+            [vec![(0, 4_096), (0, 100)]]
+        );
     }
 
     #[test]
@@ -1321,5 +1518,389 @@ mod tests {
         assert_eq!(worker.kv_store.prefill_admits(0).count(), 2);
         assert_eq!(worker.kv_store.prefill_admits(1).count(), 2);
         assert_eq!(worker.admission.queued_requests(), 2);
+    }
+
+    // ── Per-rank prefix tiers ────────────────────────────────────────────────
+
+    fn as_session(
+        store: &SharedRequests,
+        id: u32,
+        session_id: u32,
+        declared: u32,
+        arrival_ms: f64,
+    ) {
+        let mut store = store.borrow_mut();
+        let request = &mut store[RequestId(id)].request;
+        request.definition.session = SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: declared,
+        };
+        request.core.arrival_time = Time::from_ms(arrival_ms);
+    }
+
+    /// 1 B/token, 120 tokens of HBM per rank; each rank's DRAM holds 1000
+    /// tokens and reads 1e5 B/s, so 50 tokens take 0.5 ms.
+    fn rank_tiers_config() -> WorkerConfig {
+        WorkerConfig {
+            max_batch_tokens: Some(256),
+            attn_kv_bytes: 120,
+            prefix_tiers: vec![crate::worker::kv::TierSpec {
+                name: "dram",
+                capacity_gb: 1e-6,
+                read_gb_per_s: 1e-4,
+                writes: crate::worker::kv::TierWrites::EveryContext,
+            }],
+            ..WorkerConfig::default()
+        }
+    }
+
+    /// Tick at every wakeup, at least 0.1 ms apart, up to `until`.
+    fn run_ticks(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        from: Time,
+        until: Time,
+        events: &mut Vec<WorkerEventCommon>,
+    ) {
+        let mut now = from;
+        while now <= until {
+            let Some(next) = worker.tick(now, events) else {
+                break;
+            };
+            now = next.max(now + Time::from_ms(0.1));
+        }
+    }
+
+    fn hit(store: &SharedRequests, id: u32) -> Option<u32> {
+        store.borrow()[RequestId(id)]
+            .telemetry
+            .prefix_cache_hit_tokens
+    }
+
+    /// Sessions 7 (40 pre-run tokens) and 9 (20) and a standalone 8-token
+    /// prompt arrive at 0 ms on one rank. Session 7's read holds the DRAM
+    /// channel until 0.4 ms, past a 0.1 ms read-wait bound for session 9.
+    /// Returns the standalone prompt's first-token time.
+    fn first_token_behind_a_read_past_the_bound(policy: ReadWaitPolicy) -> Time {
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 20, 0.0);
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                prefix_tier_warm_start: true,
+                prefix_tier_read_wait: Some(ReadWait {
+                    max: Time::from_ms(0.1),
+                    policy,
+                }),
+                ..rank_tiers_config()
+            },
+        );
+        let mut events = Vec::new();
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        run_ticks(&mut worker, Time::ZERO, Time::from_ms(20.0), &mut events);
+        assert_eq!(events.len(), 3, "{policy:?}");
+        for (id, tokens) in [(0, 40), (1, 20)] {
+            assert_eq!(hit(&store, id), Some(tokens), "{policy:?}");
+        }
+        let first_token = store.borrow()[RequestId(2)]
+            .telemetry
+            .first_output_time
+            .expect("the standalone prompt finishes");
+        first_token
+    }
+
+    #[test]
+    fn a_rank_passes_over_a_read_past_the_bound_for_the_request_behind() {
+        // Session 9 is passed over, holding nothing; the prompt runs at 0 ms.
+        assert_eq!(
+            first_token_behind_a_read_past_the_bound(ReadWaitPolicy::PassOver),
+            Time::from_ms(1.0)
+        );
+    }
+
+    #[test]
+    fn a_rank_blocks_at_a_read_past_the_bound_under_the_block_policy() {
+        // Session 9 stops admission until its read would start within the
+        // bound: the tick at 0.3 ms, 0.1 ms before session 7's read lands.
+        assert_eq!(
+            first_token_behind_a_read_past_the_bound(ReadWaitPolicy::Block),
+            Time::from_ms(1.3)
+        );
+    }
+
+    #[test]
+    fn a_rank_reads_an_evicted_session_back_from_its_dram() {
+        // Session 7 round 0 (50 tokens), a 100-token prompt that evicts it from
+        // HBM, then round 1 declaring 51 tokens, 50 of them with KV in DRAM.
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::for_ms(1.0),
+            rank_tiers_config(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        run_ticks(&mut worker, Time::ZERO, Time::from_ms(4.0), &mut events);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        run_ticks(
+            &mut worker,
+            Time::from_ms(4.0),
+            Time::from_ms(9.0),
+            &mut events,
+        );
+        assert_eq!(events.len(), 2);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert_eq!(worker.status().queued_requests, 1);
+        // Nothing runs until the read lands.
+        assert_eq!(
+            worker.tick(Time::from_ms(10.0), &mut events),
+            Some(Time::from_ms(10.5))
+        );
+        assert_eq!(worker.status().queued_requests, 1);
+        run_ticks(
+            &mut worker,
+            Time::from_ms(10.5),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(hit(&store, 2), Some(50));
+    }
+
+    #[test]
+    fn without_tiers_the_evicted_session_is_computed() {
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::for_ms(1.0),
+            WorkerConfig {
+                prefix_tiers: Vec::new(),
+                ..rank_tiers_config()
+            },
+        );
+        let mut events = Vec::new();
+        for (id, from) in [(0, 0.0), (1, 4.0), (2, 10.0)] {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(from),
+                Time::from_ms(from + 5.0),
+                &mut events,
+            );
+        }
+        assert_eq!(events.len(), 3);
+        assert_eq!(hit(&store, 2), Some(0));
+    }
+
+    #[test]
+    fn each_rank_reads_from_its_own_tiers() {
+        // Two ranks, round robin: session 7 runs on rank 0 and session 9 on
+        // rank 1; each is evicted by a 100-token prompt on its rank, and each
+        // later round reads its context back from its own rank's DRAM.
+        let store = shared_with(&[
+            (0, 50, 1),
+            (1, 50, 1),
+            (2, 100, 1),
+            (3, 100, 1),
+            (4, 4, 1),
+            (5, 4, 1),
+        ]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 1, 9, 0, 0.0);
+        as_session(&store, 4, 7, 51, 10.0);
+        as_session(&store, 5, 9, 51, 10.0);
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::with_dp_groups(1.0, 2),
+            rank_tiers_config(),
+        );
+        let mut events = Vec::new();
+        for (ids, from) in [([0, 1], 0.0), ([2, 3], 4.0), ([4, 5], 10.0)] {
+            for id in ids {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            }
+            run_ticks(
+                &mut worker,
+                Time::from_ms(from),
+                Time::from_ms(from + 5.0),
+                &mut events,
+            );
+        }
+        assert_eq!(events.len(), 6);
+        assert_eq!((hit(&store, 4), hit(&store, 5)), (Some(50), Some(50)));
+        // Each read used its own rank's DRAM channel: both landed together.
+        assert_eq!(
+            store.borrow()[RequestId(4)].telemetry.first_output_time,
+            store.borrow()[RequestId(5)].telemetry.first_output_time,
+        );
+    }
+
+    #[test]
+    fn decode_elsewhere_on_a_dp_rank_keeps_the_session_on_it() {
+        // Round 0 of session 7 has 5 target outputs and lands on rank 0; a
+        // standalone prompt takes rank 1; round 1 finds the 54 tokens with KV
+        // (all but the last output) back on rank 0.
+        let store = shared_with(&[(0, 50, 5), (1, 8, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 55, 10.0);
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel::with_dp_groups(1.0, 2),
+            WorkerConfig {
+                external_decode: true,
+                ..rank_tiers_config()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        run_ticks(&mut worker, Time::ZERO, Time::from_ms(9.0), &mut events);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            1
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        run_ticks(
+            &mut worker,
+            Time::from_ms(10.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(hit(&store, 2), Some(54));
+    }
+
+    #[test]
+    fn hits_first_when_at_risk_reads_a_rank_context_first_only_while_it_is_at_risk() {
+        // One rank, 120 tokens of HBM, a 64-token budget. Sessions 7 (50
+        // tokens) and 8 (100) run and are written through DRAM; HBM keeps
+        // only session 8. At 10 ms a 100-token prompt of session 9 (arrived
+        // 4 ms) is overdue and session 7's round 1 (9 ms) is not. Oldest first
+        // runs the prompt; written through a 150-token DRAM it evicts session
+        // 7, so round 1 recomputes: the gated split reads it first. In a
+        // 500-token DRAM nothing is at risk: the gate keeps oldest first and
+        // round 1 still finds its context after the prompt.
+        for (dram_tokens, order, hit_tokens, round1_first) in [
+            (150, HitsFirst::Off, 0, false),
+            (150, HitsFirst::Always, 50, true),
+            (150, HitsFirst::WhenAtRisk, 50, true),
+            (500, HitsFirst::Always, 50, true),
+            (500, HitsFirst::WhenAtRisk, 50, false),
+        ] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 100, 1), (3, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 3.0);
+            as_session(&store, 2, 9, 0, 4.0);
+            as_session(&store, 3, 7, 51, 9.0);
+            let mut config = rank_tiers_config();
+            config.max_batch_tokens = Some(64);
+            config.prefix_tiers[0].capacity_gb = f64::from(dram_tokens) * 1e-9;
+            let mut worker = chunked_worker_with(
+                Rc::clone(&store),
+                FakeModel::for_ms(1.0),
+                WorkerConfig {
+                    pending_order: PendingOrderKind::ShortestPrefillFirst,
+                    started_order: StartedOrder::ShortestRemaining,
+                    force_schedule: Some(ForceSchedule {
+                        after: Time::from_ms(5.0),
+                        hits_first: order,
+                    }),
+                    ..config
+                },
+            );
+            let label = format!("DRAM {dram_tokens}, {order:?}");
+            let mut events = Vec::new();
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            run_ticks(&mut worker, Time::ZERO, Time::from_ms(2.9), &mut events);
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(3.0),
+                Time::from_ms(9.0),
+                &mut events,
+            );
+            assert_eq!(events.len(), 2, "{label}");
+            let round1 = store.borrow()[RequestId(3)].request.definition.session;
+            assert_eq!(
+                worker.kv_store.resident_prefix_tokens(4, round1),
+                0,
+                "{label}"
+            );
+            assert_eq!(
+                worker.kv_store.reusable_prefix_tokens(0, 4, round1),
+                50,
+                "{label}"
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(3)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(10.0),
+                Time::from_ms(80.0),
+                &mut events,
+            );
+            let done: Vec<RequestId> = events
+                .iter()
+                .map(|event| {
+                    let WorkerEventCommon::RequestComplete { req, .. } = event;
+                    *req
+                })
+                .collect();
+            assert_eq!(done.len(), 4, "{label}");
+            assert_eq!(hit(&store, 3), Some(hit_tokens), "{label}");
+            let position = |id| done.iter().position(|&request| request == RequestId(id));
+            assert_eq!(position(3) < position(2), round1_first, "{label}: {done:?}");
+        }
+    }
+
+    #[test]
+    fn a_hybrid_rank_stages_its_read_through_the_loading_area() {
+        // A 1-token KV byte and a 10-byte recurrent state resumed at the
+        // context's end. Session 7's 50-token round is evicted from HBM; its
+        // next round reads the 50 tokens and the state back through HBM's
+        // loading area and resumes at its end.
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let layout = crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
+            .with_part(crate::arch::kv_layout::KvCachePart::per_request("gdn", 10));
+        let mut worker = chunked_worker_with(
+            Rc::clone(&store),
+            FakeModel {
+                kv_layout: Some(layout),
+                ..FakeModel::for_ms(1.0)
+            },
+            WorkerConfig {
+                attn_kv_bytes: 200,
+                prefix_resume_points: Some(crate::worker::kv::PrefixResumePoints::ContextEnd),
+                prefill_chunk_alignment: Some(crate::worker::config::PrefillChunkAlignment::Plain),
+                prefix_tier_loading_area: 0.4,
+                ..rank_tiers_config()
+            },
+        );
+        assert!(worker.kv_store.stages_tier_reads());
+        let mut events = Vec::new();
+        for (id, from) in [(0, 0.0), (1, 4.0), (2, 10.0)] {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(from),
+                Time::from_ms(from + 5.0),
+                &mut events,
+            );
+        }
+        assert_eq!(events.len(), 3);
+        assert_eq!(hit(&store, 2), Some(50));
     }
 }

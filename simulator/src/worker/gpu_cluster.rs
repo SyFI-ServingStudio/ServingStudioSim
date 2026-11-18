@@ -65,7 +65,7 @@ use crate::log::{GpuClusterEntry, NetworkLogger};
 use crate::timing::kernels::{
     P2pInterKernel, P2pInterKernelInput, P2pIntraKernel, P2pIntraKernelInput,
 };
-use crate::worker::kv::{KvAccounting, KvCacheReport, KvOverhead};
+use crate::worker::kv::{KvAccounting, KvCacheReport, KvOverhead, SharedTiersReports};
 
 /// One physical GPU and who owns it. The cluster's `gpus` field is a flat list
 /// of these (the reporting / `run_meta.json` subset); `pool` + `worker_id` make
@@ -182,6 +182,9 @@ pub struct KvPoolFacts {
     pub bytes_per_unit: u64,
     pub kv_overhead: KvOverhead,
     pub report: Arc<KvCacheReport>,
+    /// Each partition's host tiers at the end of the run, left by the worker's
+    /// KV store when it is dropped; empty until then, and without tiers.
+    pub tiers: SharedTiersReports,
 }
 
 impl KvPoolFacts {
@@ -192,6 +195,7 @@ impl KvPoolFacts {
             bytes_per_unit: accounting.bytes_per_unit(),
             kv_overhead: accounting.overhead(),
             report: Arc::new(accounting.report(max_model_len)),
+            tiers: SharedTiersReports::default(),
         }
     }
 }

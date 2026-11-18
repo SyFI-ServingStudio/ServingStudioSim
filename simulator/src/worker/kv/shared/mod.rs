@@ -15,6 +15,12 @@
 //! - [`prefix_cache`] — the evictable retained-session tier and its four
 //!   replacement policies.
 //! - [`prefix_cache_journal`] — turning cache mutations into logged events.
+//! - [`state_retention`] — which round-end recurrent states a retained
+//!   context keeps.
+//! - [`tier_chain`] — the host DRAM/SSD tiers behind one partition's prefix
+//!   cache: writes, victim merges, cuts and read channels.
+//! - [`tier_reads`] — reads from those tiers in flight, and what admissions
+//!   found where.
 
 pub(crate) mod kv_accounting;
 pub(crate) mod kv_cache_report;
@@ -22,3 +28,6 @@ pub(crate) mod prefix_cache;
 pub(crate) mod prefix_cache_journal;
 pub(crate) mod request_ledger;
 pub(crate) mod resident_partition;
+pub(crate) mod state_retention;
+pub(crate) mod tier_chain;
+pub(crate) mod tier_reads;

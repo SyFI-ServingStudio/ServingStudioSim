@@ -697,12 +697,16 @@ impl Glm53FlashVllmFp8PpModel {
     /// The cache of the stage with the most DSA layers. vLLM sizes one
     /// shared block pool by the stage with the fewest blocks.
     pub fn pipeline_kv_cache_layout(&self) -> KvCacheLayout {
-        self.stages
-            .iter()
-            .map(|stage| &stage.kv_cache_layout)
+        self.stage_kv_cache_layouts()
             .max_by_key(|layout| layout.per_token_bytes())
             .expect("a pipeline has stages")
             .clone()
+    }
+
+    /// Each stage's own cache, in stage order: what L5 folds into the bytes a
+    /// host tier stores per GPU (`TierBytes::of_pipeline`).
+    pub fn stage_kv_cache_layouts(&self) -> impl Iterator<Item = &KvCacheLayout> {
+        self.stages.iter().map(|stage| &stage.kv_cache_layout)
     }
 
     /// vLLM's KDA cache-group count `G`; see [`kda_group_count`].

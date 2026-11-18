@@ -166,6 +166,26 @@ pub struct EngineOverhead {
     pub fixed_device_bytes: u64,
 }
 
+impl EngineOverhead {
+    /// The engine run with `block_tokens`-token blocks instead. The fixed
+    /// bytes scale with the block (they hold the null block) when a block was
+    /// declared, and stay as they are otherwise.
+    pub fn with_block_tokens(self, block_tokens: u32) -> Self {
+        let fixed_device_bytes = match self.block_tokens {
+            Some(declared) => u64::try_from(
+                u128::from(self.fixed_device_bytes) * u128::from(block_tokens)
+                    / u128::from(declared),
+            )
+            .expect("scaled fixed device bytes fit in u64"),
+            None => self.fixed_device_bytes,
+        };
+        Self {
+            block_tokens: Some(block_tokens),
+            fixed_device_bytes,
+        }
+    }
+}
+
 impl KvCacheLayout {
     /// A layout with no parts yet and no engine overhead.
     pub fn new() -> Self {

@@ -16,7 +16,7 @@ pub use impls::{
     SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL,
     AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL, PP_STAGE_POOL,
 };
-pub use impls::{PpFlow, PpStagePoolConfig, PpStagePoolController};
+pub use impls::{PpFlow, PpPlacement, PpStagePoolConfig, PpStagePoolController};
 
 use crate::common::{Request, RequestDefinition, TextGenerationDefinition, Time};
 use crate::worker::SharedGpuCluster;

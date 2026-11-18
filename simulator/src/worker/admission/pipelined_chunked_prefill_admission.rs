@@ -19,12 +19,34 @@
 //! split across the `depth` microbatches the pipeline holds and each returns
 //! to the next round on its own.
 //!
-//! The pending policy owns fresh requests. A prompt that has started and still
-//! has unscheduled prefill tokens stays in `started_prefills`, in start order,
-//! and keeps priority over fresh prompts. A request whose last chunk is in flight
+//! Prefill takes as much pending work as the budget allows by default (vLLM).
+//! `with_microbatch_budget` can size it instead (`microbatch_budget.rs`): an
+//! even split over the pipeline depth, a budget that follows the backlog, and a
+//! per-request cap. Their round is the prefill the pipeline holds: started
+//! prompts' unscheduled tokens, queued prompts' tokens (before any prefix hit,
+//! whether or not KV admits them yet), and the prefill tokens of microbatches
+//! formed and not yet exited. Counting the in-flight tokens keeps an even size
+//! steady through a round: one `P`-token prompt into an empty pipeline runs as
+//! `depth` slices of `P / depth`, not a shrinking `P/depth, 3P/depth^2, ...`
+//! series.
+//!
+//! The pending policy owns fresh requests, behind a force-schedule `Deadline`
+//! that is a pass-through unless a bound is set. Under hits-first-when-at-risk
+//! the lifecycle turns the deadline's cost-class split on at each formation
+//! while serving the overdue misses oldest first would evict a queued
+//! request's held tier context ([`TieredPrefixKv::tier_sessions_at_risk`]). A prompt that has started and
+//! still has unscheduled prefill tokens stays in `started_prefills`, in start
+//! order, and keeps priority over fresh prompts unless the started order is
+//! shortest-remaining (`started_order.rs`). A request whose last chunk is in flight
 //! is in neither list; its ticket is in the shell's in-flight queue. It joins KV's
 //! decode membership when that chunk exits, and a decode step's request is in
 //! `in_flight_decodes` until its microbatch exits.
+//!
+//! With host tiers behind HBM (`TieredPrefixKv`), a fresh request whose
+//! context a tier holds beyond HBM is read back before admission, as under
+//! vLLM's KV connector, or through loading areas under staged loading; the
+//! reading -> landed lifecycle is shared with the whole-iteration chunked
+//! prefill (`fresh_reads.rs`).
 //!
 //! KV reserves the full request footprint once at admission and releases it at
 //! completion. A hybrid recurrent model with prefix caching ends every non-final
@@ -35,22 +57,36 @@
 use std::collections::HashSet;
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::ChunkedPrefillKv;
+use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
-use super::chunked_prefill_admission::{next_chunk_tokens, ChunkEndAlignment};
-use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
+use super::chunked_prefill_admission::ChunkEndAlignment;
+use super::external_decode::ExternalDecode;
+use super::fresh_reads::{AtHead, FreshReads, FreshSource};
+use super::microbatch_budget::MicrobatchBudget;
+use super::policy::{ForceSchedule, Queued};
+use super::read_wait::ReadWait;
+use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
+use super::{
+    AdmissionCandidate, Deadline, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy,
+};
 
 /// The only attention partition of a pipeline head.
 const PARTITION: u16 = 0;
 
 pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
-    policy: P,
+    policy: Deadline<P>,
     policy_context: P::Context,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
+    /// How much prefill each microbatch takes.
+    budget: MicrobatchBudget,
+    /// Microbatches the pipeline holds, which an even split divides the round by.
+    depth: u16,
+    /// Order of started prompts against queued ones.
+    started_order: StartedOrder,
     /// Where chunks may end, when the engine can only checkpoint recurrent
     /// state on block boundaries.
     chunk_end_alignment: Option<ChunkEndAlignment>,
@@ -64,6 +100,12 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     /// Pipeline depth when decodes are balanced across microbatches; `None`
     /// schedules every ready decode (vLLM).
     balanced_depth: Option<u16>,
+    /// Prefill tokens of the committed microbatches that have not exited.
+    in_flight_prefill_tokens: u64,
+    /// Fresh requests out of their queue for a host-tier read.
+    reads: FreshReads,
+    /// The decode runs elsewhere: a request completes at its first token.
+    external_decode: Option<ExternalDecode>,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -99,16 +141,63 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             "pipelined prefill cap must be positive"
         );
         Self {
-            policy,
+            policy: Deadline::new(policy),
             policy_context,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
+            budget: MicrobatchBudget::default(),
+            depth: 1,
+            started_order: StartedOrder::default(),
             chunk_end_alignment: None,
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
             balanced_depth: None,
+            in_flight_prefill_tokens: 0,
+            reads: FreshReads::new(1),
+            external_decode: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reading_requests(&self) -> usize {
+        self.reads.reading()
+    }
+
+    /// Run each request to its first token and take its context back from a
+    /// decode elsewhere. Not vLLM.
+    pub(crate) fn with_external_decode(mut self) -> Self {
+        self.external_decode = Some(ExternalDecode::default());
+        self
+    }
+
+    /// Start a host-tier read only within `read_wait` of its tier's channel.
+    /// Not vLLM.
+    pub(crate) fn with_read_wait(mut self, read_wait: ReadWait) -> Self {
+        self.reads.set_read_wait(read_wait);
+        self
+    }
+
+    /// Size each microbatch's prefill by `budget` over a `depth`-deep pipeline.
+    pub(crate) fn with_microbatch_budget(mut self, budget: MicrobatchBudget, depth: u16) -> Self {
+        assert!(depth > 0, "pipeline depth must be positive");
+        self.budget = budget;
+        self.depth = depth;
+        self
+    }
+
+    /// Order started prompts against queued ones by `order`.
+    pub(crate) fn with_started_order(mut self, order: StartedOrder) -> Self {
+        self.started_order = order;
+        self
+    }
+
+    /// Serve a request that has waited `after` since arrival before every
+    /// other one, queued or started, in the cost classes `schedule` names.
+    /// Not vLLM.
+    pub(crate) fn with_force_schedule(mut self, schedule: ForceSchedule) -> Self {
+        self.policy = self.policy.with_force_schedule(schedule);
+        self
     }
 
     /// End every non-final chunk on a checkpoint boundary of `alignment`.
@@ -125,28 +214,93 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
-    /// Admit fresh prompts into the budget left after started prompts.
-    fn admit_fresh_prompts<K: ChunkedPrefillKv>(
+    /// The prefill the pipeline holds: started prompts' unscheduled tokens,
+    /// queued prompts' tokens and the prefill tokens in flight.
+    fn prefill_round_tokens<K: ChunkedPrefillKv>(&self, kv_store: &K) -> u64 {
+        let started: u64 = self
+            .started_prefills
+            .iter()
+            .map(|candidate| {
+                u64::from(
+                    kv_store
+                        .resolved_prefill_context(candidate.request_id)
+                        .remaining_prefill_tokens(),
+                )
+            })
+            .sum();
+        started + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens
+    }
+}
+
+impl<P, K> FillPrefillBudget<K> for PipelinedChunkedPrefillAdmission<P>
+where
+    P: PendingOrderPolicy,
+    K: TieredPrefixKv,
+{
+    type Step = ();
+
+    fn is_overdue(&self, _partition: u16, arrival: Time, now: Time) -> bool {
+        self.policy.is_overdue(arrival, now)
+    }
+
+    fn splits_by_class(&self, _partition: u16) -> bool {
+        self.policy.splits_by_class()
+    }
+
+    fn started_prefills_mut(&mut self, _partition: u16) -> &mut Vec<AdmissionCandidate> {
+        &mut self.started_prefills
+    }
+
+    fn admit_fresh_prompts(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
-        mut remaining_budget: u32,
+        _partition: u16,
+        _step: &mut (),
+        budget: u32,
         now: Time,
-    ) {
+        gate: FreshGate,
+    ) -> u32 {
+        let mut remaining_budget = budget;
+        let mut passed_over = Vec::new();
+        let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
+        if kv_store.stages_tier_reads() && gate.queues.takes_pending() {
+            self.reads
+                .start_staged_reads(PARTITION, policy, policy_context, kv_store, now);
+        }
         while remaining_budget > 0 {
-            self.policy.refresh_head(&mut |candidate| {
-                kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
-            });
-            let Some(candidate) = self.policy.peek() else {
+            let Some((source, candidate)) =
+                self.reads
+                    .peek(PARTITION, policy, policy_context, kv_store, gate.queues)
+            else {
                 break;
             };
+            match self.reads.at_head(
+                PARTITION,
+                policy,
+                policy_context,
+                kv_store,
+                source,
+                candidate,
+                &mut passed_over,
+                now,
+            ) {
+                AtHead::Admit => {}
+                AtHead::Moved => continue,
+                AtHead::Stop => break,
+            }
             let resolved_prefill = kv_store.preview_prefill_context(
                 PARTITION,
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
-            let chunk_tokens = next_chunk_tokens(
+            if !gate.admits(
+                source == FreshSource::Queued(Queued::Pending),
+                resolved_prefill.remaining_prefill_tokens(),
+            ) {
+                break;
+            }
+            let chunk_tokens = self.budget.chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
                 self.chunk_end_alignment,
@@ -163,8 +317,8 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             if !kv_store.fits(PARTITION, &footprint) {
                 break;
             }
-            let popped = self.policy.pop(&mut self.policy_context);
-            debug_assert_eq!(popped, Some(candidate));
+            self.reads
+                .take(PARTITION, policy, policy_context, source, candidate);
             kv_store.reserve_chunked_prefill_context(
                 candidate.request_id,
                 PARTITION,
@@ -185,24 +339,55 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 self.started_prefills.push(candidate);
             }
         }
+        FreshReads::return_passed_over(policy, policy_context, passed_over);
+        budget - remaining_budget
+    }
+
+    fn schedule_started_chunk(
+        &mut self,
+        kv_store: &mut K,
+        _partition: u16,
+        candidate: AdmissionCandidate,
+        budget: u32,
+    ) -> (u32, u32) {
+        let chunk_tokens = self.budget.chunk_tokens(
+            kv_store.resolved_prefill_context(candidate.request_id),
+            budget,
+            self.chunk_end_alignment,
+            self.max_batch_tokens,
+        );
+        if chunk_tokens > 0 {
+            kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
+        }
+        (chunk_tokens, chunk_tokens)
     }
 }
 
 impl<P, K> MicrobatchAdmission<K> for PipelinedChunkedPrefillAdmission<P>
 where
     P: PendingOrderPolicy,
-    K: ChunkedPrefillKv,
+    K: TieredPrefixKv,
 {
     type Ticket = MicrobatchTicket;
 
     fn accept_request(&mut self, kv_store: &mut K, request: RequestId, context: &WorkerContext) {
         debug_assert_eq!(kv_store.num_partitions(), 1);
-        let (fresh_prompt_tokens, target_output_tokens, session_input, conversation_start_time) = {
+        let (
+            arrival_time,
+            fresh_prompt_tokens,
+            target_output_tokens,
+            session_input,
+            conversation_start_time,
+        ) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
+            if let Some(external_decode) = &mut self.external_decode {
+                external_decode.accept(request, &mut record.request.definition);
+            }
             (
+                arrival_time,
                 record.request.definition.prompt_tokens,
                 record.request.definition.target_output_tokens,
                 record.request.definition.session,
@@ -219,10 +404,11 @@ where
             target_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            kv_store.reusable_prefix_tokens(PARTITION, fresh_prompt_tokens, session_input),
         );
         debug_assert!(!self.policy.contains(request));
-        self.policy.push(candidate, &mut self.policy_context);
+        self.policy
+            .push_arrived(candidate, arrival_time, &mut self.policy_context);
     }
 
     fn form_microbatch(
@@ -232,9 +418,21 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
-        let max_batch_tokens = self.max_batch_tokens;
-        let chunk_end_alignment = self.chunk_end_alignment;
-        let mut remaining_budget = max_batch_tokens;
+        self.reads.land(kv_store, now);
+        // A hit computes only its new tokens: its context is in HBM or a tier.
+        self.policy.promote(now, |candidate| {
+            kv_store.reusable_prefix_tokens(
+                PARTITION,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            )
+        });
+        if let Some(horizon) = self.policy.at_risk_horizon() {
+            let at_risk = horizon > 0
+                && FreshReads::held_context_at_risk(PARTITION, &self.policy, kv_store, horizon);
+            self.policy.set_hits_first(at_risk);
+        }
+        let mut remaining_budget = self.max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
         let decode_cap = match self.balanced_depth {
@@ -259,23 +457,23 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
-        // Started prompts keep start order. One that cannot run keeps its place.
-        self.started_prefills.retain(|candidate| {
-            let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
-            let chunk_tokens = next_chunk_tokens(
-                resolved_prefill,
+        if self.budget.follows_backlog() {
+            remaining_budget = self.budget.prefill_budget(
                 remaining_budget,
-                chunk_end_alignment,
-                max_batch_tokens,
+                self.prefill_round_tokens(kv_store),
+                self.depth,
+                self.max_batch_tokens,
             );
-            if chunk_tokens == 0 {
-                return true;
-            }
-            kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
-            remaining_budget -= chunk_tokens;
-            chunk_tokens < resolved_prefill.remaining_prefill_tokens()
-        });
-        self.admit_fresh_prompts(kv_store, context, remaining_budget, now);
+        }
+        self.fill_prefill(
+            self.started_order,
+            kv_store,
+            context,
+            PARTITION,
+            &mut (),
+            remaining_budget,
+            now,
+        );
         kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
     }
 
@@ -306,6 +504,7 @@ where
         }
         kv_store.clear_prefill_admits(PARTITION);
         kv_store.sample_submit(PARTITION, now);
+        self.in_flight_prefill_tokens += ticket.tokens();
         ticket
     }
 
@@ -317,6 +516,7 @@ where
         completed: &mut Vec<RequestId>,
         at: Time,
     ) {
+        self.in_flight_prefill_tokens -= ticket.tokens();
         let MicrobatchTicket { chunks, decodes } = ticket;
         let mut finished_decodes = Vec::new();
         {
@@ -374,14 +574,30 @@ where
             };
             kv_store.finish_chunked_prefill(chunk.request, PARTITION, remaining_output_tokens);
             if remaining_output_tokens == 0 {
-                kv_store.release_retaining_prefix(chunk.request, PARTITION, at);
+                match &mut self.external_decode {
+                    Some(external_decode) => {
+                        external_decode.release(kv_store, chunk.request, PARTITION, at);
+                    }
+                    None => kv_store.release_retaining_prefix(chunk.request, PARTITION, at),
+                }
                 completed.push(chunk.request);
             }
         }
         kv_store.sample_submit(PARTITION, at);
+        if let Some(external_decode) = &mut self.external_decode {
+            external_decode.hand_back(kv_store, PARTITION, at);
+        }
     }
 
     fn queued_requests(&self) -> u32 {
-        self.policy.len() as u32
+        (self.policy.len() + self.reads.len()) as u32
+    }
+
+    fn land_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
+        self.reads.land(kv_store, now)
+    }
+
+    fn next_read_landing(&self, kv_store: &K) -> Option<Time> {
+        kv_store.next_tier_landing()
     }
 }

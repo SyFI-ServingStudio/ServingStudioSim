@@ -648,12 +648,16 @@ impl Glm52VllmNvfp4PpDsaMoeModel {
     /// table by the stage with the fewest blocks, so a token's capacity on
     /// every GPU is set by the stage with the most layers.
     pub fn pipeline_kv_cache_layout(&self) -> KvCacheLayout {
-        self.stages
-            .iter()
-            .map(|stage| &stage.kv_cache_layout)
+        self.stage_kv_cache_layouts()
             .max_by_key(|layout| layout.per_token_bytes())
             .expect("a pipeline has stages")
             .clone()
+    }
+
+    /// Each stage's own cache, in stage order: what L5 folds into the bytes a
+    /// host tier stores per GPU (`TierBytes::of_pipeline`).
+    pub fn stage_kv_cache_layouts(&self) -> impl Iterator<Item = &KvCacheLayout> {
+        self.stages.iter().map(|stage| &stage.kv_cache_layout)
     }
 
     /// Bytes one token sends from one stage to the next: vLLM's PP

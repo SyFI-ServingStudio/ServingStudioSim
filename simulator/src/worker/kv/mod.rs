@@ -15,9 +15,14 @@ mod shared;
 
 pub use kv_cache_store::KvCacheStore;
 pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
-pub use shared::kv_accounting::{KvOverhead, PrefixResumePoints};
+pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResumePoints};
 pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+pub use shared::state_retention::StateRetention;
+pub use shared::tier_chain::{
+    LoadingQueue, StagedCharge, TierBytes, TierSpec, TierStateOptions, TierWrites, DRAM_TIER,
+};
+pub use shared::tier_reads::{SharedTiersReports, TiersReport};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,6 +169,18 @@ pub trait KvStore {
     fn sample_submit(&mut self, partition: PartitionId, now: Time);
 }
 
+/// A session request whose decode runs elsewhere, from its release until its
+/// context comes back ([`PrefixKv::hand_back_context`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandBack {
+    request: RequestId,
+    session_id: u32,
+    /// Where its prompt ended.
+    prompt_end: u64,
+    /// Tokens it shared with the session's previous context.
+    shared: u64,
+}
+
 /// Prefix-aware refinement of the same KV owner.
 ///
 /// Admission first obtains a pure plan, applies its token/KV gates, then reserves
@@ -190,6 +207,26 @@ pub trait PrefixKv: KvStore {
     );
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
+    /// [`Self::release_retaining_prefix`] of a request whose decode runs
+    /// elsewhere: HBM retains its prompt's context, and what comes back is
+    /// for [`Self::hand_back_context`]; `None` for a standalone request.
+    fn release_handing_back(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+    ) -> Option<HandBack>;
+    /// The decode run elsewhere hands the context back after `output_tokens`
+    /// outputs: every output but the last, whose KV the next round computes,
+    /// extends the prompt's context in HBM, and host tiers are written the
+    /// whole round.
+    fn hand_back_context(
+        &mut self,
+        partition: PartitionId,
+        hand_back: HandBack,
+        output_tokens: u32,
+        now: Time,
+    );
 
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
@@ -313,6 +350,93 @@ pub trait SlotPipelineKv: KvStore {
     fn estimated_peak(&self, partition: PartitionId) -> u64;
     fn has_reservation(&self, request: RequestId) -> bool;
     fn request_kv_weight(&self, request: RequestId) -> u64;
+}
+
+/// A read a host tier would serve before a queued request's admission.
+pub struct TierReadPlan<F> {
+    /// Fastest first.
+    pub tier: usize,
+    /// How long the tier's channel would make the read wait now.
+    pub queue_wait: Time,
+    /// Tokens the read resumes from, and of them what HBM already holds.
+    pub hit_tokens: u64,
+    pub resident_tokens: u64,
+    /// What the read holds in HBM until its context is put back: unstaged,
+    /// from its start, the request's whole footprint; staged, from when it
+    /// lands in HBM's loading area, the KV it lands. Both with every earlier
+    /// state it moves.
+    pub hold: F,
+    /// Staged loading: what it holds in the loading areas; `None` unstaged.
+    pub staged: Option<StagedCharge>,
+}
+
+/// Prefix refinement with host DRAM/SSD tiers behind HBM, read when admission
+/// reaches a request, as vLLM's KV connector does (`WAITING_FOR_REMOTE_KVS`).
+/// The store decides what a read moves and how long it takes; admission only
+/// decides when to start one and when to admit its request. Without tiers no
+/// request needs a read. With a loading area (staged loading, not vLLM) reads
+/// go through loading areas the store keeps free, each landing queue in
+/// order: admission starts a read only while its area has room.
+pub trait TieredPrefixKv: ChunkedPrefillKv {
+    /// The longer of HBM's resident prefix and what `partition`'s tiers would
+    /// read back: what a cache-aware order of that partition ranks a request
+    /// by.
+    fn reusable_prefix_tokens(
+        &self,
+        partition: PartitionId,
+        fresh_prompt_tokens: u32,
+        session_input: SessionInput,
+    ) -> u32;
+    /// The read the request needs before admission: a tier holds more of its
+    /// declared prefix than `partition`'s HBM. `None`: admit it from HBM.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_tier_read(
+        &self,
+        partition: PartitionId,
+        request: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        now: Time,
+    ) -> Option<TierReadPlan<Self::Footprint>>;
+    /// Whether reads stage through loading areas.
+    fn stages_tier_reads(&self) -> bool;
+    /// Staged loading: whether the planned read may start, in an area it
+    /// fits in or an empty one.
+    fn has_loading_room(
+        &self,
+        partition: PartitionId,
+        plan: &TierReadPlan<Self::Footprint>,
+    ) -> bool;
+    /// Start the planned read, holding its footprint until the context is
+    /// put back. A staged read takes its share of the loading area it lands
+    /// in first; one landing in DRAM holds nothing in HBM until it hops on,
+    /// in landing order, once HBM's area has room.
+    fn start_tier_read(
+        &mut self,
+        partition: PartitionId,
+        request: RequestId,
+        session_input: SessionInput,
+        plan: TierReadPlan<Self::Footprint>,
+        now: Time,
+    );
+    /// When the next read lands.
+    fn next_tier_landing(&self) -> Option<Time>;
+    /// The requests whose reads landed in HBM by `now`, in landing order,
+    /// each with its landing time; then the hops that now fit start.
+    fn take_landed_reads(&mut self, now: Time) -> Vec<(RequestId, Time)>;
+    /// Put a landed request's context back into HBM, ending its hold and
+    /// giving its share of HBM's loading area back, just before admission
+    /// resolves its prefix.
+    fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time);
+    /// Sessions whose context `horizon` more tokens written into
+    /// `partition`'s tiers would evict from every tier holding it, the next
+    /// victims first (an LRU tier's stack distance to eviction). Empty
+    /// without tiers.
+    fn tier_sessions_at_risk(&self, partition: PartitionId, horizon: u64) -> Vec<u32>;
+    /// Whether HBM's evictions go to `partition`'s fastest tier (a victim
+    /// tier), so a context HBM holds survives HBM's own evictions.
+    fn tiers_take_hbm_evictions(&self, partition: PartitionId) -> bool;
 }
 
 /// Additional KV lifecycle required by a PD prefill worker.

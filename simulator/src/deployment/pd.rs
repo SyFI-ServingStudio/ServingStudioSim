@@ -67,8 +67,8 @@ impl Deployment for PdDeployment {
             dg.arch.model().model_config,
         );
 
-        let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
-        let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
+        let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement)?;
+        let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement)?;
 
         let prefill_wc = worker_config(
             &pg.worker,
@@ -299,12 +299,12 @@ fn pool_cfg(
     pool: crate::common::PoolId,
     replicas: u16,
     placement: PlacementPolicy,
-) -> SimpleDpPoolConfig {
-    SimpleDpPoolConfig {
+) -> anyhow::Result<SimpleDpPoolConfig> {
+    Ok(SimpleDpPoolConfig {
         pool,
         num_workers: replicas,
-        placement: placement_into(placement),
-    }
+        placement: placement_into(placement)?,
+    })
 }
 
 /// Assemble a [`PdFlow`] from two built models. Generic over each pool's concrete
@@ -384,9 +384,12 @@ fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result
     Ok(CostSource::Kernel(kernel))
 }
 
-fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
-    match p {
+fn placement_into(p: PlacementPolicy) -> anyhow::Result<DpPlacementPolicy> {
+    Ok(match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
-    }
+        PlacementPolicy::LeastWorkAhead => {
+            bail!("pd: placement least-work-ahead is implemented only for the pp deployment")
+        }
+    })
 }

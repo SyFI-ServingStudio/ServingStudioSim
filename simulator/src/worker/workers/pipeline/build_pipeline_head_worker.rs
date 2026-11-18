@@ -12,7 +12,8 @@ use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    resolve_kv_accounting, with_host_tiers,
 };
 
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
@@ -23,6 +24,10 @@ use super::PipelineHead;
 /// requests, so the stage with the most KV per token bounds the pipeline. With
 /// prefix caching on and a resumable recurrent state in the layout (vLLM's
 /// Mamba `align` mode), every non-final chunk ends on the layout's block.
+/// Host tiers, if the config has any, sit behind the prefix cache, each GPU
+/// storing and reading `layout.tier_bytes`, with reads staged through loading
+/// areas when the config has one. With `external_decode` a request completes
+/// at its first token and its decode elsewhere hands the context back.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     id: WorkerId,
@@ -83,6 +88,14 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    let kv_store = with_host_tiers(
+        kv_store,
+        layout.tier_bytes,
+        &config,
+        essentials.tiers_reports,
+        pool_tag,
+        id,
+    );
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -91,9 +104,20 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let mut admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
-    };
+    }
+    .with_microbatch_budget(config.microbatch_budget, layout.depth)
+    .with_started_order(config.started_order);
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
+    }
+    if let Some(schedule) = config.force_schedule {
+        admission = admission.with_force_schedule(schedule);
+    }
+    if let Some(read_wait) = config.prefix_tier_read_wait {
+        admission = admission.with_read_wait(read_wait);
+    }
+    if config.external_decode {
+        admission = admission.with_external_decode();
     }
 
     PipelineHeadWorker::from_components(

@@ -1,0 +1,9 @@
+{
+  "source": "mono_sessions_d80.csv",
+  "source_sha256": "9d74c7491bd1db57f58be13991cc782fa6936531fed1427054733aca7e078ee4",
+  "sessions_per_s": 2.0,
+  "minutes": 20.0,
+  "sessions": 2457,
+  "rounds": 260801,
+  "sha256": "bc86268f825f500718b859f1a322a700fbc2d08099701fab65510ac8bf518954"
+}

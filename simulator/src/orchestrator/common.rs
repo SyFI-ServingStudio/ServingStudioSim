@@ -118,7 +118,7 @@ impl<M, W: IterWorker> UnifiedWorkerFactory<M, W> {
             self.pool_tag,
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
-            self.worker_config,
+            self.worker_config.clone(),
             self.log_dir.clone(),
             pool,
             &self.gpu_name,

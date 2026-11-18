@@ -32,7 +32,8 @@ use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
 use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
 use crate::worker::config::{
-    AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAccountingSpec, KvAdmissionSpec,
+    AttnWorkerSel, FfnWorkerSel, ForceScheduleSpec, IterWorkerSel, KvAccountingSpec,
+    KvAdmissionSpec, MicrobatchBudgetSpec, PrefixTierSpec, StateRetentionSpec,
 };
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -88,9 +89,17 @@ pub fn list_params() -> Value {
                         ("hp_unified", KvAccountingSpec::PARAMS),
                         ("chunked_prefill", KvAccountingSpec::PARAMS),
                         ("chunked_prefill", KvAdmissionSpec::PARAMS),
+                        ("chunked_prefill", MicrobatchBudgetSpec::PARAMS),
+                        ("chunked_prefill", ForceScheduleSpec::PARAMS),
+                        ("chunked_prefill", StateRetentionSpec::PARAMS),
+                        ("chunked_prefill", PrefixTierSpec::PARAMS),
                         ("speculative", KvAccountingSpec::PARAMS),
                         ("speculative", KvAdmissionSpec::PARAMS),
                         ("pipeline_chunked_prefill", KvAccountingSpec::PARAMS),
+                        ("pipeline_chunked_prefill", MicrobatchBudgetSpec::PARAMS),
+                        ("pipeline_chunked_prefill", ForceScheduleSpec::PARAMS),
+                        ("pipeline_chunked_prefill", StateRetentionSpec::PARAMS),
+                        ("pipeline_chunked_prefill", PrefixTierSpec::PARAMS),
                         ("pd_prefill", KvAccountingSpec::PARAMS),
                         ("pd_decode", KvAccountingSpec::PARAMS),
                     ],
@@ -326,6 +335,35 @@ mod tests {
         let schema = list_params();
         for worker in ["chunked_prefill", "speculative"] {
             check_flattened_kv_admission_spec(&schema, worker);
+        }
+    }
+
+    #[test]
+    fn chunked_worker_schemas_include_the_flattened_scheduling_specs() {
+        let schema = list_params();
+        for worker in ["chunked_prefill", "pipeline_chunked_prefill"] {
+            let params = schema["providers"]["worker"]["iter_wise"][worker]["params"]
+                .as_array()
+                .expect("worker params are an array");
+            for name in [
+                "pending_order",
+                "srpt",
+                "microbatch_split",
+                "min_microbatch_tokens",
+                "long_prefill_token_threshold",
+                "load_budget_low_tokens",
+                "load_budget_backlog_lo_tokens",
+                "load_budget_backlog_hi_tokens",
+                "force_schedule_after_ms",
+                "force_schedule_hits_first",
+                "force_schedule_hits_first_when_at_risk",
+            ] {
+                assert_eq!(
+                    params.iter().filter(|param| param["name"] == name).count(),
+                    1,
+                    "{worker}: parameter {name} must appear exactly once"
+                );
+            }
         }
     }
 

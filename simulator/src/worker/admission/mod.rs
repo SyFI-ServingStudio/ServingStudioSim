@@ -7,12 +7,17 @@ use crate::worker::types::IterBatchPlan;
 
 mod chunked_prefill_admission;
 mod decode_completion;
+mod external_decode;
+mod fresh_reads;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
+mod microbatch_budget;
 mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod read_wait;
+mod started_order;
 mod token_budget;
 
 pub(crate) use chunked_prefill_admission::ChunkEndAlignment;
@@ -22,15 +27,18 @@ pub use decode_completion::{
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
+pub use microbatch_budget::{LoadBudget, MicrobatchBudget, PrefillSplit};
 pub use pipelined_chunked_prefill_admission::PipelinedChunkedPrefillAdmission;
 pub use placement::LoadBalance;
 pub(crate) use placement::PartitionLoad;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
-    AdmissionCandidate, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,
-    PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
+    AdmissionCandidate, Deadline, FifoOrder, ForceSchedule, HitsFirst, LongestPrefixMatch,
+    PendingOrder, PendingOrderKind, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub use read_wait::{ReadWait, ReadWaitPolicy};
+pub use started_order::StartedOrder;
 pub(crate) use token_budget::prefill_fits_budget;
 
 pub trait IterAdmission<K: KvStore> {
@@ -53,8 +61,18 @@ pub trait IterAdmission<K: KvStore> {
         events: &mut Vec<Self::Event>,
         now: Time,
     );
+    /// Queued requests, those out of their queue for a host-tier read included.
     fn queued_requests(&self) -> u32;
     fn cancel_pending(&mut self, request: RequestId) -> bool;
+    /// Queued requests whose host-tier read has not landed: nothing can run
+    /// for them before [`Self::next_read_landing`].
+    fn reading_requests(&self) -> u32 {
+        0
+    }
+    /// When the next host-tier read lands.
+    fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
+        None
+    }
 }
 
 /// Admission surface of the pipeline-head family.
@@ -91,6 +109,15 @@ pub trait MicrobatchAdmission<K: KvStore> {
         at: Time,
     );
     fn queued_requests(&self) -> u32;
+    /// Take in the host-tier reads landed by `now`; returns the latest
+    /// landing, if any landed.
+    fn land_reads(&mut self, _kv_store: &mut K, _now: Time) -> Option<Time> {
+        None
+    }
+    /// When the next host-tier read lands.
+    fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
+        None
+    }
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

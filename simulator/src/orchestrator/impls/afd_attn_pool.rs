@@ -190,7 +190,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<DisaggAttnWorker<M>> {
                     WorkerId(i),
                     Arc::clone(&model),
                     std::rc::Rc::clone(&requests),
-                    config,
+                    config.clone(),
                     pool,
                     gpu_name,
                     std::rc::Rc::clone(cluster),

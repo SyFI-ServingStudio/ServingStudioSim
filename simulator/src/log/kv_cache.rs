@@ -5,8 +5,9 @@
 //! pool's [`KvCacheReport`]: the declared layout, the resolved options, what
 //! each part is charged, and the concurrency at `max_model_len` under both
 //! `kv_overhead` modes. Written once after the flow is built, next to
-//! `run_meta.json`; `simulator kv-cache` prints the same document, or
-//! [`kv_cache_text`] for reading.
+//! `run_meta.json`, and again after the run when a pool has host prefix tiers,
+//! whose end-of-run counters become its `tiers`; `simulator kv-cache` prints
+//! the same document, or [`kv_cache_text`] for reading.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -16,7 +17,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::arch::kv_layout::{KvGrowth, RankPlacement};
-use crate::worker::kv::{KvCacheReport, KvOverhead};
+use crate::worker::kv::{KvCacheReport, KvOverhead, PartCharge, TiersReport};
 use crate::worker::GpuCluster;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -30,6 +31,9 @@ struct PoolEntry<'a> {
     gpu_name: &'a str,
     #[serde(flatten)]
     report: &'a KvCacheReport,
+    /// The partition's host tiers at the end of the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tiers: Option<TiersReport>,
 }
 
 /// `{"schema_version": 1, "pools": [{pool_tag, pool, worker_id, group_id,
@@ -44,6 +48,7 @@ pub fn kv_cache_document(cluster: &GpuCluster) -> serde_json::Value {
             group_id,
             gpu_name: gpu_name(cluster, pool, worker_id),
             report: &facts.report,
+            tiers: facts.tiers.borrow().get(usize::from(group_id)).cloned(),
         })
         .collect();
     json!({
@@ -181,6 +186,18 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             }
             None => line.push_str(" · whole prompt in flight"),
         }
+    }
+    if !options.part_padding.is_empty() {
+        let parts: Vec<String> = options
+            .part_padding
+            .iter()
+            .map(|padding| match padding.charge {
+                PartCharge::Padded => format!("{} padded", padding.part),
+                PartCharge::Unpadded => format!("{} unpadded", padding.part),
+                PartCharge::Bytes(bytes) => format!("{} {bytes} B", padding.part),
+            })
+            .collect();
+        let _ = write!(line, " · charges {}", parts.join(", "));
     }
     let _ = writeln!(out, "{line}");
 

@@ -14,15 +14,17 @@ use serde::Deserialize;
 
 use crate::common::{RequestId, SessionInput, Time};
 
+mod deadline;
 mod fifo;
 mod longest_prefix_match;
 mod session_start;
 mod shortest_job_first;
 
+pub use deadline::{Deadline, ForceSchedule, HitsFirst, QueueAccess, Queued};
 pub use fifo::FifoOrder;
 pub use longest_prefix_match::LongestPrefixMatch;
 pub use session_start::SessionStartOrder;
-pub use shortest_job_first::ShortestJobFirst;
+pub use shortest_job_first::{JobSize, ShortestJobFirst};
 
 /// Preset-facing queue discipline selector. Carries no state — it names which
 /// of the existing policies a worker should instantiate.
@@ -36,6 +38,8 @@ pub enum PendingOrderKind {
     Fifo,
     /// Smallest remaining work first.
     ShortestJobFirst,
+    /// Fewest prefill tokens to compute first: shortest time to first token.
+    ShortestPrefillFirst,
     /// Most already-resident prefix KV first, so a batch recomputes as few
     /// evicted tokens as possible.
     LongestPrefixMatch,
@@ -68,6 +72,9 @@ impl PendingOrder {
             PendingOrderKind::SessionStart => Self::SessionStart(SessionStartOrder::new()),
             PendingOrderKind::Fifo => Self::Fifo(FifoOrder::new()),
             PendingOrderKind::ShortestJobFirst => Self::ShortestJobFirst(ShortestJobFirst::new()),
+            PendingOrderKind::ShortestPrefillFirst => {
+                Self::ShortestJobFirst(ShortestJobFirst::by(JobSize::PrefillTokens))
+            }
             PendingOrderKind::LongestPrefixMatch => {
                 Self::LongestPrefixMatch(LongestPrefixMatch::new())
             }
@@ -134,6 +141,11 @@ impl PendingOrderPolicy for PendingOrder {
     #[inline]
     fn queued_kv_tokens(&self) -> u64 {
         dispatch!(self, inner => inner.queued_kv_tokens())
+    }
+
+    #[inline]
+    fn queued_prompt_tokens(&self) -> u64 {
+        dispatch!(self, inner => inner.queued_prompt_tokens())
     }
 }
 
@@ -258,6 +270,10 @@ pub trait PendingOrderPolicy {
     fn contains(&self, request: RequestId) -> bool;
     fn len(&self) -> usize;
     fn queued_kv_tokens(&self) -> u64;
+    /// Sum of the queued candidates' `fresh_prompt_tokens`: the prefill work
+    /// waiting to start, before any prefix-cache hit, so a lifecycle can size a
+    /// batch to the backlog without walking the queue.
+    fn queued_prompt_tokens(&self) -> u64;
 
     #[inline]
     fn is_empty(&self) -> bool {

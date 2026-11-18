@@ -521,7 +521,7 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
@@ -562,8 +562,8 @@ pub struct WorkerConfig {
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
     /// Queue discipline the admission lifecycle uses to pick the head it gates
-    /// (from the worker selector). Only the iter-wise local-prefill/decode and
-    /// prefill-handoff lifecycles read it today.
+    /// (from the worker selector). The iter-wise lifecycles and the pipeline
+    /// head read it.
     pub pending_order: crate::worker::admission::PendingOrderKind,
     /// Whether chunked prefill may share an iteration with resident decode.
     /// Only `ChunkedPrefillAdmission` reads this; other lifecycles state their
@@ -576,6 +576,16 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// How much prefill a pipeline microbatch, or a chunked-prefill DP rank's
+    /// share of an iteration, takes. Only the two chunked recipes read it.
+    pub microbatch_budget: crate::worker::admission::MicrobatchBudget,
+    /// Order of started prompts against queued ones (the selector's `srpt`).
+    /// Only the two chunked recipes read it.
+    pub started_order: crate::worker::admission::StartedOrder,
+    /// Wait after which a queued request is served before the rest, and the
+    /// cost-class order of those requests; `None`: no bound. Only the two
+    /// chunked recipes read it.
+    pub force_schedule: Option<crate::worker::admission::ForceSchedule>,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -587,6 +597,33 @@ pub struct WorkerConfig {
     pub prefix_resume_points: Option<crate::worker::kv::PrefixResumePoints>,
     /// Also keep them at every multiple of this many tokens.
     pub prefix_resume_interval: Option<u32>,
+    /// Layout parts charged other entry bytes than `kv_overhead` gives them.
+    pub kv_part_padding: Vec<crate::worker::kv::PartPadding>,
+    /// The engine block in tokens, overriding the arch layout's.
+    pub kv_block_tokens: Option<u32>,
+    /// Which round-end recurrent states a retained context keeps. Only the
+    /// two chunked recipes set it.
+    pub state_retention: crate::worker::kv::StateRetention,
+    /// Each anchor stays in the host tier it first lands in. Only the
+    /// pipeline recipe reads it.
+    pub recurrent_state_anchors_in_place: bool,
+    /// Decode runs elsewhere: the pipeline head completes a request at its
+    /// first token and takes its context back from the decode.
+    pub external_decode: bool,
+    /// Host tiers behind the prefix cache, fastest first. Only the pipeline
+    /// recipe reads them.
+    pub prefix_tiers: Vec<crate::worker::kv::TierSpec>,
+    /// Tiers hold the stages' mean bytes instead of the most loaded stage's.
+    pub prefix_tier_balanced_load: bool,
+    /// The bound on a tier read's wait for its channel; `None`: unbounded.
+    pub prefix_tier_read_wait: Option<crate::worker::admission::ReadWait>,
+    /// A session context older than the run is read from the slowest tier.
+    pub prefix_tier_warm_start: bool,
+    /// Fraction of HBM (and of DRAM with an SSD behind it) kept as loading
+    /// areas staged tier reads go through; `0`: reads are not staged.
+    pub prefix_tier_loading_area: f64,
+    /// Tiers store each recurrent state over this ratio; `1`: uncompressed.
+    pub tier_state_compression_ratio: f64,
     /// Tokens one step may have in flight, which caps what admission charges a
     /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
     /// scheduling), or the whole prompt without a token budget.
@@ -630,10 +667,24 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            microbatch_budget: crate::worker::admission::MicrobatchBudget::default(),
+            started_order: crate::worker::admission::StartedOrder::StartOrder,
+            force_schedule: None,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,
             prefix_resume_interval: None,
+            kv_part_padding: Vec::new(),
+            kv_block_tokens: None,
+            state_retention: crate::worker::kv::StateRetention::Latest { k: 1 },
+            recurrent_state_anchors_in_place: false,
+            external_decode: false,
+            prefix_tiers: Vec::new(),
+            prefix_tier_balanced_load: false,
+            prefix_tier_read_wait: None,
+            prefix_tier_warm_start: false,
+            prefix_tier_loading_area: 0.0,
+            tier_state_compression_ratio: 1.0,
             kv_max_in_flight_tokens: None,
             max_model_len: None,
             prefill_chunk_alignment: None,

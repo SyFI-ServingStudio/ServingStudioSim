@@ -7,12 +7,13 @@
 
 use crate::common::{RequestId, Time};
 use crate::log::{
-    PrefixCacheEvent, PrefixCacheEventKind, PrefixCacheEvictionReason, PrefixCacheLogger,
-    PrefixCacheRetentionReason,
+    PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind, PrefixCacheEvictionReason,
+    PrefixCacheLogger, PrefixCacheRetentionReason, HBM_TIER,
 };
 use crate::worker::shared::advance_scope::PartitionId;
 
 use super::prefix_cache::{PrefixCacheMutation, PrefixCacheMutationKind};
+use super::tier_chain::{TierEvent, TierEventKind};
 
 pub(crate) struct PrefixCacheJournal {
     logger: Option<PrefixCacheLogger>,
@@ -21,6 +22,66 @@ pub(crate) struct PrefixCacheJournal {
 impl PrefixCacheJournal {
     pub(crate) fn new(logger: Option<PrefixCacheLogger>) -> Self {
         Self { logger }
+    }
+
+    pub(crate) fn is_logging(&self) -> bool {
+        self.logger.is_some()
+    }
+
+    /// One host tier's entry change, on behalf of `request`.
+    pub(crate) fn record_tier_event(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+        tier: &'static str,
+        event: TierEvent,
+    ) {
+        let kind = match event.kind {
+            TierEventKind::WriteThrough => {
+                PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::TierWriteThrough)
+            }
+            TierEventKind::Victim => {
+                PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::TierVictim)
+            }
+            TierEventKind::ReadCopy => {
+                PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::TierReadCopy)
+            }
+            TierEventKind::WarmStart => {
+                PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::TierWarmStart)
+            }
+            TierEventKind::Evict => {
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy)
+            }
+            TierEventKind::TooLarge => {
+                PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::NoCacheCapacity)
+            }
+            TierEventKind::Cut => PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::TierCut),
+            TierEventKind::Read => PrefixCacheEventKind::Activate(PrefixCacheActivation::TierRead),
+            TierEventKind::Hop => PrefixCacheEventKind::Activate(PrefixCacheActivation::TierHop),
+        };
+        let requested_tokens = match kind {
+            PrefixCacheEventKind::Activate(_) => event.hit_tokens,
+            PrefixCacheEventKind::Retain(_) => event.entry_tokens_after,
+            PrefixCacheEventKind::Evict(_) => 0,
+        };
+        self.record(PrefixCacheEvent {
+            tier,
+            partition_id: partition,
+            time: now,
+            request_id: request,
+            session_id: event.session_id,
+            kind,
+            entry_tokens_before: event.entry_tokens_before,
+            entry_tokens_after: event.entry_tokens_after,
+            cache_used_before: event.used_tokens_before,
+            cache_used_after: event.used_tokens_after,
+            requested_tokens,
+            hit_tokens: event.hit_tokens,
+            full_hit_tokens: event.hit_tokens,
+            cache_used_units: Some((event.used_units_before, event.used_units_after)),
+            ready: event.ready,
+        });
     }
 
     pub(crate) fn record(&mut self, event: PrefixCacheEvent) {
@@ -42,6 +103,7 @@ impl PrefixCacheJournal {
         retain_requested_tokens: u64,
     ) {
         self.record(PrefixCacheEvent {
+            tier: HBM_TIER,
             partition_id: partition,
             time: now,
             request_id: request,
@@ -58,6 +120,8 @@ impl PrefixCacheJournal {
             },
             hit_tokens: 0,
             full_hit_tokens: 0,
+            cache_used_units: None,
+            ready: None,
         });
     }
 

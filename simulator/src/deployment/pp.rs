@@ -7,7 +7,9 @@
 //! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
 //! The arch builds every stage's model once; the stage models are shared across
 //! replicas. The head sizes the pipeline's KV from the arch's
-//! `pipeline_kv_cache_layout`: the most constrained stage's cache.
+//! `pipeline_kv_cache_layout`: the most constrained stage's cache. Its host
+//! tiers store per GPU what `TierBytes::of_pipeline` folds from the stages'
+//! layouts.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,14 +22,15 @@ use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, PpFlow, PpStagePoolConfig, PP_STAGE_POOL,
+    Flow, PlacementPolicy, PpFlow, PpPlacement, PpStagePoolConfig, PP_STAGE_POOL,
 };
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
+use crate::worker::kv::TierBytes;
 use crate::worker::{
     build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
-    CostSource, IterWorker, IterWorkerSel, PendingOrderKind, PipelineHeadEvent, PipelineHeadMsg,
-    PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
+    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -59,8 +62,9 @@ impl Deployment for PpDeployment {
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
-            PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
-            PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            PlacementPolicy::LeastQueued => PpPlacement::LeastQueued,
+            PlacementPolicy::RoundRobin => PpPlacement::RoundRobin,
+            PlacementPolicy::LeastWorkAhead => PpPlacement::LeastWorkAhead,
         };
         let model_spec = g.arch.model();
         let _scope =
@@ -91,12 +95,17 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: TierBytes::of_pipeline(
+                        pipeline.stage_kv_cache_layouts(),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
                 let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
                     store,
@@ -117,7 +126,7 @@ impl Deployment for PpDeployment {
                             layout,
                             &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
-                            worker_config,
+                            head_config.clone(),
                             head_log_dir.clone(),
                             PP_STAGE_POOL,
                             &head_gpu,
@@ -167,12 +176,17 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: TierBytes::of_pipeline(
+                        pipeline.stage_kv_cache_layouts(),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
                 let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
                     store,
@@ -193,7 +207,7 @@ impl Deployment for PpDeployment {
                             layout,
                             &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
-                            worker_config,
+                            head_config.clone(),
                             head_log_dir.clone(),
                             PP_STAGE_POOL,
                             &head_gpu,
@@ -218,12 +232,15 @@ fn worker_config(
         gpu_time_multiplier,
         balance_decode_microbatches,
         prefill_chunk_alignment,
+        pending_order,
+        external_decode,
+        prefix_tiers,
         ..
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
     };
-    // Same defaults as unified `chunked_prefill`: FIFO and opportunistic reuse.
+    // Same default as unified `chunked_prefill`: opportunistic reuse.
     let prefix_cache = resolve_prefix_cache_config(
         "pp",
         PrefixCacheMode::Opportunistic,
@@ -239,14 +256,17 @@ fn worker_config(
         cost_log: cfg.io.cost_log_policy()?,
         gpu_time_multiplier: *gpu_time_multiplier,
         max_batch_tokens: Some(*max_batch_tokens),
-        pending_order: PendingOrderKind::Fifo,
+        pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
         prefill_chunk_alignment: *prefill_chunk_alignment,
+        external_decode: *external_decode,
         max_model_len,
         ..WorkerConfig::default()
     };
     worker.kv_accounting().apply("pp", &mut config)?;
+    worker.apply_chunked_scheduling("pp", &mut config)?;
+    prefix_tiers.apply("pp", &mut config)?;
     Ok(config)
 }
 
@@ -295,7 +315,7 @@ where
                 STAGE_POOL_TAG,
                 Arc::clone(&stages[usize::from(stage)]),
                 std::rc::Rc::clone(&store),
-                worker_config,
+                worker_config.clone(),
                 log_dir.clone(),
                 PP_STAGE_POOL,
                 &gpu_name,

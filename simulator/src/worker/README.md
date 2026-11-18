@@ -37,13 +37,13 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 |---|---|---|---|---|
 | `barebone` | `KvCacheStore` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `hp_unified` | `KvCacheStore` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
-| `chunked_prefill` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `chunked_prefill` | `KvCacheStore` with N partitions, optional host DRAM/SSD tiers per partition | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `speculative` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>` | `SpeculativeIterExecution` | `IterBatchWorker` |
 | `pd_prefill` | `KvCacheStore` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_decode` | `KvCacheStore` less the reserved pull budget, no prefix tier | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `KvCacheStore` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
-| `pipeline_chunked_prefill`, stage 0 | `KvCacheStore`, one partition, sized by the most constrained stage's `KvCacheLayout` | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
+| `pipeline_chunked_prefill`, stage 0 | `KvCacheStore`, one partition, sized by the most constrained stage's `KvCacheLayout`, optional host DRAM/SSD tiers | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
 | `pipeline_chunked_prefill`, stages 1..N-1 | none | none; L6 hands over microbatches | `UnifiedIterExecution` (as `PipelineStageExecution`) | `PipelineStageWorker` |
 
 Hybrid archs (sliding-window, recurrent, or compressed state: Inkling,
@@ -127,8 +127,11 @@ waiting one needs free (`needed_to_admit`), and what a retained prefix entry
 keeps (`entry_charge`). `current_kv` stays context tokens for the arch input;
 charge never replaces it. The worker's flattened `KvAccountingSpec` picks
 `kv_overhead` (`vllm` default: padding, state copies, engine blocks, in-flight
-window tokens; `none`: model state only), `prefix_resume_points`,
-`prefix_resume_interval`, and `kv_max_in_flight_tokens`. Rules and rationale:
+window tokens; `none`: model state only), `kv_part_padding` (one part's entry
+bytes: `padded`, `unpadded` or a byte count, other rules unchanged),
+`kv_block_tokens` (the engine block instead of the arch's),
+`prefix_resume_points`, `prefix_resume_interval`, and
+`kv_max_in_flight_tokens`. Rules and rationale:
 `doc/detailed_design/L5.md` §3.1–3.2.
 
 `SessionInput` remains one closed immutable request declaration: `Standalone`;
@@ -160,7 +163,11 @@ returns held KV to the cache only after decode acknowledges the pull.
 An entry resumes only at the `ResumePositions` its request left behind: any
 length for per-token parts, but only where a sliding-window tail or recurrent
 state was kept for the others (`prefix_resume_points`, default `prompt_end`
-under `vllm`). A hit is the largest position at or below the declared prefix.
+under `vllm`; `context_end` keeps the state at the unfloored context end, so a
+hit is the whole context or nothing; with it, `recurrent_state_checkpoints: k`
+on the chunked selectors keeps the latest `k` round-end states per entry, one
+unit with the context, and `recurrent_state_anchors` the latest hand-back and
+pass ends plus strided earlier pass ends, `kv/shared/state_retention.rs`). A hit is the largest position at or below the declared prefix.
 A running request's tails and states at positions it has already passed are
 live checkpoints: like retained entries they are a soft, evictable tier that
 never enters `fits` or `kv_usage`, and they win the slack over retained
@@ -182,6 +189,36 @@ counts make the stream replayable. An `activate` row's `full_hit_tokens` is the
 hit the entry would give if every position were resumable. The logger is an
 observer of the same `KvCacheStore`; it does not infer operations from `kv_snapshot` or maintain shadow
 residency.
+
+The pipeline head may put host tiers behind its prefix cache, and
+`chunked_prefill` behind each attention DP rank's (any arch; per-rank bytes are
+the rank's layout over its attention shards, `TierBytes::per_gpu`)
+(`PrefixTierSpec`: `dram_tier_*`, `ssd_tier_*`, `prefix_tier_*`). Each
+partition's `TierChain` (`kv/shared/tier_chain.rs`) keeps one entry per session
+per tier in tier tokens (one GPU's per-token bytes, `TierBytes`; a pipeline's
+folds the stages' layouts, `TierBytes::of_pipeline`), written through or as the victim
+tier of the one above, LRU-evicted, and cut at admission when a victim entry
+outgrows what the request shares. `TieredPrefixKv` plans, starts, lands and
+restores reads (`kv/shared/tier_reads.rs`): a read holds its request's whole
+footprint on HBM until its landed context is put back just before admission.
+With `prefix_tier_loading_area` > 0 reads are staged: a loading area of
+`floor(capacity x fraction)` units stays held on HBM (and a DRAM area carved
+from DRAM when SSD is behind it); a staged read holds only what it lands, starts
+when it fits its area or the area is empty, and an SSD read lands in DRAM before
+it hops on to HBM on DRAM's channel. A read
+moves the states that survive the round as an HBM take carries them: the states
+a round adds (`1 + external_decode`) are set once, by
+`KvCacheStore::with_external_decode` on each prefix cache, and the tier chains
+take that value. `TierStateOptions` sets the rest of how tiers move states:
+`tier_state_compression_ratio` (stored size in tiers and on SSD,
+decoded on DRAM's channel and in HBM's area), and
+`recurrent_state_anchors_in_place`. With `external_decode` the store's
+`release_handing_back` / `hand_back_context` split a request's release from its
+decode's hand-back, which extends the prompt's HBM context and writes the
+round through. Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
+counters become the pool's `tiers` in `raw/kv_cache.json`, written when the
+store is dropped and rewritten after the run. Rules:
+`doc/detailed_design/L5.md` §3.3.
 
 ## Admission axis
 
@@ -327,8 +364,9 @@ chunk while the previous one is on a later stage. Token emission, decode KV
 advance, `Done`, and KV release wait for the exit, stamped with the exact exit
 time. A decode step needs the previous token, so a running request has at most
 one microbatch in flight; each microbatch takes the ready decodes first, then
-started and fresh prompts, under one token budget. Ready decodes all join by
-default (vLLM); `balance_decode_microbatches` caps them at
+started and fresh prompts, under one token budget whose prefill share follows
+the head's `MicrobatchBudget` (the round counts in-flight prefill too). Ready
+decodes all join by default (vLLM); `balance_decode_microbatches` caps them at
 `ceil(resident decodes / depth)` per microbatch. Admission writes the chosen
 decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
 outside it.
@@ -349,7 +387,9 @@ the resolved `KvAccounting`, partition count, cost manifest — instead of a mod
 handle, so it names no L4 model trait and cannot select an execution adapter. It
 returns the `CostBuffers`; the recipe wraps them. The same file holds the KV
 helpers every KV-owning recipe shares: `resolve_kv_accounting` (layout, attention
-shard count and worker options to `KvAccounting`), `kv_cache_store`, and
+shard count and worker options to `KvAccounting`), `kv_cache_store`,
+`with_host_tiers` (the config's host tiers and loading area; it rejects a
+loading area on a layout whose tiers store no recurrent state), and
 `prefill_chunk_end_quantum`. PD decode sets its pull budget aside with
 `KvAccounting::reserving`; the pipeline head resolves the most constrained
 stage's layout (`pipeline_kv_cache_layout`).
@@ -387,12 +427,47 @@ block; when its arch's drafter prunes the last matching prefix block
 therefore the stop no chunk may run past, sits one block earlier. Only that
 chunk-end stop reads the hook; prefix-hit lengths do not yet drop the block.
 
-With several attention partitions (an attention-DP arch), `dp_placement`
-chooses where a cold request lands. `round-robin` (default) rotates blindly;
-`vllm-least-loaded` ports vLLM's DP load balancer
-(`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
-waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+Both chunked lifecycles (`chunked_prefill` per attention DP rank, and the
+pipeline head) take the same scheduling options, all off by default (vLLM):
+
+- `pending_order` picks the fresh-request policy; `shortest-prefill-first`
+  (`ShortestJobFirst::by(JobSize::PrefillTokens)`) orders by the prefill a
+  request still needs, its fresh tokens plus any declared prefix not resident.
+- `srpt` sets `StartedOrder::ShortestRemaining` (`admission/started_order.rs`):
+  queued prompts no longer than a started one go before its next chunk.
+- `MicrobatchBudgetSpec` (`microbatch_split`, `min_microbatch_tokens`,
+  `long_prefill_token_threshold`, `load_budget_*`) resolves to one
+  `MicrobatchBudget` (`admission/microbatch_budget.rs`). The lifecycle counts
+  the backlog it follows (a DP rank's queued and started prompts; the head adds
+  its in-flight prefill); `even` is pipeline-only.
+- `ForceScheduleSpec` (`force_schedule_after_ms`) wraps the policy in
+  `Deadline<P>` (`policy/deadline.rs`), which serves a request that has waited
+  past the bound before the rest of its queue; `promote(now, held)` runs at the
+  start of each formation. `force_schedule_hits_first` (with the bound and
+  `srpt`) splits the overdue requests by cost class (`HitsFirst`): those whose
+  context HBM or a tier holds go first, and the srpt fill runs once per class
+  (`FillPrefillBudget::fill_prefill_by_class`). `force_schedule_hits_first_when_at_risk`
+  splits only while the pipeline head (or a `chunked_prefill` rank) finds a
+  queued request's tier context at risk from the overdue misses' compute tokens
+  (`TieredPrefixKv::tier_sessions_at_risk`); without tiers it never splits.
+
+On the pipeline head and on each `chunked_prefill` rank with host tiers (one
+shared lifecycle, `FreshReads` in `admission/fresh_reads.rs`), a fresh request whose context a tier
+holds beyond HBM goes pending -> reading -> landed -> started; landed requests
+are offered first. `prefix_tier_max_read_wait_ms` with
+`prefix_tier_read_wait_policy` (`ReadWait`, `admission/read_wait.rs`) passes
+over or stops at a request whose read would wait too long for its channel. The
+shell wakes at each landing (`MicrobatchAdmission::next_read_landing`;
+`IterAdmission::next_read_landing` when every queued request is reading). A
+`chunked_prefill` rank with tiers or `external_decode` keeps sessions sticky:
+the rank retaining the session in HBM, else the session's last rank, else load. With
+staged loading, `start_staged_reads` runs at the start of each fresh pass
+(overdue requests, then the pending order) and starts reads in order until
+both loading areas are out of room; admission passes over a request until its
+read lands. The areas and their arithmetic stay in the KV store. With
+`external_decode` either lifecycle owns an `ExternalDecode` completion rule
+(`admission/external_decode.rs`): a request runs to its first token, and its
+context is handed back after every release of the microbatch.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;

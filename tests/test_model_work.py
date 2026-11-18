@@ -3723,6 +3723,29 @@ def test_locked_pipeline_stages_refuse_bad_layouts(monkeypatch):
         )
 
 
+def test_locked_pipeline_stages_accept_whole_replicated_pipelines(monkeypatch):
+    _pp_model, stages = _pp_case(monkeypatch, "glm53")
+    composition = _columns([{"occurrences": 1, "totals": _PP_DECODE}])
+    ranges = list(stages.values())
+    # Two replicas of the pipeline: each stage's layer range appears twice.
+    replicated = {f"pp/{index}": layers for index, layers in enumerate(ranges + ranges)}
+    aliases = {key: "pp/0" for key in replicated if key != "pp/0"}
+    result = work_floors.compute_locked_compositions(
+        Path("unused"), {"pp/0": composition}, replicated, aliases
+    )
+    assert all("error" not in result[key] for key in replicated)
+    assert result[f"pp/{len(ranges)}"]["necessary"] == result["pp/0"]["necessary"]
+    # One replica short a stage is not a whole number of pipelines.
+    partial = {f"pp/{index}": layers for index, layers in enumerate(ranges + ranges[:1])}
+    result = work_floors.compute_locked_compositions(
+        Path("unused"),
+        {"pp/0": composition},
+        partial,
+        {key: "pp/0" for key in partial if key != "pp/0"},
+    )
+    assert "not whole pipeline replicas" in result["pp/0"]["error"]
+
+
 @pytest.mark.parametrize("arch", sorted(_PP_LAYOUTS))
 def test_unlocked_pipeline_stage_levels_add_up_to_one_whole_model(monkeypatch, arch):
     _pp_model, stages = _pp_case(monkeypatch, arch)

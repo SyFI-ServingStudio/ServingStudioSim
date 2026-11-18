@@ -24,6 +24,10 @@ const CHANNEL_CAP: usize = 64;
 pub enum PrefixCacheActivation {
     Hit,
     Miss,
+    /// A host tier's entry read toward HBM.
+    TierRead,
+    /// A staged SSD read moving on from DRAM's loading area to HBM's.
+    TierHop,
 }
 
 /// Why a retained prefix-cache entry was evicted.
@@ -33,6 +37,8 @@ pub enum PrefixCacheEvictionReason {
     ReplacementPolicy,
     RetentionCapacity,
     SameSessionReplacement,
+    /// A host tier's entry cut to what the session's next request shares.
+    TierCut,
 }
 
 /// Why an active request returned its context to the retained cache.
@@ -41,6 +47,18 @@ pub enum PrefixCacheRetentionReason {
     RequestComplete,
     HandoffComplete,
     NoCacheCapacity,
+    /// A context read back from a host tier, put into HBM at admission.
+    TierRead,
+    /// A context a decode run elsewhere handed back, extending the prompt's.
+    HandBack,
+    /// A finished context written through to a host tier.
+    TierWriteThrough,
+    /// What the tier above evicted or could not keep, in its victim tier.
+    TierVictim,
+    /// A read from a slower tier copied into a faster one on its way.
+    TierReadCopy,
+    /// A context older than the run put into the slowest tier.
+    TierWarmStart,
 }
 
 /// One valid prefix-cache operation/reason pair.
@@ -67,22 +85,36 @@ impl PrefixCacheEventKind {
         match self {
             Self::Activate(PrefixCacheActivation::Hit) => "hit",
             Self::Activate(PrefixCacheActivation::Miss) => "miss",
+            Self::Activate(PrefixCacheActivation::TierRead) => "read",
+            Self::Activate(PrefixCacheActivation::TierHop) => "hop",
             Self::Evict(PrefixCacheEvictionReason::ActiveKvPressure) => "active-kv-pressure",
             Self::Evict(PrefixCacheEvictionReason::ReplacementPolicy) => "replacement-policy",
             Self::Evict(PrefixCacheEvictionReason::RetentionCapacity) => "retention-capacity",
             Self::Evict(PrefixCacheEvictionReason::SameSessionReplacement) => {
                 "same-session-replacement"
             }
+            Self::Evict(PrefixCacheEvictionReason::TierCut) => "cut",
             Self::Retain(PrefixCacheRetentionReason::RequestComplete) => "request-complete",
             Self::Retain(PrefixCacheRetentionReason::HandoffComplete) => "handoff-complete",
             Self::Retain(PrefixCacheRetentionReason::NoCacheCapacity) => "no-cache-capacity",
+            Self::Retain(PrefixCacheRetentionReason::TierRead) => "tier-read",
+            Self::Retain(PrefixCacheRetentionReason::HandBack) => "hand-back",
+            Self::Retain(PrefixCacheRetentionReason::TierWriteThrough) => "write-through",
+            Self::Retain(PrefixCacheRetentionReason::TierVictim) => "victim",
+            Self::Retain(PrefixCacheRetentionReason::TierReadCopy) => "read-copy",
+            Self::Retain(PrefixCacheRetentionReason::TierWarmStart) => "warm-start",
         }
     }
 }
 
+/// The `tier` of an HBM prefix-cache row.
+pub const HBM_TIER: &str = "hbm";
+
 /// Cache transition facts supplied by the KV owner.
 #[derive(Clone, Copy, Debug)]
 pub struct PrefixCacheEvent {
+    /// [`HBM_TIER`], or the host tier's name.
+    pub tier: &'static str,
     pub partition_id: u16,
     pub time: Time,
     pub request_id: RequestId,
@@ -99,6 +131,11 @@ pub struct PrefixCacheEvent {
     /// The shared prefix the entry covers, wherever it could resume. The gap to
     /// `hit_tokens` is what resume positions cost a hit.
     pub full_hit_tokens: u64,
+    /// A host tier's used capacity in its own units (one GPU's per-token
+    /// bytes, states included), before and after; `None` on HBM rows.
+    pub cache_used_units: Option<(u64, u64)>,
+    /// A tier read's landing time.
+    pub ready: Option<Time>,
 }
 
 /// Sim-thread handle for one worker's sparse cache-operation stream. Sequence
@@ -164,6 +201,7 @@ impl PrefixCacheLogger {
             return;
         }
         self.buffer.push(PrefixCacheEventEntry {
+            tier: event.tier,
             worker_id: self.worker_id.0,
             partition_id: event.partition_id,
             sequence: self.next_sequence,
@@ -179,6 +217,9 @@ impl PrefixCacheLogger {
             requested_tokens: event.requested_tokens,
             hit_tokens: event.hit_tokens,
             full_hit_tokens: event.full_hit_tokens,
+            cache_used_units_before: event.cache_used_units.map(|(before, _)| before),
+            cache_used_units_after: event.cache_used_units.map(|(_, after)| after),
+            ready_ms: event.ready.map(Time::as_ms),
         });
         self.next_sequence = self.next_sequence.saturating_add(1);
         if self.buffer.len() >= STREAM_FLUSH_ROWS {
@@ -252,7 +293,7 @@ mod tests {
 
     use std::fs::File;
 
-    use arrow_array::{StringArray, UInt64Array};
+    use arrow_array::{Array, Float64Array, StringArray, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::tempdir;
 
@@ -261,6 +302,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut logger = PrefixCacheLogger::open(directory.path(), "main", WorkerId(3)).unwrap();
         logger.record(PrefixCacheEvent {
+            tier: HBM_TIER,
             partition_id: 1,
             time: Time::from_ms(5.0),
             request_id: RequestId(42),
@@ -273,8 +315,11 @@ mod tests {
             requested_tokens: 100,
             hit_tokens: 100,
             full_hit_tokens: 100,
+            cache_used_units: None,
+            ready: None,
         });
         logger.record(PrefixCacheEvent {
+            tier: HBM_TIER,
             partition_id: 1,
             time: Time::from_ms(5.0),
             request_id: RequestId(42),
@@ -287,6 +332,25 @@ mod tests {
             requested_tokens: 140,
             hit_tokens: 0,
             full_hit_tokens: 0,
+            cache_used_units: None,
+            ready: None,
+        });
+        logger.record(PrefixCacheEvent {
+            tier: "dram",
+            partition_id: 1,
+            time: Time::from_ms(5.0),
+            request_id: RequestId(43),
+            session_id: 7,
+            kind: PrefixCacheEventKind::Activate(PrefixCacheActivation::TierRead),
+            entry_tokens_before: 140,
+            entry_tokens_after: 140,
+            cache_used_before: 140,
+            cache_used_after: 140,
+            requested_tokens: 140,
+            hit_tokens: 140,
+            full_hit_tokens: 140,
+            cache_used_units: Some((150, 150)),
+            ready: Some(Time::from_ms(7.0)),
         });
         logger.flush_all().unwrap();
 
@@ -298,7 +362,7 @@ mod tests {
             .build()
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 3);
 
         let sequence = batch
             .column_by_name("sequence")
@@ -306,7 +370,30 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        assert_eq!((sequence.value(0), sequence.value(1)), (0, 1));
+        assert_eq!((sequence.value(0), sequence.value(2)), (0, 2));
+        let tier = batch
+            .column_by_name("tier")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((tier.value(0), tier.value(2)), ("hbm", "dram"));
+        let units = batch
+            .column_by_name("cache_used_units_after")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(units.is_null(0));
+        assert_eq!(units.value(2), 150);
+        let ready = batch
+            .column_by_name("ready_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(ready.is_null(1));
+        assert_eq!(ready.value(2), 7.0);
         let operation = batch
             .column_by_name("operation")
             .unwrap()

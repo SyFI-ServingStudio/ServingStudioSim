@@ -16,9 +16,15 @@ use serde::Deserialize;
 
 use schema_derive::{ParamStruct, ProviderSchema};
 
-use super::admission::PendingOrderKind;
+use crate::common::Time;
+
+use super::admission::{
+    ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit,
+    ReadWait, ReadWaitPolicy, StartedOrder,
+};
 use super::kv::{
-    KvOverhead, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy, PrefixResumePoints,
+    KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
+    PrefixResumePoints, StateRetention, TierSpec, TierWrites, DRAM_TIER,
 };
 use super::types::WorkerConfig;
 
@@ -216,18 +222,19 @@ impl KvAdmissionSpec {
 }
 
 const KV_OVERHEAD_CHOICES: [&str; 2] = ["vllm", "none"];
-const PREFIX_RESUME_POINTS_CHOICES: [&str; 4] = [
+const PREFIX_RESUME_POINTS_CHOICES: [&str; 5] = [
     "prompt_end",
     "response_end",
     "prompt_and_response_end",
     "every_block",
+    "context_end",
 ];
 
 /// How a worker turns the arch's `KvCacheLayout` into charges: whether the
 /// serving engine's own allocation counts, and where a finished request keeps
 /// the state a later request resumes from. Flattened into every selector that
 /// owns KV.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ParamStruct)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, ParamStruct)]
 pub struct KvAccountingSpec {
     /// `vllm` charges what vLLM allocates (padding, state copies, engine
     /// blocks, a sliding window's in-flight tokens) and resumes prefixes where
@@ -238,7 +245,8 @@ pub struct KvAccountingSpec {
     kv_overhead: KvOverhead,
     /// Where a finished request keeps sliding-window tails and recurrent state
     /// for a later request to resume from. Absent follows `kv_overhead`:
-    /// `prompt_end` under `vllm`, `response_end` under `none`. A layout of
+    /// `prompt_end` under `vllm`, `response_end` under `none`. `context_end`
+    /// (not vLLM) keeps it at the unfloored context end only. A layout of
     /// per-token parts only resumes anywhere and ignores it.
     #[serde(default)]
     #[param(string, choices = PREFIX_RESUME_POINTS_CHOICES)]
@@ -252,11 +260,24 @@ pub struct KvAccountingSpec {
     /// async scheduling), or the whole prompt without a token budget.
     #[serde(default)]
     kv_max_in_flight_tokens: Option<u32>,
+    /// Entry bytes of named layout parts, overriding `kv_overhead` for those
+    /// parts only: `<part>=padded`, `<part>=unpadded`, or `<part>=<bytes per
+    /// entry>` (an engine that packs a state differently). Every other
+    /// `kv_overhead` rule stays. A name the arch's layout lacks is an error.
+    #[serde(default)]
+    kv_part_padding: Vec<String>,
+    /// The engine block in tokens, overriding the one the arch derives (an
+    /// engine with other pages than vLLM's). It drives per-token block
+    /// rounding, resume-point flooring, the checkpoint chunk boundary and the
+    /// null block; padded parts keep their declared bytes unless
+    /// `kv_part_padding` names them. Absent keeps the arch's block.
+    #[serde(default)]
+    kv_block_tokens: Option<u32>,
 }
 
 impl KvAccountingSpec {
     /// Validate the knobs and set them on `config`.
-    pub(crate) fn apply(self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
+    pub(crate) fn apply(&self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
         ensure!(
             self.prefix_resume_interval != Some(0),
             "{owner}: prefix_resume_interval must be positive"
@@ -265,20 +286,556 @@ impl KvAccountingSpec {
             self.kv_max_in_flight_tokens != Some(0),
             "{owner}: kv_max_in_flight_tokens must be positive"
         );
+        ensure!(
+            self.kv_block_tokens != Some(0),
+            "{owner}: kv_block_tokens must be positive"
+        );
         config.kv_overhead = self.kv_overhead;
         config.prefix_resume_points = self.prefix_resume_points;
         config.prefix_resume_interval = self.prefix_resume_interval;
         config.kv_max_in_flight_tokens = self.kv_max_in_flight_tokens;
+        config.kv_block_tokens = self.kv_block_tokens;
+        config.kv_part_padding = Vec::with_capacity(self.kv_part_padding.len());
+        for value in &self.kv_part_padding {
+            let padding: PartPadding = value
+                .parse()
+                .map_err(|error| anyhow::anyhow!("{owner}: kv_part_padding: {error:#}"))?;
+            ensure!(
+                config
+                    .kv_part_padding
+                    .iter()
+                    .all(|named| named.part != padding.part),
+                "{owner}: kv_part_padding names part `{}` twice",
+                padding.part
+            );
+            config.kv_part_padding.push(padding);
+        }
         Ok(())
     }
 }
 
-const PENDING_ORDER_CHOICES: [&str; 4] = [
+/// Which round-end recurrent states a retained context keeps. Flattened into
+/// both chunked selectors; absent keeps the end state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ParamStruct)]
+pub struct StateRetentionSpec {
+    /// Round-end states a retained context keeps: its end's and the latest
+    /// earlier rounds', so a prompt ending inside the context resumes from
+    /// the latest kept state at or before it. A context and its states are
+    /// charged, kept and evicted as one. Above 1 needs `prefix_resume_points:
+    /// context_end`. Not vLLM.
+    #[serde(default = "one_state")]
+    #[param(default = 1)]
+    recurrent_state_checkpoints: u32,
+    /// When > 0, a retained context keeps instead the latest handed-back
+    /// decode's end, the latest pass's end, and this many anchors: the latest
+    /// earlier pass ends of rounds (counted along the session's lineage) that
+    /// are a multiple of `recurrent_state_anchor_stride`. Stride 2 records an
+    /// anchor every other round, so the kept anchor is one to two rounds back
+    /// at a constant state count. Needs `recurrent_state_checkpoints: 1`. Not
+    /// vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    recurrent_state_anchors: u32,
+    /// Round stride of `recurrent_state_anchors` (>= 1). Not vLLM.
+    #[serde(default = "one_round")]
+    #[param(default = 1)]
+    recurrent_state_anchor_stride: u32,
+    /// With `recurrent_state_anchors` and a host tier: an anchor, immutable
+    /// once written, is written once, to the tier its context first lands in
+    /// below HBM, and stays there. A read moves only the state its round
+    /// resumes from (an anchor only when an inside round resumes from it,
+    /// with the KV HBM's entry for the session still holds counted as
+    /// resident); an exclusive DRAM keeps a read entry cut to its latest
+    /// surviving anchor; a demotion does not rewrite an anchor (a tier
+    /// evicting the context drops its anchors). Needs
+    /// `recurrent_state_anchors` > 0. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    recurrent_state_anchors_in_place: bool,
+}
+
+const fn one_state() -> u32 {
+    1
+}
+
+const fn one_round() -> u32 {
+    1
+}
+
+impl Default for StateRetentionSpec {
+    fn default() -> Self {
+        Self {
+            recurrent_state_checkpoints: one_state(),
+            recurrent_state_anchors: 0,
+            recurrent_state_anchor_stride: one_round(),
+            recurrent_state_anchors_in_place: false,
+        }
+    }
+}
+
+impl StateRetentionSpec {
+    /// Whether anchors stay in the tier they first land in.
+    pub(crate) fn anchors_in_place(self, owner: &str) -> Result<bool> {
+        ensure!(
+            !self.recurrent_state_anchors_in_place || self.recurrent_state_anchors > 0,
+            "{owner}: recurrent_state_anchors_in_place needs recurrent_state_anchors > 0"
+        );
+        Ok(self.recurrent_state_anchors_in_place)
+    }
+
+    /// The retention; at least one state, the end's.
+    pub(crate) fn resolve(self, owner: &str) -> Result<StateRetention> {
+        ensure!(
+            self.recurrent_state_checkpoints >= 1,
+            "{owner}: recurrent_state_checkpoints must be >= 1 (a context keeps its end state)"
+        );
+        if self.recurrent_state_anchors == 0 {
+            return Ok(StateRetention::Latest {
+                k: self.recurrent_state_checkpoints,
+            });
+        }
+        ensure!(
+            self.recurrent_state_checkpoints == 1 && self.recurrent_state_anchor_stride >= 1,
+            "{owner}: recurrent_state_anchors needs recurrent_state_checkpoints: 1 and \
+             recurrent_state_anchor_stride >= 1"
+        );
+        Ok(StateRetention::Anchors {
+            count: self.recurrent_state_anchors,
+            stride: self.recurrent_state_anchor_stride,
+        })
+    }
+}
+
+/// Host tiers behind a prefix cache: DRAM, then SSD, each per GPU. Flattened
+/// into `pipeline_chunked_prefill` (one set per pipeline) and
+/// `chunked_prefill` (one set per attention DP rank); every key absent is no
+/// tier. A session request whose context is in a tier but not in HBM reads
+/// it back when admission reaches it, as vLLM's KV connector does; the rest
+/// is not vLLM.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, ParamStruct)]
+pub struct PrefixTierSpec {
+    /// Host DRAM per GPU (GB; `0`: none).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    dram_tier_gb: f64,
+    /// DRAM -> HBM read bandwidth per GPU (GB/s): a PCIe Gen5 x16 link.
+    #[serde(default = "default_dram_tier_gb_per_s")]
+    #[param(default = 50.0)]
+    dram_tier_gb_per_s: f64,
+    /// What DRAM is written: `every-context`, each finished context
+    /// (write-through); `hbm-evictions`, only what the HBM prefix cache evicts
+    /// or cannot keep, as what DRAM's entry for the session lacks (a victim
+    /// tier); `hbm-evictions-exclusive`, the same, and a read moves the
+    /// context back to HBM instead of copying it.
+    #[serde(default)]
+    #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
+    dram_tier_writes: DramTierWrites,
+    /// Local SSD behind DRAM per GPU (GB; `0`: none).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    ssd_tier_gb: f64,
+    /// SSD -> HBM read bandwidth per GPU (GB/s): one Gen5 NVMe drive.
+    #[serde(default = "default_ssd_tier_gb_per_s")]
+    #[param(default = 10.0)]
+    ssd_tier_gb_per_s: f64,
+    /// What SSD is written: `every-context` (write-through) or
+    /// `dram-evictions`, only what DRAM evicts or cannot hold (a victim tier;
+    /// needs both tiers).
+    #[serde(default)]
+    #[param(string, default = "every-context", choices = SSD_TIER_WRITES_CHOICES)]
+    ssd_tier_writes: SsdTierWrites,
+    /// Tiers store and read the stages' mean KV bytes, as if the stages held
+    /// equal shares, instead of the most loaded stage's. HBM is unchanged. A
+    /// what-if: vLLM's layer split leaves the stages unequal. Pipeline only.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_balanced_load: bool,
+    /// Start a read only while its tier's channel would begin it within this
+    /// many ms; past that, `prefix_tier_read_wait_policy` decides. `0`: no
+    /// bound. Needs a tier.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    prefix_tier_max_read_wait_ms: f64,
+    /// With `prefix_tier_max_read_wait_ms`: `pass-over` leaves a request whose
+    /// read would wait past the bound queued, holding nothing, and admits the
+    /// ones behind it; `block` stops admission at it.
+    #[serde(default)]
+    #[param(string, default = "pass-over", choices = READ_WAIT_POLICY_CHOICES)]
+    prefix_tier_read_wait_policy: ReadWaitPolicy,
+    /// A session request whose declared prefix exceeds every context the run
+    /// stored for its session began before the run: its context is read from
+    /// the slowest tier, as a long-lived session's would be in steady state.
+    /// For closed-loop traces that start sessions mid-life.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_warm_start: bool,
+    /// Staged loading (not vLLM): reads go through loading areas of this
+    /// fraction of HBM and, with an SSD behind DRAM, of DRAM, kept free for
+    /// them. Before each admission pass, reads start in queue order while the
+    /// area each lands in has room, and admission takes a request only once
+    /// its read has landed. `0`: a read starts when admission reaches its
+    /// request. In `[0, 0.5)`; needs a tier and a recurrent-state arch, and
+    /// takes no read-wait bound.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    prefix_tier_loading_area: f64,
+    /// Tiers store each recurrent state compressed by this ratio, rounded up,
+    /// encoded and decoded by the host CPU (its time not modeled) while HBM
+    /// keeps it whole: a state costs its stored size in tier capacity, writes
+    /// and on the SSD channel, its decoded size on DRAM's channel and in
+    /// HBM's loading area. Finite and >= 1; `1`: uncompressed. Not vLLM.
+    #[serde(default = "default_tier_state_compression_ratio")]
+    #[param(default = 1.0)]
+    tier_state_compression_ratio: f64,
+}
+
+const fn default_dram_tier_gb_per_s() -> f64 {
+    50.0
+}
+
+const fn default_ssd_tier_gb_per_s() -> f64 {
+    10.0
+}
+
+const fn default_tier_state_compression_ratio() -> f64 {
+    1.0
+}
+
+impl Default for PrefixTierSpec {
+    fn default() -> Self {
+        Self {
+            dram_tier_gb: 0.0,
+            dram_tier_gb_per_s: default_dram_tier_gb_per_s(),
+            dram_tier_writes: DramTierWrites::default(),
+            ssd_tier_gb: 0.0,
+            ssd_tier_gb_per_s: default_ssd_tier_gb_per_s(),
+            ssd_tier_writes: SsdTierWrites::default(),
+            prefix_tier_balanced_load: false,
+            prefix_tier_max_read_wait_ms: 0.0,
+            prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
+            prefix_tier_warm_start: false,
+            prefix_tier_loading_area: 0.0,
+            tier_state_compression_ratio: default_tier_state_compression_ratio(),
+        }
+    }
+}
+
+impl PrefixTierSpec {
+    /// Validate the tiers and set them on `config`.
+    pub(crate) fn apply(self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
+        let (dram_gb, ssd_gb) = (self.dram_tier_gb, self.ssd_tier_gb);
+        ensure!(
+            self.dram_tier_writes == DramTierWrites::EveryContext || dram_gb > 0.0,
+            "{owner}: dram_tier_writes: hbm-evictions(-exclusive) needs dram_tier_gb > 0"
+        );
+        ensure!(
+            self.ssd_tier_writes == SsdTierWrites::EveryContext || (dram_gb > 0.0 && ssd_gb > 0.0),
+            "{owner}: ssd_tier_writes: dram-evictions needs dram_tier_gb > 0 and ssd_tier_gb > 0"
+        );
+        let tier = |name: &'static str, gb: f64, gb_per_s: f64, writes| -> Result<_> {
+            ensure!(
+                gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
+                "{owner}: {name}_tier_gb must be >= 0 and its bandwidth positive"
+            );
+            Ok((gb > 0.0).then_some(TierSpec {
+                name,
+                capacity_gb: gb,
+                read_gb_per_s: gb_per_s,
+                writes,
+            }))
+        };
+        let dram_writes = match self.dram_tier_writes {
+            DramTierWrites::EveryContext => TierWrites::EveryContext,
+            DramTierWrites::HbmEvictions => TierWrites::Evictions,
+            DramTierWrites::HbmEvictionsExclusive => TierWrites::EvictionsExclusive,
+        };
+        let ssd_writes = match self.ssd_tier_writes {
+            SsdTierWrites::EveryContext => TierWrites::EveryContext,
+            SsdTierWrites::DramEvictions => TierWrites::Evictions,
+        };
+        config.prefix_tiers = [
+            tier(DRAM_TIER, dram_gb, self.dram_tier_gb_per_s, dram_writes)?,
+            tier("ssd", ssd_gb, self.ssd_tier_gb_per_s, ssd_writes)?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let ms = self.prefix_tier_max_read_wait_ms;
+        ensure!(
+            ms.is_finite() && ms >= 0.0,
+            "{owner}: prefix_tier_max_read_wait_ms ({ms}) must be a finite value >= 0"
+        );
+        ensure!(
+            self.prefix_tier_read_wait_policy == ReadWaitPolicy::PassOver || ms > 0.0,
+            "{owner}: prefix_tier_read_wait_policy: block needs prefix_tier_max_read_wait_ms > 0"
+        );
+        ensure!(
+            ms == 0.0 || !config.prefix_tiers.is_empty(),
+            "{owner}: prefix_tier_max_read_wait_ms needs dram_tier_gb or ssd_tier_gb > 0"
+        );
+        config.prefix_tier_read_wait = (ms > 0.0).then(|| ReadWait {
+            max: Time::from_ms(ms),
+            policy: self.prefix_tier_read_wait_policy,
+        });
+        let area = self.prefix_tier_loading_area;
+        ensure!(
+            (0.0..0.5).contains(&area),
+            "{owner}: prefix_tier_loading_area ({area}) must be in [0, 0.5)"
+        );
+        ensure!(
+            area == 0.0 || !config.prefix_tiers.is_empty(),
+            "{owner}: prefix_tier_loading_area needs dram_tier_gb or ssd_tier_gb > 0"
+        );
+        ensure!(
+            area == 0.0 || ms == 0.0,
+            "{owner}: prefix_tier_max_read_wait_ms does not apply to staged reads \
+             (prefix_tier_loading_area > 0)"
+        );
+        config.prefix_tier_loading_area = area;
+        let ratio = self.tier_state_compression_ratio;
+        ensure!(
+            ratio.is_finite() && ratio >= 1.0,
+            "{owner}: tier_state_compression_ratio ({ratio}) must be a finite ratio >= 1"
+        );
+        config.tier_state_compression_ratio = ratio;
+        config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
+        config.prefix_tier_warm_start = self.prefix_tier_warm_start;
+        Ok(())
+    }
+}
+
+/// What the DRAM tier is written (`dram_tier_writes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DramTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// What HBM evicts or cannot keep (HBM's victim tier).
+    HbmEvictions,
+    /// The same, and a read moves the context out of DRAM.
+    HbmEvictionsExclusive,
+}
+
+const DRAM_TIER_WRITES_CHOICES: [&str; 3] =
+    ["every-context", "hbm-evictions", "hbm-evictions-exclusive"];
+
+/// What the SSD tier is written (`ssd_tier_writes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsdTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// What DRAM evicts or cannot hold (DRAM's victim tier).
+    DramEvictions,
+}
+
+const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
+
+const READ_WAIT_POLICY_CHOICES: [&str; 2] = ["pass-over", "block"];
+
+/// How a pipeline head sizes each microbatch's prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicrobatchSplit {
+    /// Take as much pending prefill as `max_batch_tokens` allows (vLLM).
+    #[default]
+    Greedy,
+    /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
+    /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
+    Even,
+}
+
+const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
+
+/// How much prefill one batch takes: a pipeline microbatch, or one attention
+/// DP rank's share of a `chunked_prefill` iteration. Flattened into both
+/// chunked selectors; every key absent is vLLM's greedy fill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ParamStruct)]
+pub struct MicrobatchBudgetSpec {
+    /// `greedy` (vLLM) fills each microbatch's prefill up to
+    /// `max_batch_tokens`; `even` (`pipeline_chunked_prefill` only) sizes it
+    /// to one `pp_size`-th of the pending plus in-flight prefill, so a backlog
+    /// spreads over the pipeline instead of one full microbatch followed by
+    /// small ones. Not vLLM.
+    #[serde(default)]
+    #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
+    microbatch_split: MicrobatchSplit,
+    /// Floor on the `even` target, in prefill tokens (`0`: none). Valid only
+    /// with `microbatch_split: even`; never delays a microbatch.
+    #[serde(default)]
+    #[param(default = 0)]
+    min_microbatch_tokens: u32,
+    /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+    /// request takes per batch (`0`: no cap, vLLM's default).
+    #[serde(default)]
+    #[param(default = 0)]
+    long_prefill_token_threshold: u32,
+    /// Load-following budget floor (`0`: off, vLLM's fixed budget). The batch
+    /// budget is this many tokens while the prefill backlog (queued and
+    /// started prompts' tokens, and a pipeline's in-flight ones) is at most
+    /// `load_budget_backlog_lo_tokens`, rising linearly to `max_batch_tokens`
+    /// at `load_budget_backlog_hi_tokens`; both bounds are required when the
+    /// floor is set. Each attention DP rank follows its own backlog. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_low_tokens: u32,
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_backlog_lo_tokens: u64,
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_backlog_hi_tokens: u64,
+}
+
+impl MicrobatchBudgetSpec {
+    /// Validate the knobs against `max_batch_tokens`; an even split needs a
+    /// pipeline.
+    pub(crate) fn resolve(
+        self,
+        owner: &str,
+        max_batch_tokens: u32,
+        pipelined: bool,
+    ) -> Result<MicrobatchBudget> {
+        let split = match self.microbatch_split {
+            MicrobatchSplit::Greedy => {
+                ensure!(
+                    self.min_microbatch_tokens == 0,
+                    "{owner}: min_microbatch_tokens ({}) only applies with microbatch_split: \
+                     even; greedy takes every pending token it can",
+                    self.min_microbatch_tokens
+                );
+                PrefillSplit::Greedy
+            }
+            MicrobatchSplit::Even => {
+                ensure!(
+                    pipelined,
+                    "{owner}: microbatch_split: even needs a pipeline (pipeline_chunked_prefill)"
+                );
+                ensure!(
+                    self.min_microbatch_tokens <= max_batch_tokens,
+                    "{owner}: min_microbatch_tokens ({}) must be <= max_batch_tokens \
+                     ({max_batch_tokens})",
+                    self.min_microbatch_tokens
+                );
+                PrefillSplit::Even {
+                    min_tokens: self.min_microbatch_tokens,
+                }
+            }
+        };
+        ensure!(
+            self.load_budget_low_tokens <= max_batch_tokens,
+            "{owner}: load_budget_low_tokens ({}) must be <= max_batch_tokens \
+             ({max_batch_tokens})",
+            self.load_budget_low_tokens
+        );
+        let load = if self.load_budget_low_tokens == 0 {
+            ensure!(
+                self.load_budget_backlog_lo_tokens == 0 && self.load_budget_backlog_hi_tokens == 0,
+                "{owner}: load_budget_backlog_*_tokens need load_budget_low_tokens"
+            );
+            None
+        } else {
+            ensure!(
+                self.load_budget_backlog_lo_tokens < self.load_budget_backlog_hi_tokens,
+                "{owner}: load_budget_low_tokens needs load_budget_backlog_lo_tokens < \
+                 load_budget_backlog_hi_tokens, got {} and {}",
+                self.load_budget_backlog_lo_tokens,
+                self.load_budget_backlog_hi_tokens
+            );
+            Some(LoadBudget {
+                low_tokens: self.load_budget_low_tokens,
+                backlog_lo_tokens: self.load_budget_backlog_lo_tokens,
+                backlog_hi_tokens: self.load_budget_backlog_hi_tokens,
+            })
+        };
+        Ok(MicrobatchBudget {
+            split,
+            long_prefill_token_threshold: (self.long_prefill_token_threshold > 0)
+                .then_some(self.long_prefill_token_threshold),
+            load,
+        })
+    }
+}
+
+/// When a queued request is served before the rest of its queue. Flattened
+/// into both chunked selectors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, ParamStruct)]
+pub struct ForceScheduleSpec {
+    /// Serve a request that has waited this many ms since arrival before the
+    /// rest of its queue, so a shortest-first order cannot starve it (`0`:
+    /// off); with `srpt`, overdue started prompts go first too. Per attention
+    /// DP rank. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    force_schedule_after_ms: f64,
+    /// With `force_schedule_after_ms` and `srpt`: requests split by cost
+    /// class. Those whose session's context is held (HBM or a tier), so they
+    /// compute only their new tokens, go first (overdue ones oldest first,
+    /// then shortest first); those that compute their context (a new session,
+    /// an evicted one, a prompt ending inside its context) follow in the same
+    /// order. Waiting behind recomputes cannot then turn a held context into
+    /// one. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    force_schedule_hits_first: bool,
+    /// With `force_schedule_hits_first`: split by cost class only while
+    /// serving the overdue requests oldest first would evict some queued
+    /// request's held context from every prefix tier holding it (its LRU
+    /// distance to eviction against the prefill tokens those requests
+    /// compute); otherwise oldest first. Without tiers nothing is at risk.
+    /// Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    force_schedule_hits_first_when_at_risk: bool,
+}
+
+impl ForceScheduleSpec {
+    /// The bound and its class order, `None` when off. `srpt`: the started
+    /// order is shortest remaining first, the only one that splits by class.
+    pub(crate) fn resolve(self, owner: &str, srpt: bool) -> Result<Option<ForceSchedule>> {
+        let ms = self.force_schedule_after_ms;
+        ensure!(
+            ms.is_finite() && ms >= 0.0,
+            "{owner}: force_schedule_after_ms ({ms}) must be a finite value >= 0"
+        );
+        ensure!(
+            !self.force_schedule_hits_first || (ms > 0.0 && srpt),
+            "{owner}: force_schedule_hits_first needs force_schedule_after_ms > 0 and srpt"
+        );
+        ensure!(
+            !self.force_schedule_hits_first_when_at_risk || self.force_schedule_hits_first,
+            "{owner}: force_schedule_hits_first_when_at_risk needs force_schedule_hits_first"
+        );
+        let hits_first = match (
+            self.force_schedule_hits_first,
+            self.force_schedule_hits_first_when_at_risk,
+        ) {
+            (false, _) => HitsFirst::Off,
+            (true, false) => HitsFirst::Always,
+            (true, true) => HitsFirst::WhenAtRisk,
+        };
+        Ok((ms > 0.0).then(|| ForceSchedule {
+            after: Time::from_ms(ms),
+            hits_first,
+        }))
+    }
+}
+
+const PENDING_ORDER_CHOICES: [&str; 5] = [
     "session-start",
     "fifo",
     "shortest-job-first",
+    "shortest-prefill-first",
     "longest-prefix-match",
 ];
+
+/// serde fallback for the chunked selectors' `pending_order`: vLLM's FCFS.
+const fn default_fifo_pending_order() -> PendingOrderKind {
+    PendingOrderKind::Fifo
+}
 
 const PREFIX_CACHE_POLICY_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
@@ -441,6 +998,41 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Order of each attention DP rank's waiting queue. `fifo` is vLLM's
+        /// FCFS; `shortest-prefill-first` offers the prompt with the fewest
+        /// tokens to compute first (not vLLM). Started prompts keep priority
+        /// either way unless `srpt`.
+        #[serde(default = "default_fifo_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Shortest remaining prefill first across each rank's started and
+        /// queued prompts (queue order should be `shortest-prefill-first`),
+        /// instead of vLLM's started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
+        /// Per-rank prefill budget; see [`MicrobatchBudgetSpec`].
+        #[serde(flatten)]
+        microbatch_budget: MicrobatchBudgetSpec,
+        /// Per-rank force-schedule bound; see [`ForceScheduleSpec`].
+        #[serde(flatten)]
+        force_schedule: ForceScheduleSpec,
+        /// Decode runs elsewhere: a request completes at its first token, and
+        /// its decode hands the context back, every output but the last
+        /// extending the prompt's context in its rank's HBM and tiers (a round
+        /// then adds two round-end states). Sessions stay on their rank. Not
+        /// vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
+        /// Round-end states a retained context keeps; see
+        /// [`StateRetentionSpec`].
+        #[serde(flatten)]
+        state_retention: StateRetentionSpec,
+        /// Host tiers behind each attention DP rank's prefix cache, sessions
+        /// sticky to their rank; see [`PrefixTierSpec`].
+        #[serde(flatten)]
+        prefix_tiers: PrefixTierSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -542,6 +1134,40 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         balance_decode_microbatches: bool,
+        /// Order in which queued fresh prompts are offered to the head. `fifo`
+        /// is vLLM; `shortest-prefill-first` offers the prompt with the fewest
+        /// tokens to compute first (not vLLM). Started prompts keep priority
+        /// over fresh ones unless `srpt`.
+        #[serde(default = "default_fifo_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Shortest remaining prefill first across started and queued prompts
+        /// (queue order should be `shortest-prefill-first`), instead of vLLM's
+        /// started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
+        /// Microbatch prefill budget; see [`MicrobatchBudgetSpec`].
+        #[serde(flatten)]
+        microbatch_budget: MicrobatchBudgetSpec,
+        /// Force-schedule bound, over queued and started prompts; see
+        /// [`ForceScheduleSpec`].
+        #[serde(flatten)]
+        force_schedule: ForceScheduleSpec,
+        /// Decode runs elsewhere: a request completes at its first token, and
+        /// its decode hands the context back, every output but the last
+        /// extending the prompt's context in HBM and in the tiers (a round
+        /// then adds two round-end states). Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
+        /// Round-end states a retained context keeps; see
+        /// [`StateRetentionSpec`].
+        #[serde(flatten)]
+        state_retention: StateRetentionSpec,
+        /// Host tiers behind the prefix cache; see [`PrefixTierSpec`].
+        #[serde(flatten)]
+        prefix_tiers: PrefixTierSpec,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -595,8 +1221,62 @@ impl IterWorkerSel {
             | Self::Speculative { kv_accounting, .. }
             | Self::PipelineChunkedPrefill { kv_accounting, .. }
             | Self::PdPrefill { kv_accounting, .. }
-            | Self::PdDecode { kv_accounting, .. } => *kv_accounting,
+            | Self::PdDecode { kv_accounting, .. } => kv_accounting.clone(),
         }
+    }
+
+    /// Validate a chunked selector's scheduling options and set them on
+    /// `config`; every other selector keeps vLLM's scheduler.
+    pub(crate) fn apply_chunked_scheduling(
+        &self,
+        owner: &str,
+        config: &mut WorkerConfig,
+    ) -> Result<()> {
+        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, state_retention, pipelined) =
+            match self {
+                Self::ChunkedPrefill {
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    ..
+                } => (
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    false,
+                ),
+                Self::PipelineChunkedPrefill {
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    ..
+                } => (
+                    max_batch_tokens,
+                    srpt,
+                    microbatch_budget,
+                    force_schedule,
+                    state_retention,
+                    true,
+                ),
+                _ => return Ok(()),
+            };
+        config.microbatch_budget =
+            microbatch_budget.resolve(owner, *max_batch_tokens, pipelined)?;
+        config.started_order = if *srpt {
+            StartedOrder::ShortestRemaining
+        } else {
+            StartedOrder::StartOrder
+        };
+        config.force_schedule = force_schedule.resolve(owner, *srpt)?;
+        config.state_retention = state_retention.resolve(owner)?;
+        config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
+        Ok(())
     }
 
     /// The chunk alignment a chunked selector asks for; `None` follows the
@@ -711,6 +1391,128 @@ pub(crate) fn resolve_prefix_cache_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a chunked selector of `kind` with `max_batch_tokens` 8192 plus
+    /// `keys`, and resolve its scheduling options.
+    fn chunked_scheduling(kind: &str, keys: &str) -> Result<WorkerConfig> {
+        let batch_policy = if kind == "chunked_prefill" {
+            "batch_policy: mix\n"
+        } else {
+            ""
+        };
+        let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+            "type: {kind}\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{batch_policy}{keys}"
+        ))
+        .expect("parse chunked worker");
+        let mut config = WorkerConfig::default();
+        worker.apply_chunked_scheduling("t", &mut config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn min_microbatch_tokens_requires_the_even_split() {
+        let pipeline = |keys: &str| chunked_scheduling("pipeline_chunked_prefill", keys);
+        let config = pipeline("").unwrap();
+        assert_eq!(
+            config.microbatch_budget,
+            MicrobatchBudget::default(),
+            "the default is vLLM's greedy fill"
+        );
+        assert_eq!(config.started_order, StartedOrder::StartOrder);
+        assert_eq!(config.force_schedule, None);
+
+        let error = pipeline("min_microbatch_tokens: 1024\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only applies with microbatch_split: even"),
+            "{error}"
+        );
+        assert!(pipeline("microbatch_split: even\nmin_microbatch_tokens: 8193\n").is_err());
+        assert_eq!(
+            pipeline("microbatch_split: even\nmin_microbatch_tokens: 1024\n")
+                .unwrap()
+                .microbatch_budget
+                .split,
+            PrefillSplit::Even { min_tokens: 1024 }
+        );
+        // An even split sizes pipeline microbatches; a whole iteration has none.
+        assert!(chunked_scheduling("chunked_prefill", "microbatch_split: even\n").is_err());
+    }
+
+    #[test]
+    fn chunked_prefill_scheduler_options_default_to_vllm_and_validate() {
+        let chunked = |keys: &str| chunked_scheduling("chunked_prefill", keys);
+        let config = chunked("").unwrap();
+        assert_eq!(config.microbatch_budget, MicrobatchBudget::default());
+        assert_eq!(config.started_order, StartedOrder::StartOrder);
+        assert_eq!(config.force_schedule, None);
+
+        // The floor needs ordered bounds, the bounds need the floor, and the
+        // floor cannot exceed the cap.
+        let load = |low: u32, lo: u64, hi: u64| {
+            chunked(&format!(
+                "load_budget_low_tokens: {low}\nload_budget_backlog_lo_tokens: {lo}\n\
+                 load_budget_backlog_hi_tokens: {hi}\n"
+            ))
+        };
+        assert!(load(4096, 0, 0).is_err());
+        assert!(load(4096, 3_000_000, 1_000_000).is_err());
+        assert!(load(0, 1_000_000, 3_000_000).is_err());
+        assert!(load(16384, 1_000_000, 3_000_000).is_err());
+        assert_eq!(
+            load(4096, 1_000_000, 3_000_000)
+                .unwrap()
+                .microbatch_budget
+                .load
+                .map(|budget| budget.target(2_000_000, 8192)),
+            Some(6144)
+        );
+
+        let config = chunked(
+            "pending_order: shortest-prefill-first\nsrpt: true\n\
+             long_prefill_token_threshold: 4096\nforce_schedule_after_ms: 2500\n",
+        )
+        .unwrap();
+        assert_eq!(config.started_order, StartedOrder::ShortestRemaining);
+        assert_eq!(
+            config.microbatch_budget.long_prefill_token_threshold,
+            Some(4096)
+        );
+        assert_eq!(
+            config.force_schedule,
+            Some(ForceSchedule {
+                after: Time::from_ms(2500.0),
+                hits_first: HitsFirst::Off,
+            })
+        );
+        assert!(chunked("force_schedule_after_ms: -1.0\n").is_err());
+
+        // Hits first splits the srpt fill and the overdue queue: it needs both.
+        let srpt_force = "pending_order: shortest-prefill-first\nsrpt: true\n\
+                          force_schedule_after_ms: 2500\n";
+        let order = |keys: &str| {
+            chunked(&format!("{srpt_force}{keys}"))
+                .map(|config| config.force_schedule.map(|schedule| schedule.hits_first))
+        };
+        assert_eq!(
+            order("force_schedule_hits_first: true\n").unwrap(),
+            Some(HitsFirst::Always)
+        );
+        assert_eq!(
+            order(
+                "force_schedule_hits_first: true\n\
+                 force_schedule_hits_first_when_at_risk: true\n"
+            )
+            .unwrap(),
+            Some(HitsFirst::WhenAtRisk)
+        );
+        assert!(order("force_schedule_hits_first_when_at_risk: true\n").is_err());
+        assert!(chunked("srpt: true\nforce_schedule_hits_first: true\n").is_err());
+        assert!(
+            chunked("force_schedule_after_ms: 2500\nforce_schedule_hits_first: true\n").is_err()
+        );
+    }
 
     #[test]
     fn selector_defaults_to_uncapped_opportunistic_prefix_reuse() {
@@ -874,5 +1676,190 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn kv_part_padding_parses_each_part_once() {
+        let apply = |keys: &str| {
+            let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+                "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\n\
+                 max_batch_tokens: 8192\n{keys}"
+            ))
+            .expect("parse pipeline worker");
+            let mut config = WorkerConfig::default();
+            worker
+                .kv_accounting()
+                .apply("t", &mut config)
+                .map(|()| config)
+        };
+        assert!(apply("").unwrap().kv_part_padding.is_empty());
+        let config = apply("kv_part_padding: [kda=unpadded, kpool_tail=0]\n").unwrap();
+        assert_eq!(
+            config.kv_part_padding,
+            ["kda=unpadded", "kpool_tail=0"].map(|value| value.parse().unwrap())
+        );
+        let twice = apply("kv_part_padding: [kda=unpadded, kda=padded]\n").unwrap_err();
+        assert!(twice.to_string().contains("twice"), "{twice}");
+        assert!(apply("kv_part_padding: [kda]\n").is_err());
+        assert_eq!(apply("").unwrap().kv_block_tokens, None);
+        assert_eq!(
+            apply("kv_block_tokens: 128\n").unwrap().kv_block_tokens,
+            Some(128)
+        );
+        assert!(apply("kv_block_tokens: 0\n").is_err());
+    }
+
+    #[test]
+    fn recurrent_state_checkpoints_keep_at_least_the_end_state() {
+        let pipeline = |keys: &str| chunked_scheduling("pipeline_chunked_prefill", keys);
+        assert_eq!(
+            pipeline("").unwrap().state_retention,
+            StateRetention::Latest { k: 1 }
+        );
+        assert_eq!(
+            chunked_scheduling("chunked_prefill", "recurrent_state_checkpoints: 2\n")
+                .unwrap()
+                .state_retention,
+            StateRetention::Latest { k: 2 }
+        );
+        assert!(pipeline("recurrent_state_checkpoints: 0\n").is_err());
+        assert_eq!(
+            pipeline("recurrent_state_anchors: 2\nrecurrent_state_anchor_stride: 2\n")
+                .unwrap()
+                .state_retention,
+            StateRetention::Anchors {
+                count: 2,
+                stride: 2
+            }
+        );
+        assert!(pipeline("recurrent_state_anchors: 1\nrecurrent_state_checkpoints: 2\n").is_err());
+        assert!(
+            pipeline("recurrent_state_anchors: 1\nrecurrent_state_anchor_stride: 0\n").is_err()
+        );
+        assert!(
+            pipeline("recurrent_state_anchors: 1\nrecurrent_state_anchors_in_place: true\n")
+                .unwrap()
+                .recurrent_state_anchors_in_place
+        );
+        assert!(pipeline("recurrent_state_anchors_in_place: true\n").is_err());
+    }
+
+    fn prefix_tiers(keys: &str) -> Result<WorkerConfig> {
+        let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{keys}"
+        ))
+        .expect("parse pipeline worker");
+        let IterWorkerSel::PipelineChunkedPrefill { prefix_tiers, .. } = worker else {
+            panic!("expected pipeline_chunked_prefill");
+        };
+        let mut config = WorkerConfig::default();
+        prefix_tiers.apply("t", &mut config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn tier_writes_build_the_victim_chain_and_need_their_tiers() {
+        let writes = |keys: &str| -> Vec<(&'static str, TierWrites)> {
+            prefix_tiers(keys)
+                .unwrap()
+                .prefix_tiers
+                .iter()
+                .map(|tier| (tier.name, tier.writes))
+                .collect()
+        };
+        assert!(prefix_tiers("").unwrap().prefix_tiers.is_empty());
+        let both = "dram_tier_gb: 50.0\nssd_tier_gb: 128.0\n";
+        assert_eq!(
+            writes(both),
+            [
+                ("dram", TierWrites::EveryContext),
+                ("ssd", TierWrites::EveryContext)
+            ]
+        );
+        assert_eq!(
+            writes(&format!(
+                "{both}dram_tier_writes: hbm-evictions\nssd_tier_writes: dram-evictions\n"
+            )),
+            [
+                ("dram", TierWrites::Evictions),
+                ("ssd", TierWrites::Evictions)
+            ]
+        );
+        assert_eq!(
+            writes("dram_tier_gb: 50.0\ndram_tier_writes: hbm-evictions-exclusive\n"),
+            [("dram", TierWrites::EvictionsExclusive)]
+        );
+        assert_eq!(
+            writes("ssd_tier_gb: 128.0\n"),
+            [("ssd", TierWrites::EveryContext)]
+        );
+        let config = prefix_tiers(both).unwrap();
+        assert_eq!(
+            (
+                config.prefix_tiers[0].read_gb_per_s,
+                config.prefix_tiers[1].read_gb_per_s
+            ),
+            (50.0, 10.0)
+        );
+        // A victim tier needs the tier above it.
+        assert!(prefix_tiers("dram_tier_writes: hbm-evictions\n").is_err());
+        assert!(prefix_tiers("ssd_tier_gb: 128.0\nssd_tier_writes: dram-evictions\n").is_err());
+        assert!(prefix_tiers("dram_tier_gb: -1.0\n").is_err());
+        assert!(prefix_tiers("dram_tier_gb: 50.0\ndram_tier_gb_per_s: 0.0\n").is_err());
+    }
+
+    #[test]
+    fn a_read_wait_bound_needs_a_tier_and_block_needs_a_bound() {
+        let dram = "dram_tier_gb: 50.0\n";
+        assert_eq!(prefix_tiers(dram).unwrap().prefix_tier_read_wait, None);
+        assert_eq!(
+            prefix_tiers(&format!("{dram}prefix_tier_max_read_wait_ms: 1000.0\n"))
+                .unwrap()
+                .prefix_tier_read_wait,
+            Some(ReadWait {
+                max: Time::from_ms(1000.0),
+                policy: ReadWaitPolicy::PassOver,
+            })
+        );
+        assert!(prefix_tiers("prefix_tier_max_read_wait_ms: 1000.0\n").is_err());
+        assert!(prefix_tiers(&format!("{dram}prefix_tier_max_read_wait_ms: -1.0\n")).is_err());
+        assert!(prefix_tiers(&format!("{dram}prefix_tier_read_wait_policy: block\n")).is_err());
+        assert_eq!(
+            prefix_tiers(&format!(
+                "{dram}prefix_tier_max_read_wait_ms: 5.0\nprefix_tier_read_wait_policy: block\n"
+            ))
+            .unwrap()
+            .prefix_tier_read_wait
+            .map(|wait| wait.policy),
+            Some(ReadWaitPolicy::Block)
+        );
+    }
+
+    #[test]
+    fn a_loading_area_is_a_fraction_below_half_that_needs_a_tier_and_no_read_wait() {
+        let dram = "dram_tier_gb: 50.0\n";
+        let area = |extra: &str| prefix_tiers(extra).map(|config| config.prefix_tier_loading_area);
+        assert_eq!(area(dram).unwrap(), 0.0);
+        assert_eq!(
+            area(&format!("{dram}prefix_tier_loading_area: 0.1\n")).unwrap(),
+            0.1
+        );
+        assert!(area(&format!("{dram}prefix_tier_loading_area: 0.5\n")).is_err());
+        assert!(area(&format!("{dram}prefix_tier_loading_area: -0.1\n")).is_err());
+        assert!(area("prefix_tier_loading_area: 0.1\n").is_err());
+        assert!(area(&format!(
+            "{dram}prefix_tier_loading_area: 0.1\nprefix_tier_max_read_wait_ms: 1000.0\n"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn a_tier_state_compression_ratio_is_finite_and_at_least_one() {
+        let ratio =
+            |extra: &str| prefix_tiers(extra).map(|config| config.tier_state_compression_ratio);
+        assert_eq!(ratio("").unwrap(), 1.0);
+        assert_eq!(ratio("tier_state_compression_ratio: 1.86\n").unwrap(), 1.86);
+        assert!(ratio("tier_state_compression_ratio: 0.5\n").is_err());
+        assert!(ratio("tier_state_compression_ratio: .inf\n").is_err());
     }
 }
