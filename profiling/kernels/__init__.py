@@ -61,6 +61,7 @@ from profiling.kernels import (
     kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
     kv_compress_store,  # noqa: F401
+    layered_kv_norm_rope_cache_write,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_fused_sum_post_pre_rms_norm,  # noqa: F401

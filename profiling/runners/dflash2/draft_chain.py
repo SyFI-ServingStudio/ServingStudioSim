@@ -9,6 +9,10 @@ vLLM fork's ``qwen3_dflash2`` draft (all incumbent callables are the fork's own:
   (``draft_chain_vendor``) vs q/k RMSNorm + NeoX RoPE + query QuantFP8 +
   ``reshape_and_cache_flash`` (fp8). Not bit-exact: the check requires at least
   90% of fp8 codes equal and the dequantized error below 2%.
+- ``layered_kv_norm_rope_cache_write:vllm_triton`` -- the fork's Beam
+  ``store_context_kv`` vs grouped ``rms_norm`` + ``rotary_embedding`` + one
+  ``reshape_and_cache_flash`` per layer. Byte check: at least 99.9% of cache
+  bytes equal (99.9999% measured, at most one fp8 code apart).
 
 Caches use the fork's FlashAttention layout ``[pages, kv_heads, page, 2*head_dim]``
 (fp8), slots are a shuffled page pool, and the draft's scales are 1.0 (the draft
@@ -202,3 +206,76 @@ def profile_qk_norm_rope_fp8_kv_write_triton(
         return _measure(run, flops=m * (hq + hkv) * d * 8.0, nbytes=nbytes)
 
     return _guard("qk_norm_rope_fp8_kv_write", "triton", body)
+
+
+# ------------------------------------------------------ context K/V, all layers --
+def profile_layered_kv_norm_rope_cache_write_vllm_triton(
+    num_tokens: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    input_dtype: Any,
+    kv_dtype: Any,
+) -> ComputeMetrics:
+    _positive(
+        num_tokens=num_tokens,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
+    if (str(input_dtype), str(kv_dtype)) != ("bf16", "fp8_e4m3"):
+        raise ProfilerNotImplemented("store_context_kv is measured with bf16 K/V into an fp8 cache")
+
+    def body(torch):
+        from vllm import _custom_ops as ops
+
+        try:
+            from vllm.models.beam.nvidia.dflash2_context_ops import store_context_kv
+        except ImportError as exc:
+            raise ProfilerNotImplemented(
+                "needs the vLLM fork's Beam DFlash2 ops (vllm_env)"
+            ) from exc
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        gen = torch.Generator(device=dev).manual_seed(0x0D)
+        m, nl, hkv, d = num_tokens, num_layers, num_kv_heads, head_dim
+        kv = torch.randn(m, nl, 2, hkv, d, device=dev, generator=gen).to(torch.bfloat16)
+        weight = (1.0 + 0.1 * torch.randn(nl, d, device=dev, generator=gen)).to(torch.bfloat16)
+        pos = torch.randint(0, _ROPE_POSITIONS, (m,), device=dev, generator=gen)
+        cos_sin = _rope_table(torch, d, dev)
+        caches_a, slots = _paged_caches(torch, nl, m, hkv, d, page_size, gen, dev)
+        caches_b = [c.clone() for c in caches_a]
+        fp8 = torch.float8_e4m3fn
+        one = torch.ones(1, device=dev)
+        cache_ptrs = torch.tensor([c.data_ptr() for c in caches_a], dtype=torch.int64, device=dev)
+        scale_ptrs = torch.tensor([one.data_ptr()] * (2 * nl), dtype=torch.int64, device=dev)
+
+        def run():
+            store_context_kv(
+                kv, weight, pos, cos_sin, cache_ptrs, slots, caches_a[0].view(fp8), _EPS, scale_ptrs
+            )
+
+        def incumbent():
+            perm = kv.permute(2, 1, 0, 3, 4).contiguous()
+            all_k, all_v = perm[0], perm[1]
+            kn = torch.empty_like(all_k)
+            ops.rms_norm(kn, all_k, weight, _EPS)
+            ops.rotary_embedding(pos.repeat(nl), kn.view(nl * m, -1), None, d, cos_sin, True)
+            for i in range(nl):
+                kc, vc = _fa_views(torch, caches_b[i], d)
+                ops.reshape_and_cache_flash(kn[i], all_v[i], kc, vc, slots, "fp8", one, one)
+
+        run()
+        incumbent()
+        torch.cuda.synchronize(dev)
+        eq = min(
+            _check_codes(torch, a, b, 0.999, f"layer {i} cache")
+            for i, (a, b) in enumerate(zip(caches_a, caches_b))
+        )
+        print(f"[layered_kv_norm_rope_cache_write] m={m} min cache bytes equal {eq:.6f}")
+        nbytes = m * nl * 2 * hkv * d * (2 + 1)
+        return _measure(run, flops=m * nl * hkv * d * 8.0, nbytes=nbytes)
+
+    return _guard("layered_kv_norm_rope_cache_write", "vllm_triton", body)

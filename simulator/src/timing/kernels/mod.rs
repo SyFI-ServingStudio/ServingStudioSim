@@ -53,6 +53,7 @@ pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
+pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
@@ -257,6 +258,10 @@ pub use gemm_fp32_output::{
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
+};
+pub use layered_kv_norm_rope_cache_write::{
+    LayeredKvNormRopeCacheWriteKernel, LayeredKvNormRopeCacheWriteKernelConfig,
+    LayeredKvNormRopeCacheWriteKernelInput, LayeredKvNormRopeCacheWriteSpec,
 };
 pub use qk_norm_rope_fp8_kv_write::{
     QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput,
