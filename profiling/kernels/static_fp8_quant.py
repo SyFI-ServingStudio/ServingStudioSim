@@ -38,7 +38,9 @@ DOC = KernelDoc(
         "A linear layer with static per-tensor FP8 activation scales quantizes its "
         "input before the GEMM. Under torch.compile vLLM's native QuantFP8 becomes "
         "one Inductor pointwise kernel, and an attention output gate in front of "
-        "the projection fuses into it. Inputs are seeded random bf16 rows; the "
+        "the projection fuses into it. With custom ops enabled the same quant is "
+        "vLLM's CUDA static_scaled_fp8_quant kernel instead (ungated only). "
+        "Inputs are seeded random bf16 rows; the "
         "scale is a scalar fp32 tensor read on the device."
     ),
     category="Quantization",
@@ -48,10 +50,11 @@ DOC = KernelDoc(
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
-        f"{CUPTI_METHOD} The block is compiled once with a symbolic token count, "
-        "and its first call, at 8192 tokens or at the row's token count when larger, "
-        "picks the launch config the row then uses, as vLLM's profile run at "
-        "max_num_batched_tokens does. Every launch of the compiled block is counted."
+        f"{CUPTI_METHOD} vllm_inductor compiles the block once with a symbolic "
+        "token count, and its first call, at 8192 tokens or at the row's token "
+        "count when larger, picks the launch config the row then uses, as vLLM's "
+        "profile run at max_num_batched_tokens does. Every launch of the "
+        "compiled block, or of the vllm_cuda call, is counted."
     ),
     caveats=("GB/s counts the input, the gate and the output once each.",),
     reference="profiling.runners.elementwise.static_fp8_quant_reference",
@@ -82,6 +85,33 @@ register(
                 "Inductor into one Triton kernel."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/input_quant_fp8.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 9),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.static_fp8_quant_vllm_cuda",
+            function_name="profile_static_fp8_quant_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=StaticFp8QuantArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's QuantFP8.forward_cuda (static, per-tensor): one launch of the "
+                "CUDA static_scaled_fp8_quant kernel. Ungated rows only."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/quantization/w8a8/fp8/common.cu",
         ),
     )
 )

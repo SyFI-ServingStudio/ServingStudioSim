@@ -815,8 +815,14 @@ def _build_trtllm_fp8_operands(
         torch, (num_pages, 1, _TRTLLM_PAGE_SIZE, score_dim), generator, device
     )
 
-    block_tables = torch.zeros(
+    # vLLM's triton_convert_req_index_to_global_index pre-fills the page table
+    # with -1 past each row's valid count. The kernel reads the whole
+    # selected_k-wide tile: a 0 pad gathers slot 0 for every padded entry and
+    # ran 10-11% slower on B200 (Slurm 22095: 128 queries 43.3 vs 38.9 us,
+    # 256 queries 78.0 vs 71.6 us at 2048..2051 valid of 2176).
+    block_tables = torch.full(
         (validated.num_queries, 1, selected_k),
+        -1,
         dtype=torch.int32,
         device=device,
     )
@@ -830,6 +836,9 @@ def _build_trtllm_fp8_operands(
             device=device,
         )
         block_tables[row, 0, :count].copy_(indices.to(torch.int32))
+        if count == 0:
+            # The kernel rejects a zero length; the row runs at length 1 on slot 0.
+            block_tables[row, 0, 0] = 0
 
     seq_lens = torch.tensor(validated.valid_counts, dtype=torch.int32, device=device)
     return _TrtllmFp8Operands(
@@ -957,7 +966,13 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
                 f"{_TRTLLM_FP8_BACKEND} returned {output.dtype} {tuple(output.shape)}, "
                 f"expected BF16 {expected_shape}"
             )
-        if not torch.isfinite(output).all():
+        # A row with no valid slot leaves its output unspecified: in a small
+        # 64-head batch the kernel writes NaN there (B200, Slurm job 5693,
+        # `g:(0,1,2,3)` at 4..=64 queries). Production never submits one -- a
+        # verify row always sees its own context -- so only rows with work
+        # must be finite.
+        nonempty = torch.tensor(validated.valid_counts, device=device) > 0
+        if not torch.isfinite(output[nonempty]).all():
             raise KernelLaunchFailed(f"{_TRTLLM_FP8_BACKEND} output must be finite")
 
         time_ms = Timer.cupti(kernel, kernel_name=_TRTLLM_KERNEL_NAME)

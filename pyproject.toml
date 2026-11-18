@@ -126,6 +126,9 @@ target-version = "py312"
 extend-exclude = [
     # Temporary vendored kernel source, kept byte-identical to its origin below the header.
     "profiling/runners/moe/pfused_vendor",
+    "profiling/runners/elementwise/hadamard_wscale_vendor",  # vendored Triton kernel, pinned byte-identical by its test
+    "profiling/runners/attention/state_writer_vendor",  # vendored Triton kernels, pinned byte-identical by its test
+    "profiling/runners/norm/row_split_vendor",  # vendored Triton kernel, pinned byte-identical by its test
 ]
 
 [tool.ruff.lint]

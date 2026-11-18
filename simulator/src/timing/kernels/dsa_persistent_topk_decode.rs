@@ -19,6 +19,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::sparse_indexer_topk::{COOPERATIVE_BACKEND, COOPERATIVE_MAX_ROWS};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -115,10 +116,18 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
         let padded_row_bytes = f64::from(config.logits_row_stride.get())
             * f64::from(DType::Fp32.size_bytes())
             * f64::from(config.next_n);
+        // `cooperative_topk` rejects more than 64 rows (`cooperative_topk.cu:63`).
+        let max_rows = if config.backends.contains(&COOPERATIVE_BACKEND) {
+            f64::from(COOPERATIVE_MAX_ROWS)
+        } else {
+            f64::INFINITY
+        };
+        let next_n = f64::from(config.next_n);
         grid.expand_2d(|batch_size, context_len| {
             context_len < min_context_len
                 || context_len > max_model_len
                 || batch_size * padded_row_bytes > MAX_PROFILE_ALLOCATION_BYTES
+                || batch_size * next_n > max_rows
         })
     }
 
@@ -154,6 +163,7 @@ mod tests {
     use crate::timing::bridge::DType;
     use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::kernels::sparse_indexer_topk::COOPERATIVE_BACKEND;
     use crate::timing::{Dim, SlotInput, SweepCoords};
     use serde_json::Value;
 
@@ -524,6 +534,49 @@ mod tests {
             .any(|w| w == [511.0, 512.0, 513.0]));
         let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&cfg, &grid);
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 34 * 14);
+    }
+
+    /// `cooperative_topk` refuses a call of more than 64 rows, so a config that
+    /// names it must not ask the profiler for one; the other backends keep the
+    /// whole batch axis.
+    #[test]
+    fn cooperative_backend_masks_calls_above_its_row_ceiling() {
+        for next_n in [1, 4] {
+            let mut cfg = config(next_n);
+            cfg.top_k = 512;
+            cfg.max_model_len = Dim::param("max_model_len", 8192);
+            cfg.logits_row_stride = Dim::param("max_model_len", 8192);
+            let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
+            let contexts = grid.axes()[1].len();
+            let context = grid.axes()[1]
+                .iter()
+                .position(|&context_len| context_len == 8192.0)
+                .unwrap();
+            let unmasked_batches = |cfg: &DsaPersistentTopkDecodeKernelConfig| -> Vec<f64> {
+                let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(cfg, &grid);
+                grid.axes()[0]
+                    .iter()
+                    .enumerate()
+                    .filter(|(batch, _)| !mask[batch * contexts + context])
+                    .map(|(_, &batch_size)| batch_size)
+                    .collect()
+            };
+
+            assert_eq!(unmasked_batches(&cfg), grid.axes()[0]);
+            cfg.backends = vec![COOPERATIVE_BACKEND];
+            let kept = unmasked_batches(&cfg);
+            assert!(!kept.is_empty());
+            assert!(kept
+                .iter()
+                .all(|batch_size| batch_size * f64::from(next_n) <= 64.0));
+            assert_eq!(
+                kept.len(),
+                grid.axes()[0]
+                    .iter()
+                    .filter(|&&batch_size| batch_size * f64::from(next_n) <= 64.0)
+                    .count()
+            );
+        }
     }
 
     #[test]

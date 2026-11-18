@@ -29,8 +29,9 @@ class DsaPersistentTopkDecodeArgs(KernelArgs):
     logits_dtype: DType = arg(doc="Element type of the indexer logits.")
     index_dtype: str = arg(doc="Element type of the selected positions.")
     context_mode: str = arg(
-        doc="Pattern of valid prefix lengths across requests; uniform_random also "
-        "draws the scores at random instead of an increasing sequence."
+        doc="Pattern of valid prefix lengths across requests; uniform_random and "
+        "uniform_measured also draw the scores at random (standard normal, or from a "
+        "measured live-indexer score distribution) instead of an increasing sequence."
     )
 
 
@@ -43,16 +44,19 @@ DOC = KernelDoc(
         "request has next_n rows. With context_mode uniform, a request's rows "
         "have valid lengths context_len − next_n + 1 to context_len; with "
         "max_ragged, next_n is 1 and request b has max(0, context_len − b) "
-        "valid logits; uniform_random has uniform lengths. A row no longer than "
-        "top_k yields only its own positions. The logits are FP32 in rows padded "
-        "to logits_row_stride; uniform rows all hold the same increasing "
-        "sequence, uniform_random rows seeded standard-normal scores, max_ragged "
-        "rows one seeded random template."
+        "valid logits; uniform_random and uniform_measured have uniform lengths. "
+        "A row no longer than top_k yields only its own positions. "
+        "The logits are FP32 in rows padded to logits_row_stride; "
+        "uniform rows all hold the same increasing sequence, "
+        "uniform_random rows seeded standard-normal scores, "
+        "uniform_measured rows seeded draws from a measured live-indexer score "
+        "distribution, max_ragged rows one seeded random template."
     ),
     category="Attention",
     subcategory="DSA",
     formula=(
-        "uniform, uniform_random: length[j] = context_len − next_n + 1 + (j mod next_n); "
+        "uniform, uniform_random, uniform_measured: "
+        "length[j] = context_len − next_n + 1 + (j mod next_n); "
         "max_ragged: length[b] = max(0, context_len − b)",
         "output[j] = top_k positions from logits[j, :length[j]], or natural positions "
         "when length[j] ≤ top_k",
@@ -66,14 +70,20 @@ DOC = KernelDoc(
         "back-to-back calls, taking the median of three runs. vllm_cuda and "
         "vllm_fork_cuda use CUPTI kernel time with the L2 cache flushed before "
         "each call and count every launch of the call, the workspace memset and"
-        " the persistent kernel. Operand construction and the output checks "
-        "run before timing."
+        " the persistent kernel; deep_select is timed the same way over every "
+        "DeepSelect launch. Operand construction and the output checks run "
+        "before timing."
     ),
     caveats=(
         "Time follows the score distribution: the increasing uniform template "
         "crowds a short row's valid logits into a narrow value range and the "
         "random max_ragged template is shared by every row; uniform_random "
-        "scores are independent normals, like a live indexer's continuous scores.",
+        "scores are independent normals; uniform_measured scores follow a measured live "
+        "indexer's distribution, whose real rows it times within -5..+1% on B200 "
+        "(normals read +10..+21%, the increasing template +50..+59%).",
+        "Above 64 rows the op switches to a sampled top-k when the host max_seq_len "
+        "reaches 98304 (K=512); serving passes the token max_seq_len, this runner the "
+        "row length. On B200 the difference measured within 2% at 37,500 and 75,000.",
         "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
@@ -190,6 +200,37 @@ register(
                 "rows; rejects larger batches."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/cooperative_topk.cu",
+        ),
+    )
+)
+
+
+# The fork's explicit decode top-k backend (kernel_config.sparse_indexer_topk_backend
+# = "deep_select", model_executor/layers/indexer_topk.py:186-195, 290-292): exact
+# FP32 top-k over each row's [0, end) prefix. SM100a/SM103a only (the 10.x family).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deep_select",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode_deep_select",
+            function_name="profile_dsa_persistent_topk_decode_deep_select",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepSelect's exact FP32 top-k (torch.ops.deep_select.topk) over each "
+                "row's valid prefix; the fork's opt-in decode top-k on SM100."
+            ),
+            url="https://github.com/vllm-project/DeepSelect",
         ),
     )
 )

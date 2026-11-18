@@ -58,10 +58,12 @@ DOC = KernelDoc(
     formula=(
         "logit[q, k] = scale[k] · Σₕ weight[q, h] · ReLU(query[q, h] · key[k])",
         "length[b] = context_len (uniform) or max(1, context_len − b) (max_ragged)",
-        "C = next_n · Σ_b block_size · ⌈length[b] / block_size⌉; P = ⌈context_len / block_size⌉",
+        "K = Σ_b block_size · ⌈length[b] / block_size⌉; C = next_n · K; "
+        "P = ⌈context_len / block_size⌉",
+        "passes = ⌈next_n · num_heads / 128⌉",
         "TFLOPS = 2 · C · num_heads · head_dim / time",
         "B = batch_size · next_n · num_heads · head_dim "
-        "+ 4 · batch_size · next_n · num_heads + (head_dim + 4) · C "
+        "+ 4 · batch_size · next_n · num_heads + (head_dim + 4) · K · passes "
         "+ 4 · batch_size · P + 4 · batch_size · next_n + 4 · C",
         "GB/s = B / time",
     ),
@@ -83,6 +85,11 @@ DOC = KernelDoc(
         "Both backends' TFLOPS and GB/s use the page-rounded DeepGEMM schedule;"
         " GB/s excludes the scheduling metadata, torch intermediates and "
         "physical transactions.",
+        "GB/s counts each request's keys once per pass, not once per query "
+        "row: DeepGEMM on SM100 scores up to 128 query-head rows per pass over "
+        "the keys (next_n ≤ 4 at 32 heads), so next_n 5–8 at 32 heads reads "
+        "them twice. The pass width is read off B200 timings and the kernel's "
+        "Q-block tiling; SM90 rows (next_n 1) are one pass either way.",
     ),
     reference="profiling.runners.attention.dsa_paged_mqa_logits_decode_reference",
 )
