@@ -56,14 +56,15 @@ use crate::timing::kernels::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPooledIndexCacheUpdateKernel,
     DsaPooledIndexCacheUpdateKernelConfig, DsaPooledIndexCacheUpdateKernelInput,
-    DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
-    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, HadamardFp8QuantKernel,
-    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, HadamardFp8QuantWeightScaleKernel,
-    HadamardFp8QuantWeightScaleKernelConfig, HadamardFp8QuantWeightScaleKernelInput,
-    QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput, StaticFp8QuantKernel,
-    StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
+    DsaPooledTopkPageTableKernel, DsaPooledTopkPageTableKernelConfig,
+    DsaPooledTopkPageTableKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
+    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput,
+    HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput,
+    HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
+    HadamardFp8QuantWeightScaleKernelInput, QKvRmsNormKernel, QKvRmsNormKernelConfig,
+    QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
@@ -212,7 +213,26 @@ pub struct Glm53DsaFront {
     /// the epilogue (`batched_gemm_static_fp8_quant`, slot `q_absorb_fp8`).
     /// Absorbs `q_absorb` and `q_fp8_quant`.
     pub q_absorb_fp8: Option<&'static str>,
+    /// The decode rows' selected pools to the final physical page table and
+    /// valid counts in one launch after the decode top-k
+    /// (`dsa_pooled_topk_page_table`, slot `indexer.topk_page_table`), priced
+    /// at the batch's longest context. Absorbs the decode rows' pool expand
+    /// and index remap, and the fork glue's top-k buffer fill, pool-id cast,
+    /// sequence-length `+ 1` and buffer copy ([`PAGE_TABLE_ABSORBS`]).
+    /// Prefill rows keep the fork's expand and remap.
+    pub topk_page_table: Option<&'static str>,
 }
+
+/// The decode-row launches [`Glm53DsaFront::topk_page_table`] replaces
+/// (worklet slot suffixes).
+pub const PAGE_TABLE_ABSORBS: [&str; 6] = [
+    "indexer.expand_pools",
+    "sparse_mla.index_remap",
+    "glue.topk_buffer_fill",
+    "glue.pool_ids_to_int64",
+    "glue.seq_lens_plus_one",
+    "glue.topk_buffer_copy",
+];
 
 /// How a decode batch of unequal contexts prices its indexer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -353,6 +373,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub q_lora_gemm: Option<SingleGemmKernelConfig>,
     pub q_lora_epilogue: Option<HadamardFp8QuantWeightScaleKernelConfig>,
     pub q_absorb_fp8: Option<BatchedGemmStaticFp8QuantKernelConfig>,
+    pub topk_page_table: Option<DsaPooledTopkPageTableKernelConfig>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -414,6 +435,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
     pub q_lora_epilogue: Option<Op<HadamardFp8QuantWeightScaleKernel>>,
     pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
+    pub topk_page_table: Option<Op<DsaPooledTopkPageTableKernel>>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
 
@@ -699,6 +721,21 @@ impl Glm53DsaAttnLocalWorklet {
                     dtype: q_absorb.dtype,
                 }),
             q_absorb,
+            // Compiled for `index_topk / kpool` pools, `selected_k` slots and
+            // the MLA cache block; the block table spans `max_model_len`.
+            topk_page_table: front.topk_page_table.map(|backend| {
+                DsaPooledTopkPageTableKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    max_model_len: max_model_len.clone(),
+                    top_k: cfg.index_topk / kpool,
+                    kpool,
+                    page_table_width: cfg.selected_k,
+                    block_size: cfg.cache_block_size,
+                    index_dtype: "int32".into(),
+                }
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -845,6 +882,18 @@ impl Glm53DsaAttnLocalWorklet {
                     )
                 })
                 .transpose()?,
+            topk_page_table: r
+                .topk_page_table
+                .map(|c| {
+                    atomic(
+                        n,
+                        "indexer.topk_page_table",
+                        c,
+                        DsaPooledTopkPageTableKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             name,
             resolved,
         };
@@ -947,6 +996,7 @@ impl Glm53DsaAttnLocalWorklet {
         slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.topk_page_table.as_ref().map(|op| op.compile(builder)));
         if let Some(g) = &self.fork_glue {
             slots.extend([
                 g.hidden_fp32_cast.compile(builder),
@@ -972,6 +1022,7 @@ impl Glm53DsaAttnLocalWorklet {
         let front = cfg.front;
         let q_lora_merged = front.q_lora_hadamard_epilogue.is_some();
         let absorb_fused = front.q_absorb_fp8.is_some();
+        let page_table = front.topk_page_table.is_some();
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
             &self.q_kv_norm,
@@ -1041,7 +1092,7 @@ impl Glm53DsaAttnLocalWorklet {
         );
         self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
         self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
-        let expand_rows = w.decode_rows + w.prefill_indexer_rows;
+        let expand_rows = w.prefill_indexer_rows + if page_table { 0 } else { w.decode_rows };
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
@@ -1074,6 +1125,7 @@ impl Glm53DsaAttnLocalWorklet {
                     &input.decode_kv_lens,
                     cfg.decode_next_n,
                 ),
+                decode_remap_elsewhere: page_table,
                 ..Default::default()
             },
             ev,
@@ -1101,14 +1153,22 @@ impl Glm53DsaAttnLocalWorklet {
             let input = BatchedGemmStaticFp8QuantKernelInput { m: w.total_tokens };
             push_or_zero(op, input, false, ev);
         }
+        if let Some(op) = &self.topk_page_table {
+            let input = DsaPooledTopkPageTableKernelInput {
+                batch_size: w.decode_requests,
+                context_len: w.decode_pools,
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
+            let post_topk_gone = no_decode || page_table;
             push_or_zero(&g.hidden_fp32_cast, all, false, ev);
-            push_or_zero(&g.topk_buffer_fill, decode.clone(), no_decode, ev);
+            push_or_zero(&g.topk_buffer_fill, decode.clone(), post_topk_gone, ev);
             push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
-            push_or_zero(&g.pool_ids_to_int64, decode.clone(), no_decode, ev);
-            push_or_zero(&g.seq_lens_plus_one, decode.clone(), no_decode, ev);
-            push_or_zero(&g.topk_buffer_copy, decode, no_decode, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), post_topk_gone, ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), post_topk_gone, ev);
+            push_or_zero(&g.topk_buffer_copy, decode, post_topk_gone, ev);
         }
     }
 }
@@ -1129,6 +1189,12 @@ impl Glm53DsaAttnLocalWorklet {
             (
                 front.q_absorb_fp8,
                 self.q_absorb_fp8
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.topk_page_table,
+                self.topk_page_table
                     .as_ref()
                     .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
             ),
@@ -1644,10 +1710,11 @@ mod tests {
             .collect()
     }
 
-    /// Slots `worklet` bills zero on `input` that the default worklet bills
-    /// (a structure-only kernel answers a miss, a zeroed slot answers zero).
+    /// Slots `worklet` bills zero on `input` that `base` bills (a
+    /// structure-only kernel answers a miss, a zeroed slot answers zero).
     fn newly_zeroed(
         worklet: &Glm53DsaAttnLocalWorklet,
+        base: &Glm53DsaAttnLocalWorklet,
         input: &Glm53DsaAttnLocalWorkletInput,
     ) -> Vec<String> {
         let zeroed = |w: &Glm53DsaAttnLocalWorklet| -> Vec<String> {
@@ -1662,7 +1729,7 @@ mod tests {
                 .map(|((name, _), _)| name)
                 .collect()
         };
-        let base = zeroed(&build_with(|_| {}, &[]).unwrap());
+        let base = zeroed(base);
         zeroed(worklet)
             .into_iter()
             .filter(|name| !base.contains(name))
@@ -2054,7 +2121,7 @@ mod tests {
             decode_kv_lens: vec![4000, 5000],
         };
         assert_eq!(
-            newly_zeroed(&w, &input),
+            newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
             [
                 "m.dsa.q_b_proj",
                 "m.dsa.indexer.wq_b",
@@ -2070,6 +2137,94 @@ mod tests {
                 |c| c.front = front,
                 &[("m.dsa.q_lora_epilogue", "vllm_triton")]
             ),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
+    /// Catches a page-table launch that double-bills or misses a launch: it
+    /// zeroes exactly the decode rows' post-top-k launches (each of which is
+    /// in the tree), keeps them for prefill rows, adds only its own slot on
+    /// its named backend, and prices at the longest context.
+    #[test]
+    fn topk_page_table_absorbs_exactly_the_decode_post_topk_launches() {
+        let edit = |front: Glm53DsaFront| {
+            move |c: &mut Glm53DsaAttnLocalWorkletConfig| {
+                c.glue = DsaGlue::ForkLaunchList;
+                c.front = front;
+            }
+        };
+        let front = Glm53DsaFront {
+            topk_page_table: Some("e_kernel"),
+            ..Default::default()
+        };
+        let w = build_with(edit(front), &[]).unwrap();
+        let fork = build_with(edit(Glm53DsaFront::default()), &[]).unwrap();
+        let base = slots(&fork);
+        let names = slots(&w);
+        for absorbed in PAGE_TABLE_ABSORBS {
+            let name = format!("m.dsa.{absorbed}");
+            assert!(
+                names.iter().any(|(n, _)| *n == name),
+                "{name} left the tree"
+            );
+        }
+        let added: Vec<_> = names.iter().filter(|slot| !base.contains(slot)).collect();
+        assert_eq!(
+            added,
+            [&(
+                "m.dsa.indexer.topk_page_table".to_string(),
+                "dsa_pooled_topk_page_table".to_string()
+            )]
+        );
+        let cfg = w.resolved.topk_page_table.as_ref().unwrap();
+        assert_eq!(
+            (
+                cfg.top_k,
+                cfg.kpool,
+                cfg.page_table_width,
+                cfg.block_size,
+                cfg.next_n
+            ),
+            (512, 4, 2176, 64, 1)
+        );
+        assert_eq!(cfg.max_model_len.get(), 8192);
+
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mut zeroed = newly_zeroed(&w, &fork, &decode);
+        zeroed.sort();
+        let mut absorbed: Vec<String> = PAGE_TABLE_ABSORBS
+            .iter()
+            .map(|slot| format!("m.dsa.{slot}"))
+            .collect();
+        absorbed.sort();
+        assert_eq!(zeroed, absorbed);
+        let inputs = eval_inputs(&w, &decode);
+        let table = &inputs["m.dsa.indexer.topk_page_table"];
+        assert_eq!(
+            (table["batch_size"].as_u64(), table["context_len"].as_u64()),
+            (Some(2), Some(1250))
+        );
+        // A prefill row keeps the fork's expand and remap.
+        let one_long = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 8000)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let inputs = eval_inputs(&w, &one_long);
+        let fork_inputs = eval_inputs(&fork, &one_long);
+        assert_eq!(
+            inputs["m.dsa.indexer.expand_pools"]["num_tokens"]
+                .as_u64()
+                .unwrap()
+                + 2,
+            fork_inputs["m.dsa.indexer.expand_pools"]["num_tokens"]
+                .as_u64()
+                .unwrap()
+        );
+        assert!(matches!(
+            build_with(edit(front), &[("m.dsa.indexer.topk_page_table", "torch")]),
             Err(BuildError::NoBackendForLaunch { .. })
         ));
     }
@@ -2115,7 +2270,10 @@ mod tests {
             prefill_chunk_pairs: vec![(0, 5)],
             decode_kv_lens: vec![4000, 5000],
         };
-        assert_eq!(newly_zeroed(&w, &input), replaced);
+        assert_eq!(
+            newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
+            replaced
+        );
         assert!(matches!(
             build_with(|c| c.front = front, &[("m.dsa.q_absorb_fp8", "torch")]),
             Err(BuildError::NoBackendForLaunch { .. })
