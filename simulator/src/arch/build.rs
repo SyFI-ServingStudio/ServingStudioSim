@@ -2181,7 +2181,6 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         *draft_tokens,
         checkpoint.sliding_window,
         &chain,
-        true,
     )
     .context("expanding the DFlash2 draft configs")?;
     glm53_flash_vllm_nvfp4_dflash2::build(name, target, *draft_tokens, &draft, bridge)
@@ -2257,7 +2256,6 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     )
     .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
     let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
-    // The GLM-5.3 draft leaves its query-block insert unpriced.
     let draft = dflash2_draft_resolved(
         &GLM53_DFLASH2,
         parallel.ep_size,
@@ -2265,7 +2263,6 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
         draft_tokens,
         draft_sliding_window,
         &Dflash2DraftChain::default(),
-        false,
     )
     .context("expanding the DFlash2 draft configs")?;
     glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
@@ -2274,9 +2271,9 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
 
 /// One DFlash2 draft checkpoint's worklet configs at `tp_size`, every shape
 /// taken from the checkpoint's own `config.json` (see [`Dflash2Checkpoint`]).
-/// `query_kv_append` prices each layer's insert of its own query block's K/V
-/// (the same insert the context rows go through).
-#[allow(clippy::too_many_arguments)]
+/// Each draft layer's attention writes its own query block's K/V into the
+/// draft cache ahead of the call (vLLM `Attention.forward` ->
+/// `unified_kv_cache_update`), the same insert the context rows go through.
 fn dflash2_draft_resolved(
     checkpoint: &Dflash2Checkpoint,
     tp_size: u16,
@@ -2284,7 +2281,6 @@ fn dflash2_draft_resolved(
     draft_tokens: u32,
     sliding_window: u32,
     chain: &Dflash2DraftChain,
-    query_kv_append: bool,
 ) -> Result<Dflash2DraftResolved> {
     chain.validate()?;
     anyhow::ensure!(draft_tokens > 0, "DFlash2 draft_tokens must be positive");
@@ -2340,7 +2336,7 @@ fn dflash2_draft_resolved(
         gemm_dtype: DType::Bf16,
         attn_q_dtype: chain.attention.dtype(),
         attn_kv_dtype: chain.attention.dtype(),
-        query_kv_append: query_kv_append.then(|| context_kv.context_kv_append.clone()),
+        query_kv_append: Some(context_kv.context_kv_append.clone()),
         qk_norm_rope_kv_write: chain
             .qk_norm_rope_kv_write
             .then(|| (vec!["triton"], DRAFT_PAGE_SIZE)),
@@ -4581,7 +4577,6 @@ mod tests {
             7,
             512,
             &Dflash2DraftChain::default(),
-            false,
         )
         .unwrap();
         let wide = dflash2_draft_resolved(
@@ -4591,7 +4586,6 @@ mod tests {
             7,
             131_072,
             &Dflash2DraftChain::default(),
-            false,
         )
         .unwrap();
         let narrow_bytes =
