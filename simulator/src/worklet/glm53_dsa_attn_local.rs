@@ -176,6 +176,20 @@ impl<K: Probe> MeasuredOp<K> {
     }
 }
 
+/// Which launch list prices the per-iteration elementwise glue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaGlue {
+    /// `GLUE_LAUNCHES` launches of `GLUE_BYTES_PER_TOKEN` per token.
+    #[default]
+    Placeholder,
+    /// The fork's decode launches at their real bytes ([`DsaForkGlue`]): the
+    /// hidden state's fp32 cast for `head_weights`, the top-k buffer fill, two
+    /// position casts, the pool-id cast to int64, the `+ 1` on the top-k
+    /// sequence lengths, and the copy of the expanded indices into the top-k
+    /// buffer.
+    ForkLaunchList,
+}
+
 /// How a decode batch of unequal contexts prices its indexer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DsaDecodeIndexer {
@@ -255,6 +269,25 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// included, bills the flattened rows.
     pub decode_next_n: u32,
     pub decode_indexer: DsaDecodeIndexer,
+    pub glue: DsaGlue,
+}
+
+/// The fork's decode glue launches ([`DsaGlue::ForkLaunchList`]).
+#[derive(Clone, Debug)]
+pub struct DsaForkGlueConfigs {
+    /// `hidden_states.float()` ahead of `head_weights`, every row.
+    pub hidden_fp32_cast: ElementwiseKernelConfig,
+    /// `topk_indices_buffer[:rows] = -1`.
+    pub topk_buffer_fill: ElementwiseKernelConfig,
+    /// `positions[:n].to(int32)`, once for the kpool update's positions and
+    /// once for the top-k sequence lengths.
+    pub positions_to_int32: ElementwiseKernelConfig,
+    /// `pool_topk.to(int64)`.
+    pub pool_ids_to_int64: ElementwiseKernelConfig,
+    /// The top-k sequence lengths `+ 1`.
+    pub seq_lens_plus_one: ElementwiseKernelConfig,
+    /// `topk_indices_buffer[:rows, :window] = out`.
+    pub topk_buffer_copy: ElementwiseKernelConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +323,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
     pub prefill_glue: ElementwiseKernelConfig,
+    /// `raw_cfg.glue == ForkLaunchList`.
+    pub fork_glue: Option<DsaForkGlueConfigs>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -347,8 +382,22 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
+    pub fork_glue: Option<DsaForkGlue>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
+
+/// The ops of [`DsaForkGlueConfigs`].
+pub struct DsaForkGlue {
+    pub hidden_fp32_cast: Op<ElementwiseKernel>,
+    pub topk_buffer_fill: Op<ElementwiseKernel>,
+    pub positions_to_int32: Op<ElementwiseKernel>,
+    pub pool_ids_to_int64: Op<ElementwiseKernel>,
+    pub seq_lens_plus_one: Op<ElementwiseKernel>,
+    pub topk_buffer_copy: Op<ElementwiseKernel>,
+}
+
+/// The fork casts the decode positions to int32 twice per step.
+const POSITION_CASTS: u32 = 2;
 
 impl Glm53DsaAttnLocalWorklet {
     pub fn resolve_config(
@@ -580,6 +629,14 @@ impl Glm53DsaAttnLocalWorklet {
             glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
             // One int32 index row of `selected_k` lanes in and out per row.
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
+            fork_glue: (cfg.glue == DsaGlue::ForkLaunchList).then(|| DsaForkGlueConfigs {
+                hidden_fp32_cast: ew(2 * cfg.hidden.get(), 4 * cfg.hidden.get()),
+                topk_buffer_fill: ew(0, 4 * cfg.selected_k),
+                positions_to_int32: ew(8, 4),
+                pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
+                seq_lens_plus_one: ew(4, 4),
+                topk_buffer_copy: ew(4 * window, 4 * window),
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -688,6 +745,19 @@ impl Glm53DsaAttnLocalWorklet {
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
+            fork_glue: r
+                .fork_glue
+                .map(|g| -> Result<DsaForkGlue, BuildError> {
+                    Ok(DsaForkGlue {
+                        hidden_fp32_cast: ew("glue.hidden_fp32_cast", g.hidden_fp32_cast)?,
+                        topk_buffer_fill: ew("glue.topk_buffer_fill", g.topk_buffer_fill)?,
+                        positions_to_int32: ew("glue.positions_to_int32", g.positions_to_int32)?,
+                        pool_ids_to_int64: ew("glue.pool_ids_to_int64", g.pool_ids_to_int64)?,
+                        seq_lens_plus_one: ew("glue.seq_lens_plus_one", g.seq_lens_plus_one)?,
+                        topk_buffer_copy: ew("glue.topk_buffer_copy", g.topk_buffer_copy)?,
+                    })
+                })
+                .transpose()?,
             name,
             resolved,
         };
@@ -748,37 +818,54 @@ impl Glm53DsaAttnLocalWorklet {
                  kpool top-{} x {}]",
                 self.name, cfg.num_heads, cfg.index_num_heads, cfg.index_topk, cfg.index_kpool
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.fused_qkv_a.compile(builder),
-                self.q_kv_norm.compile(builder),
-                self.q_b.compile(builder),
-                self.index_wq_b.compile(builder),
-                self.index_wk_weights.compile(builder),
-                self.index_head_weights.compile(builder),
-                self.index_k_norm.compile(builder),
-                self.index_q_fwht_quant.compile(builder),
-                self.index_weight_scale.compile(builder),
-                self.kpool_gate_score.compile(builder),
-                repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
-                self.kpool_decode_update.compile(builder),
-                self.kpool_prefill_write.compile(builder),
-                self.kpool_tail_seed.compile(builder),
-                self.mqa_logits_decode.compile(builder),
-                self.topk_decode.compile(builder),
-                self.mqa_logits_prefill.compile(builder),
-                self.topk_prefill.compile(builder),
-                self.expand_pools.compile(builder),
-                self.q_absorb.compile(builder),
-                self.q_concat.compile(builder),
-                self.q_fp8_quant.compile(builder),
-                self.sparse_mla.compile(builder),
-                self.output_copy.compile(builder),
-                self.v_up.compile(builder),
-                self.o_proj.compile(builder),
-                repeated(&self.glue, GLUE_LAUNCHES, builder),
-                repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
-            ])),
+            child: Box::new(CostNode::Sum(self.compile_slots(builder))),
         }
+    }
+
+    /// The fork's launches, then the fork's glue launch list when it replaces
+    /// the placeholder (`glue` then bills zero in `eval`).
+    fn compile_slots(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut slots = vec![
+            self.fused_qkv_a.compile(builder),
+            self.q_kv_norm.compile(builder),
+            self.q_b.compile(builder),
+            self.index_wq_b.compile(builder),
+            self.index_wk_weights.compile(builder),
+            self.index_head_weights.compile(builder),
+            self.index_k_norm.compile(builder),
+            self.index_q_fwht_quant.compile(builder),
+            self.index_weight_scale.compile(builder),
+            self.kpool_gate_score.compile(builder),
+            repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
+            self.kpool_decode_update.compile(builder),
+            self.kpool_prefill_write.compile(builder),
+            self.kpool_tail_seed.compile(builder),
+            self.mqa_logits_decode.compile(builder),
+            self.topk_decode.compile(builder),
+            self.mqa_logits_prefill.compile(builder),
+            self.topk_prefill.compile(builder),
+            self.expand_pools.compile(builder),
+            self.q_absorb.compile(builder),
+            self.q_concat.compile(builder),
+            self.q_fp8_quant.compile(builder),
+            self.sparse_mla.compile(builder),
+            self.output_copy.compile(builder),
+            self.v_up.compile(builder),
+            self.o_proj.compile(builder),
+            repeated(&self.glue, GLUE_LAUNCHES, builder),
+            repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
+        ];
+        if let Some(g) = &self.fork_glue {
+            slots.extend([
+                g.hidden_fp32_cast.compile(builder),
+                g.topk_buffer_fill.compile(builder),
+                repeated(&g.positions_to_int32, POSITION_CASTS, builder),
+                g.pool_ids_to_int64.compile(builder),
+                g.seq_lens_plus_one.compile(builder),
+                g.topk_buffer_copy.compile(builder),
+            ]);
+        }
+        slots
     }
 
     pub fn eval(&self, input: &Glm53DsaAttnLocalWorkletInput, ev: &mut Evaluator) {
@@ -904,8 +991,17 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.o_proj, rows, false, ev);
-        push_or_zero(&self.glue, all.clone(), false, ev);
-        push_or_zero(&self.prefill_glue, all, no_prefill, ev);
+        push_or_zero(&self.glue, all.clone(), self.fork_glue.is_some(), ev);
+        push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(g) = &self.fork_glue {
+            let decode = tokens(w.decode_rows);
+            push_or_zero(&g.hidden_fp32_cast, all, false, ev);
+            push_or_zero(&g.topk_buffer_fill, decode.clone(), no_decode, ev);
+            push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), no_decode, ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), no_decode, ev);
+            push_or_zero(&g.topk_buffer_copy, decode, no_decode, ev);
+        }
     }
 }
 
@@ -1326,6 +1422,7 @@ mod tests {
             indexer_max_logits_bytes: 512 << 20,
             decode_next_n: 1,
             decode_indexer: DsaDecodeIndexer::LongestContext,
+            glue: DsaGlue::Placeholder,
         }
     }
 
@@ -1709,6 +1806,42 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    /// Catches a launch list that loses a launch: seven fork launches (the
+    /// two position casts folded into one scaled leaf), decode rows only
+    /// except the hidden cast.
+    #[test]
+    fn fork_glue_lists_the_seven_decode_launches() {
+        let w = build_with(|c| c.glue = DsaGlue::ForkLaunchList, &[]).unwrap();
+        let names: Vec<String> = slots(&w)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("m.dsa.glue."))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.glue.topk_buffer_fill",
+                "m.dsa.glue.positions_to_int32",
+                "m.dsa.glue.pool_ids_to_int64",
+                "m.dsa.glue.seq_lens_plus_one",
+                "m.dsa.glue.topk_buffer_copy",
+            ]
+        );
+        let g = w.resolved.fork_glue.as_ref().unwrap();
+        assert_eq!(g.topk_buffer_fill.input_bytes_per_token.get(), 0);
+        assert_eq!(g.topk_buffer_copy.output_bytes_per_token.get(), 4 * 2051);
+        let inputs = eval_inputs(
+            &w,
+            &Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs: vec![(0, 5)],
+                decode_kv_lens: vec![4000, 5000],
+            },
+        );
+        assert_eq!(inputs["m.dsa.glue.hidden_fp32_cast"]["num_tokens"], 7);
+        assert_eq!(inputs["m.dsa.glue.topk_buffer_copy"]["num_tokens"], 2);
     }
 
     #[test]
