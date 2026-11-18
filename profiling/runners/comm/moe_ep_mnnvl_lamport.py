@@ -8,11 +8,15 @@ Times the repo's fixed-pattern exchange kernels (``mnnvl_fixed_exchange``):
   owners' landing rows and summed there (fp32, rank order);
 * ``moe_ep_reduce_scatter`` / ``mnnvl_pull``: the partials already sit in each
   rank's mapped region (the producer wrote them there) and the owner reads its
-  rows from every rank and sums them.
+  rows from every rank and sums them;
+* ``moe_ep_quantize_and_all_gather`` / ``mnnvl_lamport``: bf16 rows
+  NVFP4-quantized inside the dispatch push (quantization + all-gather in one
+  launch).
 
 One spawn per chunk maps the workspace once, sized for the chunk's largest
 per-rank count, and loops every shape inside it. Every shape is first checked
-bit for bit against a Torch reference, then timed exactly like the MNNVL
+bit for bit against a Torch reference (the fused quantization against vLLM's
+own NVFP4 quantization), then timed exactly like the MNNVL
 all-to-all runner (``runners/moe/flashinfer_mnnvl_alltoall.py``): N calls
 captured in one CUDA graph, replayed back to back, CUDA-event time per call; the
 slowest rank is kept (as the PyNCCL and MNNVL all-reduce runners do).
@@ -34,9 +38,12 @@ _MAX_ITERS_PER_GRAPH = 100
 _REPLAYS = 20
 _WARMUP_CALLS = 20
 _SENTINEL = 0xFFFFFFFF
+# The fused quantization's global scale: any positive value exercises the same
+# path; this one keeps N(0, 3) activations inside e4m3 block scales.
+_GLOBAL_SCALE = 448.0 * 6.0 / 20.0
 # Legs whose spec describes NVFP4 dispatch rows (activation_dtype, top_k); the
 # others move plain bf16 rows (dtype).
-_NVFP4_LEGS = frozenset({"dispatch"})
+_NVFP4_LEGS = frozenset({"dispatch", "quant_dispatch"})
 # Legs whose workspace holds plain bf16 rows in the dispatch landing.
 _BF16_ROW_LEGS: frozenset[str] = frozenset()
 
@@ -51,6 +58,10 @@ def profile_moe_ep_reduce_scatter_batch(kwargs_list: list[dict]) -> list[RunnerR
 
 def profile_moe_ep_reduce_scatter_pull_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     return _run(kwargs_list, "pull")
+
+
+def profile_moe_ep_quantize_and_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _run(kwargs_list, "quant_dispatch")
 
 
 def _run(kwargs_list: list[dict], leg: str) -> list[RunnerResult]:
@@ -257,6 +268,65 @@ def _time_dispatch(torch, exchange, counts, rank, world):
     return _metrics(time_ms, *_busiest_gather_bytes(counts, row_bytes))
 
 
+def _quant_inputs(torch, rank, rows, hidden, top_k):
+    g = torch.Generator(device="cuda").manual_seed(2000 + rank)
+    x = (torch.randn((rows, hidden), generator=g, device="cuda") * 3).to(torch.bfloat16)
+    if rows:
+        x[0, :32] = 0
+        x[rows - 1, 16:48] = -1e-9
+    weights = torch.rand((rows, top_k), generator=g, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 1 << 16, (rows, top_k), generator=g, device="cuda", dtype=torch.int32)
+    return x, weights, ids
+
+
+def _vllm_nvfp4(torch, x, global_scale, hidden):
+    from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+
+    q, s = moe_kernel_quantize_input(
+        x,
+        global_scale,
+        quant_dtype="nvfp4",
+        per_act_token_quant=False,
+        block_shape=None,
+        is_scale_swizzled=False,
+    )
+    rows = x.shape[0]
+    return q.view(torch.uint8).reshape(rows, hidden // 2), s.view(torch.uint8).reshape(
+        rows, hidden // 16
+    )
+
+
+def _time_quant_dispatch(torch, exchange, counts, rank, world):
+    hidden, top_k = exchange.hidden_size, exchange.top_k
+    total = sum(counts)
+    global_scale = torch.tensor([_GLOBAL_SCALE], dtype=torch.float32, device="cuda")
+    x, weights, ids = _quant_inputs(torch, rank, counts[rank], hidden, top_k)
+    out = _out_planes(torch, exchange, total)
+    exchange.quant_dispatch(x, global_scale, weights, ids, out)
+    torch.cuda.synchronize()
+    parts = []
+    for r in range(world):
+        xr, wr, idr = _quant_inputs(torch, r, counts[r], hidden, top_k)
+        if counts[r]:
+            q, s = _vllm_nvfp4(torch, xr, global_scale, hidden)
+        else:
+            q = torch.empty((0, hidden // 2), dtype=torch.uint8, device="cuda")
+            s = torch.empty((0, hidden // 16), dtype=torch.uint8, device="cuda")
+        parts.append(_canonical(torch, q, s, wr, idr))
+    want = [torch.cat(p) for p in zip(*parts)]
+    for name, got, ref in zip(("payload", "scales", "weights", "ids"), out, want):
+        _expect_equal(
+            torch, f"quant dispatch {name} (vs vLLM NVFP4 quant)", _words(torch, got), ref
+        )
+    row_bytes = exchange.row.total
+    time_ms = _graph_time_ms(
+        torch,
+        lambda: exchange.quant_dispatch(x, global_scale, weights, ids, out),
+        total * row_bytes,
+    )
+    return _metrics(time_ms, *_busiest_gather_bytes(counts, row_bytes))
+
+
 # ------------------------------------------------------------- bf16 combine (reduce-scatter)
 def _partials(torch, rank, total, hidden):
     g = torch.Generator(device="cuda").manual_seed(3000 + rank)
@@ -309,6 +379,7 @@ def _time_pull(torch, exchange, counts, rank, world):
 # Leg name -> ``(torch, exchange, counts, rank, world) -> metrics dict``.
 _TIME_LEG = {
     "dispatch": _time_dispatch,
+    "quant_dispatch": _time_quant_dispatch,
     "combine": _time_combine,
     "pull": _time_pull,
 }

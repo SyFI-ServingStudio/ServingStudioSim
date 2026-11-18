@@ -63,6 +63,7 @@ pub mod moe_align_block_size;
 pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_ep_all_gather;
+pub mod moe_ep_quantize_and_all_gather;
 pub mod moe_ep_quantized_all_gather;
 pub mod moe_ep_reduce_scatter;
 pub mod moe_finalize_fuse_shared;
@@ -314,6 +315,10 @@ pub use moe_alltoall_prepare::{
 pub use moe_ep_all_gather::{
     MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig, MoeEpAllGatherSpec,
     MoeEpCollectiveKernelInput,
+};
+pub use moe_ep_quantize_and_all_gather::{
+    MoeEpQuantizeAndAllGatherKernel, MoeEpQuantizeAndAllGatherKernelConfig,
+    MoeEpQuantizeAndAllGatherSpec,
 };
 pub use moe_ep_quantized_all_gather::{
     MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpQuantizedAllGatherSpec,

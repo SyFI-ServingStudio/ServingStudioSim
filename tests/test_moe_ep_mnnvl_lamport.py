@@ -39,7 +39,9 @@ def test_spec_error_names_what_the_kernels_cannot_run():
         "nvfp4"
         in runner.spec_error({**_GATHER, "activation_dtype": "mxfp8_e4m3"}, "dispatch").lower()
     )
-    assert "multiple of 256" in runner.spec_error({**_GATHER, "hidden_size": 4000}, "dispatch")
+    assert "multiple of 256" in runner.spec_error(
+        {**_GATHER, "hidden_size": 4000}, "quant_dispatch"
+    )
     assert "bf16" in runner.spec_error({**_SCATTER, "dtype": "fp32"}, "combine")
     assert "2..8" in runner.spec_error(
         {**_SCATTER, "num_gpus": 16, "per_rank_tokens": [1] * 16}, "combine"
