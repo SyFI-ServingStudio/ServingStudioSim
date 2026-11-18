@@ -1,9 +1,10 @@
 """Profilers for persistent decode top-k: the DSA indexer (GLM-5.x) and the QSA
 indexer (Qwen4Exp) alike.
 
-Logits come in two context modes: ``uniform`` (every row holds the same
-increasing sequence) and ``uniform_random`` (same lengths, seeded random
-scores); the fork backend's ``max_ragged`` lives in
+Logits come in three context modes: ``uniform`` (every row holds the same
+increasing sequence), ``uniform_random`` (same lengths, seeded normal scores)
+and ``uniform_measured`` (same lengths, seeded draws from a measured live-indexer
+score distribution); the fork backend's ``max_ragged`` lives in
 ``dsa_persistent_topk_decode_fork``. The helpers here (operands, reference check, logical bytes,
 the call) are shared with ``dsa_persistent_topk_decode_cooperative``, which
 times vLLM's ``cooperative_topk`` on the same operands.
@@ -42,7 +43,58 @@ _CONTEXT_MODE = "uniform"
 # spanning only the valid columns, and 35.1 µs on normal scores, which is what
 # a live indexer's continuous scores look like.
 _RANDOM_CONTEXT_MODE = "uniform_random"
-_CONTEXT_MODES = (_CONTEXT_MODE, _RANDOM_CONTEXT_MODE)
+# Uniform lengths over i.i.d. scores drawn from a measured live-indexer score
+# distribution: the inverse CDF below, piecewise linear in probability. It is
+# the mean quantile function of 48 decode rows (37,500 and 75,000 valid pools,
+# 4-token pools) dumped from a real DSA kpool-indexer decode on long text.
+# Replaying those real rows on B200 against this template agrees within -5..+1%
+# (median, 128-640 rows); standard-normal scores read +10..+21% and the
+# increasing template +50..+59%.
+_MEASURED_CONTEXT_MODE = "uniform_measured"
+_CONTEXT_MODES = (_CONTEXT_MODE, _RANDOM_CONTEXT_MODE, _MEASURED_CONTEXT_MODE)
+# fmt: off
+_MEASURED_SCORE_PROBABILITIES = (
+    0, 0.01875, 0.0375, 0.05625, 0.075, 0.09375, 0.1125, 0.13125,
+    0.15, 0.16875, 0.1875, 0.20625, 0.225, 0.24375, 0.2625, 0.28125,
+    0.3, 0.31875, 0.3375, 0.35625, 0.375, 0.39375, 0.4125, 0.43125,
+    0.45, 0.46875, 0.4875, 0.50625, 0.525, 0.54375, 0.5625, 0.58125,
+    0.6, 0.61875, 0.6375, 0.65625, 0.675, 0.69375, 0.7125, 0.73125,
+    0.75, 0.76875, 0.7875, 0.80625, 0.825, 0.84375, 0.8625, 0.88125,
+    0.9, 0.90225, 0.9045, 0.90675, 0.909, 0.91125, 0.9135, 0.91575,
+    0.918, 0.92025, 0.9225, 0.92475, 0.927, 0.92925, 0.9315, 0.93375,
+    0.936, 0.93825, 0.9405, 0.94275, 0.945, 0.94725, 0.9495, 0.95175,
+    0.954, 0.95625, 0.9585, 0.96075, 0.963, 0.96525, 0.9675, 0.96975,
+    0.972, 0.97425, 0.9765, 0.97875, 0.981, 0.98325, 0.9855, 0.98775,
+    0.99, 0.99025, 0.9905, 0.99075, 0.991, 0.99125, 0.9915, 0.99175,
+    0.992, 0.99225, 0.9925, 0.99275, 0.993, 0.99325, 0.9935, 0.99375,
+    0.994, 0.99425, 0.9945, 0.99475, 0.995, 0.99525, 0.9955, 0.99575,
+    0.996, 0.99625, 0.9965, 0.99675, 0.997, 0.99725, 0.9975, 0.99775,
+    0.998, 0.99825, 0.9985, 0.99875, 0.999, 0.99925, 0.9995, 0.99975,
+    1,
+)
+_MEASURED_SCORE_QUANTILES = (
+    -208.313, -160.212, -149.989, -142.902, -137.288, -132.451, -128.181, -124.326,
+    -120.803, -117.546, -114.506, -111.644, -108.958, -106.425, -104.002, -101.695,
+    -99.487, -97.338, -95.271, -93.246, -91.263, -89.324, -87.425, -85.565,
+    -83.731, -81.896, -80.096, -78.294, -76.505, -74.708, -72.915, -71.114,
+    -69.304, -67.451, -65.584, -63.687, -61.763, -59.782, -57.754, -55.671,
+    -53.516, -51.27, -48.944, -46.47, -43.866, -41.063, -38.021, -34.689,
+    -30.988, -30.511, -30.031, -29.534, -29.027, -28.506, -27.979, -27.443,
+    -26.903, -26.341, -25.775, -25.181, -24.597, -23.989, -23.358, -22.726,
+    -22.067, -21.392, -20.687, -19.982, -19.257, -18.493, -17.712, -16.894,
+    -16.043, -15.156, -14.246, -13.283, -12.267, -11.188, -10.06, -8.86,
+    -7.616, -6.227, -4.734, -3.093, -1.339, 0.633, 2.887, 5.548,
+    8.644, 9.019, 9.416, 9.813, 10.21, 10.613, 11.053, 11.493,
+    11.933, 12.388, 12.888, 13.388, 13.888, 14.411, 14.976, 15.541,
+    16.106, 16.714, 17.378, 18.041, 18.704, 19.422, 20.189, 20.956,
+    21.723, 22.628, 23.615, 24.603, 25.59, 26.908, 28.354, 29.801,
+    31.248, 33.424, 35.768, 38.112, 40.456, 60.701, 82.797, 104.894,
+    126.991,
+)
+# fmt: on
+# Rows filled per draw, so the inverse-CDF temporaries stay a fraction of the
+# logits allocation.
+_MEASURED_FILL_ROWS = 64
 # The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
 # an indexer over 4-token key pools selects 2048 / 4. Every backend, the fork's and
 # the Torch reference's included, shares this bound and the workspace below.
@@ -147,8 +199,8 @@ def validate_args(
         )
     if context_mode not in _CONTEXT_MODES:
         raise ValueError(
-            "dsa_persistent_topk_decode requires context_mode='uniform' or "
-            f"'uniform_random', got {context_mode!r}"
+            "dsa_persistent_topk_decode requires context_mode in "
+            f"{_CONTEXT_MODES}, got {context_mode!r}"
         )
     return (
         batch_size,
@@ -167,6 +219,22 @@ def _uses_native_extension(torch: Any) -> bool:
     """True when the device can run the corrected sm_90 extension."""
     capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
     return capability == _NATIVE_EXTENSION_CAPABILITY
+
+
+def _fill_measured_scores(torch: Any, logits_backing: Any, *, device: str) -> None:
+    """Fill rows in place with seeded i.i.d. draws from the measured score inverse CDF."""
+    probabilities = torch.tensor(_MEASURED_SCORE_PROBABILITIES, dtype=torch.float32, device=device)
+    quantiles = torch.tensor(_MEASURED_SCORE_QUANTILES, dtype=torch.float32, device=device)
+    generator = torch.Generator(device=device).manual_seed(0)
+    last = len(_MEASURED_SCORE_PROBABILITIES) - 2
+    for start in range(0, logits_backing.shape[0], _MEASURED_FILL_ROWS):
+        rows = logits_backing[start : start + _MEASURED_FILL_ROWS]
+        u = torch.rand(rows.shape, generator=generator, dtype=torch.float32, device=device)
+        index = (torch.searchsorted(probabilities, u, right=True) - 1).clamp_(0, last)
+        lo, hi = probabilities[index], probabilities[index + 1]
+        fraction = (u - lo) / (hi - lo)
+        rows.copy_(torch.lerp(quantiles[index], quantiles[index + 1], fraction))
+        del u, index, lo, hi, fraction
 
 
 def _build_common_operands(
@@ -192,6 +260,8 @@ def _build_common_operands(
         # Filled in place: no second [B*next_n, row_stride] source.
         generator = torch.Generator(device=device).manual_seed(0)
         logits_backing.normal_(generator=generator)
+    elif context_mode == _MEASURED_CONTEXT_MODE:
+        _fill_measured_scores(torch, logits_backing, device=device)
     else:
         # One row-sized template broadcasts into the exact padded production
         # allocation. Never materialize a second [B*next_n, row_stride] source.
@@ -515,9 +585,12 @@ def validate_native_semantics(
         long_logits = operands.logits.index_select(0, long_rows)
         actual_values = long_logits.gather(1, actual_long)
         expected_values = long_logits.gather(1, expected_long)
-        selection_rows = (actual_long.sort(1).values != expected_long.sort(1).values).any(1)
+        # A selection that differs from the reference only among scores equal to
+        # the k-th is still a top_k: ties have no defined winner, and drawn
+        # scores tie in FP32 (uniform_measured rows; the op itself breaks ties
+        # differently from call to call). Only a different value multiset fails.
         value_rows = (actual_values.sort(1).values != expected_values.sort(1).values).any(1)
-        for position in torch.nonzero(selection_rows | value_rows).flatten().tolist():
+        for position in torch.nonzero(value_rows).flatten().tolist():
             length = int(operands.flat_lengths[long_rows[position]])
             if not (
                 overflow_allowed
@@ -529,8 +602,7 @@ def validate_native_semantics(
                     num_rows=int(operands.flat_lengths.numel()),
                 )
             ):
-                kind = "values" if bool(value_rows[position]) else "selections"
-                raise RuntimeError(f"pinned CUDA disagrees with long-row reference {kind}")
+                raise RuntimeError("pinned CUDA disagrees with long-row reference values")
 
     if returned is not None:
         raise RuntimeError("pinned persistent_topk must return None")

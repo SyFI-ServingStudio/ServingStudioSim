@@ -456,7 +456,7 @@ def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_p
         ({"logits_row_stride": 1048575}, "positive and >= max_model_len"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
-        ({"context_mode": "mixed"}, "context_mode='uniform'"),
+        ({"context_mode": "mixed"}, "requires context_mode in"),
     ],
 )
 def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, match) -> None:
@@ -486,7 +486,7 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
         ({"max_model_len": 0}, "max_model_len must be > 0"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
-        ({"context_mode": "mixed"}, "context_mode='uniform'"),
+        ({"context_mode": "mixed"}, "requires context_mode in"),
     ],
 )
 def test_native_rejects_unsupported_args_before_import_or_allocation(
@@ -706,6 +706,48 @@ def test_uniform_random_rows_hold_seeded_independent_scores() -> None:
         operands.logits, operands.lengths, expected, top_k=512, max_seq_len=600
     )
     actual = _torch_composite(operands)
+    assert torch.equal(actual.sort(dim=1).values, expected.sort(dim=1).values)
+
+
+def test_uniform_measured_rows_follow_the_measured_score_quantiles() -> None:
+    """uniform_measured draws i.i.d. scores from the measured inverse CDF: seeded,
+    independent across rows, and with the table's quantiles (including the
+    chunked fill past _MEASURED_FILL_ROWS rows)."""
+    import numpy
+
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    def build():
+        return runner._build_operands(
+            torch,
+            batch_size=runner._MEASURED_FILL_ROWS + 3,
+            context_len=4000,
+            next_n=1,
+            max_model_len=4096,
+            top_k=512,
+            logits_row_stride=4096,
+            device="cpu",
+            context_mode="uniform_measured",
+        )
+
+    operands = build()
+    logits = operands.logits_backing
+    assert torch.equal(logits, build().logits_backing)
+    assert not torch.equal(logits[0], logits[1])
+    assert not torch.equal(logits[-1], logits[0])
+    p = torch.tensor(runner._MEASURED_SCORE_PROBABILITIES)
+    q = torch.tensor(runner._MEASURED_SCORE_QUANTILES)
+    assert bool((p[1:] > p[:-1]).all()) and bool((q[1:] >= q[:-1]).all())
+    assert float(logits.min()) >= float(q[0]) and float(logits.max()) <= float(q[-1])
+    for prob in (0.1, 0.5, 0.9, 0.99):
+        want = float(numpy.interp(prob, p.numpy(), q.numpy()))
+        got = float(torch.quantile(logits[:, :4096].flatten()[: 1 << 20], prob))
+        assert abs(got - want) < 0.02 * (float(q[-1]) - float(q[0]))
+    expected = torch.full_like(operands.out, -99)
+    dsa_persistent_topk_decode_reference(
+        operands.logits, operands.lengths, expected, top_k=512, max_seq_len=4000
+    )
+    actual = runner._torch_composite(operands)
     assert torch.equal(actual.sort(dim=1).values, expected.sort(dim=1).values)
 
 
@@ -972,6 +1014,46 @@ def test_native_semantic_validation_matches_reference_and_preserves_storage() ->
         top_k=512,
         max_seq_len=513,
     )
+
+
+def test_native_semantic_validation_accepts_ties_and_rejects_lower_values() -> None:
+    """Any top_k among scores tied at the k-th is valid; a lower score is not."""
+    from profiling.runners.attention.dsa_persistent_topk_decode import (
+        build_native_operands,
+        validate_native_semantics,
+    )
+
+    operands = build_native_operands(
+        torch,
+        batch_size=1,
+        context_len=600,
+        next_n=1,
+        max_model_len=600,
+        top_k=512,
+        logits_row_stride=600,
+        device="cpu",
+    )
+    # 510 scores above 88.0 (positions 90..599), then three tied at 88.0
+    # (positions 87, 88, 89) for the last two slots.
+    scores = torch.arange(600, dtype=torch.float32)
+    scores[87] = scores[89] = 88.0
+    operands.logits_backing[0].copy_(scores)
+    top = list(range(90, 600))
+
+    def returning(picks):
+        def op(logits, lengths, out, workspace, top_k, max_seq_len):
+            out[0] = torch.tensor(picks, dtype=out.dtype)
+
+        return op
+
+    for tied in ((87, 88), (88, 89), (87, 89)):
+        validate_native_semantics(
+            torch, returning(top + list(tied)), operands, top_k=512, max_seq_len=600
+        )
+    with pytest.raises(RuntimeError, match="long-row reference values"):
+        validate_native_semantics(
+            torch, returning(top + [88, 0]), operands, top_k=512, max_seq_len=600
+        )
 
 
 @pytest.mark.parametrize(
