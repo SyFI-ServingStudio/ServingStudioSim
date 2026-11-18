@@ -227,3 +227,41 @@ forward of rank 0, 1.27 s.
 
 This is the first direct evidence for the prefill composition excess, which `prefill_device_factor` 1.88 absorbs.
 The likely causes are spills and collective time in the composed region, not the isolated op rows.
+
+## Re-alignment on the round-7 service (official measurement, 2026-11-18)
+
+**Source.** The official round-7 measure of the R7 service (`466700d`,
+glm5-trn2 `campaigns/glm8k1k/round7/evidence/`): 346.0 tok/s/chip, median TPOT 55.92 ms (17.88 tok/s/user), C 64,
+mean decode step 54.2 ms. The 16-row cap probe measured 73.6-74.0 ms. Round 7 changed only the decode-MoE kernel
+(block-interleaved fused evacuation).
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r7.yaml`): the R4 model with round 7's measured decode-MoE
+ratios, 0.394x of `dense_local` at M 32 and 0.512x at M 64.
+
+| | measured (official) | Sim |
+|---|---|---|
+| tok/s per chip | 346.0 | 343.0 |
+| median TPOT (ms) | 55.92 | 56.48 |
+| interactivity | 17.88 | 17.71 |
+| 8-row decode step (ms) | 54.2 | 56.4 |
+| prefill step, 2048 x 4 groups (ms) | 1,236 | 1,227 |
+
+**Round 8, sparse DSA decode** (measured, not retained; `r8_dsa_sparse`): an NKI kernel gathers each row's top-512
+pools and attends over them only.
+
+- Isolated DSA decode at ctx 8192: 0.762 / 0.879 / 1.226 ms at B 8 / 16 / 32, against round 7's 0.879 / 1.252 /
+  1.839.
+- Official measure 352.86 @ 18.51 (TPOT 54.04 ms, decode step 52.9 ms). With the isolated ratios the model gives
+  348.4 @ 18.16.
+- At 8 rows the model's decode step stays ~2 ms slower than the device (55.1 vs 52.9 ms), so throughput reads -1.3%
+  and interactivity -1.9%.
+
+**Round 9, KDA prefill as one NKI kernel** (rejected on correctness, so no official measure). In the evaluator's
+warm-up the composed prefill step was 942 / 960 / 1,036 / 1,052 / 1,085 ms at ctx 2048 / 4096 / 6144 / 8192 / 9216,
+against 1,171 / 1,187 / 1,262 / 1,275 / 1,308 (-17 to -20%). In the model this is `prefill_device_factor` 1.88 ->
+~1.53: 375 tok/s/chip at C 64 with round 8's DSA kernel. The kernel failed the evaluator's concurrent passkey check:
+deterministically, in DP groups 1-3, on a prompt whose fp32 first-token margin is 0.81 logits. Cause (Tick 10): the
+kernel rounds the KDA gate GEMM products to bf16, as the torch source reads. The compiled torch path keeps them fp32
+(neuronx-cc drops the cast). That doubled passkey misses (15 against 7 of 128 prompt-group pairs). With fp32 gate
+products the kernel matches the compiled torch block (state 3.6e-6) and the miss rate returns to 7 / 128. Round 10
+carries the repaired kernel; the prefill step model above stands.

@@ -1,0 +1,61 @@
+# The glm5-trn2 R7 service (round 7 retained, `466700d`): the R4 service
+# (presets/trn2/glm53_flash_fp8_trn2_service_r4.yaml) with round 7's decode-MoE kernel (block-interleaved fused
+# evacuation), as measured on device: `moe_partial` 0.394x of `dense_local` at M 32 and 0.512x at M 64 (round 7's
+# isolated benches). Everything else is the R4 model.
+# The cap probe (16 rows only if <= 62 ms) measured 73.6-74.0 ms, so the official run served 8 rows, C 64.
+# `r7_official` replays the official C 64 request list: 343.0 tok/s/chip @ 17.71 tok/s/user against the official
+# round-7 measure's 346.0 @ 17.88 (-0.9% / -1.0%; doc/pr/trn2-glm53-flash/ALIGNMENT.md).
+# `r8_dsa_sparse` adds round 8's sparse DSA decode kernel (measured, not retained: 352.86 @ 18.51 missed its retain
+# bar by 0.06 tok/s/chip) with its isolated ratios against round 7: 0.867x at B 8, 0.702x at B 16, 0.667x at B 32.
+# At 8 rows the model's decode step reads ~2 ms slower than the device (55.1 vs 52.9 ms).
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_service_r7/{point}"
+
+pools:
+  main:
+    placement: least-loaded
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [2048]
+          decode_buckets: ${decode_buckets}
+          context_buckets: [2048, 4096, 6144, 6656, 7168, 7680, 8192, 8704, 9216]
+          slots: ${slots}
+          cmax: 9216
+          max_model_len: 9216
+          kind_time_scale: ${kts}
+          region_gap_ms: 0.05
+          prefill_device_factor: 1.88
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: ${mbt}
+          max_prefill_chunk_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: ${maxreq}
+          dp_placement: vllm-least-loaded
+          wave_admission: true
+          wave_quiet_ms: 100
+          wave_cap_ms: 2000
+          wave_first_token_from_decode: true
+
+compound:
+  point:
+    r7_official:   {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.8435", "dsa@9=0.9256", "dsa@17=0.9168", "dsa@512=1.3966", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda@9=0.79", "kda@129=1.2658"], conc: 64,  traces: [presets/trn2/inferencex_8k1k_c64.csv],  decode_buckets: [8, 16], maxreq: 8,  slots: 17, mbt: 2056}
+    c128_cap16:    {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.8435", "dsa@9=0.9256", "dsa@17=0.9168", "dsa@512=1.3966", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda@9=0.79", "kda@129=1.2658"], conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 2064}
+    r8_dsa_sparse: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.7313", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=2.0946", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda@9=0.79", "kda@129=1.2658"], conc: 64,  traces: [presets/trn2/inferencex_8k1k_c64.csv],  decode_buckets: [8, 16], maxreq: 8,  slots: 17, mbt: 2056}
