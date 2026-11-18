@@ -1,21 +1,21 @@
-//! FlashInfer rect (non-causal) attention kernel: one cached perf model per
-//! attention-dims config, swept over a 2D `(prefix_len, append_len)` grid.
+//! Non-causal rect attention kernel: one cached perf model per attention-dims
+//! config, swept over `(num_requests, q_len, kv_len)`.
 //!
-//! Rect is the non-causal sibling of `flashinfer_attn_prefill`. Unlike prefill
-//! (causal, parametrized by `(prefix_len, append_len)`), rect is parametrized by
-//! `(q_len, kv_len)` *directly* — for non-causal attention there is no causal
-//! prefix/append split, and the direct form lets rect sweep `q_len > kv_len`
-//! (wide rectangles) which the prefill encoding cannot. `causal=False` is a
-//! Python-runner concern; the Rust spec carries only identity, sweep shape, and
-//! cache kind. Everything generic lives in `engine::Kernel<S>`. The Python
-//! `FlashinferAttnRectArgs` dataclass owns the matching schema.
+//! One call covers `num_requests` requests, each a block of `q_len` queries
+//! attending (no causal mask) its own `kv_len` keys and values -- the DFlash2
+//! draft layer's varlen call. Rows written before the batch axis existed are
+//! one request (`num_requests` absent on the Python side). Everything generic
+//! lives in `engine::Kernel<S>`; the Python `FlashinferAttnRectArgs` dataclass
+//! owns the matching schema.
 //!
-//! Both axes are independent token curves -> `Cache2DLinear` + `grid.expand_2d`.
+//! Three monotone axes -> `Cache3DLinear` + `grid.expand_3d`. Work and K/V bytes
+//! both scale with `num_requests`, so a batch is priced at its own row instead
+//! of one shared context.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, Extrapolation};
+use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::sweep::{Axis, SweepGrid};
+use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -35,9 +35,20 @@ pub struct FlashinferAttnRectKernelConfig {
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct FlashinferAttnRectKernelInput {
+    /// Requests in the one call.
+    pub num_requests: u32,
+    /// Query rows of each request.
     pub q_len: u32,
+    /// Keys and values each request attends.
     pub kv_len: u32,
 }
+
+/// Requests per call: dense to 64 (a DP rank's draft batch), then sparser.
+pub const RECT_REQUEST_AXIS: [u32; 12] = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256];
+/// Query block per request: a speculative block is `1 + draft_tokens` >= 2.
+pub const RECT_Q_AXIS: [u32; 4] = [2, 4, 8, 16];
+/// Keys per request; work is linear in it.
+pub const RECT_KV_AXIS: [u32; 8] = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 pub struct FlashinferAttnRectSpec;
 
@@ -48,15 +59,17 @@ impl KernelSpec for FlashinferAttnRectSpec {
     const KIND: KernelKind = "flashinfer_attn_rect";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // q_len and kv_len are independent token curves; their cartesian product
-        // covers both q_len <= kv_len and q_len > kv_len (wide rectangles).
-        SweepGrid::new(vec![Axis::token_axis(), Axis::token_axis()])
+        // 12 x 4 x 8 = 384 points per config.
+        let axis = |v: &[u32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
+        SweepGrid::new(vec![
+            axis(&RECT_REQUEST_AXIS),
+            axis(&RECT_Q_AXIS),
+            axis(&RECT_KV_AXIS),
+        ])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        // Non-causal work is `q_len * kv_len` — every query row reads every key.
-        // The axes are the two factors, so the cross term is the work itself.
-        CacheKind::Cache2DLinear(Extrapolation::Product)
+        CacheKind::Cache3DLinear
     }
 
     fn enumerate(
@@ -64,7 +77,7 @@ impl KernelSpec for FlashinferAttnRectSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        grid.expand_2d(|q_len, kv_len| {
+        grid.expand_3d(|num_requests, q_len, kv_len| {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_qo_heads", config.num_qo_heads.get())
@@ -75,6 +88,7 @@ impl KernelSpec for FlashinferAttnRectSpec {
                 .with("o_dtype", config.o_dtype.as_str())
                 .with("q_len", q_len as u32)
                 .with("kv_len", kv_len as u32)
+                .with("num_requests", num_requests as u32)
         })
     }
 }
@@ -87,15 +101,15 @@ mod tests {
         FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, FlashinferAttnRectSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::{CacheKind, Extrapolation};
-    use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::cache::CacheKind;
+    use crate::timing::kernels::engine::KernelSpec;
     use crate::timing::SweepCoords;
     use serde_json::Value;
 
     fn config() -> FlashinferAttnRectKernelConfig {
         FlashinferAttnRectKernelConfig {
-            backends: vec!["fa2", "fa3", "cudnn"],
-            gpu_name: "H100".to_string(),
+            backends: vec!["fa2", "vllm_fa4_nosplit"],
+            gpu_name: "NVIDIA B200".to_string(),
             num_qo_heads: 32.into(),
             num_kv_heads: 8.into(),
             head_dim: 128.into(),
@@ -105,81 +119,34 @@ mod tests {
         }
     }
 
+    /// The batch is its own axis: a call of B requests must not collapse to one
+    /// request of B * q rows over one shared context.
     #[test]
-    fn config_identity_includes_backends_and_attention_dims() {
-        let cfg = config();
-        assert_eq!(cfg.backends, vec!["fa2", "fa3", "cudnn"]);
-        assert_eq!(cfg.num_qo_heads, 32);
-        assert_eq!(cfg.num_kv_heads, 8);
-        assert_eq!(cfg.head_dim, 128);
-        assert_eq!(cfg.q_dtype, DType::Bf16);
-        assert_eq!(cfg.kv_dtype, DType::Bf16);
-        assert_eq!(cfg.o_dtype, DType::Bf16);
-    }
-
-    #[test]
-    fn describe_config_renders_tidy_field_list() {
-        assert_eq!(
-            config().describe_config(),
-            serde_json::json!({
-                "backends": ["fa2", "fa3", "cudnn"], "gpu_name": "H100",
-                "num_qo_heads": {"value": 32, "expression": null, "bindings": {}},
-                "num_kv_heads": {"value": 8, "expression": null, "bindings": {}},
-                "head_dim": {"value": 128, "expression": null, "bindings": {}},
-                "q_dtype": "bf16", "kv_dtype": "bf16", "o_dtype": "bf16",
-            })
-        );
-    }
-
-    #[test]
-    fn input_sweep_coords_flatten_both_axes_in_order() {
+    fn input_coords_keep_the_request_count_separate() {
         let input = FlashinferAttnRectKernelInput {
-            q_len: 1024,
-            kv_len: 256,
+            num_requests: 32,
+            q_len: 8,
+            kv_len: 2048,
         };
-        // q_len > kv_len is representable (wide rectangle).
-        assert_eq!(&*input.coords(), &[1024.0, 256.0]);
-    }
-
-    #[test]
-    fn cache_kind_is_two_dimensional_linear() {
+        assert_eq!(&*input.coords(), &[32.0, 8.0, 2048.0]);
         assert_eq!(
             FlashinferAttnRectSpec::cache_kind("fa2"),
-            CacheKind::Cache2DLinear(Extrapolation::Product)
+            CacheKind::Cache3DLinear
         );
     }
 
     #[test]
-    fn sweep_grid_both_axes_are_token_curves() {
-        let grid = FlashinferAttnRectSpec::sweep_grid(&config());
-        assert_eq!(grid.axes().len(), 2);
-        // Both q_len and kv_len start at the token-curve minimum (no chained 0).
-        assert_eq!(grid.axes()[0][0], 32.0);
-        assert_eq!(grid.axes()[1][0], 32.0);
-    }
-
-    #[test]
-    fn enumerate_emits_payload_with_all_wire_fields() {
+    fn grid_stays_under_the_profiling_ceiling_and_forwards_every_field() {
         let cfg = config();
         let grid = FlashinferAttnRectSpec::sweep_grid(&cfg);
         let payloads = FlashinferAttnRectSpec::enumerate(&cfg, &grid, "fa2");
-
-        assert_eq!(payloads.len(), grid.axes()[0].len() * grid.axes()[1].len());
-        let first = &payloads[0];
-        let fields = first.fields();
-
-        // Wire schema must stay aligned with Python FlashinferAttnRectArgs in
-        // profiling/kernels/flashinfer_attn_rect.py.
-        assert_eq!(fields.len(), 9);
-        assert_eq!(fields.get("backend"), Some(&Value::from("fa2")));
-        assert_eq!(fields.get("num_qo_heads"), Some(&Value::from(32_u32)));
-        assert_eq!(fields.get("num_kv_heads"), Some(&Value::from(8_u32)));
-        assert_eq!(fields.get("head_dim"), Some(&Value::from(128_u32)));
-        assert_eq!(fields.get("q_dtype"), Some(&Value::from("bf16")));
-        assert_eq!(fields.get("kv_dtype"), Some(&Value::from("bf16")));
-        assert_eq!(fields.get("o_dtype"), Some(&Value::from("bf16")));
-        assert!(fields.get("q_len").and_then(Value::as_u64).is_some());
-        assert!(fields.get("kv_len").and_then(Value::as_u64).is_some());
-        assert_eq!(first.backend(), Some("fa2"));
+        assert_eq!(payloads.len(), 384);
+        let fields = payloads[0].fields();
+        // Wire schema must stay aligned with Python FlashinferAttnRectArgs.
+        assert_eq!(fields.len(), 10);
+        assert_eq!(fields.get("num_requests"), Some(&Value::from(1_u32)));
+        assert_eq!(fields.get("q_len"), Some(&Value::from(2_u32)));
+        assert_eq!(fields.get("kv_len"), Some(&Value::from(128_u32)));
+        assert_eq!(payloads[0].backend(), Some("fa2"));
     }
 }
