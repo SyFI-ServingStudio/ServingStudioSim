@@ -2086,6 +2086,7 @@ fn dflash2_draft_resolved(
         gemm_dtype: DType::Bf16,
         attn_q_dtype: DType::Bf16,
         attn_kv_dtype: DType::Bf16,
+        query_kv_append: None,
     };
     let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
         norm_backends: vec!["flashinfer"],

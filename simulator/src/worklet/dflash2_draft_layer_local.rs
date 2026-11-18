@@ -59,7 +59,8 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, FlashinferAttnRectKernel,
-    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, ResidualRmsNormKernel,
+    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, KvCacheAppendKernel,
+    KvCacheAppendKernelConfig, KvCacheAppendKernelInput, ResidualRmsNormKernel,
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -98,6 +99,11 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     /// at the call site instead of hidden in a default.
     pub attn_q_dtype: DType,
     pub attn_kv_dtype: DType,
+    /// `Some`: every layer writes its own query block's K/V into the draft's
+    /// paged cache (`reshape_and_cache_flash` ahead of the attention call), the
+    /// same insert the context-KV section runs over the context rows. `None`
+    /// leaves the insert unpriced.
+    pub query_kv_append: Option<KvCacheAppendKernelConfig>,
 }
 
 /// One grouped convolution's byte rates. `prepare` also runs a projection; both
@@ -150,6 +156,7 @@ pub struct Dflash2DraftAttnLocalWorkletResolved {
     pub q_norm: RmsNormKernelConfig,
     pub k_norm: RmsNormKernelConfig,
     pub rope: ElementwiseKernelConfig,
+    pub query_kv_append: Option<KvCacheAppendKernelConfig>,
     pub attention: FlashinferAttnRectKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
 }
@@ -172,6 +179,7 @@ pub struct Dflash2DraftAttnLocalWorklet {
     pub q_norm: Op<RmsNormKernel>,
     pub k_norm: Op<RmsNormKernel>,
     pub rope: Op<ElementwiseKernel>,
+    pub query_kv_append: Option<Op<KvCacheAppendKernel>>,
     pub attention: Op<FlashinferAttnRectKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: Dflash2DraftAttnLocalWorkletResolved,
@@ -245,6 +253,7 @@ impl Dflash2DraftAttnLocalWorklet {
                 input_bytes_per_token: rope_input_bytes.into(),
                 output_bytes_per_token: rope_output_bytes.into(),
             },
+            query_kv_append: cfg.query_kv_append.clone(),
             attention: FlashinferAttnRectKernelConfig {
                 backends: cfg.attention_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -321,6 +330,19 @@ impl Dflash2DraftAttnLocalWorklet {
                 ElementwiseKernel::build,
                 bridge,
             )?,
+            query_kv_append: resolved
+                .query_kv_append
+                .as_ref()
+                .map(|cfg| {
+                    build_atomic(
+                        &name,
+                        "query_kv_append",
+                        cfg.clone(),
+                        KvCacheAppendKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             attention: build_atomic(
                 &name,
                 "attention",
@@ -343,17 +365,23 @@ impl Dflash2DraftAttnLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: attn_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.input_add_rms_norm.compile(builder),
-                self.attn_conv_projection.compile(builder),
-                self.attn_conv_prepare.compile(builder),
-                self.qkv_proj.compile(builder),
-                self.q_norm.compile(builder),
-                self.k_norm.compile(builder),
-                self.rope.compile(builder),
-                self.attention.compile(builder),
-                self.o_proj.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = vec![
+                    self.input_add_rms_norm.compile(builder),
+                    self.attn_conv_projection.compile(builder),
+                    self.attn_conv_prepare.compile(builder),
+                    self.qkv_proj.compile(builder),
+                    self.q_norm.compile(builder),
+                    self.k_norm.compile(builder),
+                    self.rope.compile(builder),
+                ];
+                if let Some(op) = &self.query_kv_append {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.attention.compile(builder));
+                nodes.push(self.o_proj.compile(builder));
+                nodes
+            })),
         }
     }
 
@@ -409,6 +437,14 @@ impl Dflash2DraftAttnLocalWorklet {
             zero,
             ev,
         );
+        if let Some(op) = &self.query_kv_append {
+            eval_atomic_or_zero(
+                op,
+                KvCacheAppendKernelInput { num_tokens: tokens },
+                zero,
+                ev,
+            );
+        }
 
         // One aggregating slot, priced as ONE launch over every request's
         // rectangle: the engine runs a single varlen FlashAttention call per
@@ -823,7 +859,56 @@ mod tests {
             gemm_dtype: DType::Bf16,
             attn_q_dtype: DType::Bf16,
             attn_kv_dtype: DType::Bf16,
+            query_kv_append: None,
         }
+    }
+
+    fn query_kv_append() -> KvCacheAppendKernelConfig {
+        KvCacheAppendKernelConfig {
+            backends: vec!["vllm_cuda"],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_kv_heads: 2.into(),
+            head_dim: HEAD_DIM.into(),
+            head_dim_v: None,
+            block_size: 64,
+            input_dtype: DType::Bf16,
+            kv_dtype: DType::Fp8E4m3,
+            cache_layout: "NHD".to_string(),
+            scale_granularity: "tensor".to_string(),
+        }
+    }
+
+    /// Each leaf's name under the attention section, in slot order.
+    fn attn_leaves(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2DraftAttnLocalWorklet::build(
+            "attn".into(),
+            Dflash2DraftAttnLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| slot.name["attn.".len()..].to_string())
+            .collect()
+    }
+
+    /// Catches the query block's insert going missing or landing after the
+    /// attention call that reads it.
+    #[test]
+    fn the_query_block_insert_precedes_the_attention() {
+        let mut with = cfg();
+        with.query_kv_append = Some(query_kv_append());
+        let leaves = attn_leaves(&with);
+        let insert = leaves.iter().position(|l| l == "query_kv_append").unwrap();
+        let attention = leaves.iter().position(|l| l == "attention").unwrap();
+        assert_eq!(insert + 1, attention);
+        assert!(!attn_leaves(&cfg()).contains(&"query_kv_append".to_string()));
     }
 
     #[test]
