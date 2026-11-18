@@ -82,7 +82,7 @@ it returned 20x the eager value with 2-3x run-to-run spread, and per-kernel it
 was non-monotonic in token count.
 
 ``MnnvlConfig`` needs a CPU communicator with allgather/bcast/barrier. vLLM
-supplies one wrapping its own CPU process group; ``_TorchDistCommBackend`` below
+supplies one wrapping its own CPU process group; ``TorchDistCommBackend`` below
 is the same adapter over the group the launcher already created.
 """
 
@@ -122,7 +122,7 @@ def _run_batch(kwargs_list: list[dict], per_rank_fn) -> list[RunnerResult]:
     return run_comm_batch(launcher, per_rank_fn, kwargs_list)
 
 
-class _TorchDistCommBackend:
+class TorchDistCommBackend:
     """flashinfer's `CommBackend` over the launcher's process group.
 
     Mirrors vLLM's `CustomCommunicator`. Kept structural rather than imported so
@@ -161,7 +161,7 @@ class _TorchDistCommBackend:
 
         dist.barrier(group=self._group)
 
-    def Split(self, color: int, key: int) -> _TorchDistCommBackend:
+    def Split(self, color: int, key: int) -> TorchDistCommBackend:
         return self
 
 
@@ -183,7 +183,7 @@ def _mnnvl_session(rank: int, world_size: int):
     # workspace spans the whole EP group, which here is every launched rank.
     mapping = Mapping(world_size, rank, world_size, tp_size=world_size)
     config = MnnvlConfig(
-        comm_backend=_TorchDistCommBackend(dist.group.WORLD),
+        comm_backend=TorchDistCommBackend(dist.group.WORLD),
         fabric_page_size=_FABRIC_PAGE_SIZE,
         allocation_granularity=0,
     )
