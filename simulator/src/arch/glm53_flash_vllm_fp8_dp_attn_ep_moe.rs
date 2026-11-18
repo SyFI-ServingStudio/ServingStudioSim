@@ -1185,25 +1185,83 @@ fn build_moe(
     let cfg = &resolved.raw_cfg;
     let local = &cfg.local;
     let m = moe.as_str();
-    let exchange = match &cfg.fixed_exchange {
-        Some(fixed) => Exchange::Fixed(FixedExpertExchange::build(m, fixed.clone(), bridge)?),
-        None => Exchange::Measured {
-            dispatch: match cfg.dispatch.clone() {
-                Glm53FlashDispatchConfig::Fp8(dispatch) => Dispatch::Fp8(atomic(
-                    m,
-                    "dispatch_all_gather",
-                    dispatch,
-                    MoeEpAllGatherKernel::build,
-                    bridge,
-                )?),
-                Glm53FlashDispatchConfig::Nvfp4(dispatch) => Dispatch::Nvfp4(atomic(
-                    m,
-                    "dispatch_all_gather",
-                    dispatch,
-                    MoeEpQuantizedAllGatherKernel::build,
-                    bridge,
-                )?),
-            },
+    // Built in launch order: router, input copy, shared expert, select,
+    // dispatch quant, dispatch, experts, combine, combine add.
+    let router = Glm53MoeRouterLocalWorklet::build(
+        format!("{m}.router"),
+        Glm53MoeRouterLocalWorklet::resolve_config(&local.router),
+        cfg.parallel.router_gate_once,
+        bridge,
+    )?;
+    let input_glue = cfg
+        .parallel
+        .moe_input_copy
+        .then(|| {
+            atomic(
+                m,
+                "input_glue",
+                local.moe_input_glue.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )
+        })
+        .transpose()?;
+    let shared_expert = Glm53MlpLocalWorklet::build(
+        format!("{m}.shared_expert"),
+        resolved.local.shared_expert.clone(),
+        bridge,
+    )?;
+    let router_select = cfg
+        .router_select
+        .clone()
+        .map(|select| atomic(m, "router_select", select, ElementwiseKernel::build, bridge))
+        .transpose()?;
+    let dispatch_quant = Glm53ActivationQuant::build(
+        m,
+        "dispatch_quant",
+        resolved.routed[0].input_quant.clone(),
+        bridge,
+    )?;
+    let fixed = cfg
+        .fixed_exchange
+        .as_ref()
+        .map(|fixed| FixedExpertExchange::build(m, fixed.clone(), bridge))
+        .transpose()?;
+    let dispatch = match (&fixed, cfg.dispatch.clone()) {
+        (Some(_), _) => None,
+        (None, Glm53FlashDispatchConfig::Fp8(dispatch)) => Some(Dispatch::Fp8(atomic(
+            m,
+            "dispatch_all_gather",
+            dispatch,
+            MoeEpAllGatherKernel::build,
+            bridge,
+        )?)),
+        (None, Glm53FlashDispatchConfig::Nvfp4(dispatch)) => Some(Dispatch::Nvfp4(atomic(
+            m,
+            "dispatch_all_gather",
+            dispatch,
+            MoeEpQuantizedAllGatherKernel::build,
+            bridge,
+        )?)),
+    };
+    let fused_moe = resolved
+        .routed
+        .iter()
+        .enumerate()
+        .map(|(rank, routed)| {
+            atomic(
+                m,
+                &format!("routed_rank{rank}.fused_moe"),
+                routed.fused_moe.clone(),
+                Nvfp4FusedMoeKernel::build,
+                bridge,
+            )
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let exchange = match (fixed, dispatch) {
+        (Some(fixed), _) => Exchange::Fixed(fixed),
+        (None, Some(dispatch)) => Exchange::Measured {
+            dispatch,
             combine: atomic(
                 m,
                 "combine_reduce_scatter",
@@ -1212,72 +1270,31 @@ fn build_moe(
                 bridge,
             )?,
         },
+        (None, None) => unreachable!("a measured exchange builds its dispatch"),
     };
+    let combine_glue = cfg
+        .mhc_post_addend
+        .is_none()
+        .then(|| {
+            atomic(
+                m,
+                "combine_glue",
+                local.moe_combine_glue.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )
+        })
+        .transpose()?;
     Ok(MoeBlock {
-        router: Glm53MoeRouterLocalWorklet::build(
-            format!("{m}.router"),
-            Glm53MoeRouterLocalWorklet::resolve_config(&local.router),
-            cfg.parallel.router_gate_once,
-            bridge,
-        )?,
-        input_glue: cfg
-            .parallel
-            .moe_input_copy
-            .then(|| {
-                atomic(
-                    m,
-                    "input_glue",
-                    local.moe_input_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )
-            })
-            .transpose()?,
-        shared_expert: Glm53MlpLocalWorklet::build(
-            format!("{m}.shared_expert"),
-            resolved.local.shared_expert.clone(),
-            bridge,
-        )?,
-        router_select: cfg
-            .router_select
-            .clone()
-            .map(|select| atomic(m, "router_select", select, ElementwiseKernel::build, bridge))
-            .transpose()?,
-        dispatch_quant: Glm53ActivationQuant::build(
-            m,
-            "dispatch_quant",
-            resolved.routed[0].input_quant.clone(),
-            bridge,
-        )?,
+        router,
+        input_glue,
+        shared_expert,
+        router_select,
+        dispatch_quant,
         exchange,
-        fused_moe: resolved
-            .routed
-            .iter()
-            .enumerate()
-            .map(|(rank, routed)| {
-                atomic(
-                    m,
-                    &format!("routed_rank{rank}.fused_moe"),
-                    routed.fused_moe.clone(),
-                    Nvfp4FusedMoeKernel::build,
-                    bridge,
-                )
-            })
-            .collect::<std::result::Result<_, _>>()?,
+        fused_moe,
         shared_exposed: cfg.parallel.moe_shared_exposed.clone(),
-        combine_glue: cfg
-            .mhc_post_addend
-            .is_none()
-            .then(|| {
-                atomic(
-                    m,
-                    "combine_glue",
-                    local.moe_combine_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )
-            })
-            .transpose()?,
+        combine_glue,
         name: moe,
     })
 }
