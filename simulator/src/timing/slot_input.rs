@@ -46,6 +46,8 @@ use crate::timing::kernels::BatchedGemmStaticFp8QuantKernelInput;
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
 use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
+use crate::timing::kernels::DsaPooledLogitsPageTableKernelInput;
+use crate::timing::kernels::DsaPooledTopkPageTableKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
@@ -239,6 +241,8 @@ log_inputs! {
     DsaPagedMqaLogitsDecode => DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecode => DsaPersistentTopkDecodeKernelInput,
     DsaPooledIndexCacheUpdate => DsaPooledIndexCacheUpdateKernelInput,
+    DsaPooledTopkPageTable => DsaPooledTopkPageTableKernelInput,
+    DsaPooledLogitsPageTable => DsaPooledLogitsPageTableKernelInput,
     DsaSparseIndexRemap => DsaSparseIndexRemapKernelInput,
     DsaSparseMlaPrefillKernel => DsaSparseMlaPrefillKernelInput,
     DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
