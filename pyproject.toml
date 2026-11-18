@@ -124,6 +124,7 @@ markers = [
 line-length = 100
 target-version = "py312"
 extend-exclude = [
+    "profiling/runners/elementwise/hadamard_wscale_vendor",  # vendored Triton kernel, pinned byte-identical by its test
     "profiling/runners/attention/state_writer_vendor",  # vendored Triton kernels, pinned byte-identical by its test
     "profiling/runners/norm/row_split_vendor",  # vendored Triton kernel, pinned byte-identical by its test
 ]

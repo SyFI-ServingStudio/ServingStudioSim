@@ -43,12 +43,13 @@ use crate::timing::kernels::{
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
+use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
-use crate::timing::kernels::HadamardFp8QuantKernelInput;
-use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
 use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
-use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
+use crate::timing::kernels::HadamardFp8QuantKernelInput;
+use crate::timing::kernels::HadamardFp8QuantWeightScaleKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
@@ -192,6 +193,7 @@ log_inputs! {
     ClampedSwiglu => ClampedSwigluKernelInput,
     InvRopeFp8Quant => InvRopeFp8QuantKernelInput,
     HadamardFp8Quant => HadamardFp8QuantKernelInput,
+    HadamardFp8QuantWeightScale => HadamardFp8QuantWeightScaleKernelInput,
     QKvRmsNorm => QKvRmsNormKernelInput,
     DsaIndexerQRopeQuantWeightFold => DsaIndexerQRopeQuantWeightFoldKernelInput,
     DsaIndexerQRopeQuant => DsaIndexerQRopeQuantKernelInput,

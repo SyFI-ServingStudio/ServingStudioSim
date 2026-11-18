@@ -48,6 +48,7 @@ pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod grouped_rms_norm;
 pub mod hadamard_fp8_quant;
+pub mod hadamard_fp8_quant_weight_scale;
 pub mod hc_combine;
 pub mod hc_combine_norm;
 pub mod hc_gate_mix;
@@ -277,6 +278,10 @@ pub use grouped_rms_norm::{
 pub use hadamard_fp8_quant::{
     HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput,
     HadamardFp8QuantSpec,
+};
+pub use hadamard_fp8_quant_weight_scale::{
+    HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
+    HadamardFp8QuantWeightScaleKernelInput, HadamardFp8QuantWeightScaleSpec,
 };
 pub use hc_combine::{HcCombineKernel, HcCombineSpec};
 pub use hc_combine_norm::{HcCombineNormKernel, HcCombineNormSpec};
