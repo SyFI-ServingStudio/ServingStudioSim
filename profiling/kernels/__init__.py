@@ -63,6 +63,7 @@ from profiling.kernels import (
     kv_compress_store,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
+    mhc_fused_sum_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
     mhc_terminal_head,  # noqa: F401
     mla_cache_append,  # noqa: F401
