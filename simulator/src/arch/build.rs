@@ -2114,6 +2114,7 @@ fn dflash2_draft_resolved(
         // is the identity to price against; `torch` stays behind it as the
         // semantic fallback the kernel kind also registers.
         topk_backends: vec!["flashinfer", "torch"],
+        topk_small_rows: None,
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", 6144),
