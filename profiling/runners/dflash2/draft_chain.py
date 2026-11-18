@@ -13,6 +13,8 @@ vLLM fork's ``qwen3_dflash2`` draft (all incumbent callables are the fork's own:
   ``store_context_kv`` vs grouped ``rms_norm`` + ``rotary_embedding`` + one
   ``reshape_and_cache_flash`` per layer. Byte check: at least 99.9% of cache
   bytes equal (99.9999% measured, at most one fp8 code apart).
+- ``grouped_conv_residual_rms_norm:vllm_triton`` -- the fork's Beam
+  ``conv_residual_norm`` vs ``dflash2_grouped_conv`` + ``fused_add_rms_norm``.
 
 Caches use the fork's FlashAttention layout ``[pages, kv_heads, page, 2*head_dim]``
 (fp8), slots are a shuffled page pool, and the draft's scales are 1.0 (the draft
@@ -279,3 +281,62 @@ def profile_layered_kv_norm_rope_cache_write_vllm_triton(
         return _measure(run, flops=m * nl * hkv * d * 8.0, nbytes=nbytes)
 
     return _guard("layered_kv_norm_rope_cache_write", "vllm_triton", body)
+
+
+# ------------------------------------------ grouped conv finish + residual norm --
+def profile_grouped_conv_residual_rms_norm_vllm_triton(
+    num_tokens: int,
+    hidden: int,
+    group_size: int,
+    taps: int,
+    block_len: int,
+    dtype: Any,
+) -> ComputeMetrics:
+    _positive(
+        num_tokens=num_tokens, hidden=hidden, group_size=group_size, taps=taps, block_len=block_len
+    )
+    if str(dtype) != "bf16" or hidden % group_size:
+        raise ProfilerNotImplemented("conv_residual_norm is measured in bf16 with whole groups")
+    if num_tokens % block_len:
+        raise ValueError("num_tokens must be whole blocks of block_len")
+
+    def body(torch):
+        from vllm import _custom_ops as ops
+
+        try:
+            import vllm.model_executor.models.qwen3_dflash2  # noqa: F401  registers dflash2_grouped_conv
+            from vllm.models.beam.nvidia.dflash2_conv_ops import conv_residual_norm
+        except ImportError as exc:
+            raise ProfilerNotImplemented("needs the vLLM fork's DFlash2 ops (vllm_env)") from exc
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        gen = torch.Generator(device=dev).manual_seed(0x0E)
+        m, h, groups = num_tokens, hidden, hidden // group_size
+        x = torch.randn(m, h, device=dev, generator=gen).to(torch.bfloat16)
+        coeff = (0.1 * torch.randn(m, 2, taps, groups, device=dev, generator=gen)).to(
+            torch.bfloat16
+        )[:, 1]
+        base = (0.5 * torch.randn(taps, h, device=dev, generator=gen)).to(torch.bfloat16)
+        res0 = torch.randn(m, h, device=dev, generator=gen).to(torch.bfloat16)
+        weight = (1.0 + 0.1 * torch.randn(h, device=dev, generator=gen)).to(torch.bfloat16)
+        res_a, res_b = res0.clone(), res0.clone()
+
+        def run():
+            return conv_residual_norm(x, coeff, base, res_a, weight, _EPS, block_len, group_size)
+
+        out_a, _ = run()
+        y = torch.ops.vllm.dflash2_grouped_conv(x, coeff, base, block_len, group_size)
+        ops.fused_add_rms_norm(y, res_b, weight, _EPS)
+        torch.cuda.synchronize(dev)
+        rel = float((out_a.float() - y.float()).norm() / y.float().norm())
+        rrel = float((res_a.float() - res_b.float()).norm() / res_b.float().norm())
+        if rel > 1e-2 or rrel > 1e-2:
+            raise KernelLaunchFailed(
+                f"conv_residual_norm vs incumbent: out rel {rel} residual rel {rrel}"
+            )
+        print(f"[grouped_conv_residual_rms_norm] m={m} out rel {rel:.2e} residual rel {rrel:.2e}")
+        # x, residual read; residual and output written; coefficients per group.
+        nbytes = m * (4 * h * 2 + taps * groups * 2)
+        return _measure(run, flops=m * h * (2 * taps + 4.0), nbytes=nbytes)
+
+    return _guard("grouped_conv_residual_rms_norm", "vllm_triton", body)

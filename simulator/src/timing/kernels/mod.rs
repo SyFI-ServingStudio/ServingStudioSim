@@ -44,6 +44,7 @@ pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_conv_residual_rms_norm;
 pub mod grouped_rms_norm;
 pub mod hc_combine;
 pub mod hc_combine_norm;
@@ -258,6 +259,10 @@ pub use gemm_fp32_output::{
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
+};
+pub use grouped_conv_residual_rms_norm::{
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, GroupedConvResidualRmsNormSpec,
 };
 pub use layered_kv_norm_rope_cache_write::{
     LayeredKvNormRopeCacheWriteKernel, LayeredKvNormRopeCacheWriteKernelConfig,

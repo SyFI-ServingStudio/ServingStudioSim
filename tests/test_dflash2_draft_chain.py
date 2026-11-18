@@ -51,3 +51,17 @@ def test_context_kv_store_is_measured_with_bf16_input_and_an_fp8_cache_only() ->
             draft_chain.profile_layered_kv_norm_rope_cache_write_vllm_triton(
                 **(_LAYERED | overrides)
             )
+
+
+_CONV = dict(num_tokens=64, hidden=4096, group_size=16, taps=2, block_len=8, dtype="bf16")
+
+
+def test_conv_residual_norm_needs_whole_groups_and_whole_blocks() -> None:
+    # Defect: a row count that cuts a block would let taps read across requests.
+    with pytest.raises(ValueError):
+        draft_chain.profile_grouped_conv_residual_rms_norm_vllm_triton(
+            **(_CONV | {"num_tokens": 60})
+        )
+    for overrides in ({"group_size": 24}, {"dtype": "fp16"}):
+        with pytest.raises(ProfilerNotImplemented):
+            draft_chain.profile_grouped_conv_residual_rms_norm_vllm_triton(**(_CONV | overrides))

@@ -50,6 +50,7 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gdn_recurrent_decode_gated_norm,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
+    grouped_conv_residual_rms_norm,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
     hc_combine,  # noqa: F401
