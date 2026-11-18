@@ -19,7 +19,8 @@ The simulator's kernel timings come from **measured rows in
 `compute_capability`: the simulator compiles it in (`simulator/src/common/gpu.rs`)
 and uses it for capability-keyed rules, such as vLLM's FlashInfer all-reduce
 workspace budget (which bounds the token counts that take the fused kernel), and
-the profiler uses it to gate backends. Changing it can change a run. So:
+the profiler uses it to gate backends. `sm_count` is read the same way, as the
+wave size of kernels that run one CTA per row. Changing either can change a run. So:
 
 - The `name` field here (e.g. `H200-SXM-141GB`) is a catalog label; the preset's
   `gpu:` string (e.g. `"NVIDIA H200"`) is a separate profile.db cache identity.
@@ -34,6 +35,7 @@ the profiler uses it to gate backends. Changing it can change a run. So:
 | `name` | Catalog label incl. form factor + memory (`H100-SXM5-80GB`) | Distinct from a preset's `gpu:` string |
 | `vendor` / `architecture` / `year` | NVIDIA/AMD/Intel; uarch; launch year | — |
 | `compute_capability` | CUDA `"major.minor"` (H200 `"9.0"`, B300 `"10.3"`) | `null` off NVIDIA. Backend validation reads it (`BackendSupport` sm targets / minimum), and so does the simulator for capability-keyed rules, so a wrong value rejects or admits backends and can change a run |
+| `sm_count` | Streaming multiprocessors (H100/H200 `132`, B200 `148`) | Optional. The simulator reads it as the wave size of a kernel that runs one CTA per row; absent means such a kernel is priced as one wave |
 | `mem_size_gb` | HBM/GDDR capacity, GB | Per **GPU** (except GB200, see below) |
 | `mem_type` | HBM2/HBM3/HBM3e/GDDR6 | — |
 | `mem_bandwidth_gbps` | Memory bandwidth, **GB/s** (bytes) | GB/s not Gb/s; H200 = 4.8 TB/s = `4800` |
