@@ -456,7 +456,7 @@ def args_to_spec(args: KernelArgs) -> dict[str, Any]:
     for field in fields(args):
         value = getattr(args, field.name)
         if value is None and field.name in optional:
-            continue  # absent: the runner takes its `same_as` field
+            continue  # absent: the runner takes its `same_as` field (or `absent` value)
         values[field.name] = value.value if hasattr(value, "value") else value
     return values
 
