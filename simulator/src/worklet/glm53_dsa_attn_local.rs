@@ -29,32 +29,54 @@
 //! the Hadamard quant) carry an effective-bandwidth byte factor anchored to
 //! the measured T = 2048 kernels, and a prefill-bearing iteration adds its
 //! `[rows, selected_k]` index plumbing (`prefill_glue`).
+//! [`DsaGlue::ForkLaunchList`] prices the glue by the fork's own decode
+//! launches instead, and [`Glm53DsaFront`] replaces groups of the fork's
+//! launches with fused kernels; the replaced slots stay in the tree and bill
+//! zero.
 //!
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
-//! context (the measured decode grids are uniform in context).
+//! context (the measured decode grids are uniform in context). Under
+//! [`DsaDecodeIndexer::PerRequest`] the indexer follows each request's own
+//! context instead: the MQA logits price at the batch's mean context and the
+//! top-k list-schedules the rows over the SMs.
 
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use crate::common::gpu::{compute_capability, sm_count};
 use crate::op::attention::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::dsa_topk_prefill::takes_row_starts;
+use crate::timing::kernels::sparse_indexer_topk::COOPERATIVE_MAX_ROWS;
 use crate::timing::kernels::{
-    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
-    DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
-    DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
-    DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
-    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, QKvRmsNormKernel,
-    QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
+    BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
+    BatchedGemmStaticFp8QuantKernelInput, DsaFp32SplitStateUpdateKernel,
+    DsaFp32SplitStateUpdateKernelConfig, DsaFp32SplitStateUpdateKernelInput,
+    DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
+    DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernel,
+    DsaPersistentTopkDecodeKernelConfig, DsaPersistentTopkDecodeKernelInput,
+    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
+    DsaPooledIndexCacheUpdateKernelInput, DsaPooledTopkPageTableKernel,
+    DsaPooledTopkPageTableKernelConfig, DsaPooledTopkPageTableKernelInput, DsaTopkPrefillKernel,
+    DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, Fp32RowSplitLayerNormKernel,
+    Fp32RowSplitLayerNormKernelConfig, Fp32RowSplitLayerNormKernelInput, GemmFp32OutputKernel,
+    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, HadamardFp8QuantKernel,
+    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, HadamardFp8QuantWeightScaleKernel,
+    HadamardFp8QuantWeightScaleKernelConfig, HadamardFp8QuantWeightScaleKernelInput,
+    QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput, StaticFp8QuantKernel,
+    StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, SlotInput,
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
+    SlotInput,
 };
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
@@ -82,13 +104,183 @@ const Q_CONCAT_EFFECTIVE_FACTOR: u32 = 10;
 ///   (applied as 7/2).
 const OUTPUT_COPY_EFFECTIVE_NUM: u32 = 7;
 const OUTPUT_COPY_EFFECTIVE_DEN: u32 = 2;
-/// * `q_fwht_quant`: the Hadamard-128 + ue8m0 quant is not a streaming kernel;
-///   16.8 us at T = 2048 for 25 MiB of real traffic. The factor matches the
-///   prefill-bearing time; decode (5.5 us at T = 32) stays latency-bound above
-///   any elementwise row and needs a dedicated L1 kind to match.
+/// * the `q_fwht_quant` placeholder: the Hadamard-128 + ue8m0 quant is not a
+///   streaming kernel; 16.8 us at T = 2048 for 25 MiB of real traffic. The
+///   factor matches the prefill-bearing time; decode (5.5 us at T = 32) stays
+///   latency-bound above any elementwise row, which the measured
+///   `hadamard_fp8_quant` kind prices.
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
+
+/// A launch priced by its measured kernel kind, or by a byte-sized elementwise
+/// placeholder when the config names no backend for that kind. The slot keeps
+/// its name either way.
+#[derive(Clone, Debug)]
+pub enum MeasuredOrPlaceholder<M, P> {
+    Measured(M),
+    Placeholder(P),
+}
+
+pub type MeasuredConfig<C> = MeasuredOrPlaceholder<C, ElementwiseKernelConfig>;
+pub type MeasuredOp<K> = MeasuredOrPlaceholder<Op<K>, Op<ElementwiseKernel>>;
+
+impl<C> MeasuredConfig<C> {
+    /// `measured` on `backends`, or `placeholder` when there are none.
+    fn new(
+        backends: &[&'static str],
+        measured: impl FnOnce(Vec<&'static str>) -> C,
+        placeholder: ElementwiseKernelConfig,
+    ) -> Self {
+        if backends.is_empty() {
+            Self::Placeholder(placeholder)
+        } else {
+            Self::Measured(measured(backends.to_vec()))
+        }
+    }
+}
+
+impl<K: Probe> MeasuredOp<K> {
+    fn build<C>(
+        prefix: &str,
+        suffix: &str,
+        config: MeasuredConfig<C>,
+        build_kernel: impl FnOnce(String, C, &PerfApiBridge) -> Result<K, BuildError>,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        Ok(match config {
+            MeasuredOrPlaceholder::Measured(config) => {
+                Self::Measured(atomic(prefix, suffix, config, build_kernel, bridge)?)
+            }
+            MeasuredOrPlaceholder::Placeholder(config) => Self::Placeholder(atomic(
+                prefix,
+                suffix,
+                config,
+                ElementwiseKernel::build,
+                bridge,
+            )?),
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        match self {
+            Self::Measured(op) => op.compile(builder),
+            Self::Placeholder(op) => op.compile(builder),
+        }
+    }
+
+    /// Push the launch at the measured kind's `input`, or at the
+    /// placeholder's `placeholder_tokens`.
+    fn push_or_zero(&self, input: K::Input, placeholder_tokens: u32, zero: bool, ev: &mut Evaluator)
+    where
+        K::Input: Clone + Into<SlotInput>,
+    {
+        match self {
+            Self::Measured(op) => push_or_zero(op, input, zero, ev),
+            Self::Placeholder(op) => {
+                let input = ElementwiseKernelInput {
+                    num_tokens: placeholder_tokens,
+                };
+                push_or_zero(op, input, zero, ev)
+            }
+        }
+    }
+}
+
+/// Which launch list prices the per-iteration elementwise glue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaGlue {
+    /// `GLUE_LAUNCHES` launches of `GLUE_BYTES_PER_TOKEN` per token.
+    #[default]
+    Placeholder,
+    /// The fork's decode launches at their real bytes ([`DsaForkGlue`]): the
+    /// hidden state's fp32 cast for `head_weights`, the top-k buffer fill, two
+    /// position casts, the pool-id cast to int64, the `+ 1` on the top-k
+    /// sequence lengths, and the copy of the expanded indices into the top-k
+    /// buffer.
+    ForkLaunchList,
+}
+
+/// Fused launches that replace groups of the fork's DSA launches, each priced
+/// only by rows of the backend it names (a run-config override of its slot to
+/// another backend fails the build). The default is the fork's launches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glm53DsaFront {
+    /// The projections that read the hidden state (`fused_qkv_a`,
+    /// `wk_weights`, `kpool_gate_score`, and the fp32 `head_weights` with its
+    /// input cast) as one fp32-output GEMM over every column
+    /// (`gemm_fp32_output` on `fp32_gemm_backends`, slot `hidden_gemm`). Its
+    /// epilogue runs on this backend: decode rows take one state-update
+    /// launch (`dsa_fp32_split_state_update`, slot `hidden_state_writer`)
+    /// that rounds the bf16 column groups, LayerNorms the indexer k,
+    /// RMS-norms q and kv, appends the kv rows to the FP8 MLA cache, casts the
+    /// kpool positions and runs the kpool decode update
+    /// ([`SPLIT_STATE_WRITER_ABSORBS`]); prefill rows take one row-split
+    /// launch (`fp32_row_split_layer_norm`, slot `hidden_row_split`) and keep
+    /// the fork's norm and cache append. Absorbs the separate projections,
+    /// `indexer.k_norm` and the fork glue's hidden-state cast.
+    pub hidden_split_state_writer: Option<&'static str>,
+    /// `q_b` and the indexer's `wq_b`, which both read the normed q latent, as
+    /// one bf16 GEMM over concatenated weights (their callable and backends at
+    /// the summed width, slot `q_lora_gemm`), plus one epilogue launch on this
+    /// backend that reads the indexer query heads in place from the
+    /// concatenated output, Hadamard-rotates and FP8-quantizes them and
+    /// scales the head weights (`hadamard_fp8_quant_weight_scale`, slot
+    /// `q_lora_epilogue`). Absorbs `q_b_proj`, `indexer.wq_b`,
+    /// `indexer.q_fwht_quant` and `indexer.weight_scale`; the q/kv RMS norm
+    /// stays.
+    pub q_lora_hadamard_epilogue: Option<&'static str>,
+    /// `q_absorb`'s batched GEMM with the static FP8 quant of its output in
+    /// the epilogue (`batched_gemm_static_fp8_quant`, slot `q_absorb_fp8`).
+    /// Absorbs `q_absorb` and `q_fp8_quant`.
+    pub q_absorb_fp8: Option<&'static str>,
+    /// The decode rows' selected pools to the final physical page table and
+    /// valid counts in one launch after the decode top-k
+    /// (`dsa_pooled_topk_page_table`, slot `indexer.topk_page_table`), priced
+    /// at the batch's longest context. Absorbs the decode rows' pool expand
+    /// and index remap, and the fork glue's top-k buffer fill, pool-id cast,
+    /// sequence-length `+ 1` and buffer copy ([`PAGE_TABLE_ABSORBS`]).
+    /// Prefill rows keep the fork's expand and remap.
+    pub topk_page_table: Option<&'static str>,
+}
+
+/// The decode-row launches [`Glm53DsaFront::hidden_split_state_writer`]
+/// takes over beyond the projections (worklet slot suffixes): the q/kv RMS
+/// norm, the MLA cache append, the kpool position cast (one of the fork
+/// glue's two position casts; the top-k sequence lengths' stays) and the
+/// kpool decode update.
+pub const SPLIT_STATE_WRITER_ABSORBS: [&str; 4] = [
+    "q_kv_a_norm",
+    "sparse_mla.mla_cache_append",
+    "glue.positions_to_int32",
+    "indexer.kpool_decode_update",
+];
+
+/// The decode-row launches [`Glm53DsaFront::topk_page_table`] replaces
+/// (worklet slot suffixes).
+pub const PAGE_TABLE_ABSORBS: [&str; 6] = [
+    "indexer.expand_pools",
+    "sparse_mla.index_remap",
+    "glue.topk_buffer_fill",
+    "glue.pool_ids_to_int64",
+    "glue.seq_lens_plus_one",
+    "glue.topk_buffer_copy",
+];
+
+/// How a decode batch of unequal contexts prices its indexer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaDecodeIndexer {
+    /// MQA logits and top-k at the batch's longest context, the top-k on
+    /// uniform-random score rows.
+    #[default]
+    LongestContext,
+    /// Each kernel by how it spreads unequal requests. DeepGEMM's paged MQA
+    /// logits balances the SMs over each request's own context, so it prices
+    /// at the batch's mean pool count. The top-k runs one CTA per row on rows
+    /// drawn from the measured logit distribution: one wave at the longest
+    /// row, and past the GPU's SM count list-scheduled row by row.
+    PerRequest,
+}
 
 #[derive(Clone, Debug)]
 pub struct Glm53DsaAttnLocalWorkletConfig {
@@ -116,11 +308,26 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub mla_bmm_v_up_backends: Vec<&'static str>,
     pub mqa_logits_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    /// vLLM's `cooperative_topk`, which the fork's "auto" decode top-k runs
+    /// for at most 64 rows (`model_executor/layers/indexer_topk.py`). Empty
+    /// prices every decode batch on `topk_backends`.
+    pub cooperative_topk_backends: Vec<&'static str>,
     pub mqa_logits_prefill_backends: Vec<&'static str>,
     pub topk_prefill_backends: Vec<&'static str>,
     pub sparse_attention_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
     pub index_remap_backends: Vec<&'static str>,
+    /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant
+    /// (`hadamard_fp8_quant`). Empty prices `indexer.q_fwht_quant` by its
+    /// elementwise placeholder.
+    pub hadamard_quant_backends: Vec<&'static str>,
+    /// The absorbed query's static per-tensor FP8 quant, one `QuantFP8` launch
+    /// (`static_fp8_quant`). Empty prices `q_fp8_quant` by its placeholder.
+    pub static_quant_backends: Vec<&'static str>,
+    /// The pooled indexer key cache's decode update, one program per request
+    /// (`dsa_pooled_index_cache_update`). Empty prices
+    /// `indexer.kpool_decode_update` by its placeholder.
+    pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
     /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
@@ -131,6 +338,34 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// in bytes): the fp32 `[rows, pools]` matrix of one MQA-logits call stays
     /// within it, and each call is followed by its own top-k.
     pub indexer_max_logits_bytes: u64,
+    /// Query rows per decode request: 1 for plain decode, `k + 1` for a
+    /// speculative verify, whose rows sit at the request's last `k + 1`
+    /// positions. The decode indexer scores a request's rows in one group
+    /// (DeepGEMM `fp8_paged_mqa_logits` at `next_n`, one read of the request's
+    /// index keys) and its top-k selects per row; every other leaf, sparse MLA
+    /// included, bills the flattened rows.
+    pub decode_next_n: u32,
+    pub decode_indexer: DsaDecodeIndexer,
+    pub glue: DsaGlue,
+    pub front: Glm53DsaFront,
+}
+
+/// The fork's decode glue launches ([`DsaGlue::ForkLaunchList`]).
+#[derive(Clone, Debug)]
+pub struct DsaForkGlueConfigs {
+    /// `hidden_states.float()` ahead of `head_weights`, every row.
+    pub hidden_fp32_cast: ElementwiseKernelConfig,
+    /// `topk_indices_buffer[:rows] = -1`.
+    pub topk_buffer_fill: ElementwiseKernelConfig,
+    /// `positions[:n].to(int32)`, once for the kpool update's positions and
+    /// once for the top-k sequence lengths.
+    pub positions_to_int32: ElementwiseKernelConfig,
+    /// `pool_topk.to(int64)`.
+    pub pool_ids_to_int64: ElementwiseKernelConfig,
+    /// The top-k sequence lengths `+ 1`.
+    pub seq_lens_plus_one: ElementwiseKernelConfig,
+    /// `topk_indices_buffer[:rows, :window] = out`.
+    pub topk_buffer_copy: ElementwiseKernelConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -143,27 +378,38 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub index_wk_weights: SingleGemmKernelConfig,
     pub index_head_weights: GemmFp32OutputKernelConfig,
     pub index_k_norm: ElementwiseKernelConfig,
-    pub index_q_fwht_quant: ElementwiseKernelConfig,
+    pub index_q_fwht_quant: MeasuredConfig<HadamardFp8QuantKernelConfig>,
     pub index_weight_scale: ElementwiseKernelConfig,
     pub kpool_gate_score: SingleGemmKernelConfig,
     pub prefill_gather: ElementwiseKernelConfig,
-    pub kpool_decode_update: ElementwiseKernelConfig,
+    pub kpool_decode_update: MeasuredConfig<DsaPooledIndexCacheUpdateKernelConfig>,
     pub kpool_prefill_write: ElementwiseKernelConfig,
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
     pub topk_decode: DsaPersistentTopkDecodeKernelConfig,
+    /// `topk_decode` on the cooperative backends (`None` when there are none).
+    pub topk_decode_cooperative: Option<DsaPersistentTopkDecodeKernelConfig>,
     pub mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig,
     pub topk_prefill: DsaTopkPrefillKernelConfig,
     pub expand_pools: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub q_concat: ElementwiseKernelConfig,
-    pub q_fp8_quant: ElementwiseKernelConfig,
+    pub q_fp8_quant: MeasuredConfig<StaticFp8QuantKernelConfig>,
     pub sparse_mla: Glm53KpoolSparseMlaConfig,
     pub output_copy: ElementwiseKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
     pub prefill_glue: ElementwiseKernelConfig,
+    /// `raw_cfg.glue == ForkLaunchList`.
+    pub fork_glue: Option<DsaForkGlueConfigs>,
+    pub hidden_gemm: Option<GemmFp32OutputKernelConfig>,
+    pub hidden_row_split: Option<Fp32RowSplitLayerNormKernelConfig>,
+    pub hidden_state_writer: Option<DsaFp32SplitStateUpdateKernelConfig>,
+    pub q_lora_gemm: Option<SingleGemmKernelConfig>,
+    pub q_lora_epilogue: Option<HadamardFp8QuantWeightScaleKernelConfig>,
+    pub q_absorb_fp8: Option<BatchedGemmStaticFp8QuantKernelConfig>,
+    pub topk_page_table: Option<DsaPooledTopkPageTableKernelConfig>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -171,7 +417,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
 pub struct Glm53DsaAttnLocalWorkletInput {
     /// `(prefix, append)` per prefill request.
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
-    /// KV length per decode request, including the token being decoded.
+    /// KV length per decode request, including every query row it presents
+    /// (`decode_next_n` of them, ending at this length).
     pub decode_kv_lens: Vec<u32>,
 }
 
@@ -184,11 +431,11 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub index_wk_weights: Op<SingleGemmKernel>,
     pub index_head_weights: Op<GemmFp32OutputKernel>,
     pub index_k_norm: Op<ElementwiseKernel>,
-    pub index_q_fwht_quant: Op<ElementwiseKernel>,
+    pub index_q_fwht_quant: MeasuredOp<HadamardFp8QuantKernel>,
     pub index_weight_scale: Op<ElementwiseKernel>,
     pub kpool_gate_score: Op<SingleGemmKernel>,
     pub prefill_gather: Op<ElementwiseKernel>,
-    pub kpool_decode_update: Op<ElementwiseKernel>,
+    pub kpool_decode_update: MeasuredOp<DsaPooledIndexCacheUpdateKernel>,
     pub kpool_prefill_write: Op<ElementwiseKernel>,
     pub kpool_tail_seed: Op<ElementwiseKernel>,
     pub mqa_logits_decode: Op<DsaPagedMqaLogitsDecodeKernel>,
@@ -199,18 +446,51 @@ pub struct Glm53DsaAttnLocalWorklet {
     /// backends that take row starts (`dsa_topk_prefill::takes_row_starts`),
     /// when some of them do not. Its time lands in the `topk_prefill` slot.
     topk_prefill_packed: Option<Arc<DsaTopkPrefillKernel>>,
+    /// Rows `topk_decode` runs at once under [`DsaDecodeIndexer::PerRequest`]
+    /// (the GPU's SM count, one CTA per row). `None` prices every batch as one
+    /// wave: the longest-context pricing, or a GPU whose SM count the catalog
+    /// does not record.
+    topk_decode_slots: Option<u32>,
+    /// `cooperative_topk`, which the fork's "auto" dispatch runs for at most
+    /// [`COOPERATIVE_MAX_ROWS`] rows; its time lands in the `topk_decode`
+    /// slot. `None` without cooperative backends, on a GPU the fork's dispatch
+    /// skips (below SM90, or the SM12x family), or when `topk_decode` is
+    /// overridden to a backend outside [`LONG_ROW_BACKENDS`].
+    topk_decode_cooperative: Option<Arc<DsaPersistentTopkDecodeKernel>>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
-    pub q_fp8_quant: Op<ElementwiseKernel>,
+    pub q_fp8_quant: MeasuredOp<StaticFp8QuantKernel>,
     pub sparse_mla: Glm53KpoolSparseMlaOp,
     pub output_copy: Op<ElementwiseKernel>,
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
+    pub fork_glue: Option<DsaForkGlue>,
+    pub hidden_gemm: Option<Op<GemmFp32OutputKernel>>,
+    pub hidden_row_split: Option<Op<Fp32RowSplitLayerNormKernel>>,
+    pub hidden_state_writer: Option<Op<DsaFp32SplitStateUpdateKernel>>,
+    pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
+    pub q_lora_epilogue: Option<Op<HadamardFp8QuantWeightScaleKernel>>,
+    pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
+    pub topk_page_table: Option<Op<DsaPooledTopkPageTableKernel>>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
+
+/// The ops of [`DsaForkGlueConfigs`].
+pub struct DsaForkGlue {
+    pub hidden_fp32_cast: Op<ElementwiseKernel>,
+    pub topk_buffer_fill: Op<ElementwiseKernel>,
+    pub positions_to_int32: Op<ElementwiseKernel>,
+    pub pool_ids_to_int64: Op<ElementwiseKernel>,
+    pub seq_lens_plus_one: Op<ElementwiseKernel>,
+    pub topk_buffer_copy: Op<ElementwiseKernel>,
+}
+
+/// The fork casts the decode positions to int32 twice per step: for the kpool
+/// update and for the top-k sequence lengths.
+const POSITION_CASTS: u32 = 2;
 
 impl Glm53DsaAttnLocalWorklet {
     pub fn resolve_config(
@@ -241,10 +521,33 @@ impl Glm53DsaAttnLocalWorklet {
             dtype: bf16,
         };
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
-        // The per-head latent query, bf16, and its FP8 copy with one fp32
-        // scale per head.
+        // The per-head latent query, bf16.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
+        let topk_decode = DsaPersistentTopkDecodeKernelConfig {
+            backends: cfg.topk_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            next_n: cfg.decode_next_n,
+            max_model_len: max_model_len.clone(),
+            top_k: cfg.index_topk / kpool,
+            logits_row_stride: max_model_len.clone(),
+            logits_dtype: DType::Fp32,
+            index_dtype: "int32".into(),
+            context_mode: match cfg.decode_indexer {
+                DsaDecodeIndexer::LongestContext => "uniform",
+                // Scores drawn from the measured logit distribution: real
+                // GLM-5.3-Flash rows replay within ~5% of it, against
+                // 1.1-1.2x for uniform random scores.
+                DsaDecodeIndexer::PerRequest => "uniform_measured",
+            }
+            .into(),
+        };
+        let q_absorb = bmm(
+            &cfg.mla_bmm_q_absorb_backends,
+            cfg.kv_lora_rank.clone(),
+            cfg.qk_nope_head_dim.clone(),
+        );
+        let front = cfg.front;
         Glm53DsaAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
             q_kv_norm: QKvRmsNormKernelConfig {
@@ -269,19 +572,45 @@ impl Glm53DsaAttnLocalWorklet {
             // Inductor-fused fp32 LayerNorm of the indexer k: reads and writes
             // one bf16 D row per token.
             index_k_norm: ew(2 * index_dim, 2 * index_dim),
-            // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
-            index_q_fwht_quant: ew(
-                FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
-                FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
+            index_q_fwht_quant: MeasuredConfig::new(
+                &cfg.hadamard_quant_backends,
+                |backends| HadamardFp8QuantKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    head_dim: index_dim,
+                    input_dtype: bf16,
+                },
+                // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
+                ew(
+                    FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
+                    FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
+                ),
             ),
             // `weights * q_scale * scale`: two fp32 Hi rows in, one out.
             index_weight_scale: ew(2 * 4 * index_heads, 4 * index_heads),
             kpool_gate_score: gemm(index_dim, cfg.hidden.clone()),
             // 2*P*2D bytes gathered per prefill token, split over two launches.
             prefill_gather: ew(kpool * 2 * index_dim, kpool * 2 * index_dim),
-            // Per decode row: 524 read + 1536 per completed pool (1 in P rows),
-            // 512 stashed + (D+4) per completed pool.
-            kpool_decode_update: ew(524 + 1536 / kpool, 512 + (index_dim + 4) / kpool),
+            kpool_decode_update: MeasuredConfig::new(
+                &cfg.pooled_index_update_backends,
+                // One program per request walks its next_n rows in order; the
+                // tail ring holds one pool (`index_kpool` slots), as the fork's
+                // KpoolTailSpec(block_size = index_kpool).
+                |backends| DsaPooledIndexCacheUpdateKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    pool_size: kpool,
+                    tail_ring: kpool,
+                    index_dim: cfg.index_head_dim.clone(),
+                    block_size: cfg.cache_block_size,
+                    input_dtype: bf16,
+                    cache_dtype: DType::Fp8E4m3,
+                },
+                // Per decode row: 524 read + 1536 per completed pool (1 in P
+                // rows), 512 stashed + (D+4) per completed pool.
+                ew(524 + 1536 / kpool, 512 + (index_dim + 4) / kpool),
+            ),
             // Per prefill token: 9 + P*2*2D/P read, (D+4)/P written.
             kpool_prefill_write: ew(9 + 4 * index_dim, (index_dim + 4) / kpool),
             // Reads each prefill token's position; the < P tail rows are noise.
@@ -289,7 +618,7 @@ impl Glm53DsaAttnLocalWorklet {
             mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: cfg.mqa_logits_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
+                next_n: cfg.decode_next_n,
                 max_model_len: max_model_len.clone(),
                 num_heads: cfg.index_num_heads.clone(),
                 head_dim: cfg.index_head_dim.clone(),
@@ -304,17 +633,13 @@ impl Glm53DsaAttnLocalWorklet {
                 cache_format: "page_planar_fp8_fp32_scale".into(),
                 clean_logits: false,
             },
-            topk_decode: DsaPersistentTopkDecodeKernelConfig {
-                backends: cfg.topk_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
-                max_model_len: max_model_len.clone(),
-                top_k: cfg.index_topk / kpool,
-                logits_row_stride: max_model_len,
-                logits_dtype: DType::Fp32,
-                index_dtype: "int32".into(),
-                context_mode: "uniform".into(),
-            },
+            topk_decode_cooperative: (!cfg.cooperative_topk_backends.is_empty()).then(|| {
+                DsaPersistentTopkDecodeKernelConfig {
+                    backends: cfg.cooperative_topk_backends.clone(),
+                    ..topk_decode.clone()
+                }
+            }),
+            topk_decode,
             // One launch per iteration over every prefill row; each row spans
             // its own pool-granular context (`compress_ratio == index_kpool`).
             mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
@@ -342,16 +667,25 @@ impl Glm53DsaAttnLocalWorklet {
             },
             // Per row: int64 pool ids in, `index_topk + P - 1` int32 slots out.
             expand_pools: ew(8 * cfg.index_topk / kpool + 4, 4 * window),
-            q_absorb: bmm(
-                &cfg.mla_bmm_q_absorb_backends,
-                cfg.kv_lora_rank.clone(),
-                cfg.qk_nope_head_dim.clone(),
-            ),
             q_concat: ew(
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
             ),
-            q_fp8_quant: ew(latent_q_bytes, heads * (latent + 4)),
+            q_fp8_quant: MeasuredConfig::new(
+                &cfg.static_quant_backends,
+                // One static per-tensor quant over the token-major
+                // `[tokens, heads * latent]` query.
+                |backends| StaticFp8QuantKernelConfig {
+                    backends,
+                    gpu_name: cfg.gpu_name.clone(),
+                    hidden_dim: (heads * latent).into(),
+                    gated: false,
+                    dtype: bf16,
+                },
+                // The bf16 query in, its FP8 copy with one fp32 scale per head
+                // out.
+                ew(latent_q_bytes, heads * (latent + 4)),
+            ),
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
                 mla_cache_append_backends: cfg.mla_cache_append_backends.clone(),
@@ -389,6 +723,95 @@ impl Glm53DsaAttnLocalWorklet {
             glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
             // One int32 index row of `selected_k` lanes in and out per row.
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
+            fork_glue: (cfg.glue == DsaGlue::ForkLaunchList).then(|| DsaForkGlueConfigs {
+                hidden_fp32_cast: ew(2 * cfg.hidden.get(), 4 * cfg.hidden.get()),
+                topk_buffer_fill: ew(0, 4 * cfg.selected_k),
+                positions_to_int32: ew(8, 4),
+                pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
+                seq_lens_plus_one: ew(4, 4),
+                topk_buffer_copy: ew(4 * window, 4 * window),
+            }),
+            // [q_a | kv_a | k | gate score | head weights] in fp32.
+            hidden_gemm: front
+                .hidden_split_state_writer
+                .map(|_| GemmFp32OutputKernelConfig {
+                    backends: cfg.fp32_gemm_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    n: (cfg.q_lora_rank.get() + latent + 2 * index_dim + index_heads).into(),
+                    k: cfg.hidden.clone(),
+                    input_dtype: bf16,
+                }),
+            hidden_row_split: front.hidden_split_state_writer.map(|backend| {
+                Fp32RowSplitLayerNormKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    bf16_lead_cols: (cfg.q_lora_rank.get() + latent).into(),
+                    norm_cols: index_dim.into(),
+                    bf16_trail_cols: index_dim.into(),
+                    fp32_tail_cols: index_heads.into(),
+                }
+            }),
+            // The same row; the pooled index update's geometry is
+            // `kpool_decode_update`'s.
+            hidden_state_writer: front.hidden_split_state_writer.map(|backend| {
+                DsaFp32SplitStateUpdateKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    q_lora_cols: cfg.q_lora_rank.clone(),
+                    kv_lora_cols: cfg.kv_lora_rank.clone(),
+                    index_dim: cfg.index_head_dim.clone(),
+                    fp32_tail_cols: cfg.index_num_heads.clone(),
+                    pool_size: kpool,
+                    tail_ring: kpool,
+                    block_size: cfg.cache_block_size,
+                }
+            }),
+            // [q_b | wq_b] over the normed q latent; the indexer heads follow
+            // `q_b`'s columns in the concatenated row.
+            q_lora_gemm: front.q_lora_hadamard_epilogue.map(|_| {
+                gemm(
+                    heads * cfg.qk_nope_head_dim.get() + index_heads * index_dim,
+                    cfg.q_lora_rank.clone(),
+                )
+            }),
+            q_lora_epilogue: front.q_lora_hadamard_epilogue.map(|backend| {
+                HadamardFp8QuantWeightScaleKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_heads: cfg.index_num_heads.clone(),
+                    head_dim: cfg.index_head_dim.clone(),
+                    lead_cols: (heads * cfg.qk_nope_head_dim.get()).into(),
+                    input_dtype: bf16,
+                }
+            }),
+            // `q_absorb`'s shape, its output quantized in the epilogue.
+            q_absorb_fp8: front
+                .q_absorb_fp8
+                .map(|backend| BatchedGemmStaticFp8QuantKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: q_absorb.gpu_name.clone(),
+                    num_batches: q_absorb.num_batches.clone(),
+                    n: q_absorb.n.clone(),
+                    k: q_absorb.k.clone(),
+                    dtype: q_absorb.dtype,
+                }),
+            q_absorb,
+            // Compiled for `index_topk / kpool` pools, `selected_k` slots and
+            // the MLA cache block; the block table spans `max_model_len`.
+            topk_page_table: front.topk_page_table.map(|backend| {
+                DsaPooledTopkPageTableKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    max_model_len: max_model_len.clone(),
+                    top_k: cfg.index_topk / kpool,
+                    kpool,
+                    page_table_width: cfg.selected_k,
+                    block_size: cfg.cache_block_size,
+                    index_dtype: "int32".into(),
+                }
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -399,6 +822,10 @@ impl Glm53DsaAttnLocalWorklet {
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
+        let topk_decode_slots = match r.raw_cfg.decode_indexer {
+            DsaDecodeIndexer::LongestContext => None,
+            DsaDecodeIndexer::PerRequest => sm_count(&r.raw_cfg.gpu_name),
+        };
         let n = name.as_str();
         let ew = |suffix: &str, config| atomic(n, suffix, config, ElementwiseKernel::build, bridge);
         let gemm =
@@ -423,11 +850,23 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?,
             index_k_norm: ew("indexer.k_norm", r.index_k_norm)?,
-            index_q_fwht_quant: ew("indexer.q_fwht_quant", r.index_q_fwht_quant)?,
+            index_q_fwht_quant: MeasuredOp::build(
+                n,
+                "indexer.q_fwht_quant",
+                r.index_q_fwht_quant,
+                HadamardFp8QuantKernel::build,
+                bridge,
+            )?,
             index_weight_scale: ew("indexer.weight_scale", r.index_weight_scale)?,
             kpool_gate_score: gemm("indexer.kpool_gate_score", r.kpool_gate_score)?,
             prefill_gather: ew("indexer.prefill_gather", r.prefill_gather)?,
-            kpool_decode_update: ew("indexer.kpool_decode_update", r.kpool_decode_update)?,
+            kpool_decode_update: MeasuredOp::build(
+                n,
+                "indexer.kpool_decode_update",
+                r.kpool_decode_update,
+                DsaPooledIndexCacheUpdateKernel::build,
+                bridge,
+            )?,
             kpool_prefill_write: ew("indexer.kpool_prefill_write", r.kpool_prefill_write)?,
             kpool_tail_seed: ew("indexer.kpool_tail_seed", r.kpool_tail_seed)?,
             mqa_logits_decode: atomic(
@@ -452,6 +891,8 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?,
             topk_prefill_packed: None,
+            topk_decode_slots,
+            topk_decode_cooperative: None,
             topk_prefill: atomic(
                 n,
                 "indexer.topk_prefill",
@@ -462,7 +903,13 @@ impl Glm53DsaAttnLocalWorklet {
             expand_pools: ew("indexer.expand_pools", r.expand_pools)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             q_concat: ew("q_concat", r.q_concat)?,
-            q_fp8_quant: ew("q_fp8_quant", r.q_fp8_quant)?,
+            q_fp8_quant: MeasuredOp::build(
+                n,
+                "q_fp8_quant",
+                r.q_fp8_quant,
+                StaticFp8QuantKernel::build,
+                bridge,
+            )?,
             sparse_mla: Glm53KpoolSparseMlaOp::build(
                 format!("{n}.sparse_mla"),
                 r.sparse_mla,
@@ -473,9 +920,88 @@ impl Glm53DsaAttnLocalWorklet {
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
+            fork_glue: r
+                .fork_glue
+                .map(|g| -> Result<DsaForkGlue, BuildError> {
+                    Ok(DsaForkGlue {
+                        hidden_fp32_cast: ew("glue.hidden_fp32_cast", g.hidden_fp32_cast)?,
+                        topk_buffer_fill: ew("glue.topk_buffer_fill", g.topk_buffer_fill)?,
+                        positions_to_int32: ew("glue.positions_to_int32", g.positions_to_int32)?,
+                        pool_ids_to_int64: ew("glue.pool_ids_to_int64", g.pool_ids_to_int64)?,
+                        seq_lens_plus_one: ew("glue.seq_lens_plus_one", g.seq_lens_plus_one)?,
+                        topk_buffer_copy: ew("glue.topk_buffer_copy", g.topk_buffer_copy)?,
+                    })
+                })
+                .transpose()?,
+            hidden_gemm: r
+                .hidden_gemm
+                .map(|c| atomic(n, "hidden_gemm", c, GemmFp32OutputKernel::build, bridge))
+                .transpose()?,
+            hidden_row_split: r
+                .hidden_row_split
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_row_split",
+                        c,
+                        Fp32RowSplitLayerNormKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            hidden_state_writer: r
+                .hidden_state_writer
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_state_writer",
+                        c,
+                        DsaFp32SplitStateUpdateKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            q_lora_gemm: r.q_lora_gemm.map(|c| gemm("q_lora_gemm", c)).transpose()?,
+            q_lora_epilogue: r
+                .q_lora_epilogue
+                .map(|c| {
+                    atomic(
+                        n,
+                        "q_lora_epilogue",
+                        c,
+                        HadamardFp8QuantWeightScaleKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            q_absorb_fp8: r
+                .q_absorb_fp8
+                .map(|c| {
+                    atomic(
+                        n,
+                        "q_absorb_fp8",
+                        c,
+                        BatchedGemmStaticFp8QuantKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            topk_page_table: r
+                .topk_page_table
+                .map(|c| {
+                    atomic(
+                        n,
+                        "indexer.topk_page_table",
+                        c,
+                        DsaPooledTopkPageTableKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             name,
             resolved,
         };
+        worklet.check_front_backends()?;
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
         let backends = topk.kernel.config.backends.clone();
@@ -502,6 +1028,26 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?));
         }
+        // The fork's "auto" chain runs `cooperative_topk` up to 64 rows and
+        // its long-row kernel past it; checked on the backends as built, after
+        // any run-config override.
+        let topk = &worklet.topk_decode.kernel.config;
+        let cooperative_capable =
+            compute_capability(&topk.gpu_name).is_some_and(|(major, _)| major >= 9 && major != 12);
+        let auto_chain = topk
+            .backends
+            .iter()
+            .all(|backend| LONG_ROW_BACKENDS.contains(backend));
+        if let (Some(config), true) = (
+            &r.topk_decode_cooperative,
+            cooperative_capable && auto_chain,
+        ) {
+            worklet.topk_decode_cooperative = Some(Arc::new(DsaPersistentTopkDecodeKernel::build(
+                format!("{}.indexer.topk_decode.cooperative", worklet.name),
+                config.clone(),
+                bridge,
+            )?));
+        }
         Ok(worklet)
     }
 
@@ -513,80 +1059,136 @@ impl Glm53DsaAttnLocalWorklet {
                  kpool top-{} x {}]",
                 self.name, cfg.num_heads, cfg.index_num_heads, cfg.index_topk, cfg.index_kpool
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.fused_qkv_a.compile(builder),
-                self.q_kv_norm.compile(builder),
-                self.q_b.compile(builder),
-                self.index_wq_b.compile(builder),
-                self.index_wk_weights.compile(builder),
-                self.index_head_weights.compile(builder),
-                self.index_k_norm.compile(builder),
-                self.index_q_fwht_quant.compile(builder),
-                self.index_weight_scale.compile(builder),
-                self.kpool_gate_score.compile(builder),
-                repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
-                self.kpool_decode_update.compile(builder),
-                self.kpool_prefill_write.compile(builder),
-                self.kpool_tail_seed.compile(builder),
-                self.mqa_logits_decode.compile(builder),
-                self.topk_decode.compile(builder),
-                self.mqa_logits_prefill.compile(builder),
-                self.topk_prefill.compile(builder),
-                self.expand_pools.compile(builder),
-                self.q_absorb.compile(builder),
-                self.q_concat.compile(builder),
-                self.q_fp8_quant.compile(builder),
-                self.sparse_mla.compile(builder),
-                self.output_copy.compile(builder),
-                self.v_up.compile(builder),
-                self.o_proj.compile(builder),
-                repeated(&self.glue, GLUE_LAUNCHES, builder),
-                repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
-            ])),
+            child: Box::new(CostNode::Sum(self.compile_slots(builder))),
         }
+    }
+
+    /// The fork's launches, then each enabled [`Glm53DsaFront`] fusion (the
+    /// launches it replaces bill zero in `eval`), then the fork's glue launch
+    /// list when it replaces the placeholder (`glue` then bills zero).
+    fn compile_slots(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut slots = vec![
+            self.fused_qkv_a.compile(builder),
+            self.q_kv_norm.compile(builder),
+            self.q_b.compile(builder),
+            self.index_wq_b.compile(builder),
+            self.index_wk_weights.compile(builder),
+            self.index_head_weights.compile(builder),
+            self.index_k_norm.compile(builder),
+            self.index_q_fwht_quant.compile(builder),
+            self.index_weight_scale.compile(builder),
+            self.kpool_gate_score.compile(builder),
+            repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
+            self.kpool_decode_update.compile(builder),
+            self.kpool_prefill_write.compile(builder),
+            self.kpool_tail_seed.compile(builder),
+            self.mqa_logits_decode.compile(builder),
+            self.topk_decode.compile(builder),
+            self.mqa_logits_prefill.compile(builder),
+            self.topk_prefill.compile(builder),
+            self.expand_pools.compile(builder),
+            self.q_absorb.compile(builder),
+            self.q_concat.compile(builder),
+            self.q_fp8_quant.compile(builder),
+            self.sparse_mla.compile(builder),
+            self.output_copy.compile(builder),
+            self.v_up.compile(builder),
+            self.o_proj.compile(builder),
+            repeated(&self.glue, GLUE_LAUNCHES, builder),
+            repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
+        ];
+        slots.extend(self.hidden_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.hidden_row_split.as_ref().map(|op| op.compile(builder)));
+        slots.extend(
+            self.hidden_state_writer
+                .as_ref()
+                .map(|op| op.compile(builder)),
+        );
+        slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.topk_page_table.as_ref().map(|op| op.compile(builder)));
+        if let Some(g) = &self.fork_glue {
+            slots.extend([
+                g.hidden_fp32_cast.compile(builder),
+                g.topk_buffer_fill.compile(builder),
+                repeated(&g.positions_to_int32, self.position_casts(), builder),
+                g.pool_ids_to_int64.compile(builder),
+                g.seq_lens_plus_one.compile(builder),
+                g.topk_buffer_copy.compile(builder),
+            ]);
+        }
+        slots
     }
 
     pub fn eval(&self, input: &Glm53DsaAttnLocalWorkletInput, ev: &mut Evaluator) {
         let cfg = &self.resolved.raw_cfg;
-        let w = derive_work(input, &self.indexer_budget())
+        let w = derive_work(input, cfg.decode_next_n, &self.indexer_budget())
             .unwrap_or_else(|reason| panic!("invalid Glm53DsaAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
         let tokens = |num_tokens| ElementwiseKernelInput { num_tokens };
         let all = tokens(w.total_tokens);
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
-        push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
+        let front = cfg.front;
+        // The split state writer takes the decode rows' q/kv norm, cache
+        // append, kpool position cast and kpool update; prefill rows keep them.
+        let split_writer = front.hidden_split_state_writer.is_some();
+        let q_lora_merged = front.q_lora_hadamard_epilogue.is_some();
+        let absorb_fused = front.q_absorb_fp8.is_some();
+        let page_table = front.topk_page_table.is_some();
+        push_or_zero(&self.fused_qkv_a, rows.clone(), split_writer, ev);
+        let norm_tokens = if split_writer {
+            w.prefill_tokens
+        } else {
+            w.total_tokens
+        };
         push_or_zero(
             &self.q_kv_norm,
             QKvRmsNormKernelInput {
-                num_tokens: w.total_tokens,
+                num_tokens: norm_tokens,
             },
-            false,
+            split_writer && no_prefill,
             ev,
         );
-        push_or_zero(&self.q_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wq_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wk_weights, rows.clone(), false, ev);
+        push_or_zero(&self.q_b, rows.clone(), q_lora_merged, ev);
+        push_or_zero(&self.index_wq_b, rows.clone(), q_lora_merged, ev);
+        push_or_zero(&self.index_wk_weights, rows.clone(), split_writer, ev);
         push_or_zero(
             &self.index_head_weights,
             GemmFp32OutputKernelInput { m: w.total_tokens },
-            false,
+            split_writer,
             ev,
         );
-        push_or_zero(&self.index_k_norm, all.clone(), false, ev);
-        push_or_zero(&self.index_q_fwht_quant, all.clone(), false, ev);
-        push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
-        push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
+        push_or_zero(&self.index_k_norm, all.clone(), split_writer, ev);
+        self.index_q_fwht_quant.push_or_zero(
+            HadamardFp8QuantKernelInput {
+                num_rows: w.total_tokens * cfg.index_num_heads.get(),
+            },
+            w.total_tokens,
+            q_lora_merged,
+            ev,
+        );
+        push_or_zero(&self.index_weight_scale, all.clone(), q_lora_merged, ev);
+        push_or_zero(&self.kpool_gate_score, rows.clone(), split_writer, ev);
         push_or_zero(
             &self.prefill_gather,
             tokens(w.prefill_tokens),
             no_prefill,
             ev,
         );
-        push_or_zero(
-            &self.kpool_decode_update,
-            tokens(w.decode_rows),
-            no_decode,
+        // Logged as the requests (rows) this slot bills.
+        let (update_requests, update_rows) = if split_writer {
+            (0, 0)
+        } else {
+            (w.decode_requests, w.decode_rows)
+        };
+        self.kpool_decode_update.push_or_zero(
+            DsaPooledIndexCacheUpdateKernelInput {
+                num_requests: update_requests,
+            },
+            update_rows,
+            update_rows == 0,
             ev,
         );
         push_or_zero(
@@ -604,23 +1206,18 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
-                batch_size: w.decode_rows,
-                context_len: w.decode_pools,
+                batch_size: w.decode_requests,
+                context_len: match cfg.decode_indexer {
+                    DsaDecodeIndexer::LongestContext => w.decode_pools,
+                    DsaDecodeIndexer::PerRequest => w.decode_mean_pools,
+                },
             },
             no_decode,
             ev,
         );
-        push_or_zero(
-            &self.topk_decode,
-            DsaPersistentTopkDecodeKernelInput {
-                batch_size: w.decode_rows,
-                context_len: w.decode_pools,
-            },
-            no_decode,
-            ev,
-        );
+        self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
         self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
-        let expand_rows = w.decode_rows + w.prefill_indexer_rows;
+        let expand_rows = w.prefill_indexer_rows + if page_table { 0 } else { w.decode_rows };
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
@@ -630,11 +1227,18 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.q_absorb,
             BatchedGemmKernelInput { m: w.total_tokens },
-            false,
+            absorb_fused,
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
-        push_or_zero(&self.q_fp8_quant, all.clone(), false, ev);
+        self.q_fp8_quant.push_or_zero(
+            StaticFp8QuantKernelInput {
+                num_tokens: w.total_tokens,
+            },
+            w.total_tokens,
+            absorb_fused,
+            ev,
+        );
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
                 prefill_query_cache_pairs: input
@@ -642,7 +1246,13 @@ impl Glm53DsaAttnLocalWorklet {
                     .iter()
                     .map(|&(prefix, append)| (append, prefix + append))
                     .collect(),
-                decode_context_lens: input.decode_kv_lens.clone(),
+                decode_context_lens: decode_row_context_lens(
+                    &input.decode_kv_lens,
+                    cfg.decode_next_n,
+                ),
+                decode_cache_append_elsewhere: split_writer,
+                decode_remap_elsewhere: page_table,
+                ..Default::default()
             },
             ev,
         );
@@ -653,13 +1263,127 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.o_proj, rows, false, ev);
-        push_or_zero(&self.glue, all.clone(), false, ev);
-        push_or_zero(&self.prefill_glue, all, no_prefill, ev);
+        push_or_zero(&self.o_proj, rows.clone(), false, ev);
+        push_or_zero(&self.glue, all.clone(), self.fork_glue.is_some(), ev);
+        push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(op) = &self.hidden_gemm {
+            let input = GemmFp32OutputKernelInput { m: w.total_tokens };
+            push_or_zero(op, input, false, ev);
+        }
+        if let Some(op) = &self.hidden_row_split {
+            let input = Fp32RowSplitLayerNormKernelInput {
+                num_tokens: w.prefill_tokens,
+            };
+            push_or_zero(op, input, no_prefill, ev);
+        }
+        if let Some(op) = &self.hidden_state_writer {
+            let input = DsaFp32SplitStateUpdateKernelInput {
+                num_requests: w.decode_requests,
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
+        if let Some(op) = &self.q_lora_gemm {
+            push_or_zero(op, rows.clone(), false, ev);
+        }
+        if let Some(op) = &self.q_lora_epilogue {
+            let input = HadamardFp8QuantWeightScaleKernelInput {
+                num_tokens: w.total_tokens,
+            };
+            push_or_zero(op, input, false, ev);
+        }
+        if let Some(op) = &self.q_absorb_fp8 {
+            let input = BatchedGemmStaticFp8QuantKernelInput { m: w.total_tokens };
+            push_or_zero(op, input, false, ev);
+        }
+        if let Some(op) = &self.topk_page_table {
+            let input = DsaPooledTopkPageTableKernelInput {
+                batch_size: w.decode_requests,
+                context_len: w.decode_pools,
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
+        if let Some(g) = &self.fork_glue {
+            let decode = tokens(w.decode_rows);
+            let post_topk_gone = no_decode || page_table;
+            push_or_zero(&g.hidden_fp32_cast, all, split_writer, ev);
+            push_or_zero(&g.topk_buffer_fill, decode.clone(), post_topk_gone, ev);
+            push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), post_topk_gone, ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), post_topk_gone, ev);
+            push_or_zero(&g.topk_buffer_copy, decode, post_topk_gone, ev);
+        }
     }
 }
 
 impl Glm53DsaAttnLocalWorklet {
+    /// Each [`Glm53DsaFront`] fusion is priced by its named backend's rows or
+    /// not at all: a run-config override would price another kernel under
+    /// its name.
+    fn check_front_backends(&self) -> Result<(), BuildError> {
+        let front = self.resolved.raw_cfg.front;
+        let pinned = [
+            (
+                front.hidden_split_state_writer,
+                self.hidden_row_split
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.hidden_split_state_writer,
+                self.hidden_state_writer
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.q_lora_hadamard_epilogue,
+                self.q_lora_epilogue
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.q_absorb_fp8,
+                self.q_absorb_fp8
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.topk_page_table,
+                self.topk_page_table
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+        ];
+        for (backend, op) in pinned {
+            if let (Some(backend), Some((role, built, kind))) = (backend, op) {
+                if built.as_slice() != [backend] {
+                    return Err(BuildError::NoBackendForLaunch {
+                        kind,
+                        role: role.clone(),
+                        backends: built.clone(),
+                        launch: "a fused DSA launch, which only its configured backend prices",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fork-glue position casts per decode step; the split state writer
+    /// reads the int64 positions, so the kpool update's cast is gone.
+    fn position_casts(&self) -> u32 {
+        if self
+            .resolved
+            .raw_cfg
+            .front
+            .hidden_split_state_writer
+            .is_some()
+        {
+            POSITION_CASTS - 1
+        } else {
+            POSITION_CASTS
+        }
+    }
+
     fn indexer_budget(&self) -> IndexerBudget {
         let cfg = &self.resolved.raw_cfg;
         IndexerBudget {
@@ -668,6 +1392,62 @@ impl Glm53DsaAttnLocalWorklet {
             max_logits_elems: cfg.indexer_max_logits_bytes / u64::from(DType::Fp32.size_bytes()),
             max_keys: PREFILL_KEY_WORKSPACE_PER_MODEL_LEN * u64::from(cfg.max_model_len),
         }
+    }
+
+    /// The decode top-k runs one CTA per row. A batch that fits one wave of
+    /// `topk_decode_slots` rows takes as long as its longest row: the uniform
+    /// grid at the batch's max context. A larger batch is list-scheduled: rows
+    /// go in order to the earliest-free slot, each costing its own context's
+    /// per-row share of a one-wave launch, plus that launch's fixed part once.
+    /// Against real B200 batches of 120-644 rows this lands within +1..+6%
+    /// median and +9% p90, where the max context overprices by up to 2.4x and
+    /// the mean context underprices by 10-43%.
+    fn eval_decode_topk(&self, kv_lens: &[u32], w: &Work, ev: &mut Evaluator) {
+        let input = |batch_size, context_len| DsaPersistentTopkDecodeKernelInput {
+            batch_size,
+            context_len,
+        };
+        let longest = input(w.decode_requests, w.decode_pools);
+        if let Some(cooperative) = &self.topk_decode_cooperative {
+            if w.decode_rows > 0 && w.decode_rows <= COOPERATIVE_MAX_ROWS {
+                // One wave of CTA clusters over every row: the longest row
+                // sets the time. The pick is not one of the slot's backends.
+                let mut metrics = cooperative.eval(&longest);
+                metrics.backend_index = LeafMetrics::NO_BACKEND;
+                return ev.push(metrics, || longest.into());
+            }
+        }
+        let kernel = &self.topk_decode.kernel;
+        let slots = match self.topk_decode_slots {
+            Some(slots) if w.decode_rows > slots => slots,
+            _ => return push_or_zero(&self.topk_decode, longest, w.decode_rows == 0, ev),
+        };
+        let cfg = &self.resolved.raw_cfg;
+        let next_n = cfg.decode_next_n;
+        // The one-wave launch the per-row costs come from: as many requests as
+        // fill `TOPK_WAVE_ROWS` rows.
+        let wave = (TOPK_WAVE_ROWS / next_n).max(1);
+        let fixed = kernel.eval(&input(wave, cfg.index_topk / cfg.index_kpool));
+        let fixed_ms = f64::from(fixed.m.time_ms);
+        let per_row_ms = |pools| {
+            let one_wave = kernel.eval(&input(wave, pools));
+            (f64::from(one_wave.m.time_ms) - fixed_ms).max(0.0)
+        };
+        let time_ms = fixed_ms
+            + list_schedule_ms(
+                kv_lens.iter().map(|&kv| kv.div_ceil(cfg.index_kpool)),
+                next_n,
+                slots,
+                per_row_ms,
+            );
+        // Bytes and FLOPs follow the batch's total pools.
+        let mut metrics = kernel.eval(&input(w.decode_requests, w.decode_mean_pools));
+        let scale = time_ms as f32 / metrics.m.time_ms;
+        metrics.m.time_ms = time_ms as f32;
+        if scale.is_finite() {
+            metrics.m.energy_j *= scale;
+        }
+        ev.push(metrics, || longest.into());
     }
 
     /// One MQA-logits and one top-k launch per indexer chunk, each slot summing
@@ -718,9 +1498,16 @@ impl Glm53DsaAttnLocalWorklet {
 struct Work {
     total_tokens: u32,
     prefill_tokens: u32,
+    /// `decode_requests * decode_next_n`.
     decode_rows: u32,
+    decode_requests: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
+    /// `ceil(sum of ceil(decode context / index_kpool) / decode_requests)`:
+    /// the uniform context with the batch's total pools. Ragged B200 batches
+    /// of DeepGEMM's paged MQA logits match a uniform batch at this mean
+    /// within a few percent, against 3-5x at the max context.
+    decode_mean_pools: u32,
     /// Every prefill row once any prefill context exceeds `index_topk`, else
     /// 0: vLLM skips the prefill indexer only when every context fits, and
     /// otherwise scores and selects for all prefill rows.
@@ -732,6 +1519,55 @@ struct Work {
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
+
+/// The `topk_decode` backends that run past [`COOPERATIVE_MAX_ROWS`] behind
+/// the cooperative kernel. `vllm_cuda` (persistent_topk) is the fork's "auto"
+/// chain. `deep_select` there is the same chain with its long-row kernel
+/// swapped, not the fork's explicit `deep_select` setting, which runs every
+/// batch on DeepSelect. Any other backend runs every batch on itself.
+const LONG_ROW_BACKENDS: [&str; 2] = ["vllm_cuda", "deep_select"];
+
+/// Rows of the one-wave uniform launch `eval_decode_topk` prices each row
+/// from: below the SM count, so the measured batch axis does not straddle a
+/// wave edge (next_n 4 at 32 requests, next_n 8 at 16, both grid knots).
+const TOPK_WAVE_ROWS: u32 = 128;
+
+/// Greedy in-order dispatch of each request's `next_n` rows onto `slots`
+/// parallel slots, a row costing `row_ms(pools)`; the makespan.
+fn list_schedule_ms(
+    pools: impl Iterator<Item = u32>,
+    next_n: u32,
+    slots: u32,
+    mut row_ms: impl FnMut(u32) -> f64,
+) -> f64 {
+    /// A slot's free time, ordered so the max-heap yields the earliest.
+    struct Free(f64);
+    impl Ord for Free {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            other.0.total_cmp(&self.0)
+        }
+    }
+    impl PartialOrd for Free {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl PartialEq for Free {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+    impl Eq for Free {}
+    let mut heap: BinaryHeap<Free> = (0..slots).map(|_| Free(0.0)).collect();
+    for pools in pools {
+        let cost = row_ms(pools);
+        for _ in 0..next_n {
+            let mut slot = heap.peek_mut().expect("at least one slot");
+            slot.0 += cost;
+        }
+    }
+    heap.into_iter().map(|free| free.0).fold(0.0, f64::max)
+}
 
 /// What bounds the prefill indexer's launches.
 struct IndexerBudget {
@@ -833,6 +1669,7 @@ fn indexer_chunk(
 
 fn derive_work(
     input: &Glm53DsaAttnLocalWorkletInput,
+    decode_next_n: u32,
     budget: &IndexerBudget,
 ) -> Result<Work, String> {
     let (index_topk, index_kpool) = (budget.index_topk, budget.index_kpool);
@@ -858,11 +1695,27 @@ fn derive_work(
     } else {
         (0, Vec::new())
     };
-    let decode_rows = input.decode_kv_lens.len() as u32;
-    if input.decode_kv_lens.contains(&0) {
-        return Err("decode KV lengths must be positive".into());
+    let decode_requests = input.decode_kv_lens.len() as u32;
+    if input.decode_kv_lens.iter().any(|&kv| kv < decode_next_n) {
+        return Err(format!(
+            "decode KV lengths must cover their decode_next_n {decode_next_n} query rows"
+        ));
     }
+    let decode_rows = decode_requests
+        .checked_mul(decode_next_n)
+        .ok_or("decode row count overflows u32")?;
     let max_decode = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
+    let total_decode_pools: u64 = input
+        .decode_kv_lens
+        .iter()
+        .map(|&context| u64::from(context.div_ceil(index_kpool)))
+        .sum();
+    let decode_mean_pools = if decode_requests == 0 {
+        0
+    } else {
+        u32::try_from(total_decode_pools.div_ceil(u64::from(decode_requests)))
+            .map_err(|_| "decode mean pools overflow u32")?
+    };
     let total_tokens = prefill_tokens
         .checked_add(decode_rows)
         .ok_or("token sum overflows u32")?;
@@ -873,10 +1726,20 @@ fn derive_work(
         total_tokens,
         prefill_tokens,
         decode_rows,
+        decode_requests,
         decode_pools: max_decode.div_ceil(index_kpool),
+        decode_mean_pools,
         prefill_indexer_rows,
         prefill_indexer_chunks,
     })
+}
+
+/// Each request's query rows, at its last `next_n` positions.
+fn decode_row_context_lens(kv_lens: &[u32], next_n: u32) -> Vec<u32> {
+    kv_lens
+        .iter()
+        .flat_map(|&kv_len| kv_len + 1 - next_n..=kv_len)
+        .collect()
 }
 
 /// `sum over x in 1..=n of x / kpool`: the pools spanned by the rows at
@@ -898,6 +1761,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::timing::CoverageFlags;
 
     pub(crate) fn cfg() -> Glm53DsaAttnLocalWorkletConfig {
         Glm53DsaAttnLocalWorkletConfig {
@@ -923,14 +1787,22 @@ mod tests {
             mla_bmm_v_up_backends: vec!["torch_mla_v_up_unpadded"],
             mqa_logits_backends: vec!["deepgemm_fp8"],
             topk_backends: vec!["vllm_cuda"],
+            cooperative_topk_backends: Vec::new(),
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             index_remap_backends: vec!["vllm_triton"],
+            hadamard_quant_backends: Vec::new(),
+            static_quant_backends: Vec::new(),
+            pooled_index_update_backends: Vec::new(),
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
+            decode_next_n: 1,
+            decode_indexer: DsaDecodeIndexer::LongestContext,
+            glue: DsaGlue::Placeholder,
+            front: Glm53DsaFront::default(),
         }
     }
 
@@ -950,9 +1822,149 @@ mod tests {
                 prefill_chunk_pairs,
                 decode_kv_lens,
             },
+            1,
             &budget(),
         )
         .unwrap()
+    }
+
+    /// The worklet of `cfg()` after `edit`, under run-config backend
+    /// overrides of `(role, backend)`.
+    fn build_with(
+        edit: impl FnOnce(&mut Glm53DsaAttnLocalWorkletConfig),
+        overrides: &[(&str, &str)],
+    ) -> Result<Glm53DsaAttnLocalWorklet, BuildError> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let map: HashMap<String, Vec<String>> = overrides
+            .iter()
+            .map(|(role, backend)| (role.to_string(), vec![backend.to_string()]))
+            .collect();
+        let _scope = bridge.with_backend_overrides("main", Some(&map));
+        let mut config = cfg();
+        edit(&mut config);
+        Glm53DsaAttnLocalWorklet::build(
+            "m.dsa".into(),
+            Glm53DsaAttnLocalWorklet::resolve_config(&config),
+            &bridge,
+        )
+    }
+
+    /// `(name, kind)` of every compiled slot, in order.
+    fn slots(worklet: &Glm53DsaAttnLocalWorklet) -> Vec<(String, String)> {
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        let tree = builder.finish(root);
+        tree.slots
+            .iter()
+            .map(|slot| (slot.name.clone(), slot.kind.clone()))
+            .collect()
+    }
+
+    /// Each slot's logged input after one eval (structure-only kernels
+    /// answer zero time, so the logged sizes are what a test can read).
+    fn eval_inputs(
+        worklet: &Glm53DsaAttnLocalWorklet,
+        input: &Glm53DsaAttnLocalWorkletInput,
+    ) -> HashMap<String, serde_json::Value> {
+        let names = slots(worklet);
+        let mut metrics = vec![LeafMetrics::MISS; names.len()];
+        let mut inputs = Vec::new();
+        let mut ev = Evaluator::with_inputs(&mut metrics, &mut inputs);
+        worklet.eval(input, &mut ev);
+        assert_eq!(ev.filled(), names.len());
+        names
+            .into_iter()
+            .zip(inputs)
+            .map(|((name, _), input)| (name, serde_json::to_value(input).unwrap()))
+            .collect()
+    }
+
+    /// Slots `worklet` bills zero on `input` that `base` bills (a
+    /// structure-only kernel answers a miss, a zeroed slot answers zero).
+    fn newly_zeroed(
+        worklet: &Glm53DsaAttnLocalWorklet,
+        base: &Glm53DsaAttnLocalWorklet,
+        input: &Glm53DsaAttnLocalWorkletInput,
+    ) -> Vec<String> {
+        let zeroed = |w: &Glm53DsaAttnLocalWorklet| -> Vec<String> {
+            let names = slots(w);
+            let mut metrics = vec![LeafMetrics::MISS; names.len()];
+            let mut ev = Evaluator::new(&mut metrics);
+            w.eval(input, &mut ev);
+            names
+                .into_iter()
+                .zip(metrics)
+                .filter(|(_, m)| m.coverage == CoverageFlags::EMPTY)
+                .map(|((name, _), _)| name)
+                .collect()
+        };
+        let base = zeroed(base);
+        zeroed(worklet)
+            .into_iter()
+            .filter(|name| !base.contains(name))
+            .collect()
+    }
+
+    /// Catches a measured kind that prices the wrong count: the Hadamard
+    /// quant runs per indexer head row, the pooled index update per request
+    /// (not per verify row), the static quant per token. Without a backend
+    /// each slot keeps its per-token placeholder.
+    #[test]
+    fn measured_kinds_replace_the_placeholders_where_backends_are_named() {
+        const SLOTS: [(&str, &str, &str); 3] = [
+            (
+                "m.dsa.indexer.q_fwht_quant",
+                "hadamard_fp8_quant",
+                "num_rows",
+            ),
+            (
+                "m.dsa.indexer.kpool_decode_update",
+                "dsa_pooled_index_cache_update",
+                "num_requests",
+            ),
+            ("m.dsa.q_fp8_quant", "static_fp8_quant", "num_tokens"),
+        ];
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let placeholder = build_with(|c| c.decode_next_n = 4, &[]).unwrap();
+        let measured = build_with(
+            |c| {
+                c.decode_next_n = 4;
+                c.hadamard_quant_backends = vec!["vllm_triton"];
+                c.static_quant_backends = vec!["vllm_cuda"];
+                c.pooled_index_update_backends = vec!["vllm_fork_triton"];
+            },
+            &[],
+        )
+        .unwrap();
+        let kind = |worklet: &Glm53DsaAttnLocalWorklet, name: &str| {
+            let slots = slots(worklet);
+            assert_eq!(slots.len(), 24 + 4 + 3);
+            slots.into_iter().find(|(n, _)| n == name).unwrap().1
+        };
+        let (placeholder_inputs, measured_inputs) = (
+            eval_inputs(&placeholder, &input),
+            eval_inputs(&measured, &input),
+        );
+        // 5 prefill rows and 2 requests of 4 rows; 32 indexer heads.
+        for ((name, measured_kind, field), (tokens, count)) in
+            SLOTS.into_iter().zip([(13, 13 * 32), (8, 2), (13, 13)])
+        {
+            assert_eq!(kind(&placeholder, name), "elementwise", "{name}");
+            assert_eq!(placeholder_inputs[name]["num_tokens"], tokens, "{name}");
+            assert_eq!(kind(&measured, name), measured_kind, "{name}");
+            assert_eq!(measured_inputs[name][field], count, "{name}");
+        }
+        let MeasuredOrPlaceholder::Measured(update) = &measured.resolved.kpool_decode_update else {
+            panic!("named backend")
+        };
+        assert_eq!(
+            (update.next_n, update.pool_size, update.tail_ring),
+            (4, 4, 4)
+        );
     }
 
     #[test]
@@ -977,6 +1989,84 @@ mod tests {
         assert_eq!((r.v_up.n.get(), r.v_up.k.get()), (256, 512));
         assert_eq!(r.sparse_mla.softmax_scale_denominator, 16);
         assert_eq!(r.expand_pools.output_bytes_per_token.get(), 4 * 2051);
+    }
+
+    /// Catches a verify graph whose indexer bills each query row as its own
+    /// request (re-reading the index keys `next_n` times) or that loses rows.
+    #[test]
+    fn a_verify_request_scores_its_rows_in_one_indexer_group() {
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![1000, 4001],
+        };
+        let w = derive_work(&input, 8, &budget()).unwrap();
+        assert_eq!(
+            (w.decode_requests, w.decode_rows, w.total_tokens),
+            (2, 16, 16)
+        );
+        assert_eq!(w.decode_pools, 1001);
+        // 250 + 1001 pools over two requests.
+        assert_eq!(w.decode_mean_pools, 626);
+        assert_eq!(
+            decode_row_context_lens(&[10, 50], 4),
+            [7, 8, 9, 10, 47, 48, 49, 50]
+        );
+        let short = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![7],
+        };
+        assert!(derive_work(&short, 8, &budget()).is_err());
+        let mut config = cfg();
+        config.decode_next_n = 8;
+        let r = Glm53DsaAttnLocalWorklet::resolve_config(&config);
+        assert_eq!((r.mqa_logits_decode.next_n, r.topk_decode.next_n), (8, 8));
+    }
+
+    /// Catches a decode top-k that prices a batch past one wave at its longest
+    /// row (each slot then holds one row) or at the total work over the slots
+    /// (ignoring that one long row bounds the makespan).
+    #[test]
+    fn decode_topk_list_schedules_rows_onto_slots() {
+        let row_ms = |pools: u32| f64::from(pools);
+        // Two slots, two rows per request: each slot takes 10, 1, 1.
+        assert_eq!(list_schedule_ms([10, 1, 1].into_iter(), 2, 2, row_ms), 12.0);
+        // One long request on its own slot bounds the makespan.
+        assert_eq!(
+            list_schedule_ms([1, 1, 1, 20].into_iter(), 1, 2, row_ms),
+            21.0
+        );
+        assert_eq!(list_schedule_ms(std::iter::empty(), 4, 148, row_ms), 0.0);
+    }
+
+    /// The per-request pricing is opt-in: the default keeps the uniform
+    /// score rows and one wave on every GPU.
+    #[test]
+    fn per_request_indexer_pricing_takes_measured_rows_and_sm_waves() {
+        let build = |decode_indexer, gpu: &str| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let mut config = cfg();
+            config.decode_indexer = decode_indexer;
+            config.gpu_name = gpu.into();
+            Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                &bridge,
+            )
+            .unwrap()
+        };
+        let longest = build(DsaDecodeIndexer::LongestContext, "NVIDIA B200");
+        assert_eq!(longest.resolved.topk_decode.context_mode, "uniform");
+        assert_eq!(longest.topk_decode_slots, None);
+        let per_request = build(DsaDecodeIndexer::PerRequest, "NVIDIA B200");
+        assert_eq!(
+            per_request.resolved.topk_decode.context_mode,
+            "uniform_measured"
+        );
+        assert_eq!(per_request.topk_decode_slots, Some(148));
+        // No SM count in the catalog: one wave.
+        let a100 = build(DsaDecodeIndexer::PerRequest, "A100-SXM4-80GB");
+        assert_eq!(a100.topk_decode_slots, None);
     }
 
     #[test]
@@ -1122,6 +2212,506 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    /// Catches a launch list that loses a launch: seven fork launches (the
+    /// two position casts folded into one scaled leaf), decode rows only
+    /// except the hidden cast.
+    #[test]
+    fn fork_glue_lists_the_seven_decode_launches() {
+        let w = build_with(|c| c.glue = DsaGlue::ForkLaunchList, &[]).unwrap();
+        let names: Vec<String> = slots(&w)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("m.dsa.glue."))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.glue.topk_buffer_fill",
+                "m.dsa.glue.positions_to_int32",
+                "m.dsa.glue.pool_ids_to_int64",
+                "m.dsa.glue.seq_lens_plus_one",
+                "m.dsa.glue.topk_buffer_copy",
+            ]
+        );
+        let g = w.resolved.fork_glue.as_ref().unwrap();
+        assert_eq!(g.topk_buffer_fill.input_bytes_per_token.get(), 0);
+        assert_eq!(g.topk_buffer_copy.output_bytes_per_token.get(), 4 * 2051);
+        let inputs = eval_inputs(
+            &w,
+            &Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs: vec![(0, 5)],
+                decode_kv_lens: vec![4000, 5000],
+            },
+        );
+        assert_eq!(inputs["m.dsa.glue.hidden_fp32_cast"]["num_tokens"], 7);
+        assert_eq!(inputs["m.dsa.glue.topk_buffer_copy"]["num_tokens"], 2);
+    }
+
+    /// Catches a q-latent concat that drops or double-counts a projection, an
+    /// epilogue that prices the wrong span or kind, keeps the absorbed FWHT
+    /// quant and weight scale, or drifts to another backend.
+    #[test]
+    fn q_lora_concat_is_one_gemm_and_one_hadamard_epilogue() {
+        let front = Glm53DsaFront {
+            q_lora_hadamard_epilogue: Some("post_kernel"),
+            ..Default::default()
+        };
+        let w = build_with(|c| c.front = front, &[]).unwrap();
+        let r = &w.resolved;
+        let q_lora = r.q_lora_gemm.as_ref().unwrap();
+        assert_eq!(q_lora.n.get(), r.q_b.n.get() + r.index_wq_b.n.get());
+        assert_eq!((q_lora.k.get(), q_lora.dtype), (1536, DType::Bf16));
+        assert_eq!(q_lora.backends, r.q_b.backends);
+        let epi = r.q_lora_epilogue.as_ref().unwrap();
+        assert_eq!(
+            (epi.num_heads.get(), epi.head_dim.get(), epi.lead_cols.get()),
+            (32, 128, r.q_b.n.get())
+        );
+        assert_eq!(epi.input_dtype, DType::Bf16);
+        let base = slots(&build_with(|_| {}, &[]).unwrap());
+        let added: Vec<_> = slots(&w)
+            .into_iter()
+            .filter(|slot| !base.contains(slot))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("m.dsa.q_lora_gemm".to_string(), "single_gemm".to_string()),
+                (
+                    "m.dsa.q_lora_epilogue".to_string(),
+                    "hadamard_fp8_quant_weight_scale".to_string()
+                ),
+            ]
+        );
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        assert_eq!(
+            newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
+            [
+                "m.dsa.q_b_proj",
+                "m.dsa.indexer.wq_b",
+                "m.dsa.indexer.q_fwht_quant",
+                "m.dsa.indexer.weight_scale",
+            ]
+        );
+        let inputs = eval_inputs(&w, &input);
+        assert_eq!(inputs["m.dsa.q_lora_gemm"]["m"], 7);
+        assert_eq!(inputs["m.dsa.q_lora_epilogue"]["num_tokens"], 7);
+        assert!(matches!(
+            build_with(
+                |c| c.front = front,
+                &[("m.dsa.q_lora_epilogue", "vllm_triton")]
+            ),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
+    /// Catches the split state writer double-billing or dropping a launch:
+    /// the fp32 GEMM spans every hidden-state column, decode rows' state
+    /// launches move into the writer, prefill rows keep the fork's norm and
+    /// cache append and take the row split, one position cast stays, and the
+    /// epilogues run only on the named backend.
+    #[test]
+    fn split_state_writer_takes_the_projections_and_the_decode_state_launches() {
+        let edit = |front: Glm53DsaFront| {
+            move |c: &mut Glm53DsaAttnLocalWorkletConfig| {
+                c.glue = DsaGlue::ForkLaunchList;
+                c.front = front;
+            }
+        };
+        let front = Glm53DsaFront {
+            hidden_split_state_writer: Some("triton"),
+            ..Default::default()
+        };
+        let w = build_with(edit(front), &[]).unwrap();
+        let fork = build_with(edit(Glm53DsaFront::default()), &[]).unwrap();
+        let r = &w.resolved;
+        let gemm = r.hidden_gemm.as_ref().unwrap();
+        // [q_a | kv_a | k | gate score | head weights].
+        assert_eq!(
+            (gemm.n.get(), gemm.k.get(), gemm.input_dtype),
+            (1536 + 512 + 128 + 128 + 32, 4096, DType::Bf16)
+        );
+        assert_eq!(gemm.backends, r.index_head_weights.backends);
+        let split = r.hidden_row_split.as_ref().unwrap();
+        assert_eq!(
+            (
+                split.bf16_lead_cols.get(),
+                split.norm_cols.get(),
+                split.bf16_trail_cols.get(),
+                split.fp32_tail_cols.get()
+            ),
+            (2048, 128, 128, 32)
+        );
+        let writer = r.hidden_state_writer.as_ref().unwrap();
+        assert_eq!(
+            (
+                writer.q_lora_cols.get(),
+                writer.kv_lora_cols.get(),
+                writer.index_dim.get(),
+                writer.fp32_tail_cols.get()
+            ),
+            (1536, 512, 128, 32)
+        );
+        assert_eq!(
+            (
+                writer.next_n,
+                writer.pool_size,
+                writer.tail_ring,
+                writer.block_size
+            ),
+            (1, 4, 4, 64)
+        );
+        let base = slots(&fork);
+        let names = slots(&w);
+        for absorbed in SPLIT_STATE_WRITER_ABSORBS {
+            let name = format!("m.dsa.{absorbed}");
+            assert!(
+                names.iter().any(|(n, _)| *n == name),
+                "{name} left the tree"
+            );
+        }
+        let added: Vec<_> = names
+            .iter()
+            .filter(|slot| !base.contains(slot))
+            .map(|(name, kind)| (name.as_str(), kind.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("m.dsa.hidden_gemm", "gemm_fp32_output"),
+                ("m.dsa.hidden_row_split", "fp32_row_split_layer_norm"),
+                ("m.dsa.hidden_state_writer", "dsa_fp32_split_state_update"),
+            ]
+        );
+        assert_eq!((fork.position_casts(), w.position_casts()), (2, 1));
+
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mixed = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            ..decode.clone()
+        };
+        let mut zeroed = newly_zeroed(&w, &fork, &mixed);
+        zeroed.sort();
+        assert_eq!(
+            zeroed,
+            [
+                "m.dsa.fused_qkv_a",
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.indexer.head_weights",
+                "m.dsa.indexer.k_norm",
+                "m.dsa.indexer.kpool_decode_update",
+                "m.dsa.indexer.kpool_gate_score",
+                "m.dsa.indexer.wk_weights",
+            ]
+        );
+        let mut zeroed = newly_zeroed(&w, &fork, &decode);
+        zeroed.sort();
+        assert_eq!(
+            zeroed,
+            [
+                "m.dsa.fused_qkv_a",
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.hidden_row_split",
+                "m.dsa.indexer.head_weights",
+                "m.dsa.indexer.k_norm",
+                "m.dsa.indexer.kpool_decode_update",
+                "m.dsa.indexer.kpool_gate_score",
+                "m.dsa.indexer.wk_weights",
+                "m.dsa.q_kv_a_norm",
+                "m.dsa.sparse_mla.mla_cache_append",
+            ]
+        );
+        let size = |m: &HashMap<String, serde_json::Value>, s: &str| {
+            let v = &m[&format!("m.dsa.{s}")];
+            ["num_tokens", "num_requests", "m"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+                .unwrap_or_else(|| panic!("{s}: {v}"))
+        };
+        let (d, m) = (eval_inputs(&w, &decode), eval_inputs(&w, &mixed));
+        // (slot, billed on the decode / mixed input)
+        for (s, on_decode, on_mixed) in [
+            ("q_kv_a_norm", 0, 5),
+            ("sparse_mla.mla_cache_append", 0, 5),
+            ("indexer.kpool_decode_update", 0, 0),
+            ("hidden_row_split", 0, 5),
+            ("glue.positions_to_int32", 2, 2),
+            ("hidden_gemm", 2, 7),
+            ("hidden_state_writer", 2, 2),
+        ] {
+            assert_eq!((size(&d, s), size(&m, s)), (on_decode, on_mixed), "{s}");
+        }
+        for role in ["m.dsa.hidden_row_split", "m.dsa.hidden_state_writer"] {
+            assert!(
+                matches!(
+                    build_with(edit(front), &[(role, "torch")]),
+                    Err(BuildError::NoBackendForLaunch { .. })
+                ),
+                "{role}"
+            );
+        }
+    }
+
+    /// Catches fusions that overlap when combined (as the ladder's final
+    /// rungs run them): a decode step under all four zeroes exactly the union
+    /// of what each zeroes alone.
+    #[test]
+    fn front_fusions_compose_without_overlap() {
+        let with = |front: Glm53DsaFront| {
+            build_with(
+                move |c| {
+                    c.glue = DsaGlue::ForkLaunchList;
+                    c.front = front;
+                },
+                &[],
+            )
+            .unwrap()
+        };
+        let parts = [
+            Glm53DsaFront {
+                hidden_split_state_writer: Some("triton"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                q_lora_hadamard_epilogue: Some("triton"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                q_absorb_fp8: Some("cuda_tcgen05"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                topk_page_table: Some("cuda_row_scan_compact"),
+                ..Default::default()
+            },
+        ];
+        let all = Glm53DsaFront {
+            hidden_split_state_writer: Some("triton"),
+            q_lora_hadamard_epilogue: Some("triton"),
+            q_absorb_fp8: Some("cuda_tcgen05"),
+            topk_page_table: Some("cuda_row_scan_compact"),
+        };
+        let fork = with(Glm53DsaFront::default());
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mut union: Vec<String> = parts
+            .into_iter()
+            .flat_map(|front| newly_zeroed(&with(front), &fork, &decode))
+            .collect();
+        let mut combined = newly_zeroed(&with(all), &fork, &decode);
+        union.sort();
+        combined.sort();
+        let distinct = {
+            let mut d = union.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(distinct, union, "two fusions zero the same slot");
+        assert_eq!(combined, union);
+    }
+
+    /// Catches a page-table launch that double-bills or misses a launch: it
+    /// zeroes exactly the decode rows' post-top-k launches (each of which is
+    /// in the tree), keeps them for prefill rows, adds only its own slot on
+    /// its named backend, and prices at the longest context.
+    #[test]
+    fn topk_page_table_absorbs_exactly_the_decode_post_topk_launches() {
+        let edit = |front: Glm53DsaFront| {
+            move |c: &mut Glm53DsaAttnLocalWorkletConfig| {
+                c.glue = DsaGlue::ForkLaunchList;
+                c.front = front;
+            }
+        };
+        let front = Glm53DsaFront {
+            topk_page_table: Some("e_kernel"),
+            ..Default::default()
+        };
+        let w = build_with(edit(front), &[]).unwrap();
+        let fork = build_with(edit(Glm53DsaFront::default()), &[]).unwrap();
+        let base = slots(&fork);
+        let names = slots(&w);
+        for absorbed in PAGE_TABLE_ABSORBS {
+            let name = format!("m.dsa.{absorbed}");
+            assert!(
+                names.iter().any(|(n, _)| *n == name),
+                "{name} left the tree"
+            );
+        }
+        let added: Vec<_> = names.iter().filter(|slot| !base.contains(slot)).collect();
+        assert_eq!(
+            added,
+            [&(
+                "m.dsa.indexer.topk_page_table".to_string(),
+                "dsa_pooled_topk_page_table".to_string()
+            )]
+        );
+        let cfg = w.resolved.topk_page_table.as_ref().unwrap();
+        assert_eq!(
+            (
+                cfg.top_k,
+                cfg.kpool,
+                cfg.page_table_width,
+                cfg.block_size,
+                cfg.next_n
+            ),
+            (512, 4, 2176, 64, 1)
+        );
+        assert_eq!(cfg.max_model_len.get(), 8192);
+
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mut zeroed = newly_zeroed(&w, &fork, &decode);
+        zeroed.sort();
+        let mut absorbed: Vec<String> = PAGE_TABLE_ABSORBS
+            .iter()
+            .map(|slot| format!("m.dsa.{slot}"))
+            .collect();
+        absorbed.sort();
+        assert_eq!(zeroed, absorbed);
+        let inputs = eval_inputs(&w, &decode);
+        let table = &inputs["m.dsa.indexer.topk_page_table"];
+        assert_eq!(
+            (table["batch_size"].as_u64(), table["context_len"].as_u64()),
+            (Some(2), Some(1250))
+        );
+        // A prefill row keeps the fork's expand and remap.
+        let one_long = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 8000)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let inputs = eval_inputs(&w, &one_long);
+        let fork_inputs = eval_inputs(&fork, &one_long);
+        assert_eq!(
+            inputs["m.dsa.indexer.expand_pools"]["num_tokens"]
+                .as_u64()
+                .unwrap()
+                + 2,
+            fork_inputs["m.dsa.indexer.expand_pools"]["num_tokens"]
+                .as_u64()
+                .unwrap()
+        );
+        assert!(matches!(
+            build_with(edit(front), &[("m.dsa.indexer.topk_page_table", "torch")]),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
+    /// Catches a fused q_absorb priced as the bf16 `batched_gemm` (no FP8
+    /// output), at another width than `q_absorb`, alongside the launches it
+    /// replaces, or on another backend than the one named.
+    #[test]
+    fn q_absorb_fp8_is_the_static_fp8_quant_kind_at_q_absorb_width() {
+        let front = Glm53DsaFront {
+            q_absorb_fp8: Some("tc_kernel"),
+            ..Default::default()
+        };
+        let w = build_with(|c| c.front = front, &[]).unwrap();
+        let c = w.resolved.q_absorb_fp8.as_ref().unwrap();
+        let a = &w.resolved.q_absorb;
+        assert_eq!(
+            (c.num_batches.get(), c.n.get(), c.k.get(), c.dtype),
+            (16, 512, 256, DType::Bf16)
+        );
+        assert_eq!(
+            (a.num_batches.get(), a.n.get(), a.k.get(), a.dtype),
+            (16, 512, 256, DType::Bf16)
+        );
+        let base = slots(&build_with(|_| {}, &[]).unwrap());
+        let added: Vec<_> = slots(&w)
+            .into_iter()
+            .filter(|slot| !base.contains(slot))
+            .collect();
+        assert_eq!(
+            added,
+            [(
+                "m.dsa.q_absorb_fp8".to_string(),
+                "batched_gemm_static_fp8_quant".to_string()
+            )]
+        );
+        assert_eq!(
+            w.q_absorb_fp8.as_ref().unwrap().kernel.config.backends,
+            ["tc_kernel"]
+        );
+        let replaced = ["m.dsa.q_absorb", "m.dsa.q_fp8_quant"];
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        assert_eq!(
+            newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
+            replaced
+        );
+        assert!(matches!(
+            build_with(|c| c.front = front, &[("m.dsa.q_absorb_fp8", "torch")]),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_topk_takes_the_cooperative_kernel_only_ahead_of_a_long_row_kernel() {
+        // The fork's "auto" decode top-k runs cooperative_topk up to 64 rows,
+        // also with DeepSelect for the longer batches; torch or a pre-SM90 GPU
+        // never does, and neither does a config that names no cooperative
+        // backend.
+        let build = |cooperative: Vec<&'static str>, topk: Option<Vec<&str>>, gpu: &str| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let map: HashMap<String, Vec<String>> = topk
+                .into_iter()
+                .map(|backends| {
+                    let backends = backends.iter().map(|b| b.to_string()).collect();
+                    ("m.dsa.indexer.topk_decode".to_string(), backends)
+                })
+                .collect();
+            let _scope = bridge.with_backend_overrides("main", Some(&map));
+            let mut config = cfg();
+            config.cooperative_topk_backends = cooperative;
+            config.decode_indexer = DsaDecodeIndexer::PerRequest;
+            config.gpu_name = gpu.into();
+            Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                &bridge,
+            )
+            .unwrap()
+        };
+        let cooperative = || vec!["vllm_cuda_cooperative"];
+        let worklet = build(cooperative(), None, "NVIDIA B200");
+        let kernel = worklet.topk_decode_cooperative.as_ref().unwrap();
+        assert_eq!(kernel.config.backends, vec!["vllm_cuda_cooperative"]);
+        // The same rows as the long-row kernel.
+        assert_eq!(kernel.config.context_mode, "uniform_measured");
+        assert!(
+            build(cooperative(), Some(vec!["deep_select"]), "NVIDIA B200")
+                .topk_decode_cooperative
+                .is_some()
+        );
+        assert!(build(cooperative(), Some(vec!["torch"]), "NVIDIA B200")
+            .topk_decode_cooperative
+            .is_none());
+        assert!(build(cooperative(), None, "A100-SXM4-80GB")
+            .topk_decode_cooperative
+            .is_none());
+        assert!(build(Vec::new(), None, "NVIDIA B200")
+            .topk_decode_cooperative
+            .is_none());
+        // Its time lands in the topk_decode slot: no extra leaf.
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        assert_eq!(builder.finish(root).slots.len(), 24 + 4 + 3);
     }
 
     #[test]

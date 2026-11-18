@@ -421,6 +421,13 @@ impl<S: KernelSpec> Kernel<S> {
 
     fn best_of(&self, eval: impl Fn(usize, &BackendCache) -> LeafMetrics) -> LeafMetrics {
         match self.backend_caches.as_slice() {
+            // An enumerate-mode (structure-only) kernel has no cache. Tests walk
+            // such a model's eval to check its slot order, so it answers a
+            // zero-time miss there (distinct from a slot billed zero); anywhere
+            // else an empty cache is a bug.
+            #[cfg(test)]
+            [] => LeafMetrics::MISS,
+            #[cfg(not(test))]
             [] => panic!("kernel config validation must create at least one backend cache"),
             [backend_cache] => {
                 // Single candidate: it is trivially the selected one. Stamp its
