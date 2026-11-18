@@ -635,7 +635,13 @@ def _prepare_per_rank_batch(
         for index, spec in enumerate(specs):
             results.append(
                 _time_one_prepare(
-                    torch, mnnvl_moe, prepare_workspace, spec, rank, world_size, seed=index
+                    torch,
+                    mnnvl_moe.mnnvl_moe_alltoallv_prepare_without_allgather,
+                    prepare_workspace,
+                    spec,
+                    rank,
+                    world_size,
+                    seed=index,
                 )
             )
             torch.cuda.empty_cache()
@@ -650,7 +656,7 @@ def _prepare_per_rank_batch(
 
 
 def _time_one_prepare(
-    torch, mnnvl_moe, prepare_workspace, spec: dict, rank: int, world_size: int, *, seed: int
+    torch, prepare_fn, prepare_workspace, spec: dict, rank: int, world_size: int, *, seed: int
 ) -> dict:
     """One grid cell of the metadata pass. A function for the same scope reason
     as `_time_one_transfer`: the routing table and the graph's captured output
@@ -661,7 +667,7 @@ def _time_one_prepare(
     expert_ids, weights = _routing(torch, tokens, top_k, slot_count, seed=seed)
 
     def run_once():
-        return mnnvl_moe.mnnvl_moe_alltoallv_prepare_without_allgather(
+        return prepare_fn(
             expert_ids,
             weights,
             None,
@@ -684,3 +690,157 @@ def _time_one_prepare(
     index_bytes = tokens * top_k * 4
     algbw_gbps, busbw_gbps = _bandwidths(index_bytes, time_ms)
     return {"time_ms": time_ms, "algbw_gbps": algbw_gbps, "busbw_gbps": busbw_gbps}
+
+
+# ---------------------------------------------------------------------------
+# FlashInfer >= 0.7 (`flashinfer.moe_ep` NVLink two-sided)
+#
+# FlashInfer 0.7 removed `flashinfer.comm.trtllm_alltoall`; vLLM's
+# `--all2all-backend=flashinfer_nvlink_two_sided` now goes through
+# `flashinfer.moe_ep.NVLinkTwoSidedAlltoAll`. Its kernel-level module
+# (`moe_ep/backends/split/comm/nvlink_two_sided/kernels.py`) exposes the same two
+# calls the runners above time, built from the same CUDA (`moeAllToAllKernel`
+# and the five prepare kernels; the 0.7.3 sources only drop index helpers the
+# old wrapper used and nothing calls):
+#
+#     old (<= 0.6)                                   new (0.7)
+#     MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_   kernels.prepare
+#       allgather
+#     trtllm_alltoall.moe_comm                       kernels.alltoallv
+#
+# The class wraps them the way the old wrapper did: dispatch = prepare + one
+# `alltoallv` per tensor (hidden, then scale when quantised) into a
+# `new_empty(ep_size * tokens_per_rank)` buffer; combine = `new_zeros(tokens *
+# top_k)` + `alltoallv` + `sum` over top-k. So the timed calls, the index
+# construction and the graph-replay basis are shared with the runners above; only
+# the session (workspace allocation through `MnnvlMemory`) differs.
+# ---------------------------------------------------------------------------
+
+
+def profile_moe_alltoall_two_sided_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    """`moe_alltoall` through `flashinfer.moe_ep`'s NVLink two-sided `alltoallv`."""
+    return _run_batch(kwargs_list, _two_sided_alltoall_per_rank_batch)
+
+
+def profile_moe_alltoall_prepare_two_sided_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    """`moe_alltoall_prepare` through `flashinfer.moe_ep`'s NVLink two-sided `prepare`."""
+    return _run_batch(kwargs_list, _two_sided_prepare_per_rank_batch)
+
+
+def _two_sided_session(rank: int, world_size: int):
+    """Allocate the FIFO and prepare workspaces the way `NVLinkTwoSidedAlltoAll`
+    does, over the launcher's process group. Returns `(torch, kernels, memories,
+    workspace, prepare_workspace)`; `memories` must go to
+    `_release_two_sided_session`."""
+    try:
+        import torch
+        import torch.distributed as dist
+        from flashinfer.comm.mapping import Mapping
+        from flashinfer.comm.mnnvl import MnnvlConfig, MnnvlMemory
+        from flashinfer.moe_ep.backends.split.comm.nvlink_two_sided import kernels
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "torch and flashinfer>=0.7 (moe_ep nvlink_two_sided) are required for the "
+            "NVLink two-sided MoE all-to-all runner"
+        ) from exc
+
+    # Same pure-EP mapping as `moe_ep.backends.split.comm.nvlink_common`.
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=world_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+    )
+    config = MnnvlConfig(comm_backend=TorchDistCommBackend(dist.group.WORLD))
+    try:
+        MnnvlMemory.initialize()
+        MnnvlMemory.set_comm_from_config(mapping, config)
+        memory = MnnvlMemory(mapping, kernels.comm_workspace_size_per_rank(world_size))
+        prepare_memory = MnnvlMemory(mapping, kernels.prepare_workspace_size_per_rank(world_size))
+    except Exception as exc:  # noqa: BLE001 — fabric memory is a host capability
+        raise KernelLaunchFailed(
+            f"MNNVL workspace allocation failed (fabric memory unavailable?): {exc}"
+        ) from exc
+    workspace = memory.as_torch_strided_tensor(torch.uint64)
+    prepare_workspace = prepare_memory.as_torch_strided_tensor(torch.uint64)
+    return torch, kernels, [memory, prepare_memory], workspace, prepare_workspace
+
+
+def _release_two_sided_session(memories: list) -> None:
+    """Unmap the workspaces while the process group is still up; see
+    `_release_mnnvl_session` for why this cannot be left to garbage collection."""
+    import gc
+
+    import torch
+    import torch.distributed as dist
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    memories.clear()
+    gc.collect()
+    dist.barrier()
+
+
+def _two_sided_alltoall_per_rank_batch(
+    *,
+    rank: int,
+    world_size: int,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+) -> list[dict] | None:
+    """As `_alltoall_per_rank_batch`, timing `kernels.alltoallv`."""
+    torch, kernels, memories, workspace, _prepare_workspace = _two_sided_session(rank, world_size)
+    results: list[dict] = []
+    try:
+        for spec in specs:
+            results.append(
+                _time_one_transfer(torch, kernels.alltoallv, workspace, spec, rank, world_size)
+            )
+            torch.cuda.empty_cache()
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+    finally:
+        del workspace, _prepare_workspace
+        _release_two_sided_session(memories)
+
+    if rank != 0:
+        return None
+    return results
+
+
+def _two_sided_prepare_per_rank_batch(
+    *,
+    rank: int,
+    world_size: int,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+) -> list[dict] | None:
+    """As `_prepare_per_rank_batch`, timing `kernels.prepare`."""
+    torch, kernels, memories, _workspace, prepare_workspace = _two_sided_session(rank, world_size)
+    results: list[dict] = []
+    try:
+        for index, spec in enumerate(specs):
+            results.append(
+                _time_one_prepare(
+                    torch,
+                    kernels.prepare,
+                    prepare_workspace,
+                    spec,
+                    rank,
+                    world_size,
+                    seed=index,
+                )
+            )
+            torch.cuda.empty_cache()
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+    finally:
+        del _workspace, prepare_workspace
+        _release_two_sided_session(memories)
+
+    if rank != 0:
+        return None
+    return results

@@ -110,3 +110,40 @@ register(
         ),
     )
 )
+
+
+# FlashInfer 0.7 removed `flashinfer.comm.trtllm_alltoall`, which the
+# `flashinfer_mnnvl` backend above imports. vLLM's flashinfer_nvlink_two_sided
+# path now calls `flashinfer.moe_ep.NVLinkTwoSidedAlltoAll`, whose kernel-level
+# call is built from the same CUDA source. Measured in the vLLM image (FlashInfer
+# 0.7.x) with an IMEX channel, which its fabric-handle workspace needs inside the
+# container.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_nvlink_two_sided",
+        supports=BackendSupport(
+            compute=None,
+            sm_targets=frozenset({"sm_100a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.flashinfer_mnnvl_alltoall",
+            function_name="profile_moe_alltoall_prepare_two_sided_batch",
+        ),
+        table_name=KIND,
+        args_schema=MoeAlltoallPrepareArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        gpu_count_fn=lambda spec: int(spec["ep_size"]),
+        list_native=True,
+        subprocess_env="vllm_env",
+        imex_channel=True,
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer 0.7 moe_ep NVLink two-sided prepare (routing exchange "
+                "and send/receive indices), timed as one call."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/moe_ep",
+        ),
+    )
+)
