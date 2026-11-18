@@ -77,6 +77,7 @@ from profiling.kernels import (
     moe_alltoall,  # noqa: F401
     moe_alltoall_prepare,  # noqa: F401
     moe_ep_all_gather,  # noqa: F401
+    moe_ep_quantize_and_all_gather,  # noqa: F401
     moe_ep_quantized_all_gather,  # noqa: F401
     moe_ep_reduce_scatter,  # noqa: F401
     moe_finalize_fuse_shared,  # noqa: F401
@@ -105,6 +106,7 @@ from profiling.kernels import (
     rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    row_all_gather,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
     scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401

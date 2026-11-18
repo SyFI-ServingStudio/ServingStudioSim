@@ -108,3 +108,34 @@ register(
         ),
     )
 )
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="mnnvl_lamport",
+        supports=BackendSupport(compute=frozenset({DType.NVFP4_E2M1})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.moe_ep_mnnvl_lamport",
+            function_name="profile_moe_ep_quantized_all_gather_batch",
+        ),
+        table_name=KIND,
+        args_schema=MoeEpQuantizedAllGatherArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # FlashInfer 0.7.3's fabric-memory helpers (SymmDeviceMemory) and its JIT.
+        subprocess_env="vllm_env",
+        imex_channel=True,
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "One kernel launch: every GPU stores its rows' four tensors directly into "
+                "every peer's landing rows in fabric (MNNVL) memory and copies out the "
+                "gathered rows once each landing word has lost its sentinel (Lamport-style "
+                "arrival, no separate barrier)."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/comm/moe_alltoall_lamport.cuh",
+        ),
+    )
+)

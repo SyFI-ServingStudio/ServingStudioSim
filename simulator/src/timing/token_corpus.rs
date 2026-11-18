@@ -335,6 +335,31 @@ impl TokenCorpus {
         }
     }
 
+    /// Mean distinct EP ranks a recorded token's top-k reach, over every token
+    /// and every layer of the slice, with experts split contiguously by id
+    /// over ranks of `experts_per_rank`.
+    pub fn mean_distinct_ranks(&self, experts_per_rank: usize) -> f64 {
+        let config = &self.config;
+        let (mut sum, mut count) = (0_u64, 0_u64);
+        let mut hit = Vec::with_capacity(config.top_k);
+        for token in 0..config.num_tokens {
+            for layer in config.layers() {
+                let offset = (token * config.num_layers + layer) * config.top_k;
+                hit.clear();
+                hit.extend(
+                    self.ids[offset..offset + config.top_k]
+                        .iter()
+                        .map(|&expert| expert as usize / experts_per_rank),
+                );
+                hit.sort_unstable();
+                hit.dedup();
+                sum += hit.len() as u64;
+                count += 1;
+            }
+        }
+        sum as f64 / count.max(1) as f64
+    }
+
     /// Draw `sampling_candidates` complete folded histograms and return the
     /// most central *real* one. Deterministic in the config's seed.
     pub fn sample_and_fold(&self, num_tokens: u32, experts_per_rank: usize) -> Vec<u32> {
@@ -581,6 +606,20 @@ pub(crate) mod tests {
         config.group_size = 129;
         let error = config.load().expect_err("no window of that width exists");
         assert!(format!("{error:#}").contains("shorter than one sampling group"));
+    }
+
+    #[test]
+    fn distinct_ranks_count_the_ranks_a_tokens_experts_span() {
+        let dir = temp_dir("distinct-ranks");
+        // Each token picks 8 consecutive ids (mod 64).
+        let corpus = synthetic(&dir, 64, 8, 4, 256).load().unwrap();
+        // One rank holds every expert.
+        assert_eq!(corpus.mean_distinct_ranks(64), 1.0);
+        // One expert per rank: every slot is its own rank.
+        assert_eq!(corpus.mean_distinct_ranks(1), 8.0);
+        // 8 consecutive ids over ranks of 8 span two ranks unless aligned
+        // (start % 8 == 0), which happens for 1 in 8 tokens.
+        assert!((corpus.mean_distinct_ranks(8) - (1.0 + 7.0 * 2.0) / 8.0).abs() < 1e-12);
     }
 
     #[test]

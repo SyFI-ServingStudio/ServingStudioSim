@@ -70,6 +70,7 @@ pub mod moe_align_block_size;
 pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_ep_all_gather;
+pub mod moe_ep_quantize_and_all_gather;
 pub mod moe_ep_quantized_all_gather;
 pub mod moe_ep_reduce_scatter;
 pub mod moe_finalize_fuse_shared;
@@ -98,6 +99,7 @@ pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
+pub mod row_all_gather;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
@@ -351,6 +353,10 @@ pub use moe_ep_all_gather::{
     MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig, MoeEpAllGatherSpec,
     MoeEpCollectiveKernelInput,
 };
+pub use moe_ep_quantize_and_all_gather::{
+    MoeEpQuantizeAndAllGatherKernel, MoeEpQuantizeAndAllGatherKernelConfig,
+    MoeEpQuantizeAndAllGatherSpec,
+};
 pub use moe_ep_quantized_all_gather::{
     MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpQuantizedAllGatherSpec,
 };
@@ -436,6 +442,7 @@ pub use residual_rms_norm::{
     ResidualRmsNormSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
+pub use row_all_gather::{RowAllGatherKernel, RowAllGatherKernelConfig, RowAllGatherSpec};
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
