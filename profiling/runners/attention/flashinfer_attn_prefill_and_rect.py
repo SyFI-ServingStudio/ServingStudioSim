@@ -109,8 +109,12 @@ def _run_ragged(
     q_dtype: DType | str,
     kv_dtype: DType | str,
     o_dtype: DType | str,
+    num_requests: int | None = None,
 ) -> ComputeMetrics:
     """Core ragged caller keyed on (q_len, kv_len) + causal, shared by both kinds.
+
+    ``num_requests`` (rect only; absent means one) builds that many requests of
+    ``q_len`` queries, each over its own ``kv_len`` keys and values.
 
     Picks the wrapper, builds ``plan()`` kwargs + the ``run()`` closure, and
     measures. The wire-schema -> (q_len, kv_len) mapping is the caller's job
@@ -118,6 +122,9 @@ def _run_ragged(
     """
     q_len = int(q_len)
     kv_len = int(kv_len)
+    requests = 1 if num_requests is None else int(num_requests)
+    if requests <= 0:
+        raise ValueError(f"num_requests must be positive, got {num_requests!r}")
 
     try:
         import torch
@@ -125,6 +132,8 @@ def _run_ragged(
         raise ProfilerNotImplemented("torch is required for attention runners") from exc
 
     if backend == "cudnn":
+        if requests != 1:
+            raise ProfilerNotImplemented("cudnn rect measures one request")
         return _run_cudnn_attention(
             q_len=q_len,
             kv_len=kv_len,
@@ -152,6 +161,7 @@ def _run_ragged(
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             o_dtype=o_dtype,
+            num_requests=requests,
         )
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             _common.make_workspace(),
@@ -187,7 +197,7 @@ def _run_ragged(
             def benchmark_fn():
                 return wrapper.run(inp.q, inp.k, inp.v)
 
-        flops = _common.attention_flops(
+        flops = requests * _common.attention_flops(
             q_len=q_len,
             kv_len=kv_len,
             num_qo_heads=num_qo_heads,

@@ -135,8 +135,10 @@ def build_ragged_inputs(
     q_dtype: DType | str,
     kv_dtype: DType | str,
     o_dtype: DType | str,
+    num_requests: int = 1,
 ) -> RaggedInputs:
-    """Allocate q/k/v + CSR indptr for one ragged request (batch_size = 1).
+    """Allocate q/k/v + CSR indptr for ``num_requests`` ragged requests, each
+    ``q_len`` queries over its own ``kv_len`` keys and values.
 
     Symmetric head dims. For fp8 the q/k/v are generated in fp16 then per-head
     quantized; the caller passes the returned scales to ``run`` and sets the
@@ -145,8 +147,9 @@ def build_ragged_inputs(
     import torch
 
     uses_fp8 = is_fp8(q_dtype) or is_fp8(kv_dtype)
-    qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device="cuda")
-    kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device="cuda")
+    qo_indptr = torch.arange(num_requests + 1, dtype=torch.int32, device="cuda") * q_len
+    kv_indptr = torch.arange(num_requests + 1, dtype=torch.int32, device="cuda") * kv_len
+    q_rows, kv_rows = num_requests * q_len, num_requests * kv_len
 
     if uses_fp8:
         if not (is_fp8(q_dtype) and is_fp8(kv_dtype)) or is_fp8(o_dtype):
@@ -154,17 +157,17 @@ def build_ragged_inputs(
                 "ragged fp8 attention requires q_dtype == kv_dtype == fp8 and a "
                 "non-fp8 o_dtype"
             )
-        q_base = torch.randn(q_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
-        k_base = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
-        v_base = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        q_base = torch.randn(q_rows, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+        k_base = torch.randn(kv_rows, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v_base = torch.randn(kv_rows, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
         q, s_q = per_head_symmetric_quant(q_base)
         k, s_k = per_head_symmetric_quant(k_base)
         v, s_v = per_head_symmetric_quant(v_base)
         scales: tuple[Any, Any, Any] | None = (s_q, s_k, s_v)
     else:
-        q = randn(q_len, num_qo_heads, head_dim, dtype=to_torch_dtype(q_dtype))
-        k = randn(kv_len, num_kv_heads, head_dim, dtype=to_torch_dtype(kv_dtype))
-        v = randn(kv_len, num_kv_heads, head_dim, dtype=to_torch_dtype(kv_dtype))
+        q = randn(q_rows, num_qo_heads, head_dim, dtype=to_torch_dtype(q_dtype))
+        k = randn(kv_rows, num_kv_heads, head_dim, dtype=to_torch_dtype(kv_dtype))
+        v = randn(kv_rows, num_kv_heads, head_dim, dtype=to_torch_dtype(kv_dtype))
         scales = None
 
     o_elem = torch.tensor([], dtype=to_torch_dtype(o_dtype)).element_size()
@@ -172,7 +175,7 @@ def build_ragged_inputs(
         q.numel() * q.element_size()
         + k.numel() * k.element_size()
         + v.numel() * v.element_size()
-        + q_len * num_qo_heads * head_dim * o_elem
+        + q_rows * num_qo_heads * head_dim * o_elem
     )
     return RaggedInputs(q, k, v, qo_indptr, kv_indptr, scales, bytes_accessed)
 

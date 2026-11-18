@@ -22,6 +22,7 @@ pub mod dsa_sparse_index_remap;
 pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
+mod draft_rows;
 pub mod elementwise;
 pub mod embedding_row_gather;
 pub mod engine;
@@ -43,6 +44,7 @@ pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_conv_residual_rms_norm;
 pub mod grouped_rms_norm;
 pub mod hc_combine;
 pub mod hc_combine_norm;
@@ -55,9 +57,11 @@ pub mod kda_recoverssm_conv_verify;
 pub mod kda_recoverssm_verify;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
+pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
+pub mod mhc_fused_sum_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mhc_terminal_head;
 pub mod mla_cache_append;
@@ -89,6 +93,7 @@ pub mod ple_short_conv;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
+pub mod qk_norm_rope_fp8_kv_write;
 pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
@@ -259,6 +264,18 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use grouped_conv_residual_rms_norm::{
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, GroupedConvResidualRmsNormSpec,
+};
+pub use layered_kv_norm_rope_cache_write::{
+    LayeredKvNormRopeCacheWriteKernel, LayeredKvNormRopeCacheWriteKernelConfig,
+    LayeredKvNormRopeCacheWriteKernelInput, LayeredKvNormRopeCacheWriteSpec,
+};
+pub use qk_norm_rope_fp8_kv_write::{
+    QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput,
+    QkNormRopeFp8KvWriteSpec,
+};
 pub use grouped_rms_norm::{
     GroupedRmsNormKernel, GroupedRmsNormKernelConfig, GroupedRmsNormKernelInput, GroupedRmsNormSpec,
 };
@@ -304,6 +321,9 @@ pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
+pub use mhc_fused_sum_post_pre_rms_norm::{
+    MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel, MhcFusedSumPostPreRmsNormSpec,
+};
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };

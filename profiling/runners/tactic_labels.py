@@ -69,5 +69,9 @@ def flashinfer_fp8_tensor(**_args: Any) -> str:
     return "single_gemm.flashinfer_fp8_tensor"
 
 
+def flashinfer_cutedsl_bf16(**_args: Any) -> str:
+    return "single_gemm.flashinfer_cutedsl_bf16"
+
+
 def flashinfer_mxfp8(**_args: Any) -> str:
     return "single_gemm.flashinfer_mxfp8"

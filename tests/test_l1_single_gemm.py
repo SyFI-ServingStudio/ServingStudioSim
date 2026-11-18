@@ -143,6 +143,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
         "flashinfer_mxfp8_prequantized",
+        "flashinfer_cutedsl_bf16",
     }
 
 
@@ -1655,3 +1656,19 @@ def _first_visible_gpu_index() -> int:
     if not first_visible_device.isdecimal():
         pytest.skip("perf_api GEMM profiling example needs a numeric CUDA_VISIBLE_DEVICES mask")
     return int(first_visible_device)
+
+
+def test_flashinfer_cutedsl_bf16_is_a_pinned_tactic_bf16_sm10x_row():
+    # Defect: a tuned BF16 row with no tactic file to pin it (re-tuned per
+    # process), or one that accepts a k vLLM would route to F.linear.
+    from profiling.runners.gemm import flashinfer_bf16
+
+    spec = find_kernel_profiler_spec("single_gemm", "flashinfer_cutedsl_bf16")
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.BF16})
+    assert spec.supports.sm_targets == frozenset({"sm_100f"})
+    assert spec.tactic_label() == "single_gemm.flashinfer_cutedsl_bf16"
+    assert flashinfer_bf16.validate(128, 24896, 4096, "bf16") == (128, 24896, 4096)
+    for bad in [(128, 24896, 4000, "bf16"), (128, 24896, 4096, "fp16"), (0, 8, 128, "bf16")]:
+        with pytest.raises(ValueError):
+            flashinfer_bf16.validate(*bad)
