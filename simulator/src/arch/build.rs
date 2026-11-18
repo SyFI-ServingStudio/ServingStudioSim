@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::glm53_flash_vllm_nvfp4_dflash2::{self, Glm53FlashDflash2Model};
 use crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::Dflash2DraftChain;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
@@ -58,7 +59,7 @@ use crate::timing::kernels::AllReduceKernelConfig;
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::ExpertDemand;
 use crate::timing::{Dim, PerfApiBridge};
-use crate::worklet::dflash2_checkpoint::{Dflash2Checkpoint, GLM53_DFLASH2};
+use crate::worklet::dflash2_checkpoint::{Dflash2Checkpoint, GLM53_DFLASH2, GLM53_FLASH_DFLASH2};
 use crate::worklet::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig, Dflash2DraftAttnLocalWorklet,
     Dflash2DraftFfnLocalWorklet, Dflash2DraftLayerLocalWorkletConfig, Dflash2SelectorLocalWorklet,
@@ -1989,6 +1990,222 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
 }
 
+/// GLM-5.3-Flash NVFP4 (DP-attention/EP graph) verifying the
+/// `incoai/GLM-5.3-Flash-DFlash2` proposer: one TP1 draft per attention DP
+/// rank, the target compiled at verify width `draft_tokens + 1`.
+pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashDflash2Model> {
+    use crate::arch::config::{DsaGluePricing, DsaHiddenGemmMode, DsaQLoraGemmMode};
+    use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::{MoeSharedOverlap, MoeSharedPair};
+    use crate::timing::bridge::intern_backend;
+    use crate::worklet::{DsaDecodeIndexer, DsaGlue, Glm53DsaFront};
+    let IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+        model: model_spec,
+        ep_size,
+        kda_tp_gpus,
+        kda_gate_b_merged,
+        max_model_len,
+        routing,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+        mla_layout_copies: _,
+        indexer_max_logits_mb: _,
+        draft_tokens,
+        kda_state_dtype,
+        kda_spec_verify,
+        expert_exchange,
+        mhc_fused_saving_us,
+        dsa_glue,
+        dsa_hidden_gemm,
+        dsa_hidden_gemm_backend,
+        dsa_q_lora_gemm,
+        dsa_q_lora_gemm_backend,
+        dsa_q_absorb_fp8_backend,
+        dsa_topk_page_table_backend,
+        router_gate_once,
+        moe_input_copy,
+        moe_combine_add_in_mhc_post,
+        moe_shared_overlap,
+        moe_shared_pair_file,
+        moe_shared_pair_column,
+        draft_attention,
+        draft_topk,
+        draft_context_kv_store,
+        draft_qk_norm_rope_kv_write,
+        draft_conv_residual_norm,
+    } = sel
+    else {
+        bail!("{sel:?} is not glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2");
+    };
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact \
+             hybrid 45-layer schedule is required"
+        );
+    }
+    let checkpoint = &GLM53_FLASH_DFLASH2;
+    anyhow::ensure!(
+        (1..=checkpoint.draft_tokens()).contains(draft_tokens),
+        "the {} draft has block_size {} and drafts 1..={} tokens, not {draft_tokens}",
+        checkpoint.name,
+        checkpoint.block_size,
+        checkpoint.draft_tokens()
+    );
+    let verify_width = draft_tokens + 1;
+    if let Some(us) = mhc_fused_saving_us {
+        anyhow::ensure!(*us >= 0.0, "mhc_fused_saving_us must be >= 0, got {us}");
+        anyhow::ensure!(
+            !(*moe_combine_add_in_mhc_post && *us > 0.0),
+            "moe_combine_add_in_mhc_post with a {us} us per-boundary saving: that saving was \
+             measured as the one-launch kernel (with the shared add) against vLLM's add + \
+             TileLang, so its after-MoE share already removes this add; use the saving only \
+             where it is 0"
+        );
+    }
+    let moe_shared_exposed = match (
+        moe_shared_overlap,
+        moe_shared_pair_file,
+        moe_shared_pair_column,
+    ) {
+        (MoeSharedOverlap::Exposed, Some(path), Some(column)) => {
+            Some(MoeSharedPair::load_exposed(path, column)?)
+        }
+        (MoeSharedOverlap::Exposed, _, _) => bail!(
+            "moe_shared_overlap: exposed needs moe_shared_pair_file and moe_shared_pair_column"
+        ),
+        (MoeSharedOverlap::Chain, None, None) => None,
+        (MoeSharedOverlap::Chain, _, _) => {
+            bail!("moe_shared_pair_file / moe_shared_pair_column need moe_shared_overlap: exposed")
+        }
+    };
+    let backend = |param: &str, backend: &Option<String>| match backend.as_deref() {
+        Some("") => bail!("{param}: empty backend name"),
+        other => Ok(other.map(intern_backend)),
+    };
+    let front_cut = |param: &str, on: bool, value: &Option<String>| match (
+        on,
+        backend(&format!("{param}_backend"), value)?,
+    ) {
+        (true, Some(b)) => Ok(Some(b)),
+        (false, None) => Ok(None),
+        (true, None) => bail!("{param} needs {param}_backend (the backend whose rows price it)"),
+        (false, Some(_)) => bail!("{param}_backend is for a fused {param} mode"),
+    };
+    let front = Glm53DsaFront {
+        hidden_split_state_writer: front_cut(
+            "dsa_hidden_gemm",
+            *dsa_hidden_gemm == DsaHiddenGemmMode::Fp32SplitStateWriter,
+            dsa_hidden_gemm_backend,
+        )?,
+        q_lora_hadamard_epilogue: front_cut(
+            "dsa_q_lora_gemm",
+            *dsa_q_lora_gemm == DsaQLoraGemmMode::ConcatHadamardEpilogue,
+            dsa_q_lora_gemm_backend,
+        )?,
+        q_absorb_fp8: backend("dsa_q_absorb_fp8_backend", dsa_q_absorb_fp8_backend)?,
+        topk_page_table: backend("dsa_topk_page_table_backend", dsa_topk_page_table_backend)?,
+    };
+    let chain = Dflash2DraftChain {
+        attention: *draft_attention,
+        topk: *draft_topk,
+        context_kv_store: *draft_context_kv_store,
+        qk_norm_rope_kv_write: *draft_qk_norm_rope_kv_write,
+        conv_residual_norm: *draft_conv_residual_norm,
+    };
+
+    let quant = Glm53FlashQuant::Nvfp4;
+    let model_cfg = glm53_flash_model_cfg(model_spec, quant)?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: *routing,
+        seed: *routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: *ep_size,
+        expert_popularity_file: expert_popularity_file.as_deref(),
+        token_corpus_file: token_corpus_file.as_deref(),
+        num_routed_layers: routed_layers,
+    };
+    let demand = source.demand(0..routed_layers as usize, verify_width)?;
+    let mut parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel::new(
+        *ep_size,
+        *max_model_len,
+        gpu.to_string(),
+        cudagraph_capture_sizes.clone(),
+        glm53_flash_kernel_path(sel)?,
+    );
+    parallel.expert_exchange = *expert_exchange;
+    parallel.kda_tp_gpus = *kda_tp_gpus;
+    parallel.kda_gate_b_merged = *kda_gate_b_merged;
+    parallel.mhc_fused_saving_us = *mhc_fused_saving_us;
+    parallel.router_gate_once = *router_gate_once;
+    parallel.moe_input_copy = *moe_input_copy;
+    parallel.moe_combine_add_in_mhc_post = *moe_combine_add_in_mhc_post;
+    parallel.moe_shared_exposed = moe_shared_exposed;
+    let mut configs =
+        glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
+    // The verify: every decode request presents `verify_width` rows to DSA and
+    // KDA, on the KDA pool's dtype and verify mode.
+    for kda in [&mut configs.local.kda, &mut configs.kda_tp1] {
+        kda.decode_query_len = verify_width;
+        kda.ssm_state_dtype = kda_state_dtype.dtype();
+        kda.spec_verify = *kda_spec_verify;
+    }
+    // The vLLM fork's decode-indexer path at verify widths: its cooperative
+    // top-k, Triton Hadamard quant, CUDA static FP8 quant and fork kpool
+    // update, each request's indexer priced by its own context.
+    let dsa = &mut configs.local.dsa;
+    dsa.decode_next_n = verify_width;
+    dsa.decode_indexer = DsaDecodeIndexer::PerRequest;
+    dsa.cooperative_topk_backends = vec!["vllm_cuda_cooperative"];
+    dsa.hadamard_quant_backends = vec!["vllm_triton"];
+    dsa.static_quant_backends = vec!["vllm_cuda"];
+    dsa.pooled_index_update_backends = vec!["vllm_fork_triton"];
+    dsa.glue = match dsa_glue {
+        DsaGluePricing::Placeholder => DsaGlue::Placeholder,
+        DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
+    };
+    dsa.front = front;
+    let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
+    let target = glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")?;
+    // Each DP rank drafts its own requests at TP1; the query block's own K/V
+    // goes through the same insert as the context rows.
+    let draft = dflash2_draft_resolved(
+        checkpoint,
+        1,
+        gpu,
+        *draft_tokens,
+        checkpoint.sliding_window,
+        &chain,
+        true,
+    )
+    .context("expanding the DFlash2 draft configs")?;
+    glm53_flash_vllm_nvfp4_dflash2::build(name, target, *draft_tokens, &draft, bridge)
+        .context("building GLM-5.3-Flash NVFP4 DP + DFlash2 (often a missing profile.db row)")
+}
+
+/// The `glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2` design: the
+/// knob-by-knob selector it fixes
+/// (`arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`).
+pub fn glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashDflash2Model> {
+    let target =
+        crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::target_selector(sel)?;
+    glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(&target, gpu, name, bridge)
+}
+
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
 ///
 /// The draft is a separate dense checkpoint, so its dimensions come from that
@@ -2326,6 +2543,11 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             mla_layout_copies,
             indexer_max_logits_mb,
             ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
         } => (*mla_layout_copies, *indexer_max_logits_mb),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
     };
@@ -2343,7 +2565,8 @@ pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
     match sel {
         IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. }
-        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. } => Glm53FlashQuant::Nvfp4,
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => Glm53FlashQuant::Nvfp4,
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe { .. } => Glm53FlashQuant::Fp8Block,
@@ -2850,6 +3073,8 @@ pub fn build_iter_model(
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
         | IterArchSel::DeepseekV41VllmDspark { .. }
         | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
         | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
@@ -2921,6 +3146,18 @@ pub fn build_speculative_iter_model(
                 gpu,
                 name,
                 bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                selector, gpu, name, bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
+                selector, gpu, name, bridge,
             )?),
             *draft_tokens,
         )),
@@ -3288,6 +3525,8 @@ fn build_arch(
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
                     | IterArchSel::DeepseekV41VllmDspark { .. }
                     | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
                     | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {

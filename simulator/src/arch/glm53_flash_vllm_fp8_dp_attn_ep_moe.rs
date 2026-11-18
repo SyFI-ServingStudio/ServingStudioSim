@@ -185,8 +185,9 @@ impl Glm53FlashDpAttnEpParallel {
     }
 }
 
-/// How the routed tokens reach the experts and come back.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How the routed tokens reach the experts and come back (`expert_exchange`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExpertExchange {
     /// vLLM's profiled all-gatherv and bf16 reduce-scatterv.
     #[default]
@@ -194,6 +195,24 @@ pub enum ExpertExchange {
     /// [`FixedExpertExchange`] (NVFP4, EP 8 only).
     FixedPattern,
 }
+
+/// The `expert_exchange` choices the launcher schema advertises.
+pub const EXPERT_EXCHANGES: [&str; 2] = ["measured_allgather", "fixed_pattern"];
+
+/// How the aux-stream shared expert (local rows <= 256) overlaps the MoE
+/// chain (`moe_shared_overlap`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoeSharedOverlap {
+    /// The overlap factor over the dispatch + routed + combine chain.
+    #[default]
+    Chain,
+    /// [`MoeSharedPair`]: the measured time it adds to the MoE block.
+    Exposed,
+}
+
+/// The `moe_shared_overlap` choices the launcher schema advertises.
+pub const MOE_SHARED_OVERLAPS: [&str; 2] = ["chain", "exposed"];
 
 /// Measured time the aux-stream shared expert adds to an MoE block, by rows
 /// per rank. Linear between points, the nearest point outside them; the
@@ -1268,12 +1287,6 @@ impl Glm53FlashDpAttnEpModel {
         let mut builder = CostTreeBuilder::new();
         let root = self.compile_root(&mut builder);
         builder.finish(root)
-    }
-
-    /// Ranks that split one scheduler partition's drafts and commit; 1, as
-    /// every rank owns its requests.
-    pub(crate) fn partition_ranks(&self) -> u16 {
-        1
     }
 
     /// The whole forward as one node in `builder`, so a speculative model can
