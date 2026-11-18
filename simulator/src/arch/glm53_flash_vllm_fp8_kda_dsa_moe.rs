@@ -717,6 +717,7 @@ pub fn build_configs(
             ssm_state_dtype: DType::Fp32,
             decode_query_len: 1,
             spec_verify: crate::worklet::KdaSpecVerify::Recoverssm,
+            merge_gate_b: false,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
