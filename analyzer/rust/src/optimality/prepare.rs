@@ -262,6 +262,7 @@ fn is_communication_kind(kind: &str) -> bool {
             | "moe_alltoall"
             | "moe_ep_all_gather"
             | "moe_ep_quantized_all_gather"
+            | "row_all_gather"
             | "moe_ep_reduce_scatter"
             | "broadcast"
             | "gather"
@@ -307,6 +308,7 @@ mod tests {
             "moe_ep_all_gather",
             "moe_ep_quantized_all_gather",
             "moe_ep_reduce_scatter",
+            "row_all_gather",
         ] {
             assert!(is_communication_kind(kind), "{kind}");
         }
