@@ -119,20 +119,31 @@ def field_types(args_schema: type[KernelArgs]) -> dict[str, Any]:
 
 
 @cache
-def optional_fields(args_schema: type[KernelArgs]) -> dict[str, str]:
-    """``{field: same_as}`` of each field declared with ``optional_arg``."""
+def optional_fields(args_schema: type[KernelArgs]) -> dict[str, str | None]:
+    """``{field: same_as}`` of each field declared with ``optional_arg`` (``None``
+    for a field whose absent value is a fixed ``absent``)."""
 
     return {f.name: f.metadata["same_as"] for f in fields(args_schema) if "same_as" in f.metadata}
 
 
-def canonical_args(args: KernelArgs) -> KernelArgs:
-    """``args`` with each optional field that equals its ``same_as`` field unset,
-    so a call has one key whether or not its spec spelled the field out."""
+@cache
+def _absent_values(args_schema: type[KernelArgs]) -> dict[str, Any]:
+    return {
+        f.name: f.metadata.get("absent") for f in fields(args_schema) if "same_as" in f.metadata
+    }
 
+
+def canonical_args(args: KernelArgs) -> KernelArgs:
+    """``args`` with each optional field that equals what its absence means (its
+    ``same_as`` field, or its fixed ``absent`` value) unset, so a call has one key
+    whether or not its spec spelled the field out."""
+
+    absent = _absent_values(type(args))
     changes = {
         name: None
         for name, same_as in optional_fields(type(args)).items()
-        if getattr(args, name) is not None and getattr(args, name) == getattr(args, same_as)
+        if getattr(args, name) is not None
+        and getattr(args, name) == (absent[name] if same_as is None else getattr(args, same_as))
     }
     return replace(args, **changes) if changes else args
 
