@@ -1,0 +1,293 @@
+"""KDA (Kimi Delta Attention) RecoverSSM accepted-state commit as one public call.
+
+Wire string: ``"kda_recoverssm_commit"``. The facade stem is
+``get_kda_recoverssm_commit_times`` / ``count_missing_kda_recoverssm_commit``.
+
+The measured boundary is one ``KDARecoverSSMCommitContext.commit`` call from
+the vLLM fork's ``vllm.models.kimi_k3.nvidia.ops.recoverssm``. vLLM makes it
+once per KDA KV-cache group after sampling (``RecoverSSMState.commit_step``),
+and one call covers every layer of the group. It launches three kernels:
+
+- ``_prepare_commit_plan_kernel`` clamps each request's accepted count to its
+  window and plans the destination slots;
+- ``_compact_conv_state_kernel`` shifts each layer's short-conv window so it
+  ends at the last accepted token;
+- ``_commit_kda_state_kernel`` reads each layer's fp32 checkpoint once, folds
+  the first ``commit_len`` correction and key/gate records into it, and writes
+  it once.
+
+``num_layers`` is the number of KDA layers in the group, a static property of
+the deployment: vLLM's hybrid allocator splits the KDA layers into groups the
+size of the smallest attention type. ``commit_len`` is the accepted count of
+every request (1..spec_query_len; spec decode always accepts the target token).
+
+The non-align cache mode is measured (no prefix caching), so the committed
+state goes back to the checkpoint's own slot. ``state_dtype`` is the
+checkpoint pool's element type (vLLM ``--mamba-ssm-cache-dtype``); the fold
+runs in fp32 and rounds once on the store.
+
+Backend ``vllm_cute`` is the same call with the context built as
+``backend="cute"``, what the fork selects on SM10x with a bf16 pool: the plan
+and conv compaction stay Triton and ``cute_recoverssm_commit`` replaces the
+Triton fold (one tensor-core launch over every layer of the group).
+
+Backend ``tilelang`` is this repository's own kernel for the same call
+(``profiling.runners.attention.kda_recoverssm_commit_tilelang``), shipped by
+no engine: a Triton prep forms each row's decayed key, then a TileLang fold
+adds the accepted rows in closed form as one fp32 rank-n update per state
+tile, so the state is read and written once whatever the accepted length;
+the conv compaction is the fork's. It runs in the main environment, not the
+vLLM fork's.
+
+Backend ``cuda_persistent_ws`` is a vendored persistent warp-specialized CUDA
+fold (``profiling.runners.attention.kda_recoverssm_commit_ws``), shipped by no
+engine: the fork's plan launch, then one launch that folds every layer and
+fuses the conv compaction. It is byte-identical to ``vllm_cute`` on the same
+pages, needs the SD conv layout (channel stride 1) and has no align mode.
+``cuda_persistent_ws_tf32_mma`` is the same structure with the fold as one
+3xTF32 tensor-core MMA over the whole window (time flat in commit_len); its
+state matches ``vllm_cute`` to rounding (the oracle tolerance gates it), its
+conv windows byte for byte. Same SD-only and no-align limits.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.outlier import BatchOutlierPolicy
+from profiling.db.registry import (
+    BackendSupport,
+    KernelProfilerSpec,
+    MetricFamily,
+    RunnerRef,
+    register,
+)
+
+KIND: str = "kda_recoverssm_commit"
+
+
+@dataclass(frozen=True)
+class KdaRecoverSSMCommitArgs(KernelArgs):
+    batch_size: int = arg(unit="requests", doc="Requests whose accepted tokens are committed.")
+    commit_len: int = arg(
+        unit="tokens", doc="Accepted tokens folded into every request's state (1..spec_query_len)."
+    )
+    num_heads: int = arg(unit="heads", doc="Local KDA heads per layer.")
+    head_dim: int = arg(unit="elements", doc="Features in each key and value head.")
+    spec_query_len: int = arg(
+        unit="tokens", doc="Verify window per request (k + 1), the record depth."
+    )
+    num_layers: int = arg(unit="layers", doc="KDA layers committed by the one call.")
+    dtype: DType = arg(doc="Element type of the activations and key/gate record.")
+    state_dtype: DType = arg(doc="Element type of the checkpoint state pool the call folds into.")
+
+
+DOC = KernelDoc(
+    title="KDA RecoverSSM commit",
+    summary=(
+        "Fold each request's accepted tokens into its KDA checkpoint and conv window, "
+        "for every layer of a KV-cache group in one call."
+    ),
+    description=(
+        "The commit step of KDA with RecoverSSM speculative decoding. After "
+        "sampling, one call per KDA cache group plans each request's accepted "
+        "length, shifts every layer's short-conv window to end at the last "
+        "accepted token, and folds the accepted tokens' correction and key/gate "
+        "records into each layer's FP32 checkpoint: one read and one write of "
+        "the state per request, head and layer. Three Triton launches."
+    ),
+    category="Attention",
+    subcategory="Gated DeltaNet",
+    formula=(
+        "S ← S·Π_t diag(decay_t) + Σ_t (c_t·k̂_tᵀ)·Π_{u<t} diag(decay_u), t < commit_len",
+        "FLOPs = num_layers·batch_size·num_heads·(3·commit_len + 2)·head_dim²",
+        "bytes = num_layers·batch_size·(8·num_heads·head_dim² + "
+        "8·commit_len·num_heads·head_dim + 4·3·num_heads·head_dim·3)",
+        "TFLOPS = FLOPs / time",
+        "GB/s = bytes / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} Five warm-up calls run first; all three launches are "
+        "counted. Every call advances the states and conv windows in place, as "
+        "vLLM does. Before timing, one call is checked against a PyTorch "
+        "reference on the first 16 requests of every layer."
+    ),
+    caveats=(
+        "Every request commits the same commit_len.",
+        "Measured without prefix caching (no align-mode boundary state).",
+        "The cost grows with num_layers; a deployment calls it once per KDA cache group.",
+    ),
+    reference="profiling.runners.attention.kda_recoverssm_reference",
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_triton",
+        # Plain @triton.jit kernels with no arch-specific instructions; the
+        # fork serves them in bf16.
+        # The fold loads the checkpoint at the pool's dtype, accumulates in
+        # fp32 and stores back at the pool's dtype, so fp32 and bf16 pools run.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP32, DType.BF16}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_vllm_triton",
+            function_name="profile_kda_recoverssm_commit_vllm_triton",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # Kimi-K3 RecoverSSM ships in the vllm_env image's upstream base (5629b26).
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM fork's KDARecoverSSMCommitContext.commit (Kimi-K3): plan, conv "
+                "compaction and the fused all-layer state fold."
+            ),
+            url="https://github.com/vllm-project/vllm",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="tilelang",
+        # fp32 and bf16 pools both load into an fp32 fold and store back at the
+        # pool's dtype.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP32, DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_tilelang",
+            function_name="profile_kda_recoverssm_commit_tilelang",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "This repository's commit (no engine ships it): a Triton prep, a "
+                "TileLang closed-form fold of the accepted rows as one rank-n update "
+                "per state tile, and the conv compaction; three launches."
+            ),
+        ),
+    )
+)
+
+
+# The fork's state fold on SM10x: ``KDARecoverSSMCommitContext(backend="cute")``
+# keeps the Triton plan and conv compaction and replaces the Triton fold with
+# ``cute_recoverssm_commit`` (``cutedsl/commit.py``), one launch over every
+# layer of the group. The layer selects it with its CuTe verify
+# (``can_use_cute_recoverssm``: SM10x, bf16 activations, conv state and SSM
+# state); its fold is compiled for bf16 checkpoints only.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cute",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_vllm_cute",
+            function_name="profile_kda_recoverssm_commit_vllm_cute",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM fork's KDARecoverSSMCommitContext.commit with the CuTe fold: Triton "
+                "plan and conv compaction, then one tensor-core launch folding every "
+                "layer's accepted records into its bf16 checkpoint."
+            ),
+            url="https://github.com/vllm-project/vllm",
+        ),
+    )
+)
+
+
+# A persistent warp-specialized CUDA commit (vendored, see the runner): the
+# fork's plan launch, then one launch that streams every (layer, request, head)
+# item's records, state page and conv history through a shared-memory ring
+# (TMA producer warp, coefficient warps, fold warps) and fuses the conv
+# compaction. Byte-identical to ``vllm_cute`` on the same pages; it needs the
+# SD conv layout (channel stride 1) and has no align mode. No engine ships it.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="cuda_persistent_ws",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_ws",
+            function_name="profile_kda_recoverssm_commit_cuda_persistent_ws",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # Needs the fork's plan kernel and commit context (vllm_env image).
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "Persistent warp-specialized CUDA commit (shipped by no engine): the fork's "
+                "plan, then one launch streaming records, state and conv history through a "
+                "shared-memory ring, folding on packed FP32 FMAs and fusing the conv compaction."
+            ),
+        ),
+    )
+)
+
+
+# The same persistent structure with the fold on tensor cores: each item is
+# decoded once by the producer, the gate chain runs over the whole window
+# without branches, and the accepted rows fold as one 3xTF32 MMA per tile, so
+# the time does not depend on commit_len. Rounding differs from ``vllm_cute``
+# (gated by the oracle tolerance); conv windows are byte-identical.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="cuda_persistent_ws_tf32_mma",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_ws",
+            function_name="profile_kda_recoverssm_commit_cuda_persistent_ws_tf32_mma",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "Persistent warp-specialized CUDA commit with a 3xTF32 tensor-core fold "
+                "(shipped by no engine): the fork's plan, then one launch whose time does not "
+                "depend on the accepted length; conv compaction fused."
+            ),
+        ),
+    )
+)

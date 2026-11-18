@@ -58,6 +58,7 @@ from profiling.kernels import (
     indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
+    kda_recoverssm_commit,  # noqa: F401
     kda_recoverssm_verify,  # noqa: F401
     kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401

@@ -46,7 +46,6 @@ use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
-use crate::timing::kernels::KdaRecoverSSMVerifyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
@@ -57,6 +56,7 @@ use crate::timing::kernels::{
     SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
     SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
 };
+use crate::timing::kernels::{KdaRecoverSSMCommitKernelInput, KdaRecoverSSMVerifyKernelInput};
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
@@ -178,6 +178,7 @@ log_inputs! {
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,
     KdaChunkPrefill => KdaChunkPrefillKernelInput,
+    KdaRecoverSSMCommit => KdaRecoverSSMCommitKernelInput,
     KdaRecoverSSMVerify => KdaRecoverSSMVerifyKernelInput,
     KdaRecurrentDecode => KdaRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
