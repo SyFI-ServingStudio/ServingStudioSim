@@ -29,6 +29,10 @@
 //! the Hadamard quant) carry an effective-bandwidth byte factor anchored to
 //! the measured T = 2048 kernels, and a prefill-bearing iteration adds its
 //! `[rows, selected_k]` index plumbing (`prefill_glue`).
+//! [`DsaGlue::ForkLaunchList`] prices the glue by the fork's own decode
+//! launches instead, and [`Glm53DsaFront`] replaces groups of the fork's
+//! launches with fused kernels; the replaced slots stay in the tree and bill
+//! zero.
 //!
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
 //! context (the measured decode grids are uniform in context). Under
@@ -50,21 +54,24 @@ use crate::timing::kernels::sparse_indexer_topk::COOPERATIVE_MAX_ROWS;
 use crate::timing::kernels::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
     BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
-    BatchedGemmStaticFp8QuantKernelInput, DsaMqaLogitsPrefillKernel,
-    DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
-    DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
-    DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, DsaPooledIndexCacheUpdateKernel,
-    DsaPooledIndexCacheUpdateKernelConfig, DsaPooledIndexCacheUpdateKernelInput,
-    DsaPooledTopkPageTableKernel, DsaPooledTopkPageTableKernelConfig,
-    DsaPooledTopkPageTableKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
-    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput,
-    HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput,
-    HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
-    HadamardFp8QuantWeightScaleKernelInput, QKvRmsNormKernel, QKvRmsNormKernelConfig,
-    QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
-    StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
+    BatchedGemmStaticFp8QuantKernelInput, DsaFp32SplitStateUpdateKernel,
+    DsaFp32SplitStateUpdateKernelConfig, DsaFp32SplitStateUpdateKernelInput,
+    DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
+    DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernel,
+    DsaPersistentTopkDecodeKernelConfig, DsaPersistentTopkDecodeKernelInput,
+    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
+    DsaPooledIndexCacheUpdateKernelInput, DsaPooledTopkPageTableKernel,
+    DsaPooledTopkPageTableKernelConfig, DsaPooledTopkPageTableKernelInput, DsaTopkPrefillKernel,
+    DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, Fp32RowSplitLayerNormKernel,
+    Fp32RowSplitLayerNormKernelConfig, Fp32RowSplitLayerNormKernelInput, GemmFp32OutputKernel,
+    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, HadamardFp8QuantKernel,
+    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, HadamardFp8QuantWeightScaleKernel,
+    HadamardFp8QuantWeightScaleKernelConfig, HadamardFp8QuantWeightScaleKernelInput,
+    QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput, StaticFp8QuantKernel,
+    StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
@@ -199,6 +206,20 @@ pub enum DsaGlue {
 /// another backend fails the build). The default is the fork's launches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Glm53DsaFront {
+    /// The projections that read the hidden state (`fused_qkv_a`,
+    /// `wk_weights`, `kpool_gate_score`, and the fp32 `head_weights` with its
+    /// input cast) as one fp32-output GEMM over every column
+    /// (`gemm_fp32_output` on `fp32_gemm_backends`, slot `hidden_gemm`). Its
+    /// epilogue runs on this backend: decode rows take one state-update
+    /// launch (`dsa_fp32_split_state_update`, slot `hidden_state_writer`)
+    /// that rounds the bf16 column groups, LayerNorms the indexer k,
+    /// RMS-norms q and kv, appends the kv rows to the FP8 MLA cache, casts the
+    /// kpool positions and runs the kpool decode update
+    /// ([`SPLIT_STATE_WRITER_ABSORBS`]); prefill rows take one row-split
+    /// launch (`fp32_row_split_layer_norm`, slot `hidden_row_split`) and keep
+    /// the fork's norm and cache append. Absorbs the separate projections,
+    /// `indexer.k_norm` and the fork glue's hidden-state cast.
+    pub hidden_split_state_writer: Option<&'static str>,
     /// `q_b` and the indexer's `wq_b`, which both read the normed q latent, as
     /// one bf16 GEMM over concatenated weights (their callable and backends at
     /// the summed width, slot `q_lora_gemm`), plus one epilogue launch on this
@@ -222,6 +243,18 @@ pub struct Glm53DsaFront {
     /// Prefill rows keep the fork's expand and remap.
     pub topk_page_table: Option<&'static str>,
 }
+
+/// The decode-row launches [`Glm53DsaFront::hidden_split_state_writer`]
+/// takes over beyond the projections (worklet slot suffixes): the q/kv RMS
+/// norm, the MLA cache append, the kpool position cast (one of the fork
+/// glue's two position casts; the top-k sequence lengths' stays) and the
+/// kpool decode update.
+pub const SPLIT_STATE_WRITER_ABSORBS: [&str; 4] = [
+    "q_kv_a_norm",
+    "sparse_mla.mla_cache_append",
+    "glue.positions_to_int32",
+    "indexer.kpool_decode_update",
+];
 
 /// The decode-row launches [`Glm53DsaFront::topk_page_table`] replaces
 /// (worklet slot suffixes).
@@ -370,6 +403,9 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub prefill_glue: ElementwiseKernelConfig,
     /// `raw_cfg.glue == ForkLaunchList`.
     pub fork_glue: Option<DsaForkGlueConfigs>,
+    pub hidden_gemm: Option<GemmFp32OutputKernelConfig>,
+    pub hidden_row_split: Option<Fp32RowSplitLayerNormKernelConfig>,
+    pub hidden_state_writer: Option<DsaFp32SplitStateUpdateKernelConfig>,
     pub q_lora_gemm: Option<SingleGemmKernelConfig>,
     pub q_lora_epilogue: Option<HadamardFp8QuantWeightScaleKernelConfig>,
     pub q_absorb_fp8: Option<BatchedGemmStaticFp8QuantKernelConfig>,
@@ -432,6 +468,9 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
     pub fork_glue: Option<DsaForkGlue>,
+    pub hidden_gemm: Option<Op<GemmFp32OutputKernel>>,
+    pub hidden_row_split: Option<Op<Fp32RowSplitLayerNormKernel>>,
+    pub hidden_state_writer: Option<Op<DsaFp32SplitStateUpdateKernel>>,
     pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
     pub q_lora_epilogue: Option<Op<HadamardFp8QuantWeightScaleKernel>>,
     pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
@@ -449,7 +488,8 @@ pub struct DsaForkGlue {
     pub topk_buffer_copy: Op<ElementwiseKernel>,
 }
 
-/// The fork casts the decode positions to int32 twice per step.
+/// The fork casts the decode positions to int32 twice per step: for the kpool
+/// update and for the top-k sequence lengths.
 const POSITION_CASTS: u32 = 2;
 
 impl Glm53DsaAttnLocalWorklet {
@@ -691,6 +731,42 @@ impl Glm53DsaAttnLocalWorklet {
                 seq_lens_plus_one: ew(4, 4),
                 topk_buffer_copy: ew(4 * window, 4 * window),
             }),
+            // [q_a | kv_a | k | gate score | head weights] in fp32.
+            hidden_gemm: front
+                .hidden_split_state_writer
+                .map(|_| GemmFp32OutputKernelConfig {
+                    backends: cfg.fp32_gemm_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    n: (cfg.q_lora_rank.get() + latent + 2 * index_dim + index_heads).into(),
+                    k: cfg.hidden.clone(),
+                    input_dtype: bf16,
+                }),
+            hidden_row_split: front.hidden_split_state_writer.map(|backend| {
+                Fp32RowSplitLayerNormKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    bf16_lead_cols: (cfg.q_lora_rank.get() + latent).into(),
+                    norm_cols: index_dim.into(),
+                    bf16_trail_cols: index_dim.into(),
+                    fp32_tail_cols: index_heads.into(),
+                }
+            }),
+            // The same row; the pooled index update's geometry is
+            // `kpool_decode_update`'s.
+            hidden_state_writer: front.hidden_split_state_writer.map(|backend| {
+                DsaFp32SplitStateUpdateKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    q_lora_cols: cfg.q_lora_rank.clone(),
+                    kv_lora_cols: cfg.kv_lora_rank.clone(),
+                    index_dim: cfg.index_head_dim.clone(),
+                    fp32_tail_cols: cfg.index_num_heads.clone(),
+                    pool_size: kpool,
+                    tail_ring: kpool,
+                    block_size: cfg.cache_block_size,
+                }
+            }),
             // [q_b | wq_b] over the normed q latent; the indexer heads follow
             // `q_b`'s columns in the concatenated row.
             q_lora_gemm: front.q_lora_hadamard_epilogue.map(|_| {
@@ -857,6 +933,34 @@ impl Glm53DsaAttnLocalWorklet {
                     })
                 })
                 .transpose()?,
+            hidden_gemm: r
+                .hidden_gemm
+                .map(|c| atomic(n, "hidden_gemm", c, GemmFp32OutputKernel::build, bridge))
+                .transpose()?,
+            hidden_row_split: r
+                .hidden_row_split
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_row_split",
+                        c,
+                        Fp32RowSplitLayerNormKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            hidden_state_writer: r
+                .hidden_state_writer
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_state_writer",
+                        c,
+                        DsaFp32SplitStateUpdateKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             q_lora_gemm: r.q_lora_gemm.map(|c| gemm("q_lora_gemm", c)).transpose()?,
             q_lora_epilogue: r
                 .q_lora_epilogue
@@ -993,6 +1097,13 @@ impl Glm53DsaAttnLocalWorklet {
             repeated(&self.glue, GLUE_LAUNCHES, builder),
             repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
         ];
+        slots.extend(self.hidden_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.hidden_row_split.as_ref().map(|op| op.compile(builder)));
+        slots.extend(
+            self.hidden_state_writer
+                .as_ref()
+                .map(|op| op.compile(builder)),
+        );
         slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
@@ -1001,7 +1112,7 @@ impl Glm53DsaAttnLocalWorklet {
             slots.extend([
                 g.hidden_fp32_cast.compile(builder),
                 g.topk_buffer_fill.compile(builder),
-                repeated(&g.positions_to_int32, POSITION_CASTS, builder),
+                repeated(&g.positions_to_int32, self.position_casts(), builder),
                 g.pool_ids_to_int64.compile(builder),
                 g.seq_lens_plus_one.compile(builder),
                 g.topk_buffer_copy.compile(builder),
@@ -1020,28 +1131,36 @@ impl Glm53DsaAttnLocalWorklet {
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
         let front = cfg.front;
+        // The split state writer takes the decode rows' q/kv norm, cache
+        // append, kpool position cast and kpool update; prefill rows keep them.
+        let split_writer = front.hidden_split_state_writer.is_some();
         let q_lora_merged = front.q_lora_hadamard_epilogue.is_some();
         let absorb_fused = front.q_absorb_fp8.is_some();
         let page_table = front.topk_page_table.is_some();
-        push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
+        push_or_zero(&self.fused_qkv_a, rows.clone(), split_writer, ev);
+        let norm_tokens = if split_writer {
+            w.prefill_tokens
+        } else {
+            w.total_tokens
+        };
         push_or_zero(
             &self.q_kv_norm,
             QKvRmsNormKernelInput {
-                num_tokens: w.total_tokens,
+                num_tokens: norm_tokens,
             },
-            false,
+            split_writer && no_prefill,
             ev,
         );
         push_or_zero(&self.q_b, rows.clone(), q_lora_merged, ev);
         push_or_zero(&self.index_wq_b, rows.clone(), q_lora_merged, ev);
-        push_or_zero(&self.index_wk_weights, rows.clone(), false, ev);
+        push_or_zero(&self.index_wk_weights, rows.clone(), split_writer, ev);
         push_or_zero(
             &self.index_head_weights,
             GemmFp32OutputKernelInput { m: w.total_tokens },
-            false,
+            split_writer,
             ev,
         );
-        push_or_zero(&self.index_k_norm, all.clone(), false, ev);
+        push_or_zero(&self.index_k_norm, all.clone(), split_writer, ev);
         self.index_q_fwht_quant.push_or_zero(
             HadamardFp8QuantKernelInput {
                 num_rows: w.total_tokens * cfg.index_num_heads.get(),
@@ -1051,19 +1170,25 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_weight_scale, all.clone(), q_lora_merged, ev);
-        push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
+        push_or_zero(&self.kpool_gate_score, rows.clone(), split_writer, ev);
         push_or_zero(
             &self.prefill_gather,
             tokens(w.prefill_tokens),
             no_prefill,
             ev,
         );
+        // Logged as the requests (rows) this slot bills.
+        let (update_requests, update_rows) = if split_writer {
+            (0, 0)
+        } else {
+            (w.decode_requests, w.decode_rows)
+        };
         self.kpool_decode_update.push_or_zero(
             DsaPooledIndexCacheUpdateKernelInput {
-                num_requests: w.decode_requests,
+                num_requests: update_requests,
             },
-            w.decode_rows,
-            no_decode,
+            update_rows,
+            update_rows == 0,
             ev,
         );
         push_or_zero(
@@ -1125,6 +1250,7 @@ impl Glm53DsaAttnLocalWorklet {
                     &input.decode_kv_lens,
                     cfg.decode_next_n,
                 ),
+                decode_cache_append_elsewhere: split_writer,
                 decode_remap_elsewhere: page_table,
                 ..Default::default()
             },
@@ -1140,6 +1266,22 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(&self.o_proj, rows.clone(), false, ev);
         push_or_zero(&self.glue, all.clone(), self.fork_glue.is_some(), ev);
         push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(op) = &self.hidden_gemm {
+            let input = GemmFp32OutputKernelInput { m: w.total_tokens };
+            push_or_zero(op, input, false, ev);
+        }
+        if let Some(op) = &self.hidden_row_split {
+            let input = Fp32RowSplitLayerNormKernelInput {
+                num_tokens: w.prefill_tokens,
+            };
+            push_or_zero(op, input, no_prefill, ev);
+        }
+        if let Some(op) = &self.hidden_state_writer {
+            let input = DsaFp32SplitStateUpdateKernelInput {
+                num_requests: w.decode_requests,
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
         if let Some(op) = &self.q_lora_gemm {
             push_or_zero(op, rows.clone(), false, ev);
         }
@@ -1163,7 +1305,7 @@ impl Glm53DsaAttnLocalWorklet {
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
             let post_topk_gone = no_decode || page_table;
-            push_or_zero(&g.hidden_fp32_cast, all, false, ev);
+            push_or_zero(&g.hidden_fp32_cast, all, split_writer, ev);
             push_or_zero(&g.topk_buffer_fill, decode.clone(), post_topk_gone, ev);
             push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
             push_or_zero(&g.pool_ids_to_int64, decode.clone(), post_topk_gone, ev);
@@ -1180,6 +1322,18 @@ impl Glm53DsaAttnLocalWorklet {
     fn check_front_backends(&self) -> Result<(), BuildError> {
         let front = self.resolved.raw_cfg.front;
         let pinned = [
+            (
+                front.hidden_split_state_writer,
+                self.hidden_row_split
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.hidden_split_state_writer,
+                self.hidden_state_writer
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
             (
                 front.q_lora_hadamard_epilogue,
                 self.q_lora_epilogue
@@ -1212,6 +1366,22 @@ impl Glm53DsaAttnLocalWorklet {
             }
         }
         Ok(())
+    }
+
+    /// Fork-glue position casts per decode step; the split state writer
+    /// reads the int64 positions, so the kpool update's cast is gone.
+    fn position_casts(&self) -> u32 {
+        if self
+            .resolved
+            .raw_cfg
+            .front
+            .hidden_split_state_writer
+            .is_some()
+        {
+            POSITION_CASTS - 1
+        } else {
+            POSITION_CASTS
+        }
     }
 
     fn indexer_budget(&self) -> IndexerBudget {
@@ -2139,6 +2309,216 @@ mod tests {
             ),
             Err(BuildError::NoBackendForLaunch { .. })
         ));
+    }
+
+    /// Catches the split state writer double-billing or dropping a launch:
+    /// the fp32 GEMM spans every hidden-state column, decode rows' state
+    /// launches move into the writer, prefill rows keep the fork's norm and
+    /// cache append and take the row split, one position cast stays, and the
+    /// epilogues run only on the named backend.
+    #[test]
+    fn split_state_writer_takes_the_projections_and_the_decode_state_launches() {
+        let edit = |front: Glm53DsaFront| {
+            move |c: &mut Glm53DsaAttnLocalWorkletConfig| {
+                c.glue = DsaGlue::ForkLaunchList;
+                c.front = front;
+            }
+        };
+        let front = Glm53DsaFront {
+            hidden_split_state_writer: Some("triton"),
+            ..Default::default()
+        };
+        let w = build_with(edit(front), &[]).unwrap();
+        let fork = build_with(edit(Glm53DsaFront::default()), &[]).unwrap();
+        let r = &w.resolved;
+        let gemm = r.hidden_gemm.as_ref().unwrap();
+        // [q_a | kv_a | k | gate score | head weights].
+        assert_eq!(
+            (gemm.n.get(), gemm.k.get(), gemm.input_dtype),
+            (1536 + 512 + 128 + 128 + 32, 4096, DType::Bf16)
+        );
+        assert_eq!(gemm.backends, r.index_head_weights.backends);
+        let split = r.hidden_row_split.as_ref().unwrap();
+        assert_eq!(
+            (
+                split.bf16_lead_cols.get(),
+                split.norm_cols.get(),
+                split.bf16_trail_cols.get(),
+                split.fp32_tail_cols.get()
+            ),
+            (2048, 128, 128, 32)
+        );
+        let writer = r.hidden_state_writer.as_ref().unwrap();
+        assert_eq!(
+            (
+                writer.q_lora_cols.get(),
+                writer.kv_lora_cols.get(),
+                writer.index_dim.get(),
+                writer.fp32_tail_cols.get()
+            ),
+            (1536, 512, 128, 32)
+        );
+        assert_eq!(
+            (
+                writer.next_n,
+                writer.pool_size,
+                writer.tail_ring,
+                writer.block_size
+            ),
+            (1, 4, 4, 64)
+        );
+        let base = slots(&fork);
+        let names = slots(&w);
+        for absorbed in SPLIT_STATE_WRITER_ABSORBS {
+            let name = format!("m.dsa.{absorbed}");
+            assert!(
+                names.iter().any(|(n, _)| *n == name),
+                "{name} left the tree"
+            );
+        }
+        let added: Vec<_> = names
+            .iter()
+            .filter(|slot| !base.contains(slot))
+            .map(|(name, kind)| (name.as_str(), kind.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("m.dsa.hidden_gemm", "gemm_fp32_output"),
+                ("m.dsa.hidden_row_split", "fp32_row_split_layer_norm"),
+                ("m.dsa.hidden_state_writer", "dsa_fp32_split_state_update"),
+            ]
+        );
+        assert_eq!((fork.position_casts(), w.position_casts()), (2, 1));
+
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mixed = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            ..decode.clone()
+        };
+        let mut zeroed = newly_zeroed(&w, &fork, &mixed);
+        zeroed.sort();
+        assert_eq!(
+            zeroed,
+            [
+                "m.dsa.fused_qkv_a",
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.indexer.head_weights",
+                "m.dsa.indexer.k_norm",
+                "m.dsa.indexer.kpool_decode_update",
+                "m.dsa.indexer.kpool_gate_score",
+                "m.dsa.indexer.wk_weights",
+            ]
+        );
+        let mut zeroed = newly_zeroed(&w, &fork, &decode);
+        zeroed.sort();
+        assert_eq!(
+            zeroed,
+            [
+                "m.dsa.fused_qkv_a",
+                "m.dsa.glue.hidden_fp32_cast",
+                "m.dsa.hidden_row_split",
+                "m.dsa.indexer.head_weights",
+                "m.dsa.indexer.k_norm",
+                "m.dsa.indexer.kpool_decode_update",
+                "m.dsa.indexer.kpool_gate_score",
+                "m.dsa.indexer.wk_weights",
+                "m.dsa.q_kv_a_norm",
+                "m.dsa.sparse_mla.mla_cache_append",
+            ]
+        );
+        let size = |m: &HashMap<String, serde_json::Value>, s: &str| {
+            let v = &m[&format!("m.dsa.{s}")];
+            ["num_tokens", "num_requests", "m"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+                .unwrap_or_else(|| panic!("{s}: {v}"))
+        };
+        let (d, m) = (eval_inputs(&w, &decode), eval_inputs(&w, &mixed));
+        // (slot, billed on the decode / mixed input)
+        for (s, on_decode, on_mixed) in [
+            ("q_kv_a_norm", 0, 5),
+            ("sparse_mla.mla_cache_append", 0, 5),
+            ("indexer.kpool_decode_update", 0, 0),
+            ("hidden_row_split", 0, 5),
+            ("glue.positions_to_int32", 2, 2),
+            ("hidden_gemm", 2, 7),
+            ("hidden_state_writer", 2, 2),
+        ] {
+            assert_eq!((size(&d, s), size(&m, s)), (on_decode, on_mixed), "{s}");
+        }
+        for role in ["m.dsa.hidden_row_split", "m.dsa.hidden_state_writer"] {
+            assert!(
+                matches!(
+                    build_with(edit(front), &[(role, "torch")]),
+                    Err(BuildError::NoBackendForLaunch { .. })
+                ),
+                "{role}"
+            );
+        }
+    }
+
+    /// Catches fusions that overlap when combined (as the ladder's final
+    /// rungs run them): a decode step under all four zeroes exactly the union
+    /// of what each zeroes alone.
+    #[test]
+    fn front_fusions_compose_without_overlap() {
+        let with = |front: Glm53DsaFront| {
+            build_with(
+                move |c| {
+                    c.glue = DsaGlue::ForkLaunchList;
+                    c.front = front;
+                },
+                &[],
+            )
+            .unwrap()
+        };
+        let parts = [
+            Glm53DsaFront {
+                hidden_split_state_writer: Some("triton"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                q_lora_hadamard_epilogue: Some("triton"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                q_absorb_fp8: Some("cuda_tcgen05"),
+                ..Default::default()
+            },
+            Glm53DsaFront {
+                topk_page_table: Some("cuda_row_scan_compact"),
+                ..Default::default()
+            },
+        ];
+        let all = Glm53DsaFront {
+            hidden_split_state_writer: Some("triton"),
+            q_lora_hadamard_epilogue: Some("triton"),
+            q_absorb_fp8: Some("cuda_tcgen05"),
+            topk_page_table: Some("cuda_row_scan_compact"),
+        };
+        let fork = with(Glm53DsaFront::default());
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mut union: Vec<String> = parts
+            .into_iter()
+            .flat_map(|front| newly_zeroed(&with(front), &fork, &decode))
+            .collect();
+        let mut combined = newly_zeroed(&with(all), &fork, &decode);
+        union.sort();
+        combined.sort();
+        let distinct = {
+            let mut d = union.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(distinct, union, "two fusions zero the same slot");
+        assert_eq!(combined, union);
     }
 
     /// Catches a page-table launch that double-bills or misses a launch: it
