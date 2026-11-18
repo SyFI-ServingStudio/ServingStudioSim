@@ -11,7 +11,12 @@ Times the repo's fixed-pattern exchange kernels (``mnnvl_fixed_exchange``):
   rows from every rank and sums them;
 * ``moe_ep_quantize_and_all_gather`` / ``mnnvl_lamport``: bf16 rows
   NVFP4-quantized inside the dispatch push (quantization + all-gather in one
-  launch).
+  launch);
+* ``row_all_gather`` / ``mnnvl_lamport``: plain bf16 rows all-gathered by the
+  dispatch push (one plane);
+* ``row_all_gather`` / ``mnnvl_pull``: every rank's rows already sit in its own
+  mapped region (the producer wrote them there) and every rank copies all of
+  them out after the ready flags.
 
 One spawn per chunk maps the workspace once, sized for the chunk's largest
 per-rank count, and loops every shape inside it. Every shape is first checked
@@ -45,7 +50,7 @@ _GLOBAL_SCALE = 448.0 * 6.0 / 20.0
 # others move plain bf16 rows (dtype).
 _NVFP4_LEGS = frozenset({"dispatch", "quant_dispatch"})
 # Legs whose workspace holds plain bf16 rows in the dispatch landing.
-_BF16_ROW_LEGS: frozenset[str] = frozenset()
+_BF16_ROW_LEGS = frozenset({"gather", "pull_gather"})
 
 
 def profile_moe_ep_quantized_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
@@ -62,6 +67,14 @@ def profile_moe_ep_reduce_scatter_pull_batch(kwargs_list: list[dict]) -> list[Ru
 
 def profile_moe_ep_quantize_and_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     return _run(kwargs_list, "quant_dispatch")
+
+
+def profile_row_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _run(kwargs_list, "gather")
+
+
+def profile_row_all_gather_pull_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _run(kwargs_list, "pull_gather")
 
 
 def _run(kwargs_list: list[dict], leg: str) -> list[RunnerResult]:
@@ -376,10 +389,55 @@ def _time_pull(torch, exchange, counts, rank, world):
     return _metrics(time_ms, *_busiest_scatter_bytes(counts, hidden))
 
 
+# ----------------------------------------------------------------- bf16 rows (all-gather)
+def _rows(torch, rank, count, hidden):
+    g = torch.Generator(device="cuda").manual_seed(4000 + rank)
+    return (torch.randn((count, hidden), generator=g, device="cuda") * 2).to(torch.bfloat16)
+
+
+def _gather_reference(torch, counts, hidden):
+    return torch.cat([_rows(torch, r, c, hidden) for r, c in enumerate(counts)])
+
+
+def _time_gather(torch, exchange, counts, rank, world):
+    hidden = exchange.hidden_size
+    total = sum(counts)
+    rows = _rows(torch, rank, counts[rank], hidden)
+    out = torch.empty((total, hidden), dtype=torch.bfloat16, device="cuda")
+    exchange.all_gather(rows, out)
+    torch.cuda.synchronize()
+    _expect_equal(torch, "all-gather", out, _gather_reference(torch, counts, hidden))
+    time_ms = _graph_time_ms(torch, lambda: exchange.all_gather(rows, out), total * hidden * 2)
+    return _metrics(time_ms, *_busiest_gather_bytes(counts, 2 * hidden))
+
+
+def _time_pull_gather(torch, exchange, counts, rank, world):
+    import torch.distributed as dist
+
+    hidden = exchange.hidden_size
+    total = sum(counts)
+    first = sum(counts[:rank])
+    rows = _rows(torch, rank, counts[rank], hidden)
+    # Both sets hold this rank's rows, so graph replays of either round parity read them.
+    for set_index in (0, 1):
+        exchange.partials(set_index, total)[first : first + counts[rank]].copy_(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
+    out = torch.empty((total, hidden), dtype=torch.bfloat16, device="cuda")
+    exchange.pull_gather(out)
+    torch.cuda.synchronize()
+    _expect_equal(torch, "pull all-gather", out, _gather_reference(torch, counts, hidden))
+    time_ms = _graph_time_ms(torch, lambda: exchange.pull_gather(out), total * hidden * 2)
+    dist.barrier()
+    return _metrics(time_ms, *_busiest_gather_bytes(counts, 2 * hidden))
+
+
 # Leg name -> ``(torch, exchange, counts, rank, world) -> metrics dict``.
 _TIME_LEG = {
     "dispatch": _time_dispatch,
     "quant_dispatch": _time_quant_dispatch,
     "combine": _time_combine,
     "pull": _time_pull,
+    "gather": _time_gather,
+    "pull_gather": _time_pull_gather,
 }

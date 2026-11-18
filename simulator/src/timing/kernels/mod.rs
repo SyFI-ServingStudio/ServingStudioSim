@@ -91,6 +91,7 @@ pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
+pub mod row_all_gather;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
@@ -405,6 +406,7 @@ pub use residual_rms_norm::{
     ResidualRmsNormSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
+pub use row_all_gather::{RowAllGatherKernel, RowAllGatherKernelConfig, RowAllGatherSpec};
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
