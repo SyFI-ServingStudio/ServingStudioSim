@@ -59,10 +59,11 @@ use crate::timing::kernels::{
     DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
     ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
     GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, HadamardFp8QuantKernel,
-    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, QKvRmsNormKernel,
-    QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput, StaticFp8QuantKernel, StaticFp8QuantKernelConfig,
-    StaticFp8QuantKernelInput,
+    HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, HadamardFp8QuantWeightScaleKernel,
+    HadamardFp8QuantWeightScaleKernelConfig, HadamardFp8QuantWeightScaleKernelInput,
+    QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput, StaticFp8QuantKernel,
+    StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
@@ -197,6 +198,16 @@ pub enum DsaGlue {
 /// another backend fails the build). The default is the fork's launches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Glm53DsaFront {
+    /// `q_b` and the indexer's `wq_b`, which both read the normed q latent, as
+    /// one bf16 GEMM over concatenated weights (their callable and backends at
+    /// the summed width, slot `q_lora_gemm`), plus one epilogue launch on this
+    /// backend that reads the indexer query heads in place from the
+    /// concatenated output, Hadamard-rotates and FP8-quantizes them and
+    /// scales the head weights (`hadamard_fp8_quant_weight_scale`, slot
+    /// `q_lora_epilogue`). Absorbs `q_b_proj`, `indexer.wq_b`,
+    /// `indexer.q_fwht_quant` and `indexer.weight_scale`; the q/kv RMS norm
+    /// stays.
+    pub q_lora_hadamard_epilogue: Option<&'static str>,
     /// `q_absorb`'s batched GEMM with the static FP8 quant of its output in
     /// the epilogue (`batched_gemm_static_fp8_quant`, slot `q_absorb_fp8`).
     /// Absorbs `q_absorb` and `q_fp8_quant`.
@@ -339,6 +350,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub prefill_glue: ElementwiseKernelConfig,
     /// `raw_cfg.glue == ForkLaunchList`.
     pub fork_glue: Option<DsaForkGlueConfigs>,
+    pub q_lora_gemm: Option<SingleGemmKernelConfig>,
+    pub q_lora_epilogue: Option<HadamardFp8QuantWeightScaleKernelConfig>,
     pub q_absorb_fp8: Option<BatchedGemmStaticFp8QuantKernelConfig>,
 }
 
@@ -398,6 +411,8 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
     pub fork_glue: Option<DsaForkGlue>,
+    pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
+    pub q_lora_epilogue: Option<Op<HadamardFp8QuantWeightScaleKernel>>,
     pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
@@ -654,6 +669,24 @@ impl Glm53DsaAttnLocalWorklet {
                 seq_lens_plus_one: ew(4, 4),
                 topk_buffer_copy: ew(4 * window, 4 * window),
             }),
+            // [q_b | wq_b] over the normed q latent; the indexer heads follow
+            // `q_b`'s columns in the concatenated row.
+            q_lora_gemm: front.q_lora_hadamard_epilogue.map(|_| {
+                gemm(
+                    heads * cfg.qk_nope_head_dim.get() + index_heads * index_dim,
+                    cfg.q_lora_rank.clone(),
+                )
+            }),
+            q_lora_epilogue: front.q_lora_hadamard_epilogue.map(|backend| {
+                HadamardFp8QuantWeightScaleKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_heads: cfg.index_num_heads.clone(),
+                    head_dim: cfg.index_head_dim.clone(),
+                    lead_cols: (heads * cfg.qk_nope_head_dim.get()).into(),
+                    input_dtype: bf16,
+                }
+            }),
             // `q_absorb`'s shape, its output quantized in the epilogue.
             q_absorb_fp8: front
                 .q_absorb_fp8
@@ -787,6 +820,19 @@ impl Glm53DsaAttnLocalWorklet {
                     })
                 })
                 .transpose()?,
+            q_lora_gemm: r.q_lora_gemm.map(|c| gemm("q_lora_gemm", c)).transpose()?,
+            q_lora_epilogue: r
+                .q_lora_epilogue
+                .map(|c| {
+                    atomic(
+                        n,
+                        "q_lora_epilogue",
+                        c,
+                        HadamardFp8QuantWeightScaleKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             q_absorb_fp8: r
                 .q_absorb_fp8
                 .map(|c| {
@@ -898,6 +944,8 @@ impl Glm53DsaAttnLocalWorklet {
             repeated(&self.glue, GLUE_LAUNCHES, builder),
             repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
         ];
+        slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
         if let Some(g) = &self.fork_glue {
             slots.extend([
@@ -922,6 +970,7 @@ impl Glm53DsaAttnLocalWorklet {
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
         let front = cfg.front;
+        let q_lora_merged = front.q_lora_hadamard_epilogue.is_some();
         let absorb_fused = front.q_absorb_fp8.is_some();
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
@@ -932,8 +981,8 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.q_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wq_b, rows.clone(), false, ev);
+        push_or_zero(&self.q_b, rows.clone(), q_lora_merged, ev);
+        push_or_zero(&self.index_wq_b, rows.clone(), q_lora_merged, ev);
         push_or_zero(&self.index_wk_weights, rows.clone(), false, ev);
         push_or_zero(
             &self.index_head_weights,
@@ -947,10 +996,10 @@ impl Glm53DsaAttnLocalWorklet {
                 num_rows: w.total_tokens * cfg.index_num_heads.get(),
             },
             w.total_tokens,
-            false,
+            q_lora_merged,
             ev,
         );
-        push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
+        push_or_zero(&self.index_weight_scale, all.clone(), q_lora_merged, ev);
         push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
         push_or_zero(
             &self.prefill_gather,
@@ -1036,9 +1085,18 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.o_proj, rows, false, ev);
+        push_or_zero(&self.o_proj, rows.clone(), false, ev);
         push_or_zero(&self.glue, all.clone(), self.fork_glue.is_some(), ev);
         push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(op) = &self.q_lora_gemm {
+            push_or_zero(op, rows.clone(), false, ev);
+        }
+        if let Some(op) = &self.q_lora_epilogue {
+            let input = HadamardFp8QuantWeightScaleKernelInput {
+                num_tokens: w.total_tokens,
+            };
+            push_or_zero(op, input, false, ev);
+        }
         if let Some(op) = &self.q_absorb_fp8 {
             let input = BatchedGemmStaticFp8QuantKernelInput { m: w.total_tokens };
             push_or_zero(op, input, false, ev);
@@ -1061,12 +1119,20 @@ impl Glm53DsaAttnLocalWorklet {
     /// its name.
     fn check_front_backends(&self) -> Result<(), BuildError> {
         let front = self.resolved.raw_cfg.front;
-        let pinned = [(
-            front.q_absorb_fp8,
-            self.q_absorb_fp8
-                .as_ref()
-                .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
-        )];
+        let pinned = [
+            (
+                front.q_lora_hadamard_epilogue,
+                self.q_lora_epilogue
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+            (
+                front.q_absorb_fp8,
+                self.q_absorb_fp8
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, op.kernel.kind())),
+            ),
+        ];
         for (backend, op) in pinned {
             if let (Some(backend), Some((role, built, kind))) = (backend, op) {
                 if built.as_slice() != [backend] {
@@ -1947,6 +2013,67 @@ mod tests {
         assert_eq!(inputs["m.dsa.glue.topk_buffer_copy"]["num_tokens"], 2);
     }
 
+    /// Catches a q-latent concat that drops or double-counts a projection, an
+    /// epilogue that prices the wrong span or kind, keeps the absorbed FWHT
+    /// quant and weight scale, or drifts to another backend.
+    #[test]
+    fn q_lora_concat_is_one_gemm_and_one_hadamard_epilogue() {
+        let front = Glm53DsaFront {
+            q_lora_hadamard_epilogue: Some("post_kernel"),
+            ..Default::default()
+        };
+        let w = build_with(|c| c.front = front, &[]).unwrap();
+        let r = &w.resolved;
+        let q_lora = r.q_lora_gemm.as_ref().unwrap();
+        assert_eq!(q_lora.n.get(), r.q_b.n.get() + r.index_wq_b.n.get());
+        assert_eq!((q_lora.k.get(), q_lora.dtype), (1536, DType::Bf16));
+        assert_eq!(q_lora.backends, r.q_b.backends);
+        let epi = r.q_lora_epilogue.as_ref().unwrap();
+        assert_eq!(
+            (epi.num_heads.get(), epi.head_dim.get(), epi.lead_cols.get()),
+            (32, 128, r.q_b.n.get())
+        );
+        assert_eq!(epi.input_dtype, DType::Bf16);
+        let base = slots(&build_with(|_| {}, &[]).unwrap());
+        let added: Vec<_> = slots(&w)
+            .into_iter()
+            .filter(|slot| !base.contains(slot))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("m.dsa.q_lora_gemm".to_string(), "single_gemm".to_string()),
+                (
+                    "m.dsa.q_lora_epilogue".to_string(),
+                    "hadamard_fp8_quant_weight_scale".to_string()
+                ),
+            ]
+        );
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            decode_kv_lens: vec![4000, 5000],
+        };
+        assert_eq!(
+            newly_zeroed(&w, &input),
+            [
+                "m.dsa.q_b_proj",
+                "m.dsa.indexer.wq_b",
+                "m.dsa.indexer.q_fwht_quant",
+                "m.dsa.indexer.weight_scale",
+            ]
+        );
+        let inputs = eval_inputs(&w, &input);
+        assert_eq!(inputs["m.dsa.q_lora_gemm"]["m"], 7);
+        assert_eq!(inputs["m.dsa.q_lora_epilogue"]["num_tokens"], 7);
+        assert!(matches!(
+            build_with(
+                |c| c.front = front,
+                &[("m.dsa.q_lora_epilogue", "vllm_triton")]
+            ),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
     /// Catches a fused q_absorb priced as the bf16 `batched_gemm` (no FP8
     /// output), at another width than `q_absorb`, alongside the launches it
     /// replaces, or on another backend than the one named.
@@ -1954,6 +2081,7 @@ mod tests {
     fn q_absorb_fp8_is_the_static_fp8_quant_kind_at_q_absorb_width() {
         let front = Glm53DsaFront {
             q_absorb_fp8: Some("tc_kernel"),
+            ..Default::default()
         };
         let w = build_with(|c| c.front = front, &[]).unwrap();
         let c = w.resolved.q_absorb_fp8.as_ref().unwrap();
