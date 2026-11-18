@@ -70,8 +70,9 @@ DOC = KernelDoc(
         "back-to-back calls, taking the median of three runs. vllm_cuda and "
         "vllm_fork_cuda use CUPTI kernel time with the L2 cache flushed before "
         "each call and count every launch of the call, the workspace memset and"
-        " the persistent kernel. Operand construction and the output checks "
-        "run before timing."
+        " the persistent kernel; deep_select is timed the same way over every "
+        "DeepSelect launch. Operand construction and the output checks run "
+        "before timing."
     ),
     caveats=(
         "Time follows the score distribution: the increasing uniform template "
@@ -199,6 +200,37 @@ register(
                 "rows; rejects larger batches."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/cooperative_topk.cu",
+        ),
+    )
+)
+
+
+# The fork's explicit decode top-k backend (kernel_config.sparse_indexer_topk_backend
+# = "deep_select", model_executor/layers/indexer_topk.py:186-195, 290-292): exact
+# FP32 top-k over each row's [0, end) prefix. SM100a/SM103a only (the 10.x family).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deep_select",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode_deep_select",
+            function_name="profile_dsa_persistent_topk_decode_deep_select",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepSelect's exact FP32 top-k (torch.ops.deep_select.topk) over each "
+                "row's valid prefix; the fork's opt-in decode top-k on SM100."
+            ),
+            url="https://github.com/vllm-project/DeepSelect",
         ),
     )
 )
