@@ -638,6 +638,7 @@ fn build_group(
                 router: Glm53MoeRouterLocalWorklet::build(
                     format!("{m}.router"),
                     Glm53MoeRouterLocalWorklet::resolve_config(&local.router),
+                    false,
                     bridge,
                 )?,
                 input_glue: atomic(

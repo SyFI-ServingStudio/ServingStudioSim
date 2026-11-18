@@ -2,9 +2,13 @@
 //! whole experts, or (`ep_size` 1, `moe_intermediate` already divided by TP)
 //! a MoE-TP rank's slice of every expert.
 //!
-//! The router gate is `GateLinear` (BF16 weight, fp32 logits) and vLLM computes
-//! it twice per layer (`glm5next/nvidia/model.py:264` and `moe_runner.py`),
-//! so [`Glm53MoeRouterLocalWorklet`] has two identical leaves.
+//! The router gate is `GateLinear` (BF16 weight, fp32 logits). The fork line
+//! the GLM-5.3 captures ran computes it twice per layer:
+//! `Glm5NextMoE.forward` calls `self.gate` (`glm5next/nvidia/model.py:264`) and
+//! also hands it to the `MoERunner`, which recomputes the logits
+//! (`moe_runner.py`). Fork commit 1768273c13 (#55736) drops the second call;
+//! [`Glm53MoeRouterLocalWorklet`] has two identical leaves unless built with
+//! `gate_once`.
 //!
 //! [`Glm53RoutedMoeLocalWorklet`] is the routed path through a TRT-LLM fused
 //! MoE: a quant of the routed input, then one fused call (routing, FC1,
@@ -53,7 +57,8 @@ pub struct Glm53MoeRouterLocalWorkletInput {
 pub struct Glm53MoeRouterLocalWorklet {
     pub name: String,
     pub gate: Op<GemmFp32OutputKernel>,
-    pub gate_recompute: Op<GemmFp32OutputKernel>,
+    /// The MoE runner's recompute; `None` when the gate runs once.
+    pub gate_recompute: Option<Op<GemmFp32OutputKernel>>,
 }
 
 impl Glm53MoeRouterLocalWorklet {
@@ -70,6 +75,7 @@ impl Glm53MoeRouterLocalWorklet {
     pub fn build(
         name: String,
         resolved: GemmFp32OutputKernelConfig,
+        gate_once: bool,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let n = name.as_str();
@@ -81,27 +87,35 @@ impl Glm53MoeRouterLocalWorklet {
                 GemmFp32OutputKernel::build,
                 bridge,
             )?,
-            gate_recompute: atomic(
-                n,
-                "gate_recompute",
-                resolved,
-                GemmFp32OutputKernel::build,
-                bridge,
-            )?,
+            gate_recompute: (!gate_once)
+                .then(|| {
+                    atomic(
+                        n,
+                        "gate_recompute",
+                        resolved,
+                        GemmFp32OutputKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             name,
         })
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let mut leaves = vec![self.gate.compile(builder)];
+        leaves.extend(self.gate_recompute.as_ref().map(|op| op.compile(builder)));
         CostNode::Labeled {
             label: format!(
-                "{} (Glm53MoeRouterLocalWorklet) [gate computed twice]",
-                self.name
+                "{} (Glm53MoeRouterLocalWorklet) [gate computed {}]",
+                self.name,
+                if self.gate_recompute.is_some() {
+                    "twice"
+                } else {
+                    "once"
+                }
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.gate.compile(builder),
-                self.gate_recompute.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(leaves)),
         }
     }
 
@@ -111,7 +125,9 @@ impl Glm53MoeRouterLocalWorklet {
         };
         let zero = input.num_tokens == 0;
         push_or_zero(&self.gate, rows.clone(), zero, ev);
-        push_or_zero(&self.gate_recompute, rows, zero, ev);
+        if let Some(recompute) = &self.gate_recompute {
+            push_or_zero(recompute, rows, zero, ev);
+        }
     }
 }
 
@@ -320,6 +336,40 @@ mod tests {
             expert_demand: ExpertDemand::popularity(&RoutingDistribution::uniform(288), 1),
             folded_rank_position: 0,
         }
+    }
+
+    /// Catches `gate_once` leaving the recompute priced, or the default
+    /// dropping it.
+    #[test]
+    fn gate_once_drops_only_the_recompute() {
+        let router = Glm53MoeRouterLocalWorkletConfig {
+            hidden: 4096.into(),
+            num_experts: 288.into(),
+            activation_dtype: DType::Bf16,
+            gpu_name: "NVIDIA B200".into(),
+            gemm_backends: vec!["torch"],
+        };
+        let leaves = |gate_once: bool| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let worklet = Glm53MoeRouterLocalWorklet::build(
+                "router".into(),
+                Glm53MoeRouterLocalWorklet::resolve_config(&router),
+                gate_once,
+                &bridge,
+            )
+            .unwrap();
+            let mut builder = CostTreeBuilder::new();
+            let root = worklet.compile(&mut builder);
+            builder
+                .finish(root)
+                .slots
+                .iter()
+                .map(|slot| slot.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(leaves(false), ["router.gate", "router.gate_recompute"]);
+        assert_eq!(leaves(true), ["router.gate"]);
     }
 
     #[test]
