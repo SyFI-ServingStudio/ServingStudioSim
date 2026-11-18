@@ -738,6 +738,7 @@ pub fn build_configs(
             mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
+            cooperative_topk_backends: Vec::new(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),

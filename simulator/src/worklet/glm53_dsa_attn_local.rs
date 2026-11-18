@@ -39,13 +39,14 @@
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use crate::common::gpu::sm_count;
+use crate::common::gpu::{compute_capability, sm_count};
 use crate::op::attention::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::dsa_topk_prefill::takes_row_starts;
+use crate::timing::kernels::sparse_indexer_topk::COOPERATIVE_MAX_ROWS;
 use crate::timing::kernels::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
@@ -136,6 +137,10 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub mla_bmm_v_up_backends: Vec<&'static str>,
     pub mqa_logits_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    /// vLLM's `cooperative_topk`, which the fork's "auto" decode top-k runs
+    /// for at most 64 rows (`model_executor/layers/indexer_topk.py`). Empty
+    /// prices every decode batch on `topk_backends`.
+    pub cooperative_topk_backends: Vec<&'static str>,
     pub mqa_logits_prefill_backends: Vec<&'static str>,
     pub topk_prefill_backends: Vec<&'static str>,
     pub sparse_attention_backends: Vec<&'static str>,
@@ -180,6 +185,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
     pub topk_decode: DsaPersistentTopkDecodeKernelConfig,
+    /// `topk_decode` on the cooperative backends (`None` when there are none).
+    pub topk_decode_cooperative: Option<DsaPersistentTopkDecodeKernelConfig>,
     pub mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig,
     pub topk_prefill: DsaTopkPrefillKernelConfig,
     pub expand_pools: ElementwiseKernelConfig,
@@ -233,6 +240,12 @@ pub struct Glm53DsaAttnLocalWorklet {
     /// wave: the longest-context pricing, or a GPU whose SM count the catalog
     /// does not record.
     topk_decode_slots: Option<u32>,
+    /// `cooperative_topk`, which the fork's "auto" dispatch runs for at most
+    /// [`COOPERATIVE_MAX_ROWS`] rows; its time lands in the `topk_decode`
+    /// slot. `None` without cooperative backends, on a GPU the fork's dispatch
+    /// skips (below SM90, or the SM12x family), or when `topk_decode` is
+    /// overridden to a backend outside [`LONG_ROW_BACKENDS`].
+    topk_decode_cooperative: Option<Arc<DsaPersistentTopkDecodeKernel>>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
@@ -279,6 +292,24 @@ impl Glm53DsaAttnLocalWorklet {
         // scale per head.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
+        let topk_decode = DsaPersistentTopkDecodeKernelConfig {
+            backends: cfg.topk_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            next_n: cfg.decode_next_n,
+            max_model_len: max_model_len.clone(),
+            top_k: cfg.index_topk / kpool,
+            logits_row_stride: max_model_len.clone(),
+            logits_dtype: DType::Fp32,
+            index_dtype: "int32".into(),
+            context_mode: match cfg.decode_indexer {
+                DsaDecodeIndexer::LongestContext => "uniform",
+                // Scores drawn from the measured logit distribution: real
+                // GLM-5.3-Flash rows replay within ~5% of it, against
+                // 1.1-1.2x for uniform random scores.
+                DsaDecodeIndexer::PerRequest => "uniform_measured",
+            }
+            .into(),
+        };
         Glm53DsaAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
             q_kv_norm: QKvRmsNormKernelConfig {
@@ -338,24 +369,13 @@ impl Glm53DsaAttnLocalWorklet {
                 cache_format: "page_planar_fp8_fp32_scale".into(),
                 clean_logits: false,
             },
-            topk_decode: DsaPersistentTopkDecodeKernelConfig {
-                backends: cfg.topk_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                next_n: cfg.decode_next_n,
-                max_model_len: max_model_len.clone(),
-                top_k: cfg.index_topk / kpool,
-                logits_row_stride: max_model_len,
-                logits_dtype: DType::Fp32,
-                index_dtype: "int32".into(),
-                context_mode: match cfg.decode_indexer {
-                    DsaDecodeIndexer::LongestContext => "uniform",
-                    // Scores drawn from the measured logit distribution: real
-                    // GLM-5.3-Flash rows replay within ~5% of it, against
-                    // 1.1-1.2x for uniform random scores.
-                    DsaDecodeIndexer::PerRequest => "uniform_measured",
+            topk_decode_cooperative: (!cfg.cooperative_topk_backends.is_empty()).then(|| {
+                DsaPersistentTopkDecodeKernelConfig {
+                    backends: cfg.cooperative_topk_backends.clone(),
+                    ..topk_decode.clone()
                 }
-                .into(),
-            },
+            }),
+            topk_decode,
             // One launch per iteration over every prefill row; each row spans
             // its own pool-granular context (`compress_ratio == index_kpool`).
             mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
@@ -498,6 +518,7 @@ impl Glm53DsaAttnLocalWorklet {
             )?,
             topk_prefill_packed: None,
             topk_decode_slots,
+            topk_decode_cooperative: None,
             topk_prefill: atomic(
                 n,
                 "indexer.topk_prefill",
@@ -545,6 +566,26 @@ impl Glm53DsaAttnLocalWorklet {
                     backends: packed,
                     ..topk.kernel.config.clone()
                 },
+                bridge,
+            )?));
+        }
+        // The fork's "auto" chain runs `cooperative_topk` up to 64 rows and
+        // its long-row kernel past it; checked on the backends as built, after
+        // any run-config override.
+        let topk = &worklet.topk_decode.kernel.config;
+        let cooperative_capable =
+            compute_capability(&topk.gpu_name).is_some_and(|(major, _)| major >= 9 && major != 12);
+        let auto_chain = topk
+            .backends
+            .iter()
+            .all(|backend| LONG_ROW_BACKENDS.contains(backend));
+        if let (Some(config), true) = (
+            &r.topk_decode_cooperative,
+            cooperative_capable && auto_chain,
+        ) {
+            worklet.topk_decode_cooperative = Some(Arc::new(DsaPersistentTopkDecodeKernel::build(
+                format!("{}.indexer.topk_decode.cooperative", worklet.name),
+                config.clone(),
                 bridge,
             )?));
         }
@@ -729,6 +770,15 @@ impl Glm53DsaAttnLocalWorklet {
             context_len,
         };
         let longest = input(w.decode_requests, w.decode_pools);
+        if let Some(cooperative) = &self.topk_decode_cooperative {
+            if w.decode_rows > 0 && w.decode_rows <= COOPERATIVE_MAX_ROWS {
+                // One wave of CTA clusters over every row: the longest row
+                // sets the time. The pick is not one of the slot's backends.
+                let mut metrics = cooperative.eval(&longest);
+                metrics.backend_index = LeafMetrics::NO_BACKEND;
+                return ev.push(metrics, || longest.into());
+            }
+        }
         let kernel = &self.topk_decode.kernel;
         let slots = match self.topk_decode_slots {
             Some(slots) if w.decode_rows > slots => slots,
@@ -831,6 +881,13 @@ struct Work {
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
+
+/// The `topk_decode` backends that run past [`COOPERATIVE_MAX_ROWS`] behind
+/// the cooperative kernel. `vllm_cuda` (persistent_topk) is the fork's "auto"
+/// chain. `deep_select` there is the same chain with its long-row kernel
+/// swapped, not the fork's explicit `deep_select` setting, which runs every
+/// batch on DeepSelect. Any other backend runs every batch on itself.
+const LONG_ROW_BACKENDS: [&str; 2] = ["vllm_cuda", "deep_select"];
 
 /// Rows of the one-wave uniform launch `eval_decode_topk` prices each row
 /// from: below the SM count, so the measured batch axis does not straddle a
@@ -1091,6 +1148,7 @@ mod tests {
             mla_bmm_v_up_backends: vec!["torch_mla_v_up_unpadded"],
             mqa_logits_backends: vec!["deepgemm_fp8"],
             topk_backends: vec!["vllm_cuda"],
+            cooperative_topk_backends: Vec::new(),
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
@@ -1371,6 +1429,60 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    #[test]
+    fn decode_topk_takes_the_cooperative_kernel_only_ahead_of_a_long_row_kernel() {
+        // The fork's "auto" decode top-k runs cooperative_topk up to 64 rows,
+        // also with DeepSelect for the longer batches; torch or a pre-SM90 GPU
+        // never does, and neither does a config that names no cooperative
+        // backend.
+        let build = |cooperative: Vec<&'static str>, topk: Option<Vec<&str>>, gpu: &str| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let map: HashMap<String, Vec<String>> = topk
+                .into_iter()
+                .map(|backends| {
+                    let backends = backends.iter().map(|b| b.to_string()).collect();
+                    ("m.dsa.indexer.topk_decode".to_string(), backends)
+                })
+                .collect();
+            let _scope = bridge.with_backend_overrides("main", Some(&map));
+            let mut config = cfg();
+            config.cooperative_topk_backends = cooperative;
+            config.decode_indexer = DsaDecodeIndexer::PerRequest;
+            config.gpu_name = gpu.into();
+            Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                &bridge,
+            )
+            .unwrap()
+        };
+        let cooperative = || vec!["vllm_cuda_cooperative"];
+        let worklet = build(cooperative(), None, "NVIDIA B200");
+        let kernel = worklet.topk_decode_cooperative.as_ref().unwrap();
+        assert_eq!(kernel.config.backends, vec!["vllm_cuda_cooperative"]);
+        // The same rows as the long-row kernel.
+        assert_eq!(kernel.config.context_mode, "uniform_measured");
+        assert!(
+            build(cooperative(), Some(vec!["deep_select"]), "NVIDIA B200")
+                .topk_decode_cooperative
+                .is_some()
+        );
+        assert!(build(cooperative(), Some(vec!["torch"]), "NVIDIA B200")
+            .topk_decode_cooperative
+            .is_none());
+        assert!(build(cooperative(), None, "A100-SXM4-80GB")
+            .topk_decode_cooperative
+            .is_none());
+        assert!(build(Vec::new(), None, "NVIDIA B200")
+            .topk_decode_cooperative
+            .is_none());
+        // Its time lands in the topk_decode slot: no extra leaf.
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        assert_eq!(builder.finish(root).slots.len(), 24 + 4 + 3);
     }
 
     #[test]
