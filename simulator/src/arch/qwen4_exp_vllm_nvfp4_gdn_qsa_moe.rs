@@ -1512,6 +1512,7 @@ mod tests {
                     .map(|kv_len| SpeculativeDecodeInput {
                         kv_len,
                         query_len: 4,
+                        committed_rows: 4,
                     })
                     .collect(),
                 total_kv_len: 0,
@@ -1625,6 +1626,7 @@ mod tests {
         group.decode_requests.push(SpeculativeDecodeInput {
             kv_len: 131071,
             query_len: 2,
+            committed_rows: 2,
         });
         group.decode_tokens += 2;
         group.batch_tokens += 2;
@@ -1659,6 +1661,7 @@ mod tests {
         group.decode_requests.push(SpeculativeDecodeInput {
             kv_len: 131071,
             query_len: 1,
+            committed_rows: 1,
         });
         group.decode_tokens += 1;
         group.batch_tokens += 1;

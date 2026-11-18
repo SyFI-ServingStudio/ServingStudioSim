@@ -324,7 +324,12 @@ impl SpeculativePredictGroup {
         }
         for [kv_len, query_len] in self.decode_requests {
             ensure_fits("final verify KV length", kv_len, max_model_len)?;
-            let row = SpeculativeDecodeInput { kv_len, query_len };
+            // A case states no acceptance, so every row commits.
+            let row = SpeculativeDecodeInput {
+                kv_len,
+                query_len,
+                committed_rows: query_len,
+            };
             row.check_verify_row(draft_tokens, max_model_len)
                 .map_err(|reason| anyhow!(reason))?;
             group.decode_tokens = group
@@ -929,7 +934,8 @@ mod tests {
             lowered.decode_requests[1],
             SpeculativeDecodeInput {
                 kv_len: 206,
-                query_len: 6
+                query_len: 6,
+                committed_rows: 6,
             }
         );
         assert!(

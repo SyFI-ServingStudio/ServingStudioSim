@@ -195,6 +195,106 @@ const fn default_dflash2_sliding_window() -> u32 {
     2048
 }
 
+/// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaStateDtype {
+    #[default]
+    Fp32,
+    Bf16,
+}
+
+impl KdaStateDtype {
+    pub fn dtype(self) -> crate::timing::bridge::DType {
+        match self {
+            Self::Fp32 => crate::timing::bridge::DType::Fp32,
+            Self::Bf16 => crate::timing::bridge::DType::Bf16,
+        }
+    }
+}
+
+/// [`KdaStateDtype`]'s serde representation.
+const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
+/// [`crate::worklet::KdaSpecVerify`]'s serde representation.
+const KDA_SPEC_VERIFIES: [&str; 2] = ["recoverssm", "recurrent_per_position"];
+
+/// How the DSA layers' elementwise glue is priced (`dsa_glue`; see
+/// [`crate::worklet::DsaGlue`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DsaGluePricing {
+    /// 17 launches of 64 B per token.
+    #[default]
+    Placeholder,
+    /// The vLLM fork's 7 decode launches at their real bytes.
+    ForkLaunchList,
+}
+
+const DSA_GLUE_PRICINGS: [&str; 2] = ["placeholder", "fork_launch_list"];
+
+/// DSA front cut A (`dsa_hidden_gemm`): the GEMMs reading the hidden state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DsaHiddenGemmMode {
+    /// The fork's separate projections.
+    #[default]
+    Separate,
+    /// [`crate::worklet::Glm53DsaFront::hidden_split_state_writer`], priced by
+    /// `dsa_hidden_gemm_backend`.
+    Fp32SplitStateWriter,
+}
+
+const DSA_HIDDEN_GEMM_MODES: [&str; 2] = ["separate", "fp32_split_state_writer"];
+
+/// DSA front cut B (`dsa_q_lora_gemm`): the GEMMs reading the normed q latent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DsaQLoraGemmMode {
+    /// The fork's separate `q_b_proj` and indexer `wq_b`.
+    #[default]
+    Separate,
+    /// [`crate::worklet::Glm53DsaFront::q_lora_hadamard_epilogue`], priced by
+    /// `dsa_q_lora_gemm_backend`.
+    ConcatHadamardEpilogue,
+}
+
+const DSA_Q_LORA_GEMM_MODES: [&str; 2] = ["separate", "concat_hadamard_epilogue"];
+
+const EXPERT_EXCHANGES: [&str; 2] =
+    crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::EXPERT_EXCHANGES;
+const MOE_SHARED_OVERLAPS: [&str; 2] =
+    crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MOE_SHARED_OVERLAPS;
+const DRAFT_ATTENTIONS: [&str; 3] = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_ATTENTIONS;
+const DRAFT_TOPKS: [&str; 2] = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_TOPKS;
+const MHC_BOUNDARIES: [&str; 2] =
+    crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MHC_BOUNDARIES;
+const KDA_TP_COMM_PRICINGS: [&str; 1] =
+    crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KDA_TP_COMM_PRICINGS;
+const TAG_EXPERT_EXCHANGES: [&str; 1] =
+    crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::EXPERT_EXCHANGES;
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_false() -> bool {
+    false
+}
+
+const fn default_kda_tp_gpus() -> u16 {
+    1
+}
+
+/// The KDA-TP design's one-node EP group.
+const fn default_kda_tp_fused_ep_size() -> u16 {
+    8
+}
+
+/// The KDA-TP design's pool dtype: the fork's CuTe RecoverSSM kernels need bf16.
+const fn default_kda_tp_fused_kda_state_dtype() -> KdaStateDtype {
+    KdaStateDtype::Bf16
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -1165,6 +1265,367 @@ pub enum IterArchSel {
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
     },
+    /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoe`] verifying a DFlash2
+    /// proposer's drafts (`arch::glm53_flash_vllm_nvfp4_dflash2`), one TP1
+    /// proposer per attention DP rank, with the DP graph's options.
+    Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// KDA layers tensor-parallel over groups of this many owner ranks
+        /// (the MLA layers stay on each request's owner rank); 1 is plain DP
+        /// attention. Must divide `ep_size`.
+        #[serde(default = "default_kda_tp_gpus")]
+        #[param(default = 1, cache_key)]
+        kda_tp_gpus: u16,
+        /// Each KDA layer's two low-rank gate up-projections (`f_b`, `g_b`) as
+        /// one batched GEMM. Not a vLLM path.
+        #[serde(default)]
+        #[param(cache_key)]
+        kda_gate_b_merged: bool,
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same EP size.
+        /// Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes, as a manifest path. Requires
+        /// `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the DP graph.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Candidate positions drafted per request per iteration, at most the
+        /// Flash draft checkpoint's `block_size - 1` (7). The speculative
+        /// worker's `draft_tokens` must match.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`).
+        #[serde(default)]
+        #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
+        /// How the verify advances the KDA state: `recoverssm` (verify +
+        /// commit, one state per request) or `recurrent_per_position` (the
+        /// fork's GLM path: a state per position, `1 + draft_tokens` state
+        /// pages per request, no commit).
+        #[serde(default)]
+        #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
+        kda_spec_verify: crate::worklet::KdaSpecVerify,
+        /// Expert exchange: `measured_allgather` (vLLM's all-gatherv and
+        /// reduce-scatterv) or `fixed_pattern` (the fixed-pattern MNNVL
+        /// exchange as measured; NVFP4 EP 8).
+        #[serde(default)]
+        #[param(string, default = "measured_allgather", choices = EXPERT_EXCHANGES, cache_key)]
+        expert_exchange: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::ExpertExchange,
+        /// What-if (`extrapolated`): every fused mHC post/pre boundary costs
+        /// vLLM's row less this many us. Absent: vLLM's rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_fused_saving_us: Option<f64>,
+        /// DSA elementwise glue: `placeholder` (17 launches of 64 B per token)
+        /// or `fork_launch_list` (the fork's 7 decode launches at their real
+        /// bytes).
+        #[serde(default)]
+        #[param(string, default = "placeholder", choices = DSA_GLUE_PRICINGS, cache_key)]
+        dsa_glue: DsaGluePricing,
+        /// Not a fork path: DSA front cut A ([`DsaHiddenGemmMode`]).
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_HIDDEN_GEMM_MODES, cache_key)]
+        dsa_hidden_gemm: DsaHiddenGemmMode,
+        /// `dsa_hidden_gemm: fp32_split_state_writer` only (required there):
+        /// the epilogue's backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_hidden_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut B ([`DsaQLoraGemmMode`]).
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_Q_LORA_GEMM_MODES, cache_key)]
+        dsa_q_lora_gemm: DsaQLoraGemmMode,
+        /// `dsa_q_lora_gemm: concat_hadamard_epilogue` only (required there):
+        /// the epilogue's backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_lora_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
+        /// its epilogue ([`crate::worklet::Glm53DsaFront::q_absorb_fp8`]), on
+        /// this backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_absorb_fp8_backend: Option<String>,
+        /// Not a fork path: DSA indexer cut E, the decode rows' selected pools
+        /// to the final page table in one launch
+        /// ([`crate::worklet::Glm53DsaFront::topk_page_table`]), on this
+        /// backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_page_table_backend: Option<String>,
+        /// Compute the MoE router gate once per layer (the fork since #55736)
+        /// instead of twice (the 2026-09 capture's line).
+        #[serde(default = "default_false")]
+        #[param(default = false, cache_key)]
+        router_gate_once: bool,
+        /// Price a bf16 copy of the routed input ahead of the dispatch quant
+        /// (`moe.input_glue`, from the 2026-09 FP8 TP4/EP4 capture). The
+        /// fork's NVFP4 naive DP/EP path quantizes the hidden directly, so
+        /// `false` drops the leaf.
+        #[serde(default = "default_true")]
+        #[param(default = true, cache_key)]
+        moe_input_copy: bool,
+        /// Fold the MoE block's shared + routed add into the next mHC post
+        /// (`mhc_fused_sum_post_pre_rms_norm` `vllm_tilelang_post_addend`);
+        /// the add is not billed. Refused beside a nonzero
+        /// `mhc_fused_saving_us`, whose after-MoE share already removes it.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_combine_add_in_mhc_post: bool,
+        /// How the aux-stream shared expert (local rows <= 256) overlaps the
+        /// MoE chain: `chain` (an overlap factor) or `exposed` (the measured
+        /// time it adds, from `moe_shared_pair_file`).
+        #[serde(default)]
+        #[param(string, default = "chain", choices = MOE_SHARED_OVERLAPS, cache_key)]
+        moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
+        /// `moe_shared_overlap: exposed` only (required there): a table
+        /// `{"points": [{"rows", "<column>_us", ...}, ...]}` of the time the
+        /// shared expert adds to the MoE block by rows per rank.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_file: Option<String>,
+        /// The `<column>_us` column of `moe_shared_pair_file`.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_column: Option<String>,
+        /// DFlash2 draft attention leaf
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]).
+        #[serde(default)]
+        #[param(string, default = "fa2_bf16", choices = DRAFT_ATTENTIONS, cache_key)]
+        draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
+        /// DFlash2 draft vocabulary top-k
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        #[serde(default)]
+        #[param(string, default = "flashinfer", choices = DRAFT_TOPKS, cache_key)]
+        draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
+        /// DFlash2 context K/V: one launch normalizes, rotates and writes every
+        /// draft layer's cache (`layered_kv_norm_rope_cache_write`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_context_kv_store: bool,
+        /// DFlash2 draft layers: one launch for q/k norm, RoPE, the fp8 query
+        /// quant and the block's K/V write. Needs an fp8 `draft_attention`.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_qk_norm_rope_kv_write: bool,
+        /// DFlash2 draft layers: each conv finish fused with the residual
+        /// RMSNorm after it.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_conv_residual_norm: bool,
+    },
+    /// GLM-5.3-Flash NVFP4 + DFlash2 under attention DP with the KDA layers
+    /// tensor-parallel in groups of `kda_tp_gpus`, the fixed-pattern expert
+    /// exchange and the merged KDA gate up-projection. Not a vLLM layout: a
+    /// fixed configuration of [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]
+    /// (`arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`).
+    Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention DP ranks, which are also the EP group: one GPU each.
+        #[serde(default = "default_kda_tp_fused_ep_size")]
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        /// GPUs per KDA tensor-parallel group (1 = plain DP attention). Must
+        /// divide `ep_size`; set it per load point.
+        #[param(cache_key)]
+        kda_tp_gpus: u16,
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        /// MoE routing; no default (a synthetic default would hide a missing
+        /// corpus).
+        #[param(string, choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same EP size.
+        /// Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes, as a manifest path. Requires
+        /// `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the DP graph.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM fork 3f667d7's two sparse-MLA layout copies; vLLM 04730e8 and
+        /// later drop them (the default here).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        mla_layout_copies: bool,
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Candidate positions drafted per request per iteration, at most the
+        /// Flash draft checkpoint's `block_size - 1` (7). The speculative
+        /// worker's `draft_tokens` must match.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// KDA recurrent state pool dtype; `bf16` (the default here) lets the
+        /// fork's CuTe RecoverSSM kernels run.
+        #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
+        #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
+        /// How the verify advances the KDA state: `recoverssm` (verify +
+        /// commit, one state per request) or `recurrent_per_position` (the
+        /// fork's GLM path: a state per position, `1 + draft_tokens` state
+        /// pages per request, no commit).
+        #[serde(default)]
+        #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
+        kda_spec_verify: crate::worklet::KdaSpecVerify,
+        /// How the mHC post/pre boundaries are priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
+        #[serde(default)]
+        #[param(string, default = "unfused", choices = MHC_BOUNDARIES, cache_key)]
+        mhc_boundary:
+            crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary,
+        /// `mhc_boundary: fused_less_saving` only (required there): the
+        /// measured per-boundary saving of the one-launch kernel over vLLM's
+        /// TileLang call at this deployment's rows per rank, us.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_fused_saving_us: Option<f64>,
+        /// How the KDA group's all-gather + reduce-scatter is priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KdaTpCommPricing`]).
+        #[serde(default)]
+        #[param(string, default = "gather_scatter", choices = KDA_TP_COMM_PRICINGS, cache_key)]
+        kda_tp_comm_pricing:
+            crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KdaTpCommPricing,
+        /// How the expert exchange is priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::ExpertExchange`]).
+        #[serde(default)]
+        #[param(string, default = "fixed_measured", choices = TAG_EXPERT_EXCHANGES, cache_key)]
+        expert_exchange:
+            crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::ExpertExchange,
+        /// DSA elementwise glue: `placeholder` (17 launches of 64 B per token)
+        /// or `fork_launch_list` (the fork's 7 decode launches at their real
+        /// bytes).
+        #[serde(default)]
+        #[param(string, default = "placeholder", choices = DSA_GLUE_PRICINGS, cache_key)]
+        dsa_glue: DsaGluePricing,
+        /// Not a fork path: DSA front cut A ([`DsaHiddenGemmMode`]).
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_HIDDEN_GEMM_MODES, cache_key)]
+        dsa_hidden_gemm: DsaHiddenGemmMode,
+        /// `dsa_hidden_gemm: fp32_split_state_writer` only (required there):
+        /// the epilogue's backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_hidden_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut B ([`DsaQLoraGemmMode`]).
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_Q_LORA_GEMM_MODES, cache_key)]
+        dsa_q_lora_gemm: DsaQLoraGemmMode,
+        /// `dsa_q_lora_gemm: concat_hadamard_epilogue` only (required there):
+        /// the epilogue's backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_lora_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
+        /// its epilogue ([`crate::worklet::Glm53DsaFront::q_absorb_fp8`]), on
+        /// this backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_absorb_fp8_backend: Option<String>,
+        /// Not a fork path: DSA indexer cut E, the decode rows' selected pools
+        /// to the final page table in one launch
+        /// ([`crate::worklet::Glm53DsaFront::topk_page_table`]), on this
+        /// backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_page_table_backend: Option<String>,
+        /// Compute the MoE router gate once per layer (the fork since #55736)
+        /// instead of twice (the 2026-09 capture's line).
+        #[serde(default = "default_true")]
+        #[param(default = true, cache_key)]
+        router_gate_once: bool,
+        /// Price a bf16 copy of the routed input ahead of the dispatch quant
+        /// (`moe.input_glue`, from the 2026-09 FP8 TP4/EP4 capture). The
+        /// fork's NVFP4 naive DP/EP path quantizes the hidden directly, so
+        /// `false` drops the leaf.
+        #[serde(default = "default_true")]
+        #[param(default = true, cache_key)]
+        moe_input_copy: bool,
+        /// Fold the MoE block's shared + routed add into the next mHC post
+        /// (`mhc_fused_sum_post_pre_rms_norm` `vllm_tilelang_post_addend`);
+        /// the add is not billed. Refused beside a nonzero
+        /// `mhc_fused_saving_us`, whose after-MoE share already removes it.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_combine_add_in_mhc_post: bool,
+        /// How the aux-stream shared expert (local rows <= 256) overlaps the
+        /// MoE chain: `chain` (an overlap factor) or `exposed` (the measured
+        /// time it adds, from `moe_shared_pair_file`).
+        #[serde(default)]
+        #[param(string, default = "chain", choices = MOE_SHARED_OVERLAPS, cache_key)]
+        moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
+        /// `moe_shared_overlap: exposed` only (required there): a table
+        /// `{"points": [{"rows", "<column>_us", ...}, ...]}` of the time the
+        /// shared expert adds to the MoE block by rows per rank.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_file: Option<String>,
+        /// The `<column>_us` column of `moe_shared_pair_file`.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_column: Option<String>,
+        /// DFlash2 draft attention leaf
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]).
+        #[serde(default)]
+        #[param(string, default = "fa2_bf16", choices = DRAFT_ATTENTIONS, cache_key)]
+        draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
+        /// DFlash2 draft vocabulary top-k
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        #[serde(default)]
+        #[param(string, default = "flashinfer", choices = DRAFT_TOPKS, cache_key)]
+        draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
+        /// DFlash2 context K/V: one launch normalizes, rotates and writes every
+        /// draft layer's cache (`layered_kv_norm_rope_cache_write`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_context_kv_store: bool,
+        /// DFlash2 draft layers: one launch for q/k norm, RoPE, the fp8 query
+        /// quant and the block's K/V write. Needs an fp8 `draft_attention`.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_qk_norm_rope_kv_write: bool,
+        /// DFlash2 draft layers: each conv finish fused with the residual
+        /// RMSNorm after it.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_conv_residual_norm: bool,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -1395,6 +1856,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { model, .. }
+            | Self::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
@@ -1420,6 +1883,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { max_model_len, .. }
+            | Self::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }

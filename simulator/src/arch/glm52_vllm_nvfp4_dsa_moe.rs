@@ -3505,6 +3505,7 @@ mod tests {
                     .map(|&kv_len| SpeculativeDecodeInput {
                         kv_len,
                         query_len: verify_width,
+                        committed_rows: verify_width,
                     })
                     .collect(),
                 total_kv_len: decode_kv_lens
@@ -3548,6 +3549,7 @@ mod tests {
         group.decode_requests.push(SpeculativeDecodeInput {
             kv_len: 8_191,
             query_len: 2,
+            committed_rows: 2,
         });
         group.decode_tokens += 2;
         group.batch_tokens += 2;

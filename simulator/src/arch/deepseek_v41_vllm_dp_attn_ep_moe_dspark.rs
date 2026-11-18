@@ -723,7 +723,11 @@ mod tests {
             prefill_chunk_pairs: Vec::new(),
             decode_requests: decode
                 .iter()
-                .map(|&(kv_len, query_len)| SpeculativeDecodeInput { kv_len, query_len })
+                .map(|&(kv_len, query_len)| SpeculativeDecodeInput {
+                    kv_len,
+                    query_len,
+                    committed_rows: query_len,
+                })
                 .collect(),
             total_kv_len: 0,
         }
