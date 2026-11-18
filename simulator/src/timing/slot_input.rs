@@ -56,7 +56,10 @@ use crate::timing::kernels::{
     SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
     SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
 };
-use crate::timing::kernels::{KdaRecoverSSMCommitKernelInput, KdaRecoverSSMVerifyKernelInput};
+use crate::timing::kernels::{
+    KdaRecoverSSMCommitKernelInput, KdaRecoverSSMConvVerifyKernelInput,
+    KdaRecoverSSMVerifyKernelInput,
+};
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
@@ -179,6 +182,7 @@ log_inputs! {
     GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,
     KdaChunkPrefill => KdaChunkPrefillKernelInput,
     KdaRecoverSSMCommit => KdaRecoverSSMCommitKernelInput,
+    KdaRecoverSSMConvVerify => KdaRecoverSSMConvVerifyKernelInput,
     KdaRecoverSSMVerify => KdaRecoverSSMVerifyKernelInput,
     KdaRecurrentDecode => KdaRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
