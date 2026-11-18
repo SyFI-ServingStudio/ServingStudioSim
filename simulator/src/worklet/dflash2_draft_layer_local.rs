@@ -559,23 +559,20 @@ impl Dflash2DraftAttnLocalWorklet {
             ),
         }
 
-        // One aggregating slot, priced as ONE launch over every request's
-        // rectangle: the engine runs a single varlen FlashAttention call per
-        // layer, not one per request. See `batched_rectangle`. `add_fanin` (not
-        // `add`) so the slot carries the selected backend rather than the ZERO
+        // One aggregating slot, priced as ONE launch over the whole batch: the
+        // engine runs a single varlen FlashAttention call per layer, not one
+        // per request. See `batched_rectangles`. `add_fanin` (not `add`) so the slot carries the selected backend rather than the ZERO
         // accumulator's sentinel, which would read as "never executed".
         // Under `attention_large_batch` the launch goes to exactly one of the
         // two slots by its request count; the other reads ZERO.
         let mut attention = LeafMetrics::ZERO;
         let mut large = LeafMetrics::ZERO;
-        if let Some((q_len, kv_len)) = batched_rectangle(&input.rectangles) {
-            let shape = FlashinferAttnRectKernelInput { q_len, kv_len };
-            let requests = input.rectangles.iter().filter(|&&(q, _)| q > 0).count();
+        if let Some(batch) = batched_rectangles(&input.rectangles) {
             match &self.attention_large_batch {
-                Some((min_requests, op)) if requests >= *min_requests as usize => {
-                    large.add_fanin(op.kernel.eval(&shape))
+                Some((min_requests, op)) if batch.num_requests >= *min_requests => {
+                    large.add_fanin(op.kernel.eval(&batch))
                 }
-                _ => attention.add_fanin(self.attention.kernel.eval(&shape)),
+                _ => attention.add_fanin(self.attention.kernel.eval(&batch)),
             }
         }
         let log = || {
@@ -1009,32 +1006,30 @@ where
     ))
 }
 
-/// The single rectangle one batched draft-attention launch is priced as:
-/// `q_len = sum(q_i)` and `kv_len = sum(q_i * kv_i) / sum(q_i)`, rounded up.
+/// One rank's draft-attention launch: `num_requests` requests, each a block of
+/// `q_len` rows attending its own `kv_len` keys.
 ///
-/// The rect leaf is profiled one request at a time, so summing it per request
-/// bills the launch and its fixed latency once per request. The engine makes one
-/// varlen call per layer, and on the v0.28 captures
-/// (`logs/20260923_4_glm53_dflash2_pack`) the per-request sum overstated
-/// `dflash2.layer.attn.attention` 55x at 256 concurrent requests (811 ms simulated
-/// vs 14.6 ms measured over the case) and 9x at 32; the error grew with the
-/// request count, not the context. One rectangle keeps the attention work
-/// (`sum(q_i * kv_i)`, every query row against its own keys) and bills one
-/// launch. It reads the keys of one mean-length context rather than every
-/// request's own, which errs fast on a KV-bound call; the leaf is measured at
-/// bf16 against the engine's fp8, which errs slow (see the module note).
-fn batched_rectangle(rectangles: &[(u32, u32)]) -> Option<(u32, u32)> {
-    let q_total: u64 = rectangles.iter().map(|&(q, _)| u64::from(q)).sum();
+/// The engine makes one varlen call per layer, and on the v0.28 captures
+/// (`logs/20260923_4_glm53_dflash2_pack`) a per-request sum overstated
+/// `dflash2.layer.attn.attention` 55x at 256 concurrent requests, so the call is
+/// one leaf. It is not one rectangle of `sum(q_i)` rows over a mean context
+/// either: every request reads its own K/V, so the K/V bytes scale with the
+/// request count. The leaf is profiled at that batch shape; a block is the same
+/// width for every request, and the window caps the contexts, so the mean
+/// context stands for each (rounded up; the leaf is linear in it).
+fn batched_rectangles(rectangles: &[(u32, u32)]) -> Option<FlashinferAttnRectKernelInput> {
+    let active = rectangles.iter().filter(|&&(q, _)| q > 0);
+    let num_requests = active.clone().count() as u64;
+    let q_total: u64 = active.clone().map(|&(q, _)| u64::from(q)).sum();
     if q_total == 0 {
         return None;
     }
-    let work: u64 = rectangles
-        .iter()
-        .map(|&(q, kv)| u64::from(q) * u64::from(kv))
-        .sum();
-    let q_len = u32::try_from(q_total).expect("draft query rows fit u32");
-    let kv_len = u32::try_from(work.div_ceil(q_total)).expect("mean kv_len fits u32");
-    Some((q_len, kv_len))
+    let kv_total: u64 = active.map(|&(_, kv)| u64::from(kv)).sum();
+    Some(FlashinferAttnRectKernelInput {
+        num_requests: u32::try_from(num_requests).expect("draft requests fit u32"),
+        q_len: u32::try_from(q_total.div_ceil(num_requests)).expect("draft block fits u32"),
+        kv_len: u32::try_from(kv_total.div_ceil(num_requests)).expect("mean kv_len fits u32"),
+    })
 }
 
 fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
@@ -1157,13 +1152,22 @@ mod tests {
         assert!(!attn_leaves(&cfg()).contains(&"query_kv_append".to_string()));
     }
 
+    fn shape(batch: Option<FlashinferAttnRectKernelInput>) -> Option<(u32, u32, u32)> {
+        batch.map(|b| (b.num_requests, b.q_len, b.kv_len))
+    }
+
+    /// Catches the batch collapsing back to one rectangle over one shared
+    /// context: two requests must stay two requests, each with its own keys.
     #[test]
-    fn a_batch_of_rectangles_is_one_launch_with_the_same_work() {
-        assert_eq!(batched_rectangle(&[]), None);
-        assert_eq!(batched_rectangle(&[(0, 100)]), None);
-        assert_eq!(batched_rectangle(&[(8, 100)]), Some((8, 100)));
-        // 8*100 + 8*301 = 3208 query-key pairs over 16 rows: 200.5, rounded up.
-        assert_eq!(batched_rectangle(&[(8, 100), (8, 301)]), Some((16, 201)));
+    fn a_batch_of_rectangles_is_one_launch_over_every_request() {
+        assert_eq!(shape(batched_rectangles(&[])), None);
+        assert_eq!(shape(batched_rectangles(&[(0, 100)])), None);
+        assert_eq!(shape(batched_rectangles(&[(8, 100)])), Some((1, 8, 100)));
+        // Two blocks of 8; contexts 100 and 301 average 200.5, rounded up.
+        assert_eq!(
+            shape(batched_rectangles(&[(8, 100), (8, 301), (0, 50)])),
+            Some((2, 8, 201))
+        );
     }
 
     /// Catches the fused launch standing beside the four it replaces, or
