@@ -490,3 +490,62 @@ def profile_mla_v_up_unpadded(
         backend, (layout.kv_lora_rank, layout.v_head_dim), num_batches, m, n, k, dtype
     )
     return _profile_layout_bmm(backend, _build_layout_v_up_operands, layout, *args)
+
+
+def profile_bmm_packed_lhs(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile ``num_batches`` same-shape linears as one strided Torch BMM.
+
+    The LHS of batch ``b`` is columns ``[b*k, (b+1)*k)`` of one packed
+    ``(m, num_batches*k)`` activation, a strided view with no copy. The weights
+    are ``num_batches`` linear weights in ``(n, k)`` layout stacked into one
+    ``(num_batches, n, k)`` tensor; the output is ``(num_batches, m, n)``.
+    """
+    num_batches, m, n, k = (int(v) for v in (num_batches, m, n, k))
+    dtype = DType.from_value(dtype)
+    if num_batches <= 0 or m <= 0 or n <= 0 or k <= 0:
+        raise ValueError(
+            "num_batches, m, n, and k must be > 0, got "
+            f"num_batches={num_batches}, m={m}, n={n}, k={k}"
+        )
+    if dtype is not _SUPPORTED_DTYPE:
+        raise ValueError(f"torch_bmm_packed_lhs supports only bf16, got {dtype.value}")
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "torch is required for the torch_bmm_packed_lhs backend"
+        ) from exc
+
+    try:
+        torch_dtype = dtype.torch()
+        packed = torch.randn((m, num_batches * k), dtype=torch_dtype, device="cuda")
+        lhs = packed.view(m, num_batches, k).transpose(0, 1)
+        weight = torch.randn((num_batches, n, k), dtype=torch_dtype, device="cuda")
+        rhs = weight.transpose(1, 2)
+        out = torch.empty((num_batches, m, n), dtype=torch_dtype, device="cuda")
+
+        def kernel() -> None:
+            torch.bmm(lhs, rhs, out=out)
+
+        # Same effective-duration boundary as single_gemm's torch_linear rows,
+        # so a split-K assembly is timed the same way on both sides.
+        time_ms = Timer.cupti(kernel, interval_union=True)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+        flops = 2 * num_batches * m * n * k
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0.0 else 0.0
+        bytes_accessed = int(_logical_elements(num_batches, m, n, k) * dtype.size_bytes())
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0.0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
