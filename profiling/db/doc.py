@@ -100,6 +100,11 @@ SUBCATEGORIES: dict[str, tuple[Subcategory, ...]] = {
             "mHC: each token keeps several residual streams, mixed before and after "
             "every block; these calls fuse the mixing with RMSNorm.",
         ),
+        Subcategory(
+            "LayerNorm",
+            "Mean-and-variance normalization with a weight and bias, fused into "
+            "the call that produces or splits its input.",
+        ),
     ),
 }
 

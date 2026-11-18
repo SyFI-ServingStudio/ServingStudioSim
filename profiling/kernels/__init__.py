@@ -43,6 +43,7 @@ from profiling.kernels import (
     fp8_block_quant,  # noqa: F401
     fp8_blockscale_grouped_gemm,  # noqa: F401
     fp8_per_token_group_quant,  # noqa: F401
+    fp32_row_split_layer_norm,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401

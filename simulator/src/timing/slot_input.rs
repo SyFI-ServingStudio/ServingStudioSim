@@ -47,6 +47,7 @@ use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::HadamardFp8QuantKernelInput;
 use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
+use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
@@ -165,6 +166,7 @@ log_inputs! {
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
+    Fp32RowSplitLayerNorm => Fp32RowSplitLayerNormKernelInput,
     Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,

@@ -32,6 +32,7 @@ pub mod fa4_varlen_projection;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
+pub mod fp32_row_split_layer_norm;
 pub mod fp8_block_quant;
 pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
@@ -215,6 +216,10 @@ pub use flashinfer_attn_prefill::{
 pub use flashinfer_attn_rect::{
     FlashinferAttnRectKernel, FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
     FlashinferAttnRectSpec,
+};
+pub use fp32_row_split_layer_norm::{
+    Fp32RowSplitLayerNormKernel, Fp32RowSplitLayerNormKernelConfig,
+    Fp32RowSplitLayerNormKernelInput, Fp32RowSplitLayerNormSpec,
 };
 pub use fp8_block_quant::{
     Fp8BlockQuantKernel, Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput, Fp8BlockQuantSpec,
