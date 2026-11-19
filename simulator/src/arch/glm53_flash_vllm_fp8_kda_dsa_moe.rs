@@ -764,6 +764,7 @@ pub fn build_configs(
             static_quant_backends: STATIC_QUANT_BACKENDS.to_vec(),
             pooled_index_update_backends: POOLED_INDEX_UPDATE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            fork_glue_backends: Vec::new(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
                 * 1024

@@ -108,6 +108,8 @@ pub const DESIGN_KERNELS: Glm53FlashDflash2Kernels = Glm53FlashDflash2Kernels {
     // and the one-launch CUDA kernel at its rows per rank.
     mhc_post_pre: &["vllm_tilelang", "cuda_one_launch"],
     mhc_sum_post_pre: &["vllm_tilelang_post_addend", "cuda_one_launch"],
+    // The fork's eager torch glue, as the vLLM tag.
+    dsa_fork_glue: &["torch_vllm"],
 };
 
 /// `sel` (this tag) as the `glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`

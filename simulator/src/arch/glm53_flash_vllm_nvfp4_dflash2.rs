@@ -35,8 +35,8 @@
 //! expert's measured exposure (the `production` column of
 //! `model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json`). Where a
 //! worklet takes a kernel choice, [`VLLM_FORK_KERNELS`] names the fork's call.
-//! The DSA glue launches are still priced on Triton rows; the fork runs them
-//! as eager torch ops.
+//! The DSA glue launches are priced as the fork runs them, eager torch ops
+//! (`torch_vllm`).
 //!
 //! # The proposer
 //!
@@ -99,6 +99,8 @@ pub struct Glm53FlashDflash2Kernels {
     /// (`attn_mhc_sum_post_pre` and the terminal post after an MoE layer,
     /// `mhc_fused_sum_post_pre_rms_norm`), under `moe_combine_add_in_mhc_post`.
     pub mhc_sum_post_pre: &'static [&'static str],
+    /// The DSA glue launches of the fork's launch list (`dsa.glue.*`).
+    pub dsa_fork_glue: &'static [&'static str],
 }
 
 /// What the vLLM fork (79838a5a, the DFlash2 serving fork) calls; the source
@@ -129,6 +131,9 @@ pub const VLLM_FORK_KERNELS: Glm53FlashDflash2Kernels = Glm53FlashDflash2Kernels
     // addend variant is the nearest.
     mhc_post_pre: &["vllm_tilelang"],
     mhc_sum_post_pre: &["vllm_tilelang_post_addend"],
+    // Eager torch ops: `common/attention.py:318`, `nvidia/sparse_indexer.py:291,
+    // 563, 719, 746`, `common/sparse_indexer.py:114`.
+    dsa_fork_glue: &["torch_vllm"],
 };
 
 impl Glm53FlashDflash2Kernels {
@@ -146,6 +151,7 @@ impl Glm53FlashDflash2Kernels {
             routed.fused_moe_backends = self.routed_moe.to_vec();
         }
         configs.local.dsa.topk_backends = self.dsa_topk_decode.to_vec();
+        configs.local.dsa.fork_glue_backends = self.dsa_fork_glue.to_vec();
         configs.local.mhc_fused.backends = self.mhc_post_pre.to_vec();
         if let Some(sum) = &mut configs.mhc_post_addend {
             sum.backends = self.mhc_sum_post_pre.to_vec();

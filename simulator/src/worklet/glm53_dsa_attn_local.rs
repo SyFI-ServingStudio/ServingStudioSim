@@ -329,6 +329,10 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// `indexer.kpool_decode_update` by its placeholder.
     pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// The launches of [`DsaGlue::ForkLaunchList`] (`glue.*`): the fork runs
+    /// them as eager torch ops (`torch_vllm`). Empty prices them on
+    /// `elementwise_backends`.
+    pub fork_glue_backends: Vec<&'static str>,
     /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
     /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
     /// skips the empty-query `masked_fill_` unless DCP or HiSparse is on, so
@@ -739,20 +743,29 @@ impl Glm53DsaAttnLocalWorklet {
             glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
             // One int32 index row of `selected_k` lanes in and out per row.
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
-            fork_glue: (cfg.glue == DsaGlue::ForkLaunchList).then(|| DsaForkGlueConfigs {
-                hidden_fp32_cast: ew(2 * cfg.hidden.get(), 4 * cfg.hidden.get()),
-                topk_buffer_fill: ew(0, 4 * cfg.selected_k),
-                positions_to_int32: ew(8, 4),
-                pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
-                seq_lens_plus_one: ew(4, 4),
-                topk_buffer_copy: ew(4 * window, 4 * window),
-                // Per row over the four launches: the copy writes 4 bytes a
-                // lane, the compare a 1-byte mask, the masked fill reads that
-                // mask and the int32 row and writes the row.
-                short_decode_causal_fill: ew(
-                    5 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
-                    9 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
-                ),
+            fork_glue: (cfg.glue == DsaGlue::ForkLaunchList).then(|| {
+                let backends = if cfg.fork_glue_backends.is_empty() {
+                    &cfg.elementwise_backends
+                } else {
+                    &cfg.fork_glue_backends
+                };
+                let ew =
+                    |input: u32, output: u32| elementwise(backends, &cfg.gpu_name, input, output);
+                DsaForkGlueConfigs {
+                    hidden_fp32_cast: ew(2 * cfg.hidden.get(), 4 * cfg.hidden.get()),
+                    topk_buffer_fill: ew(0, 4 * cfg.selected_k),
+                    positions_to_int32: ew(8, 4),
+                    pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
+                    seq_lens_plus_one: ew(4, 4),
+                    topk_buffer_copy: ew(4 * window, 4 * window),
+                    // Per row over the four launches: the copy writes 4 bytes a
+                    // lane, the compare a 1-byte mask, the masked fill reads that
+                    // mask and the int32 row and writes the row.
+                    short_decode_causal_fill: ew(
+                        5 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
+                        9 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
+                    ),
+                }
             }),
             // [q_a | kv_a | k | gate score | head weights] in fp32.
             hidden_gemm: front
@@ -1855,6 +1868,7 @@ mod tests {
             static_quant_backends: Vec::new(),
             pooled_index_update_backends: Vec::new(),
             elementwise_backends: vec!["triton"],
+            fork_glue_backends: Vec::new(),
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
             decode_next_n: 1,
