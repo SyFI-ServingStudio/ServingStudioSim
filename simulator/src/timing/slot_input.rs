@@ -42,18 +42,35 @@ use crate::timing::kernels::{
     SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
+use crate::timing::kernels::BatchedGemmStaticFp8QuantKernelInput;
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
+use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
+use crate::timing::kernels::DsaPooledLogitsPageTableKernelInput;
+use crate::timing::kernels::DsaPooledTopkPageTableKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
+use crate::timing::kernels::HadamardFp8QuantKernelInput;
+use crate::timing::kernels::HadamardFp8QuantWeightScaleKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
+use crate::timing::kernels::SigmoidGatedRmsNormKernelInput;
+use crate::timing::kernels::{
+    GroupedConvResidualRmsNormKernelInput, LayeredKvNormRopeCacheWriteKernelInput,
+    QkNormRopeFp8KvWriteKernelInput,
+};
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
     SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
     SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
+};
+use crate::timing::kernels::{
+    KdaRecoverSSMCommitKernelInput, KdaRecoverSSMConvVerifyKernelInput,
+    KdaRecoverSSMVerifyKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
@@ -163,6 +180,8 @@ log_inputs! {
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
+    Fp32RowSplitLayerNorm => Fp32RowSplitLayerNormKernelInput,
+    DsaFp32SplitStateUpdate => DsaFp32SplitStateUpdateKernelInput,
     Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,
@@ -171,10 +190,14 @@ log_inputs! {
     GdnCausalConvPrefillFanIn => GdnCausalConvPrefillLog,
     GdnChunkDeltaRule => GdnChunkDeltaRuleKernelInput,
     GdnGatedRmsNorm => GdnGatedRmsNormKernelInput,
+    SigmoidGatedRmsNorm => SigmoidGatedRmsNormKernelInput,
     GdnPrefillPostConv => GdnPrefillPostConvKernelInput,
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,
     KdaChunkPrefill => KdaChunkPrefillKernelInput,
+    KdaRecoverSSMCommit => KdaRecoverSSMCommitKernelInput,
+    KdaRecoverSSMConvVerify => KdaRecoverSSMConvVerifyKernelInput,
+    KdaRecoverSSMVerify => KdaRecoverSSMVerifyKernelInput,
     KdaRecurrentDecode => KdaRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
     MoeFusedTopk => MoeFusedTopkKernelInput,
@@ -185,6 +208,9 @@ log_inputs! {
     MoeSum => MoeSumKernelInput,
     ClampedSwiglu => ClampedSwigluKernelInput,
     InvRopeFp8Quant => InvRopeFp8QuantKernelInput,
+    HadamardFp8Quant => HadamardFp8QuantKernelInput,
+    HadamardFp8QuantWeightScale => HadamardFp8QuantWeightScaleKernelInput,
+    BatchedGemmStaticFp8Quant => BatchedGemmStaticFp8QuantKernelInput,
     QKvRmsNorm => QKvRmsNormKernelInput,
     DsaIndexerQRopeQuantWeightFold => DsaIndexerQRopeQuantWeightFoldKernelInput,
     DsaIndexerQRopeQuant => DsaIndexerQRopeQuantKernelInput,
@@ -227,6 +253,9 @@ log_inputs! {
     DsaMqaLogitsPrefill => DsaMqaLogitsPrefillKernelInput,
     DsaPagedMqaLogitsDecode => DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecode => DsaPersistentTopkDecodeKernelInput,
+    DsaPooledIndexCacheUpdate => DsaPooledIndexCacheUpdateKernelInput,
+    DsaPooledTopkPageTable => DsaPooledTopkPageTableKernelInput,
+    DsaPooledLogitsPageTable => DsaPooledLogitsPageTableKernelInput,
     DsaSparseIndexRemap => DsaSparseIndexRemapKernelInput,
     DsaSparseMlaPrefillKernel => DsaSparseMlaPrefillKernelInput,
     DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
@@ -236,6 +265,9 @@ log_inputs! {
     MultiAddRmsNorm => MultiAddRmsNormKernelInput,
     SiluAndMul => SiluAndMulKernelInput,
     GroupedRmsNorm => GroupedRmsNormKernelInput,
+    GroupedConvResidualRmsNorm => GroupedConvResidualRmsNormKernelInput,
+    LayeredKvNormRopeCacheWrite => LayeredKvNormRopeCacheWriteKernelInput,
+    QkNormRopeFp8KvWrite => QkNormRopeFp8KvWriteKernelInput,
     ScaledSilu => ScaledSiluKernelInput,
     StaticFp8Quant => StaticFp8QuantKernelInput,
     IndexedRowCopy => IndexedRowCopyKernelInput,

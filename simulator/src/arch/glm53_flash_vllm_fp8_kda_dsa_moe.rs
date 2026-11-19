@@ -69,7 +69,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{split_short_appends, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
@@ -81,9 +81,9 @@ use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    KdaRecoverSSMCommitKernelConfig, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
+    MhcRmsNormKernelConfig, MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
+    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -96,7 +96,7 @@ use crate::worklet::{
     Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput, Glm53MlpLocalWorkletResolved,
     Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
-    Glm53RoutedMoeLocalWorkletResolved, Glm53WeightPrecision,
+    Glm53RoutedMoeLocalWorkletResolved, Glm53WeightPrecision, RECOVERSSM_CUTE_BACKENDS,
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe";
@@ -142,6 +142,15 @@ const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's `fwht128_quant_fp8` (`glm5next/nvidia/ops/kpool_compress.py`),
+/// one `_fwht_quant_kernel` launch per DSA layer in the TP4 capture.
+const HADAMARD_QUANT_BACKENDS: &[&str] = &["vllm_triton"];
+/// The absorbed query's `_DecodeConcatQuantFP8` (`QuantFP8.forward_cuda`,
+/// per-tensor static): one `scaled_fp8_quant_kernel_strided_group_shape`.
+const STATIC_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+/// The fork's `kpool_decode_update_and_maybe_write_cache_batched`, one
+/// `_kpool_decode_update_batched_kernel` launch per decode step.
+const POOLED_INDEX_UPDATE_BACKENDS: &[&str] = &["vllm_fork_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 /// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
 /// single-group router on both the FP8 block and the NVFP4 MoE path
@@ -709,11 +718,18 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
+            in_out_proj_backends: BF16_GEMM_BACKENDS.to_vec(),
             conv_prefill_backends: CONV_PREFILL_BACKENDS.to_vec(),
             conv_decode_backends: CONV_DECODE_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            conv_verify_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            commit_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            ssm_state_dtype: DType::Fp32,
+            decode_query_len: 1,
+            spec_verify: crate::worklet::KdaSpecVerify::Recoverssm,
+            merge_gate_b: false,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -738,16 +754,25 @@ pub fn build_configs(
             mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
+            cooperative_topk_backends: Vec::new(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
+            hadamard_quant_backends: HADAMARD_QUANT_BACKENDS.to_vec(),
+            static_quant_backends: STATIC_QUANT_BACKENDS.to_vec(),
+            pooled_index_update_backends: POOLED_INDEX_UPDATE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            fork_glue_backends: Vec::new(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
                 * 1024
                 * 1024,
+            decode_next_n: 1,
+            decode_indexer: Default::default(),
+            glue: Default::default(),
+            front: Default::default(),
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
@@ -1161,6 +1186,7 @@ pub(crate) fn build_layer_group(
                 router: Glm53MoeRouterLocalWorklet::build(
                     format!("{m}.router"),
                     Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
+                    false,
                     bridge,
                 )?,
                 input_glue: atomic(
@@ -1264,6 +1290,7 @@ pub fn build(
         dsa_layers,
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
+        resolved.kda.state_pages_per_request,
         hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
         cfg.parallel.tp_size,
     );
@@ -1347,7 +1374,9 @@ pub fn build(
 /// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
 /// keeps its state in a slot of one of those blocks, padded to an MLA page, and
 /// the KDA layers are dealt over `kda_groups` groups: a request holds one block
-/// per group, `kda_groups` blocks however few KDA layers fill the last one. The
+/// per group, `kda_groups` blocks however few KDA layers fill the last one, and
+/// `kda_state_pages` such sets when each layer keeps that many state pages per
+/// request (a per-position speculative verify keeps `1 + k`). The
 /// kpool tail, the raw index keys of a pool still filling up, takes one more
 /// block per request and is never reused by a prefix hit. vLLM reserves one null
 /// block out of the pool.
@@ -1357,6 +1386,7 @@ pub(crate) fn hybrid_kv_cache_layout(
     dsa_layers: u32,
     kda_layers: u32,
     kda_groups: u32,
+    kda_state_pages: u32,
     block_tokens: u32,
     attn_tp: u16,
 ) -> KvCacheLayout {
@@ -1381,14 +1411,16 @@ pub(crate) fn hybrid_kv_cache_layout(
                 .replicated(tp),
         );
     if kda_layers > 0 {
-        // One rank's slice of every KDA layer's state, times the ranks.
+        // One rank's slice of every KDA layer's state, times the ranks and
+        // the state pages each request keeps per layer.
         let ranks = u64::from(tp);
+        let pages = u64::from(kda_state_pages);
         layout = layout.with_part(
             KvCachePart::per_request(
                 "kda",
-                ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
+                pages * ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
             )
-            .padded_to(ranks * u64::from(kda_groups) * block_bytes)
+            .padded_to(pages * ranks * u64::from(kda_groups) * block_bytes)
             .sharded(tp),
         );
     }
@@ -1405,10 +1437,62 @@ pub(crate) fn hybrid_kv_cache_layout(
         })
 }
 
-/// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
-/// state plus the causal-conv window.
+/// One rank's recurrent state of one KDA layer for one request: the SSM state
+/// at the pool dtype, the causal-conv window, and a verify graph's RecoverSSM
+/// records.
 pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolved) -> u64 {
-    u64::from(resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request)
+    u64::from(resolved.kda.ssm_state_bytes_per_request)
+        + u64::from(resolved.kda.conv_state_bytes_per_request)
+        + u64::from(resolved.kda.verify_cache_bytes_per_request)
+}
+
+/// Whether a verify graph stores a KDA state per position, with no commit.
+pub(crate) fn commitless_verify(resolved: &Glm53FlashVllmResolved) -> bool {
+    let kda = &resolved.kda.raw_cfg;
+    kda.decode_query_len > 1
+        && kda.spec_verify == crate::worklet::KdaSpecVerify::RecurrentPerPosition
+}
+
+/// What a speculative verify's RecoverSSM commit needs from a Flash graph.
+#[derive(Clone, Debug)]
+pub struct KdaCommitPlan {
+    /// The rank-local commit that folds the verify's records, with the
+    /// backends the verify mode selects; `num_layers` is set per group.
+    pub commit: KdaRecoverSSMCommitKernelConfig,
+    /// KDA layers in each of vLLM's KDA KV-cache groups; one commit call
+    /// covers one group.
+    pub cache_group_layers: Vec<u32>,
+}
+
+/// The commit plan of a graph compiled at verify width above 1.
+pub(crate) fn kda_commit_plan(resolved: &Glm53FlashVllmResolved) -> Option<KdaCommitPlan> {
+    let commit = resolved.kda.recoverssm_commit.clone()?;
+    let model = &resolved.raw_cfg.model;
+    Some(KdaCommitPlan {
+        commit,
+        cache_group_layers: kda_cache_group_layers(
+            model.kda_layers.len() as u32,
+            model.num_dsa_layers(),
+        ),
+    })
+}
+
+/// vLLM's split of the KDA layers into KV-cache groups (`kv_cache_utils.py`,
+/// uniform page size): the group size is the smaller layer count of the two
+/// cache types, or the larger when it is under 1.5x the smaller, and group `i`
+/// takes every `num_groups`-th layer from `i`. A DFlash2 draft's window layers
+/// are paged as their own group and take no part. 34 KDA beside 11 DSA layers
+/// make groups of 9, 9, 8 and 8.
+pub(crate) fn kda_cache_group_layers(kda_layers: u32, dsa_layers: u32) -> Vec<u32> {
+    let (fewer, more) = (kda_layers.min(dsa_layers), kda_layers.max(dsa_layers));
+    if fewer == 0 {
+        return vec![kda_layers];
+    }
+    let size = if 2 * more < 3 * fewer { more } else { fewer };
+    let groups = kda_layers.div_ceil(size);
+    (0..groups)
+        .map(|i| (kda_layers - i).div_ceil(groups))
+        .collect()
 }
 
 /// vLLM's hybrid attention block size (`platforms/interface.py`
@@ -1460,7 +1544,7 @@ impl Glm53FlashVllmModel {
     }
 
     fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
-        let batch = normalize_input(input, self.max_model_len)
+        let batch = normalize_input(input, self.max_model_len, &self.cudagraph_capture_sizes)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
         push(
@@ -1520,7 +1604,7 @@ impl Glm53FlashVllmModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, &self.cudagraph_capture_sizes).map(|_| ())
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
@@ -1587,9 +1671,77 @@ pub(crate) struct NormalizedBatch {
     dsa: Glm53DsaAttnLocalWorkletInput,
 }
 
+/// The verify width both attention sublayers were configured for: 1, or
+/// `k + 1` when the graph verifies a speculative chain.
+pub(crate) fn verify_width(cfg: &Glm53FlashVllmConfigs) -> std::result::Result<u32, BuildError> {
+    let width = cfg.dsa.decode_next_n;
+    if width == 0 || cfg.kda.decode_query_len != width {
+        return Err(fit_failed(format!(
+            "KDA decode_query_len {} and DSA decode_next_n {width} must be one positive \
+             verify width",
+            cfg.kda.decode_query_len
+        )));
+    }
+    if width == 1 && cfg.kda.ssm_state_dtype != DType::Fp32 {
+        return Err(fit_failed(format!(
+            "a {:?} KDA state pool is modeled only for a speculative verify; plain decode's \
+             recurrent rows are fp32-pool",
+            cfg.kda.ssm_state_dtype
+        )));
+    }
+    Ok(width)
+}
+
+/// The KDA and DSA sublayer inputs for one attention group, with each request
+/// classified the way vLLM's attention metadata does
+/// ([`crate::arch::contract::runs_as_decode`]).
+///
+/// A one-token append after a cached prefix runs the decode kernels: KDA's
+/// recurrent step instead of `chunk_kda` (the GDN builder splits at a decode
+/// threshold of 1, `v1/attention/backends/gdn_attn.py`), and the DSA decode
+/// indexer and sparse MLA (the indexer and sparse-MLA builders keep
+/// `treat_short_extends_as_decodes` on without prefill context parallelism).
+pub(crate) fn attention_inputs(
+    prefill_chunk_pairs: &[(u32, u32)],
+    decode_kv_lens: &[u32],
+) -> (Glm53KdaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletInput) {
+    let (prefills, appended) = split_short_appends(prefill_chunk_pairs);
+    let mut decodes = decode_kv_lens.to_vec();
+    decodes.extend(appended);
+    (
+        Glm53KdaAttnLocalWorkletInput {
+            prefill_sequence_lengths: prefills.iter().map(|&(_, append)| append).collect(),
+            decode_batch_size: decodes.len() as u32,
+        },
+        Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: prefills,
+            decode_kv_lens: decodes,
+            decode_graph_replay: false,
+        },
+    )
+}
+
+/// Whether vLLM replays a batch of `rows` as one full CUDA graph: a uniform
+/// decode batch (no prefill once short appends join the decodes, see
+/// [`attention_inputs`]) within the largest captured size. vLLM's default
+/// `FULL_AND_PIECEWISE` mode runs any other batch on the piecewise graphs,
+/// attention eager. The DSA indexer's short-context skip is host-side, so it
+/// happens only outside a full replay ([`Glm53DsaAttnLocalWorkletInput`]).
+pub(crate) fn replays_full_graph(
+    sorted_capture_sizes: &[u32],
+    rows: u32,
+    dsa: &Glm53DsaAttnLocalWorkletInput,
+) -> bool {
+    dsa.prefill_chunk_pairs.is_empty()
+        && sorted_capture_sizes
+            .last()
+            .is_some_and(|&largest| rows <= largest)
+}
+
 pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     max_model_len: u32,
+    sorted_capture_sizes: &[u32],
 ) -> std::result::Result<NormalizedBatch, String> {
     let [group] = input.groups.as_slice() else {
         return Err(format!(
@@ -1644,21 +1796,13 @@ pub(crate) fn normalize_input(
     if total_tokens == 0 {
         return Err("an iteration must carry at least one token".into());
     }
+    let (kda, mut dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
+    dsa.decode_graph_replay = replays_full_graph(sorted_capture_sizes, total_tokens, &dsa);
     Ok(NormalizedBatch {
         total_tokens,
         request_count: group.request_count(),
-        kda: Glm53KdaAttnLocalWorkletInput {
-            prefill_sequence_lengths: group
-                .prefill_chunk_pairs
-                .iter()
-                .map(|&(_, append)| append)
-                .collect(),
-            decode_batch_size: decode_tokens,
-        },
-        dsa: Glm53DsaAttnLocalWorkletInput {
-            prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
-            decode_kv_lens: group.decode_kv_lens.clone(),
-        },
+        kda,
+        dsa,
     })
 }
 
@@ -2284,13 +2428,13 @@ mod tests {
             }],
             tokens_per_source_rank: Vec::new(),
         };
-        let batch = normalize_input(&input, 8192).unwrap();
+        let batch = normalize_input(&input, 8192, &[]).unwrap();
         assert_eq!((batch.total_tokens, batch.request_count), (2048, 30));
         assert_eq!(batch.kda.prefill_sequence_lengths, [2019]);
         assert_eq!(batch.kda.decode_batch_size, 29);
         assert_eq!(batch.dsa.decode_kv_lens.len(), 29);
         let mut bad = input.clone();
         bad.groups[0].decode_kv_lens = vec![9000; 29];
-        assert!(normalize_input(&bad, 8192).is_err());
+        assert!(normalize_input(&bad, 8192, &[]).is_err());
     }
 }

@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{split_short_appends, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
@@ -1559,6 +1559,35 @@ impl NormalizedBatch {
     }
 }
 
+/// One group's attention input, with a one-token append after a cached prefix
+/// run as a decode the way vLLM's DSA indexer and sparse-MLA metadata split
+/// it ([`split_short_appends`]). The decode launch is priced at the batch's
+/// longest context, so the appended request joins it at `prefix + 1`.
+///
+/// `decode_kv_lens` stay the decodes the MTP head drafts for; only attention
+/// sees the appended request as a decode.
+fn attention_input(
+    prefill_chunk_pairs: &[(u32, u32)],
+    decode_kv_lens: &[u32],
+) -> VllmGlm52DsaAttnLocalWorkletInput {
+    let (prefills, appended) = split_short_appends(prefill_chunk_pairs);
+    let decode_requests = (decode_kv_lens.len() + appended.len()) as u32;
+    let decode_context = decode_kv_lens.iter().chain(&appended).copied().max();
+    VllmGlm52DsaAttnLocalWorkletInput {
+        num_new_tokens: prefills.iter().map(|&(_, append)| append).sum::<u32>() + decode_requests,
+        prefill_query_cache_pairs: prefills
+            .into_iter()
+            .map(|(prefix, append)| (append, prefix + append))
+            .collect(),
+        decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+            batch_size: decode_requests,
+            context_len,
+            context_lens: None,
+            requires_padding: false,
+        }),
+    }
+}
+
 fn normalize_input(
     input: &UnifiedArchInput,
     ep_size: u16,
@@ -1573,7 +1602,6 @@ fn normalize_input(
     let mut total_tokens = 0_u32;
     for (group_index, group) in input.groups.iter().enumerate() {
         let mut prefill_tokens = 0_u32;
-        let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
         for (request_index, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
             if append == 0 {
                 return Err(format!(
@@ -1591,7 +1619,6 @@ fn normalize_input(
             prefill_tokens = prefill_tokens
                 .checked_add(append)
                 .ok_or_else(|| format!("group {group_index} prefill token sum overflows u32"))?;
-            prefill_query_cache_pairs.push((append, cache_tokens));
         }
         if group.prefill_tokens != prefill_tokens {
             return Err(format!(
@@ -1607,15 +1634,12 @@ fn normalize_input(
                 group.decode_tokens
             ));
         }
-        let mut decode_context = None;
         for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
             if !(1..=TIMING_MAX_MODEL_LEN).contains(&context) {
                 return Err(format!(
                     "group {group_index} decode request {request_index} context {context} must be in 1..={TIMING_MAX_MODEL_LEN}"
                 ));
             }
-            decode_context =
-                Some(decode_context.map_or(context, |current: u32| current.max(context)));
         }
         let batch_tokens = prefill_tokens
             .checked_add(decode_tokens)
@@ -1636,17 +1660,8 @@ fn normalize_input(
             batch_tokens,
             decode_tokens,
             request_count,
-            decode_context,
-            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-                num_new_tokens: batch_tokens,
-                prefill_query_cache_pairs,
-                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                    batch_size: decode_tokens,
-                    context_len,
-                    context_lens: None,
-                    requires_padding: false,
-                }),
-            },
+            decode_context: group.decode_kv_lens.iter().copied().max(),
+            attention_input: attention_input(&group.prefill_chunk_pairs, &group.decode_kv_lens),
         });
     }
     let routed_selections = total_tokens

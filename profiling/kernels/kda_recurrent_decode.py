@@ -6,7 +6,11 @@ Wire string: ``"kda_recurrent_decode"``. The facade stem is
 The measured boundary is one call of the vendored
 ``vllm.models.glm5next.nvidia.ops.third_party.kda.fused_recurrent_kda``, made
 exactly as ``Glm5NextLinearAttention._forward`` makes it on a plain decode
-step (no prefill, no speculative decoding). The call launches five kernels:
+step (no prefill, no speculative decoding), or, with ``num_tokens`` set, on a
+speculative verify step (the spec branch: ``q = num_tokens / batch_size`` tokens
+per request, ``ssm_state_indices`` ``[B, q]`` and ``num_accepted_tokens``; the
+kernel reads each request's last accepted state once and stores the state after
+every token into that token's slot). The call launches five kernels:
 
 - the ``.contiguous()`` copies of q, k, v and beta. All four are row-strided
   views into the merged ``in_proj_qkvbfg_a`` output, because the short conv
@@ -28,10 +32,11 @@ computed from a bf16 ``raw_g[B,H,K]`` and an fp32 ``dt_bias[H*K]``. KDA has no
 separate q/k and value head counts, and a different entry point that includes
 four copy launches.
 
-The state is fp32 ``[slots, H, V, K]``. ``kda_state_dtype`` hard-codes the
-recurrent state to fp32 whatever ``mamba_cache_dtype`` is, so state dtype is
-not an arg. ``lower_bound=-5.0``, ``scale=K**-0.5``, BV=8 and one warp are
-fixed by the production path.
+The state pool is ``[slots, H, V, K]`` at vLLM's ``mamba_ssm_cache_dtype``:
+fp32 by default (``auto``), bf16 when selected (``kda_state_dtype``). Rows
+measured before ``state_dtype`` existed are fp32 and keep their keys (absent =
+fp32). ``lower_bound=-5.0``, ``scale=K**-0.5``, BV=8 and one warp are fixed by
+the production path.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg, optional_arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -58,6 +63,19 @@ class KdaRecurrentDecodeArgs(KernelArgs):
     num_heads: int = arg(unit="heads", doc="Heads, each with its own query, key, value and state.")
     head_dim: int = arg(unit="elements", doc="Features in each query, key and value head.")
     dtype: DType = arg(doc="Element type of the activations, gate input and output.")
+    num_tokens: int | None = optional_arg(
+        unit="tokens",
+        same_as="batch_size",
+        doc=(
+            "Tokens across the batch, an equal number per request: a speculative verify "
+            "step's accepted token plus drafts, each with its own state slot. Absent when "
+            "each request decodes one token."
+        ),
+    )
+    state_dtype: DType | None = optional_arg(
+        absent=DType.FP32,
+        doc="Element type of the recurrent state pool. Absent means fp32.",
+    )
 
 
 DOC = KernelDoc(
@@ -79,9 +97,9 @@ DOC = KernelDoc(
         "decay = exp(−5·sigmoid(exp(A_log)·(raw_g + dt_bias))), per head and key channel",
         "q, k = L2Norm(q, k); q = q·head_dim⁻¹ᐟ²; beta = sigmoid(b)",
         "S′ = diag(decay)·S + k·(beta·(v − kᵀ(diag(decay)·S)))ᵀ; y = qᵀS′",
-        "FLOPs = 7·batch_size·num_heads·head_dim²",
-        "bytes = 10·batch_size·num_heads·head_dim + 2·batch_size·num_heads + "
-        "8·batch_size·num_heads·head_dim²",
+        "T = num_tokens (batch_size when absent); s = bytes(state_dtype), fp32 when absent",
+        "FLOPs = 7·T·num_heads·head_dim²",
+        "bytes = 10·T·num_heads·head_dim + 2·T·num_heads + s·(batch_size + T)·num_heads·head_dim²",
         "TFLOPS = FLOPs / time",
         "GB/s = bytes / time",
     ),
@@ -94,7 +112,10 @@ DOC = KernelDoc(
     ),
     caveats=(
         "The kernel takes any head_dim.",
-        "Only a plain decode step is measured, one token per request and no speculative decoding.",
+        "num_tokens > batch_size is a speculative verify step: each request reads the state "
+        "at its last accepted slot and writes a full state after every one of its "
+        "num_tokens / batch_size tokens; bytes then count one state read plus one write per "
+        "token.",
         "The short causal convolution before the call is a separate kind, gdn_causal_conv_decode.",
         "GB/s counts each input once and leaves out the copies' extra reads and writes.",
     ),

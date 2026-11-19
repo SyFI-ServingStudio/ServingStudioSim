@@ -54,6 +54,39 @@ impl ArchGroupInput {
     }
 }
 
+/// Whether vLLM's attention metadata runs a prefill chunk `(prefix, append)`
+/// as a decode: one query token on top of a cached prefix.
+///
+/// That is the step an engine runs after a full prefix hit or a P/D KV
+/// transfer (the prompt's last token recomputed). The model runner orders it
+/// right after the decodes as a short extend
+/// (`reorder_batch_to_split_decodes_and_prefills`, or `sort_batch_req_ids` in
+/// the V2 runner), and `split_decodes_and_prefills`
+/// (`vllm/v1/attention/backends/utils.py`, `treat_short_extends_as_decodes`
+/// on by default) counts it a decode against a decode threshold of 1. A
+/// speculative backend that requires uniform decode query lengths splits it
+/// off again; the caller decides that. A one-token prompt (`prefix == 0`) has
+/// no context and stays a prefill.
+pub fn runs_as_decode(prefix: u32, append: u32) -> bool {
+    append == 1 && prefix > 0
+}
+
+/// Split prefill chunks `(prefix, append)` the way vLLM's attention metadata
+/// does ([`runs_as_decode`]): the chunks that still run as prefills, and the
+/// context lengths (`prefix + 1`) of those that run as decodes, in order.
+pub fn split_short_appends(prefill_chunk_pairs: &[(u32, u32)]) -> (Vec<(u32, u32)>, Vec<u32>) {
+    let mut prefills = Vec::with_capacity(prefill_chunk_pairs.len());
+    let mut decode_contexts = Vec::new();
+    for &(prefix, append) in prefill_chunk_pairs {
+        if runs_as_decode(prefix, append) {
+            decode_contexts.push(prefix + append);
+        } else {
+            prefills.push((prefix, append));
+        }
+    }
+    (prefills, decode_contexts)
+}
+
 #[cfg(test)]
 mod arch_group_input_tests {
     use super::ArchGroupInput;
@@ -70,6 +103,16 @@ mod arch_group_input_tests {
         };
 
         assert_eq!(group.request_count(), 5);
+    }
+
+    /// Catches a one-token append after a cached prefix kept as a prefill, or
+    /// a one-token prompt (no context) moved to the decodes.
+    #[test]
+    fn a_one_token_append_after_a_prefix_runs_as_a_decode() {
+        let (prefills, decodes) =
+            super::split_short_appends(&[(70_000, 1), (0, 1), (500, 64), (8, 1)]);
+        assert_eq!(prefills, [(0, 1), (500, 64)]);
+        assert_eq!(decodes, [70_001, 9]);
     }
 }
 
@@ -221,6 +264,10 @@ pub struct SpeculativeDecodeInput {
     pub kv_len: u32,
     /// Query rows emitted for this request in the current verify group.
     pub query_len: u32,
+    /// Of those rows, the ones this verify accepts (the target's own token
+    /// plus the leading accepted drafts, `1..=query_len`): what a model that
+    /// commits recurrent state after the verify folds in.
+    pub committed_rows: u32,
 }
 
 impl SpeculativeDecodeInput {
@@ -447,10 +494,12 @@ mod speculative_arch_input_tests {
                 SpeculativeDecodeInput {
                     kv_len: 64,
                     query_len: 6,
+                    committed_rows: 6,
                 },
                 SpeculativeDecodeInput {
                     kv_len: 91,
                     query_len: 6,
+                    committed_rows: 6,
                 },
             ],
             total_kv_len: 155,

@@ -115,3 +115,21 @@ def test_mnnvl_batch_rejects_non_production_specs_and_forwards_the_rest(monkeypa
     assert "budget" in results[1].error
     assert results[2].metrics.time_ms == 4096.0
     assert "NVLink" in results[3].error
+
+
+def test_unbudgeted_backend_lifts_only_the_byte_budget():
+    # The unbudgeted row exists to measure past vLLM's budget; it must still
+    # refuse what the MNNVL kernel itself cannot run.
+    from profiling.runners.comm.flashinfer_mnnvl import spec_error, unbudgeted_spec_error
+
+    over_budget = {
+        "num_gpus": 8,
+        "num_tokens": 2048,
+        "hidden_dim": 4096,
+        "dtype": "bf16",
+        "fabric": "nvlink",
+    }
+    assert "budget" in spec_error(over_budget)
+    assert unbudgeted_spec_error(over_budget) is None
+    assert "NVLink" in unbudgeted_spec_error({**over_budget, "fabric": "pcie"})
+    assert "TP" in unbudgeted_spec_error({**over_budget, "num_gpus": 16})

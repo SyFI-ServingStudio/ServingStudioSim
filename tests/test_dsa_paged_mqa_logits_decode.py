@@ -747,28 +747,19 @@ def test_operand_construction_exact_layout_and_scattered_pages(context_len):
     assert bool(torch.all(operands.scale_view > 0))
 
 
-def test_cache_initialization_uses_only_page_independent_templates(monkeypatch):
+def test_cache_pages_hold_independent_random_values(monkeypatch):
+    # Defect: one page template copied into every page repeats each logit once
+    # per page, so every row's top-k boundary is a tie and value-dependent
+    # consumers (decode top-k) are timed on their tie paths.
     from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
 
-    stable_value_shapes = []
-    real_stable_values = runner._stable_values
-
-    def record_stable_values(torch_module, shape, *, phase, device):
-        stable_value_shapes.append(shape)
-        return real_stable_values(
-            torch_module,
-            shape,
-            phase=phase,
-            device=device,
-        )
-
-    monkeypatch.setattr(runner, "_stable_values", record_stable_values)
+    monkeypatch.setattr(runner, "_FILL_PAGES", 100)  # 256 pages: three bounded slabs
     operands = runner._build_operands(
         torch,
         batch_size=3,
-        context_len=65,
-        next_n=1,
-        max_model_len=128,
+        context_len=4096,
+        next_n=2,
+        max_model_len=4096,
         num_heads=64,
         head_dim=128,
         block_size=64,
@@ -776,23 +767,35 @@ def test_cache_initialization_uses_only_page_independent_templates(monkeypatch):
     )
 
     num_pages = operands.cache.shape[0]
-    assert num_pages == 256
-    assert stable_value_shapes == [
-        (3, 1, 64, 128),
-        (3, 64),
-        (64, 128),
-        (64,),
-    ]
-    assert all(num_pages not in shape for shape in stable_value_shapes)
+    assert num_pages == 385
+    for page in [1, 99, 100, 255, num_pages - 1]:
+        assert not torch.equal(operands.key_view[page], operands.key_view[0])
+    scales = operands.scale_view.unique().tolist()
+    assert set(scales) == {0.25, 0.5, 1.0, 2.0}
+    assert bool(torch.any(operands.key_view.float() < 0))
+    assert bool(torch.any(operands.key_view.float() > 0))
+    assert operands.q[0, 0].float().unique().numel() > 16
+    assert operands.weights.unique().numel() == operands.weights.numel()
 
-    for page in [1, 17, num_pages - 1]:
-        assert torch.equal(operands.key_view[page], operands.key_view[0])
-        assert torch.equal(operands.scale_view[page], operands.scale_view[0])
-    assert bool(torch.any(operands.key_view[0].float() < 0))
-    assert bool(torch.any(operands.key_view[0].float() > 0))
-    assert bool(torch.isfinite(operands.scale_view).all())
-    assert bool(torch.all(operands.scale_view > 0))
-    assert operands.scale_view[0].unique().numel() > 1
+    logits = runner._torch_composite(operands, context_len=4096, max_model_len=4096)
+    row = logits[0]
+    top = torch.topk(row, 512).values
+    # The 512th value is not tied with the values above it.
+    assert int((row == top[-1]).sum()) <= 2
+    assert row.unique().numel() > 0.99 * row.numel()
+
+    again = runner._build_operands(
+        torch,
+        batch_size=3,
+        context_len=4096,
+        next_n=2,
+        max_model_len=4096,
+        num_heads=64,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+    )
+    assert torch.equal(again.cache, operands.cache)  # seeded
 
 
 def test_page_plane_raw_byte_offsets():
@@ -962,3 +965,30 @@ def test_cpu_composite_matches_reference_and_preserves_every_operand():
     )
     for tensor, snapshot in zip(tensors, snapshots, strict=True):
         assert torch.equal(tensor, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("next_n", "num_heads", "passes"),
+    [(1, 32, 1), (4, 32, 1), (5, 32, 2), (8, 32, 2), (2, 64, 1), (3, 64, 2), (8, 64, 4)],
+)
+def test_key_bytes_count_each_pass_not_each_query_row(next_n, num_heads, passes):
+    """Counting keys once per query row billed 26 TB/s on B200, above HBM, so
+    every roofline rung collapsed onto the measured time."""
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _logical_scheduled_bytes,
+    )
+
+    shape = {"batch_size": 16, "context_len": 4096, "num_heads": num_heads, "head_dim": 128}
+    key_bytes = 16 * 4096 * (128 + 4)
+    fixed = (
+        16 * next_n * num_heads * 128
+        + 4 * 16 * next_n * num_heads
+        + 4 * 16 * (4096 // 64)
+        + 4 * 16 * next_n
+        + 4 * next_n * 16 * 4096
+    )
+
+    assert (
+        _logical_scheduled_bytes(next_n=next_n, block_size=64, **shape)
+        == fixed + passes * key_bytes
+    )

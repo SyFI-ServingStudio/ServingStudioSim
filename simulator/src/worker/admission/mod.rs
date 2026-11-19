@@ -21,6 +21,7 @@ mod started_order;
 mod token_budget;
 
 pub(crate) use chunked_prefill_admission::ChunkEndAlignment;
+pub(crate) use decode_completion::speculative_accepted_length;
 pub use chunked_prefill_admission::ChunkedPrefillAdmission;
 pub use decode_completion::{
     DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,

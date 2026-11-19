@@ -80,6 +80,10 @@ measurement behind that claim lives in the workspace-level (out-of-repo)
 - **`op/comm/`** — `TpAllReduceRmsNormOp`: a TP sublayer boundary under vLLM's
   `allreduce_rms` pass, the fused FlashInfer call up to its token cap and the
   unfused all-reduce + residual RMSNorm above it (or where vLLM does not fuse).
+  `FixedExpertExchange` / `GroupGatherScatter`: the fixed-pattern MNNVL
+  exchange's measured rows, as an EP dispatch + combine around the routed
+  experts and as a row-parallel group's input all-gather + output
+  reduce-scatter.
   Other dense collectives are atomic `Op<K>` over the `all_reduce*` kernels.
 - **Stub:** `op/ssm` is still a one-line module header; the compound SSM ops are
   specified in `doc/detailed_design/L2.md`.

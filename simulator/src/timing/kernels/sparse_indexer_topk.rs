@@ -44,8 +44,8 @@ pub const COOPERATIVE_BACKEND: &str = "vllm_cuda_cooperative";
 pub const COOPERATIVE_MAX_ROWS: u32 = 64;
 
 /// 132/133 and 148/149 bracket the one-row-per-SM wave of H100 (132 SMs) and
-/// B200 (148 SMs). `gpu/spec.json` carries no SM count to derive them from, so
-/// a GPU with another SM count adds its pair here.
+/// B200 (148 SMs). The axis is fixed, so a GPU with another SM count adds its
+/// pair here.
 const ROWS_AXIS: [u32; 31] = [
     1, 2, 4, 8, 12, 16, 17, 24, 32, 48, 64, 65, 96, 128, 132, 133, 148, 149, 192, 256, 384, 512,
     768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 16384,

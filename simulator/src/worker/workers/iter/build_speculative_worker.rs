@@ -102,6 +102,9 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         prefix_cache_logger,
     );
     let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
+    // One seed for the completion that retires each verify and the execution
+    // that bills its commit.
+    let acceptance_seed = config.speculative_acceptance_seed.unwrap_or(0);
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))
@@ -110,11 +113,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         config.batch_policy,
         config.kv_admission,
         balance,
-        SpeculativeDecodeCompletion::new(
-            draft_tokens,
-            model.max_model_len(),
-            config.speculative_acceptance_seed.unwrap_or(0),
-        ),
+        SpeculativeDecodeCompletion::new(draft_tokens, model.max_model_len(), acceptance_seed),
         drafting_slots,
     );
     let admission = match chunk_end_alignment {
@@ -126,7 +125,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
+        SpeculativeIterExecution::new(model, essentials.cost, draft_tokens, acceptance_seed),
     )
 }
 

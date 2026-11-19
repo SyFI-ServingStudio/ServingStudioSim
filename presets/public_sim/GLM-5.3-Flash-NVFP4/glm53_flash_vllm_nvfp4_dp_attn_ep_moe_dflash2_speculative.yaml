@@ -1,0 +1,22 @@
+# vLLM GLM-5.3-Flash NVFP4 + DFlash2 (7 draft tokens) on one 8x B200 node: attention DP8,
+# MoE EP8, every rank drafting its own requests at TP1. Speculative worker with mixed batches of
+# up to 8192 tokens, vLLM's DP load balancer placing requests, gpu_time_multiplier 1.0 (pure
+# kernel sum), 110.12 GB of KV and recurrent state per GPU.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: 1
+        arch:
+          preset: glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2
+          max_model_len: ${max_model_len}
+        worker:
+          type: speculative
+          max_batch_tokens: 8192
+          batch_policy: mix
+          draft_tokens: 7
+          gpu_time_multiplier: 1.0
+          attn_gpu_memory_gb: 110.12
+          dp_placement: vllm-least-loaded
+sweep:
+  max_model_len: [1048576]

@@ -939,6 +939,29 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. }
+            | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(match &g.arch {
+                    IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
+                        arch_build::glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                            &g.arch, &gpu_name, MODEL_NAME, bridge,
+                        )?
+                    }
+                    _ => arch_build::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
+                        &g.arch, &gpu_name, MODEL_NAME, bridge,
+                    )?,
+                });
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::DeepseekV41VllmDspark {
                 routing,
                 routing_seed,

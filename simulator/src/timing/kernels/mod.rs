@@ -4,6 +4,7 @@ pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
+pub mod batched_gemm_static_fp8_quant;
 pub mod bf16_fused_moe;
 mod causal_rows;
 pub mod clamped_swiglu;
@@ -12,16 +13,21 @@ pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
+pub mod dsa_fp32_split_state_update;
 pub mod dsa_index_cache_append;
 pub mod dsa_indexer_q_rope_quant;
 pub mod dsa_indexer_q_rope_quant_weight_fold;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
+pub mod dsa_pooled_index_cache_update;
+pub mod dsa_pooled_logits_page_table;
+pub mod dsa_pooled_topk_page_table;
 pub mod dsa_sparse_index_remap;
 pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
+mod draft_rows;
 pub mod elementwise;
 pub mod embedding_row_gather;
 pub mod engine;
@@ -31,6 +37,7 @@ pub mod fa4_varlen_projection;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
+pub mod fp32_row_split_layer_norm;
 pub mod fp8_block_quant;
 pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
@@ -43,18 +50,26 @@ pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_conv_residual_rms_norm;
 pub mod grouped_rms_norm;
+pub mod hadamard_fp8_quant;
+pub mod hadamard_fp8_quant_weight_scale;
 pub mod hc_combine;
 pub mod hc_combine_norm;
 pub mod hc_gate_mix;
 pub mod indexed_row_copy;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
+pub mod kda_recoverssm_commit;
+pub mod kda_recoverssm_conv_verify;
+pub mod kda_recoverssm_verify;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
+pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
+pub mod mhc_fused_sum_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mhc_terminal_head;
 pub mod mla_cache_append;
@@ -63,6 +78,7 @@ pub mod moe_align_block_size;
 pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_ep_all_gather;
+pub mod moe_ep_quantize_and_all_gather;
 pub mod moe_ep_quantized_all_gather;
 pub mod moe_ep_reduce_scatter;
 pub mod moe_finalize_fuse_shared;
@@ -86,13 +102,16 @@ pub mod ple_short_conv;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
+pub mod qk_norm_rope_fp8_kv_write;
 pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
+pub mod row_all_gather;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
+pub mod sigmoid_gated_rms_norm;
 pub mod silu_and_mul;
 pub mod single_gemm;
 pub mod sparse_gqa_paged_attention;
@@ -116,6 +135,10 @@ pub use all_reduce_residual_rms_norm::{
 };
 pub use batched_gemm::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, BatchedGemmSpec,
+};
+pub use batched_gemm_static_fp8_quant::{
+    BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
+    BatchedGemmStaticFp8QuantKernelInput, BatchedGemmStaticFp8QuantSpec,
 };
 pub use bf16_fused_moe::{
     Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec,
@@ -144,6 +167,10 @@ pub use dsa_compressed_topk_prefill::{
     DsaCompressedTopkPrefillKernel, DsaCompressedTopkPrefillKernelConfig,
     DsaCompressedTopkPrefillSpec,
 };
+pub use dsa_fp32_split_state_update::{
+    DsaFp32SplitStateUpdateKernel, DsaFp32SplitStateUpdateKernelConfig,
+    DsaFp32SplitStateUpdateKernelInput, DsaFp32SplitStateUpdateSpec,
+};
 pub use dsa_index_cache_append::{
     DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,
     DsaIndexCacheAppendSpec,
@@ -167,6 +194,18 @@ pub use dsa_paged_mqa_logits_decode::{
 pub use dsa_persistent_topk_decode::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPersistentTopkDecodeSpec,
+};
+pub use dsa_pooled_index_cache_update::{
+    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
+    DsaPooledIndexCacheUpdateKernelInput, DsaPooledIndexCacheUpdateSpec,
+};
+pub use dsa_pooled_logits_page_table::{
+    DsaPooledLogitsPageTableKernel, DsaPooledLogitsPageTableKernelConfig,
+    DsaPooledLogitsPageTableKernelInput, DsaPooledLogitsPageTableSpec,
+};
+pub use dsa_pooled_topk_page_table::{
+    DsaPooledTopkPageTableKernel, DsaPooledTopkPageTableKernelConfig,
+    DsaPooledTopkPageTableKernelInput, DsaPooledTopkPageTableSpec,
 };
 pub use dsa_sparse_index_remap::{
     DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,
@@ -209,6 +248,10 @@ pub use flashinfer_attn_prefill::{
 pub use flashinfer_attn_rect::{
     FlashinferAttnRectKernel, FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
     FlashinferAttnRectSpec,
+};
+pub use fp32_row_split_layer_norm::{
+    Fp32RowSplitLayerNormKernel, Fp32RowSplitLayerNormKernelConfig,
+    Fp32RowSplitLayerNormKernelInput, Fp32RowSplitLayerNormSpec,
 };
 pub use fp8_block_quant::{
     Fp8BlockQuantKernel, Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput, Fp8BlockQuantSpec,
@@ -255,8 +298,28 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use grouped_conv_residual_rms_norm::{
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, GroupedConvResidualRmsNormSpec,
+};
+pub use layered_kv_norm_rope_cache_write::{
+    LayeredKvNormRopeCacheWriteKernel, LayeredKvNormRopeCacheWriteKernelConfig,
+    LayeredKvNormRopeCacheWriteKernelInput, LayeredKvNormRopeCacheWriteSpec,
+};
+pub use qk_norm_rope_fp8_kv_write::{
+    QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput,
+    QkNormRopeFp8KvWriteSpec,
+};
 pub use grouped_rms_norm::{
     GroupedRmsNormKernel, GroupedRmsNormKernelConfig, GroupedRmsNormKernelInput, GroupedRmsNormSpec,
+};
+pub use hadamard_fp8_quant::{
+    HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput,
+    HadamardFp8QuantSpec,
+};
+pub use hadamard_fp8_quant_weight_scale::{
+    HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
+    HadamardFp8QuantWeightScaleKernelInput, HadamardFp8QuantWeightScaleSpec,
 };
 pub use hc_combine::{HcCombineKernel, HcCombineSpec};
 pub use hc_combine_norm::{HcCombineNormKernel, HcCombineNormSpec};
@@ -273,6 +336,18 @@ pub use kda_chunk_prefill::{
     KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
     KdaChunkPrefillSpec,
 };
+pub use kda_recoverssm_commit::{
+    KdaRecoverSSMCommitKernel, KdaRecoverSSMCommitKernelConfig, KdaRecoverSSMCommitKernelInput,
+    KdaRecoverSSMCommitSpec,
+};
+pub use kda_recoverssm_conv_verify::{
+    KdaRecoverSSMConvVerifyKernel, KdaRecoverSSMConvVerifyKernelConfig,
+    KdaRecoverSSMConvVerifyKernelInput, KdaRecoverSSMConvVerifySpec,
+};
+pub use kda_recoverssm_verify::{
+    KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput,
+    KdaRecoverSSMVerifySpec,
+};
 pub use kda_recurrent_decode::{
     KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
     KdaRecurrentDecodeSpec,
@@ -288,6 +363,9 @@ pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
+pub use mhc_fused_sum_post_pre_rms_norm::{
+    MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel, MhcFusedSumPostPreRmsNormSpec,
+};
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };
@@ -314,6 +392,10 @@ pub use moe_alltoall_prepare::{
 pub use moe_ep_all_gather::{
     MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig, MoeEpAllGatherSpec,
     MoeEpCollectiveKernelInput,
+};
+pub use moe_ep_quantize_and_all_gather::{
+    MoeEpQuantizeAndAllGatherKernel, MoeEpQuantizeAndAllGatherKernelConfig,
+    MoeEpQuantizeAndAllGatherSpec,
 };
 pub use moe_ep_quantized_all_gather::{
     MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpQuantizedAllGatherSpec,
@@ -400,6 +482,7 @@ pub use residual_rms_norm::{
     ResidualRmsNormSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
+pub use row_all_gather::{RowAllGatherKernel, RowAllGatherKernelConfig, RowAllGatherSpec};
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
@@ -409,6 +492,10 @@ pub use scaled_silu::{
 };
 pub use sconv_qkvr_prep::{
     SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SconvQkvrPrepSpec,
+};
+pub use sigmoid_gated_rms_norm::{
+    SigmoidGatedRmsNormKernel, SigmoidGatedRmsNormKernelConfig, SigmoidGatedRmsNormKernelInput,
+    SigmoidGatedRmsNormSpec,
 };
 pub use silu_and_mul::{
     SiluAndMulKernel, SiluAndMulKernelConfig, SiluAndMulKernelInput, SiluAndMulSpec,

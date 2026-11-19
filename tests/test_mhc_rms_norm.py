@@ -83,6 +83,27 @@ def test_deepgemm_mega_nonshifted_rejects_shapes_mega_mhc_does_not_take(
         validate_nonshifted_args(*arguments)
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (128, 5120, 4, "bf16", 1),
+        (128, 4096, 2, "bf16", 1),
+        (128, 4096, 4, "bf16", 0),
+        (128, 4096, 4, "bf16", 9),
+    ],
+)
+def test_cuda_one_launch_rejects_shapes_its_builds_do_not_take(
+    arguments: tuple[object, ...],
+) -> None:
+    # Catches the one-launch kernel profiling a hidden size or hc_mult it is not
+    # compiled for, or more partial outputs than its parameter block holds.
+    from profiling.runners.mhc.mhc_one_launch_cuda import validate_args as validate_one_launch
+
+    with pytest.raises(ProfilerNotImplemented):
+        validate_one_launch("mhc", *arguments)
+    assert validate_one_launch("mhc", 128, 4096, 4, "bf16", 8) == Shape(128, 4096, 4)
+
+
 def _nbytes(*tensors: tuple[tuple[int, ...], int]) -> int:
     return sum(math.prod(shape) * itemsize for shape, itemsize in tensors)
 

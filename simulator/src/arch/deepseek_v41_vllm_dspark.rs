@@ -1137,7 +1137,11 @@ mod tests {
     fn step(decode: &[(u32, u32)], prefill: &[(u32, u32)]) -> SpeculativeArchInput {
         let decode_requests: Vec<_> = decode
             .iter()
-            .map(|&(kv_len, query_len)| SpeculativeDecodeInput { kv_len, query_len })
+            .map(|&(kv_len, query_len)| SpeculativeDecodeInput {
+                kv_len,
+                query_len,
+                committed_rows: query_len,
+            })
             .collect();
         let prefill_tokens = prefill.iter().map(|&(_, a)| a).sum();
         let decode_tokens = decode.iter().map(|&(_, q)| q).sum();

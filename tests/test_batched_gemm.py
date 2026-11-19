@@ -59,6 +59,7 @@ def test_kind_table_backend_and_runner_ref_contract():
         "torch_mla_q_absorb_no_rope",
         "torch_mla_v_up_unpadded",
         _WO_A_BACKEND,
+        "torch_bmm_packed_lhs",
     ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
@@ -358,6 +359,8 @@ def test_no_rope_unpadded_layout_has_no_rope_split_and_no_head_padding():
     assert tuple(q.lhs.shape) == (16, 3, 256)
     assert q.lhs.stride() == (256, 16 * 256, 1)
     assert tuple(q.rhs.shape) == (16, 256, 512)
+    assert tuple(q.out.shape) == (16, 3, 512)
+    assert q.out.stride() == (512, 16 * 512, 1)
     v = runner._build_layout_v_up_operands(
         torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
     )

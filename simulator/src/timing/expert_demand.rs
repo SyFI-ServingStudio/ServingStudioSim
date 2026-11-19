@@ -148,6 +148,19 @@ impl ExpertDemand {
         })
     }
 
+    /// A recorded corpus's mean distinct ranks per token (contiguous split,
+    /// `experts_per_rank` each); `None` for a popularity source, which keeps
+    /// no per-token routes.
+    pub fn corpus_mean_distinct_ranks(
+        &self,
+        experts_per_rank: usize,
+    ) -> anyhow::Result<Option<f64>> {
+        Ok(match self.prepare()? {
+            PreparedDemand::Corpus(corpus) => Some(corpus.mean_distinct_ranks(experts_per_rank)),
+            _ => None,
+        })
+    }
+
     /// Extend a kernel's token axis with the shapes this source makes reachable.
     ///
     /// A block-structured batch only ever presents multiples of the verify

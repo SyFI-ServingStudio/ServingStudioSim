@@ -13,6 +13,8 @@ from dataclasses import fields
 import pytest
 import torch
 
+from profiling.db.args import DType
+from profiling.db.batch import coerce_args
 from profiling.kernels.kda_recurrent_decode import KdaRecurrentDecodeArgs
 from profiling.runners.attention import kda_recurrent_decode_vllm_triton as runner
 from profiling.runners.attention.kda_chunk_prefill_reference import (
@@ -21,6 +23,7 @@ from profiling.runners.attention.kda_chunk_prefill_reference import (
 )
 from profiling.runners.attention.kda_recurrent_decode_reference import (
     kda_recurrent_decode_reference,
+    kda_spec_verify_reference,
 )
 
 # The in-situ capture: decode iteration 727, 32 requests, TP4.
@@ -30,7 +33,7 @@ _CAPTURE = dict(batch_size=32, num_heads=16, head_dim=128, dtype="bf16")
 def test_args_fields_are_the_runner_kwargs() -> None:
     # Defect: schema/DB key order drifting from what the worker passes the runner.
     names = [f.name for f in fields(KdaRecurrentDecodeArgs)]
-    assert names == ["batch_size", "num_heads", "head_dim", "dtype"]
+    assert names == ["batch_size", "num_heads", "head_dim", "dtype", "num_tokens", "state_dtype"]
     signature = inspect.signature(runner.profile_kda_recurrent_decode_vllm_triton)
     assert list(signature.parameters) == names
 
@@ -152,3 +155,77 @@ def test_oracle_decays_per_key_channel_and_sigmoids_raw_beta() -> None:
     decay = kda_safe_gate(raw_g, a_log, dt_bias, -5.0).exp()  # [B, H, K]
     for seq, slot in enumerate(slots.tolist()):
         torch.testing.assert_close(updated[slot], pool[slot] * decay[seq][:, None, :])
+
+
+def test_fp32_state_and_one_token_keep_the_plain_decode_key() -> None:
+    # Defect: the verify fields re-keying the measured plain-decode rows (fp32
+    # pool, one token per request), or a bf16 / verify spec collapsing onto them.
+    plain = coerce_args(
+        KdaRecurrentDecodeArgs, {**_CAPTURE, "num_tokens": 32, "state_dtype": "fp32"}
+    )
+    assert plain == coerce_args(KdaRecurrentDecodeArgs, _CAPTURE)
+    assert plain.num_tokens is None and plain.state_dtype is None
+    verify = coerce_args(
+        KdaRecurrentDecodeArgs, {**_CAPTURE, "num_tokens": 256, "state_dtype": "bf16"}
+    )
+    assert (verify.num_tokens, verify.state_dtype) == (256, DType.BF16)
+
+
+def test_verify_invoke_passes_the_spec_branch_operands() -> None:
+    # Defect: timing a verify as B*q one-token decodes (1-D indices, no
+    # num_accepted_tokens), or a pool at the wrong dtype.
+    shape = runner.validate_args(
+        batch_size=3, num_heads=2, head_dim=128, dtype="bf16", num_tokens=12, state_dtype="bf16"
+    )
+    operands = runner.build_operands(torch, shape, device=torch.device("cpu"))
+    seen: dict = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out"], kwargs["initial_state"]
+
+    runner.invoke(fake, operands)
+    assert seen["q"].shape == (1, 12, 2, 128)
+    assert seen["ssm_state_indices"].tolist() == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
+    assert seen["num_accepted_tokens"].tolist() == [1, 2, 3]
+    assert seen["cu_seqlens"].tolist() == [0, 4, 8, 12]
+    assert seen["initial_state"].shape == (13, 2, 128, 128)
+    assert seen["initial_state"].dtype is torch.bfloat16
+    assert seen["out"].shape == (1, 12, 2, 128)
+
+
+def test_verify_oracle_starts_at_the_accepted_slot_and_stores_every_position() -> None:
+    # Defect: starting from slot 0 of the row instead of the last accepted
+    # token's slot, or storing only the final state. Token t of a request
+    # equals the plain-decode oracle chained from the accepted state.
+    requests, per_request = 2, 3
+    q, k, v, raw_g = _inputs(requests * per_request)
+    raw_beta = torch.randn(6, 2, generator=torch.Generator().manual_seed(1))
+    a_log = torch.tensor([0.5, 1.5]).log().view(1, 1, 2, 1)
+    dt_bias = torch.randn(8, generator=torch.Generator().manual_seed(2)) * 0.1
+    pool = torch.randn(7, 2, 4, 4, generator=torch.Generator().manual_seed(3))
+    slots = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    accepted = torch.tensor([2, 3], dtype=torch.int32)
+    o, updated = kda_spec_verify_reference(
+        q, k, v, raw_g, raw_beta, a_log, dt_bias, pool, slots, accepted, lower_bound=-5.0
+    )
+    for n in range(requests):
+        chain = pool.clone()
+        chain[0] = pool[int(slots[n, accepted[n] - 1])]
+        for t in range(per_request):
+            row = n * per_request + t
+            step_o, chain = kda_recurrent_decode_reference(
+                q[row : row + 1],
+                k[row : row + 1],
+                v[row : row + 1],
+                raw_g[row : row + 1],
+                raw_beta[row : row + 1],
+                a_log,
+                dt_bias,
+                chain,
+                torch.tensor([0], dtype=torch.int32),
+                lower_bound=-5.0,
+            )
+            torch.testing.assert_close(o[row], step_o[0])
+            torch.testing.assert_close(updated[int(slots[n, t])], chain[0])
+    assert torch.equal(updated[0], pool[0])

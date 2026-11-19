@@ -258,6 +258,38 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="cutedsl_routed_fused_fc1_fc2_sm100",
+        # Same logical I/O as flashinfer_trtllm_routed_sm100 (top-k IDs and fp32
+        # weights in, finalized BF16 out). The kernels are a temporary vendored copy
+        # (runners/moe/pfused_vendor) built for H=4096 I=2048 36 local experts top-8;
+        # other shapes raise ProfilerNotImplemented.
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            sm_targets=frozenset({"sm_100a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.nvfp4_fused_moe_cutedsl_fused",
+            function_name="profile_nvfp4_fused_moe_cutedsl_fused",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "A routing kernel that permutes and gathers the NVFP4 tokens per local "
+                "expert, then one persistent CuTe DSL launch that runs FC1 with SwiGLU "
+                "and NVFP4 requantization, FC2, and the weighted finalize, overlapped "
+                "with the router by PDL. The chain is fixed per token band."
+            ),
+        ),
+        subprocess_env="vllm_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="flashinfer_trtllm_routed_sm100_fork",
         # The routed call above, run in the alignment vLLM checkout's env
         # (vllm_env). It was added when vllm_env's image was an older fork

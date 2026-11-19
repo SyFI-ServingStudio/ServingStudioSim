@@ -59,24 +59,20 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, FlashinferAttnRectKernel,
-    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, ResidualRmsNormKernel,
-    ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
-    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, KvCacheAppendKernel, KvCacheAppendKernelConfig,
+    KvCacheAppendKernelInput, QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig,
+    QkNormRopeFp8KvWriteKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
+    ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dflash2DraftAttnLog, Dim, Evaluator, LeafMetrics,
     PerfApiBridge, Probe, SlotInput,
 };
 
-const HIDDEN_DIM: u32 = 6144;
-const INTERMEDIATE_DIM: u32 = 12288;
-const HEAD_DIM: u32 = 128;
-const NUM_QO_HEADS: u32 = 64;
-const NUM_KV_HEADS: u32 = 8;
-/// `dflash_config.conv_kernel_size` — the convolution reaches back one position.
-const CONV_TAPS: u32 = 2;
-/// `dflash_config.conv_group_size`.
-const CONV_GROUP_SIZE: u32 = 16;
+use super::dflash2_checkpoint::validate_against_checkpoints;
 
 /// Shared identity for both halves of one draft layer.
 #[derive(Clone, Debug)]
@@ -86,6 +82,11 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub attention_backends: Vec<&'static str>,
+    /// `Some((min_requests, backends))`: an attention launch carrying at least
+    /// `min_requests` requests runs these backends instead (the engine picks
+    /// its split count per launch); smaller launches keep
+    /// `attention_backends`.
+    pub attention_large_batch: Option<(u32, Vec<&'static str>)>,
     pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
@@ -106,6 +107,25 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     /// at the call site instead of hidden in a default.
     pub attn_q_dtype: DType,
     pub attn_kv_dtype: DType,
+    /// `Some`: every layer writes its own query block's K/V into the draft's
+    /// paged cache (`reshape_and_cache_flash` ahead of the attention call), the
+    /// same insert the context-KV section runs over the context rows. `None`
+    /// leaves the insert unpriced.
+    pub query_kv_append: Option<KvCacheAppendKernelConfig>,
+    /// `Some((backends, page_size))`: one launch normalizes and rotates q and
+    /// k, quantizes q to the attention's fp8 and writes the block's K/V into
+    /// the paged cache of `page_size` tokens (`qk_norm_rope_fp8_kv_write`),
+    /// replacing q_norm, k_norm, RoPE and the query-block insert. Needs fp8
+    /// attention.
+    pub qk_norm_rope_kv_write: Option<(Vec<&'static str>, u32)>,
+    /// `Some((backends, query_block_len))`: each grouped convolution's finish
+    /// half runs fused with the residual add + RMSNorm after it
+    /// (`grouped_conv_residual_rms_norm`): `attn_conv_finish` with
+    /// `post_attn_add_rms_norm`, and `mlp_conv_finish` with the next layer's
+    /// `input_add_rms_norm`, which the attention section then drops.
+    /// `query_block_len` is the bonus position plus the drafts; the fused
+    /// kernel keys on it because its taps do not cross a block.
+    pub conv_residual_norm: Option<(Vec<&'static str>, u32)>,
 }
 
 /// One grouped convolution's byte rates. `prepare` also runs a projection; both
@@ -158,7 +178,11 @@ pub struct Dflash2DraftAttnLocalWorkletResolved {
     pub q_norm: RmsNormKernelConfig,
     pub k_norm: RmsNormKernelConfig,
     pub rope: ElementwiseKernelConfig,
+    pub query_kv_append: Option<KvCacheAppendKernelConfig>,
+    pub qk_norm_rope_kv_write: Option<QkNormRopeFp8KvWriteKernelConfig>,
     pub attention: FlashinferAttnRectKernelConfig,
+    /// `attention` at the large-batch backends, from `min_requests` requests.
+    pub attention_large_batch: Option<(u32, FlashinferAttnRectKernelConfig)>,
     pub o_proj: SingleGemmKernelConfig,
 }
 
@@ -171,16 +195,29 @@ pub struct Dflash2DraftAttnLocalWorkletInput {
     pub rectangles: Vec<(u32, u32)>,
 }
 
+/// q/k norm, RoPE and the query-block insert: separate launches, or one.
+pub enum QkPrep {
+    Separate {
+        q_norm: Op<RmsNormKernel>,
+        k_norm: Op<RmsNormKernel>,
+        rope: Op<ElementwiseKernel>,
+        query_kv_append: Option<Op<KvCacheAppendKernel>>,
+    },
+    Fused(Op<QkNormRopeFp8KvWriteKernel>),
+}
+
 pub struct Dflash2DraftAttnLocalWorklet {
     pub name: String,
-    pub input_add_rms_norm: Op<ResidualRmsNormKernel>,
+    /// `None` under `conv_residual_norm`: the previous layer's fused
+    /// `mlp_conv_finish` launch already ran it.
+    pub input_add_rms_norm: Option<Op<ResidualRmsNormKernel>>,
     pub attn_conv_projection: Op<SingleGemmKernel>,
     pub attn_conv_prepare: Op<ElementwiseKernel>,
     pub qkv_proj: Op<SingleGemmKernel>,
-    pub q_norm: Op<RmsNormKernel>,
-    pub k_norm: Op<RmsNormKernel>,
-    pub rope: Op<ElementwiseKernel>,
+    pub qk_prep: QkPrep,
     pub attention: Op<FlashinferAttnRectKernel>,
+    /// Its own slot, so the cost log shows which launches took it.
+    pub attention_large_batch: Option<(u32, Op<FlashinferAttnRectKernel>)>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: Dflash2DraftAttnLocalWorkletResolved,
 }
@@ -217,6 +254,16 @@ impl Dflash2DraftAttnLocalWorklet {
             checked_product("rope.output_bytes_per_token", &[rope_width, dtype_bytes])
                 .expect("validated DFlash2 RoPE output byte rate must fit u32");
 
+        let attention = FlashinferAttnRectKernelConfig {
+            backends: cfg.attention_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            num_qo_heads: qo_heads_per_rank.clone(),
+            num_kv_heads: kv_heads_per_rank.clone(),
+            head_dim: cfg.head_dim.clone(),
+            q_dtype: cfg.attn_q_dtype,
+            kv_dtype: cfg.attn_kv_dtype,
+            o_dtype: cfg.dtype,
+        };
         Dflash2DraftAttnLocalWorkletResolved {
             input_add_rms_norm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
@@ -253,16 +300,27 @@ impl Dflash2DraftAttnLocalWorklet {
                 input_bytes_per_token: rope_input_bytes.into(),
                 output_bytes_per_token: rope_output_bytes.into(),
             },
-            attention: FlashinferAttnRectKernelConfig {
-                backends: cfg.attention_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_qo_heads: qo_heads_per_rank,
-                num_kv_heads: kv_heads_per_rank,
-                head_dim: cfg.head_dim.clone(),
-                q_dtype: cfg.attn_q_dtype,
-                kv_dtype: cfg.attn_kv_dtype,
-                o_dtype: cfg.dtype,
-            },
+            query_kv_append: cfg.query_kv_append.clone(),
+            qk_norm_rope_kv_write: cfg.qk_norm_rope_kv_write.as_ref().map(
+                |(backends, page_size)| QkNormRopeFp8KvWriteKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_qo_heads: qo_heads_per_rank.clone(),
+                    num_kv_heads: kv_heads_per_rank.clone(),
+                    head_dim: cfg.head_dim.clone(),
+                    page_size: *page_size,
+                    input_dtype: cfg.dtype,
+                    kv_dtype: cfg.attn_kv_dtype,
+                },
+            ),
+            attention_large_batch: cfg.attention_large_batch.as_ref().map(
+                |(min_requests, backends)| {
+                    let mut large = attention.clone();
+                    large.backends = backends.clone();
+                    (*min_requests, large)
+                },
+            ),
+            attention,
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -279,14 +337,64 @@ impl Dflash2DraftAttnLocalWorklet {
         resolved: Dflash2DraftAttnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        Ok(Self {
-            input_add_rms_norm: build_atomic(
+        let qk_prep = match &resolved.qk_norm_rope_kv_write {
+            Some(cfg) => QkPrep::Fused(build_atomic(
+                &name,
+                "qk_norm_rope_kv_write",
+                cfg.clone(),
+                QkNormRopeFp8KvWriteKernel::build,
+                bridge,
+            )?),
+            None => QkPrep::Separate {
+                q_norm: build_atomic(
+                    &name,
+                    "q_norm",
+                    resolved.q_norm.clone(),
+                    RmsNormKernel::build,
+                    bridge,
+                )?,
+                k_norm: build_atomic(
+                    &name,
+                    "k_norm",
+                    resolved.k_norm.clone(),
+                    RmsNormKernel::build,
+                    bridge,
+                )?,
+                rope: build_atomic(
+                    &name,
+                    "rope",
+                    resolved.rope.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                query_kv_append: resolved
+                    .query_kv_append
+                    .as_ref()
+                    .map(|cfg| {
+                        build_atomic(
+                            &name,
+                            "query_kv_append",
+                            cfg.clone(),
+                            KvCacheAppendKernel::build,
+                            bridge,
+                        )
+                    })
+                    .transpose()?,
+            },
+        };
+        let input_add_rms_norm = match resolved.raw_cfg.conv_residual_norm {
+            Some(_) => None,
+            None => Some(build_atomic(
                 &name,
                 "input_add_rms_norm",
                 resolved.input_add_rms_norm.clone(),
                 ResidualRmsNormKernel::build,
                 bridge,
-            )?,
+            )?),
+        };
+        Ok(Self {
+            qk_prep,
+            input_add_rms_norm,
             attn_conv_projection: build_atomic(
                 &name,
                 "attn_conv_projection",
@@ -308,27 +416,6 @@ impl Dflash2DraftAttnLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
-            q_norm: build_atomic(
-                &name,
-                "q_norm",
-                resolved.q_norm.clone(),
-                RmsNormKernel::build,
-                bridge,
-            )?,
-            k_norm: build_atomic(
-                &name,
-                "k_norm",
-                resolved.k_norm.clone(),
-                RmsNormKernel::build,
-                bridge,
-            )?,
-            rope: build_atomic(
-                &name,
-                "rope",
-                resolved.rope.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
             attention: build_atomic(
                 &name,
                 "attention",
@@ -336,6 +423,20 @@ impl Dflash2DraftAttnLocalWorklet {
                 FlashinferAttnRectKernel::build,
                 bridge,
             )?,
+            attention_large_batch: resolved
+                .attention_large_batch
+                .as_ref()
+                .map(|(min_requests, cfg)| {
+                    build_atomic(
+                        &name,
+                        "attention_large_batch",
+                        cfg.clone(),
+                        FlashinferAttnRectKernel::build,
+                        bridge,
+                    )
+                    .map(|op| (*min_requests, op))
+                })
+                .transpose()?,
             o_proj: build_atomic(
                 &name,
                 "o_proj",
@@ -351,17 +452,37 @@ impl Dflash2DraftAttnLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: attn_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.input_add_rms_norm.compile(builder),
-                self.attn_conv_projection.compile(builder),
-                self.attn_conv_prepare.compile(builder),
-                self.qkv_proj.compile(builder),
-                self.q_norm.compile(builder),
-                self.k_norm.compile(builder),
-                self.rope.compile(builder),
-                self.attention.compile(builder),
-                self.o_proj.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = Vec::with_capacity(10);
+                if let Some(op) = &self.input_add_rms_norm {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.attn_conv_projection.compile(builder));
+                nodes.push(self.attn_conv_prepare.compile(builder));
+                nodes.push(self.qkv_proj.compile(builder));
+                match &self.qk_prep {
+                    QkPrep::Separate {
+                        q_norm,
+                        k_norm,
+                        rope,
+                        query_kv_append,
+                    } => {
+                        nodes.push(q_norm.compile(builder));
+                        nodes.push(k_norm.compile(builder));
+                        nodes.push(rope.compile(builder));
+                        if let Some(op) = query_kv_append {
+                            nodes.push(op.compile(builder));
+                        }
+                    }
+                    QkPrep::Fused(op) => nodes.push(op.compile(builder)),
+                }
+                nodes.push(self.attention.compile(builder));
+                if let Some((_, op)) = &self.attention_large_batch {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.o_proj.compile(builder));
+                nodes
+            })),
         }
     }
 
@@ -371,12 +492,9 @@ impl Dflash2DraftAttnLocalWorklet {
         let qo_heads = self.resolved.attention.num_qo_heads.get();
         let kv_heads = self.resolved.attention.num_kv_heads.get();
 
-        eval_atomic_or_zero(
-            &self.input_add_rms_norm,
-            ResidualRmsNormKernelInput { m: tokens },
-            zero,
-            ev,
-        );
+        if let Some(op) = &self.input_add_rms_norm {
+            eval_atomic_or_zero(op, ResidualRmsNormKernelInput { m: tokens }, zero, ev);
+        }
         eval_atomic_or_zero(
             &self.attn_conv_projection,
             SingleGemmKernelInput { m: tokens },
@@ -395,48 +513,78 @@ impl Dflash2DraftAttnLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(
-            &self.q_norm,
-            RmsNormKernelInput {
-                m: tokens.saturating_mul(qo_heads),
-            },
-            zero,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.k_norm,
-            RmsNormKernelInput {
-                m: tokens.saturating_mul(kv_heads),
-            },
-            zero,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.rope,
-            ElementwiseKernelInput { num_tokens: tokens },
-            zero,
-            ev,
-        );
-
-        // One aggregating slot, priced as ONE launch over every request's
-        // rectangle: the engine runs a single varlen FlashAttention call per
-        // layer, not one per request. See `batched_rectangle`. `add_fanin` (not
-        // `add`) so the slot carries the selected backend rather than the ZERO
-        // accumulator's sentinel, which would read as "never executed".
-        let mut attention = LeafMetrics::ZERO;
-        if let Some((q_len, kv_len)) = batched_rectangle(&input.rectangles) {
-            attention.add_fanin(
-                self.attention
-                    .kernel
-                    .eval(&FlashinferAttnRectKernelInput { q_len, kv_len }),
-            );
+        match &self.qk_prep {
+            QkPrep::Separate {
+                q_norm,
+                k_norm,
+                rope,
+                query_kv_append,
+            } => {
+                eval_atomic_or_zero(
+                    q_norm,
+                    RmsNormKernelInput {
+                        m: tokens.saturating_mul(qo_heads),
+                    },
+                    zero,
+                    ev,
+                );
+                eval_atomic_or_zero(
+                    k_norm,
+                    RmsNormKernelInput {
+                        m: tokens.saturating_mul(kv_heads),
+                    },
+                    zero,
+                    ev,
+                );
+                eval_atomic_or_zero(
+                    rope,
+                    ElementwiseKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+                if let Some(op) = query_kv_append {
+                    eval_atomic_or_zero(
+                        op,
+                        KvCacheAppendKernelInput { num_tokens: tokens },
+                        zero,
+                        ev,
+                    );
+                }
+            }
+            QkPrep::Fused(op) => eval_atomic_or_zero(
+                op,
+                QkNormRopeFp8KvWriteKernelInput { num_tokens: tokens },
+                zero,
+                ev,
+            ),
         }
-        ev.push(attention, || {
+
+        // One aggregating slot, priced as ONE launch over the whole batch: the
+        // engine runs a single varlen FlashAttention call per layer, not one
+        // per request. See `batched_rectangles`. `add_fanin` (not `add`) so the slot carries the selected backend rather than the ZERO
+        // accumulator's sentinel, which would read as "never executed".
+        // Under `attention_large_batch` the launch goes to exactly one of the
+        // two slots by its request count; the other reads ZERO.
+        let mut attention = LeafMetrics::ZERO;
+        let mut large = LeafMetrics::ZERO;
+        if let Some(batch) = batched_rectangles(&input.rectangles) {
+            match &self.attention_large_batch {
+                Some((min_requests, op)) if batch.num_requests >= *min_requests => {
+                    large.add_fanin(op.kernel.eval(&batch))
+                }
+                _ => attention.add_fanin(self.attention.kernel.eval(&batch)),
+            }
+        }
+        let log = || {
             Dflash2DraftAttnLog {
                 rectangles: input.rectangles.clone(),
             }
             .into()
-        });
+        };
+        ev.push(attention, log);
+        if self.attention_large_batch.is_some() {
+            ev.push(large, log);
+        }
 
         eval_atomic_or_zero(&self.o_proj, SingleGemmKernelInput { m: tokens }, zero, ev);
     }
@@ -447,6 +595,9 @@ impl Dflash2DraftAttnLocalWorklet {
 #[derive(Clone, Debug)]
 pub struct Dflash2DraftFfnLocalWorkletResolved {
     pub raw_cfg: Dflash2DraftLayerLocalWorkletConfig,
+    /// Set under `conv_residual_norm`: both conv finishes, each fused with the
+    /// residual add + RMSNorm after it.
+    pub conv_residual_norm: Option<GroupedConvResidualRmsNormKernelConfig>,
     pub attn_conv_finish: ElementwiseKernelConfig,
     pub post_attn_add_rms_norm: ResidualRmsNormKernelConfig,
     pub mlp_conv_projection: SingleGemmKernelConfig,
@@ -462,16 +613,71 @@ pub struct Dflash2DraftFfnLocalWorkletInput {
     pub query_tokens: u32,
 }
 
+/// A conv finish and the residual norm after it: two launches, or one.
+pub enum ConvFinish {
+    Separate {
+        conv_finish: Op<ElementwiseKernel>,
+        /// `None` for the MLP finish, whose norm is the next layer's
+        /// `input_add_rms_norm` (priced there).
+        residual_norm: Option<Op<ResidualRmsNormKernel>>,
+    },
+    Fused(Op<GroupedConvResidualRmsNormKernel>),
+}
+
+impl ConvFinish {
+    fn compile(&self, builder: &mut CostTreeBuilder, nodes: &mut Vec<CostNode>) {
+        match self {
+            ConvFinish::Separate {
+                conv_finish,
+                residual_norm,
+            } => {
+                nodes.push(conv_finish.compile(builder));
+                if let Some(op) = residual_norm {
+                    nodes.push(op.compile(builder));
+                }
+            }
+            ConvFinish::Fused(op) => nodes.push(op.compile(builder)),
+        }
+    }
+
+    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+        let zero = tokens == 0;
+        match self {
+            ConvFinish::Separate {
+                conv_finish,
+                residual_norm,
+            } => {
+                eval_atomic_or_zero(
+                    conv_finish,
+                    ElementwiseKernelInput { num_tokens: tokens },
+                    zero,
+                    ev,
+                );
+                if let Some(op) = residual_norm {
+                    eval_atomic_or_zero(op, ResidualRmsNormKernelInput { m: tokens }, zero, ev);
+                }
+            }
+            ConvFinish::Fused(op) => eval_atomic_or_zero(
+                op,
+                GroupedConvResidualRmsNormKernelInput { num_tokens: tokens },
+                zero,
+                ev,
+            ),
+        }
+    }
+}
+
 pub struct Dflash2DraftFfnLocalWorklet {
     pub name: String,
-    pub attn_conv_finish: Op<ElementwiseKernel>,
-    pub post_attn_add_rms_norm: Op<ResidualRmsNormKernel>,
+    /// `attn_conv_finish` + `post_attn_add_rms_norm`.
+    pub attn_conv_finish: ConvFinish,
     pub mlp_conv_projection: Op<SingleGemmKernel>,
     pub mlp_conv_prepare: Op<ElementwiseKernel>,
     pub gate_up_proj: Op<SingleGemmKernel>,
     pub silu_and_mul: Op<ElementwiseKernel>,
     pub down_proj: Op<SingleGemmKernel>,
-    pub mlp_conv_finish: Op<ElementwiseKernel>,
+    /// `mlp_conv_finish` (+ the next layer's `input_add_rms_norm` when fused).
+    pub mlp_conv_finish: ConvFinish,
     resolved: Dflash2DraftFfnLocalWorkletResolved,
 }
 
@@ -502,6 +708,20 @@ impl Dflash2DraftFfnLocalWorklet {
             .expect("validated DFlash2 conv byte rate must fit u32");
 
         Dflash2DraftFfnLocalWorkletResolved {
+            conv_residual_norm: cfg
+                .conv_residual_norm
+                .as_ref()
+                .map(
+                    |(backends, block_len)| GroupedConvResidualRmsNormKernelConfig {
+                        backends: backends.clone(),
+                        gpu_name: cfg.gpu_name.clone(),
+                        hidden: cfg.hidden_dim.clone(),
+                        group_size: cfg.conv_group_size,
+                        taps: cfg.conv_taps,
+                        block_len: *block_len,
+                        dtype: cfg.dtype,
+                    },
+                ),
             attn_conv_finish: conv.clone(),
             post_attn_add_rms_norm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
@@ -542,21 +762,54 @@ impl Dflash2DraftFfnLocalWorklet {
         resolved: Dflash2DraftFfnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        let (attn_conv_finish, mlp_conv_finish) = match &resolved.conv_residual_norm {
+            Some(cfg) => (
+                ConvFinish::Fused(build_atomic(
+                    &name,
+                    "attn_conv_finish_residual_norm",
+                    cfg.clone(),
+                    GroupedConvResidualRmsNormKernel::build,
+                    bridge,
+                )?),
+                ConvFinish::Fused(build_atomic(
+                    &name,
+                    "mlp_conv_finish_residual_norm",
+                    cfg.clone(),
+                    GroupedConvResidualRmsNormKernel::build,
+                    bridge,
+                )?),
+            ),
+            None => (
+                ConvFinish::Separate {
+                    conv_finish: build_atomic(
+                        &name,
+                        "attn_conv_finish",
+                        resolved.attn_conv_finish.clone(),
+                        ElementwiseKernel::build,
+                        bridge,
+                    )?,
+                    residual_norm: Some(build_atomic(
+                        &name,
+                        "post_attn_add_rms_norm",
+                        resolved.post_attn_add_rms_norm.clone(),
+                        ResidualRmsNormKernel::build,
+                        bridge,
+                    )?),
+                },
+                ConvFinish::Separate {
+                    conv_finish: build_atomic(
+                        &name,
+                        "mlp_conv_finish",
+                        resolved.mlp_conv_finish.clone(),
+                        ElementwiseKernel::build,
+                        bridge,
+                    )?,
+                    residual_norm: None,
+                },
+            ),
+        };
         Ok(Self {
-            attn_conv_finish: build_atomic(
-                &name,
-                "attn_conv_finish",
-                resolved.attn_conv_finish.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
-            post_attn_add_rms_norm: build_atomic(
-                &name,
-                "post_attn_add_rms_norm",
-                resolved.post_attn_add_rms_norm.clone(),
-                ResidualRmsNormKernel::build,
-                bridge,
-            )?,
+            attn_conv_finish,
             mlp_conv_projection: build_atomic(
                 &name,
                 "mlp_conv_projection",
@@ -592,13 +845,7 @@ impl Dflash2DraftFfnLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
-            mlp_conv_finish: build_atomic(
-                &name,
-                "mlp_conv_finish",
-                resolved.mlp_conv_finish.clone(),
-                ElementwiseKernel::build,
-                bridge,
-            )?,
+            mlp_conv_finish,
             name,
             resolved,
         })
@@ -607,16 +854,17 @@ impl Dflash2DraftFfnLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: ffn_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.attn_conv_finish.compile(builder),
-                self.post_attn_add_rms_norm.compile(builder),
-                self.mlp_conv_projection.compile(builder),
-                self.mlp_conv_prepare.compile(builder),
-                self.gate_up_proj.compile(builder),
-                self.silu_and_mul.compile(builder),
-                self.down_proj.compile(builder),
-                self.mlp_conv_finish.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = Vec::with_capacity(8);
+                self.attn_conv_finish.compile(builder, &mut nodes);
+                nodes.push(self.mlp_conv_projection.compile(builder));
+                nodes.push(self.mlp_conv_prepare.compile(builder));
+                nodes.push(self.gate_up_proj.compile(builder));
+                nodes.push(self.silu_and_mul.compile(builder));
+                nodes.push(self.down_proj.compile(builder));
+                self.mlp_conv_finish.compile(builder, &mut nodes);
+                nodes
+            })),
         }
     }
 
@@ -625,13 +873,7 @@ impl Dflash2DraftFfnLocalWorklet {
         let zero = tokens == 0;
         let whole = ElementwiseKernelInput { num_tokens: tokens };
 
-        eval_atomic_or_zero(&self.attn_conv_finish, whole.clone(), zero, ev);
-        eval_atomic_or_zero(
-            &self.post_attn_add_rms_norm,
-            ResidualRmsNormKernelInput { m: tokens },
-            zero,
-            ev,
-        );
+        self.attn_conv_finish.eval(tokens, ev);
         eval_atomic_or_zero(
             &self.mlp_conv_projection,
             SingleGemmKernelInput { m: tokens },
@@ -645,7 +887,7 @@ impl Dflash2DraftFfnLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(&self.silu_and_mul, whole.clone(), zero, ev);
+        eval_atomic_or_zero(&self.silu_and_mul, whole, zero, ev);
         eval_atomic_or_zero(
             &self.down_proj,
             SingleGemmKernelInput { m: tokens },
@@ -655,30 +897,28 @@ impl Dflash2DraftFfnLocalWorklet {
         // Billed in this section although it runs after the architecture's
         // collective. `CostNode::Sum` is additive, so the total is unchanged;
         // only the cost-log narrative places it one boundary early.
-        eval_atomic_or_zero(&self.mlp_conv_finish, whole, zero, ev);
+        self.mlp_conv_finish.eval(tokens, ev);
     }
 }
 
 // ------------------------------------------------------------------ shared --
 
 fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), String> {
-    for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        (
-            "intermediate_dim",
-            cfg.intermediate_dim.get(),
-            INTERMEDIATE_DIM,
-        ),
-        ("head_dim", cfg.head_dim.get(), HEAD_DIM),
-        ("num_qo_heads", cfg.num_qo_heads.get(), NUM_QO_HEADS),
-        ("num_kv_heads", cfg.num_kv_heads.get(), NUM_KV_HEADS),
-        ("conv_taps", cfg.conv_taps, CONV_TAPS),
-        ("conv_group_size", cfg.conv_group_size, CONV_GROUP_SIZE),
-    ] {
-        if actual != required {
-            return Err(format!("{name} must be {required}, got {actual}"));
-        }
-    }
+    validate_against_checkpoints(|c| {
+        vec![
+            ("hidden_dim", cfg.hidden_dim.get(), c.hidden_dim),
+            (
+                "intermediate_dim",
+                cfg.intermediate_dim.get(),
+                c.intermediate_dim,
+            ),
+            ("head_dim", cfg.head_dim.get(), c.head_dim),
+            ("num_qo_heads", cfg.num_qo_heads.get(), c.num_qo_heads),
+            ("num_kv_heads", cfg.num_kv_heads.get(), c.num_kv_heads),
+            ("conv_taps", cfg.conv_taps, c.conv_taps),
+            ("conv_group_size", cfg.conv_group_size, c.conv_group_size),
+        ]
+    })?;
     if cfg.dtype != DType::Bf16 {
         return Err(format!(
             "dtype must be {}, got {}",
@@ -688,6 +928,13 @@ fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), Stri
     }
     if cfg.tp_size == 0 {
         return Err("tp_size must be positive".to_string());
+    }
+    if cfg.qk_norm_rope_kv_write.is_some() && cfg.attn_q_dtype != DType::Fp8E4m3 {
+        return Err(format!(
+            "qk_norm_rope_kv_write emits an fp8 query for fp8 attention, but the draft \
+             attention reads {} queries",
+            cfg.attn_q_dtype.as_str()
+        ));
     }
     // The ragged rect path requires one compute dtype for both operands.
     if cfg.attn_q_dtype != cfg.attn_kv_dtype {
@@ -759,32 +1006,30 @@ where
     ))
 }
 
-/// The single rectangle one batched draft-attention launch is priced as:
-/// `q_len = sum(q_i)` and `kv_len = sum(q_i * kv_i) / sum(q_i)`, rounded up.
+/// One rank's draft-attention launch: `num_requests` requests, each a block of
+/// `q_len` rows attending its own `kv_len` keys.
 ///
-/// The rect leaf is profiled one request at a time, so summing it per request
-/// bills the launch and its fixed latency once per request. The engine makes one
-/// varlen call per layer, and on the v0.28 captures
-/// (`logs/20260923_4_glm53_dflash2_pack`) the per-request sum overstated
-/// `dflash2.layer.attn.attention` 55x at 256 concurrent requests (811 ms simulated
-/// vs 14.6 ms measured over the case) and 9x at 32; the error grew with the
-/// request count, not the context. One rectangle keeps the attention work
-/// (`sum(q_i * kv_i)`, every query row against its own keys) and bills one
-/// launch. It reads the keys of one mean-length context rather than every
-/// request's own, which errs fast on a KV-bound call; the leaf is measured at
-/// bf16 against the engine's fp8, which errs slow (see the module note).
-fn batched_rectangle(rectangles: &[(u32, u32)]) -> Option<(u32, u32)> {
-    let q_total: u64 = rectangles.iter().map(|&(q, _)| u64::from(q)).sum();
+/// The engine makes one varlen call per layer, and on the v0.28 captures
+/// (`logs/20260923_4_glm53_dflash2_pack`) a per-request sum overstated
+/// `dflash2.layer.attn.attention` 55x at 256 concurrent requests, so the call is
+/// one leaf. It is not one rectangle of `sum(q_i)` rows over a mean context
+/// either: every request reads its own K/V, so the K/V bytes scale with the
+/// request count. The leaf is profiled at that batch shape; a block is the same
+/// width for every request, and the window caps the contexts, so the mean
+/// context stands for each (rounded up; the leaf is linear in it).
+fn batched_rectangles(rectangles: &[(u32, u32)]) -> Option<FlashinferAttnRectKernelInput> {
+    let active = rectangles.iter().filter(|&&(q, _)| q > 0);
+    let num_requests = active.clone().count() as u64;
+    let q_total: u64 = active.clone().map(|&(q, _)| u64::from(q)).sum();
     if q_total == 0 {
         return None;
     }
-    let work: u64 = rectangles
-        .iter()
-        .map(|&(q, kv)| u64::from(q) * u64::from(kv))
-        .sum();
-    let q_len = u32::try_from(q_total).expect("draft query rows fit u32");
-    let kv_len = u32::try_from(work.div_ceil(q_total)).expect("mean kv_len fits u32");
-    Some((q_len, kv_len))
+    let kv_total: u64 = active.map(|&(_, kv)| u64::from(kv)).sum();
+    Some(FlashinferAttnRectKernelInput {
+        num_requests: u32::try_from(num_requests).expect("draft requests fit u32"),
+        q_len: u32::try_from(q_total.div_ceil(num_requests)).expect("draft block fits u32"),
+        kv_len: u32::try_from(kv_total.div_ceil(num_requests)).expect("mean kv_len fits u32"),
+    })
 }
 
 fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
@@ -803,6 +1048,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklet::dflash2_checkpoint::GLM53_DFLASH2 as CKPT;
+
+    const HIDDEN_DIM: u32 = CKPT.hidden_dim;
+    const INTERMEDIATE_DIM: u32 = CKPT.intermediate_dim;
+    const HEAD_DIM: u32 = CKPT.head_dim;
+    const NUM_QO_HEADS: u32 = CKPT.num_qo_heads;
+    const NUM_KV_HEADS: u32 = CKPT.num_kv_heads;
+    const CONV_TAPS: u32 = CKPT.conv_taps;
+    const CONV_GROUP_SIZE: u32 = CKPT.conv_group_size;
 
     fn cfg() -> Dflash2DraftLayerLocalWorkletConfig {
         Dflash2DraftLayerLocalWorkletConfig {
@@ -811,6 +1065,7 @@ mod tests {
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
             attention_backends: vec!["flashinfer"],
+            attention_large_batch: None,
             tp_size: 4,
             gpu_name: "NVIDIA B200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
@@ -824,16 +1079,185 @@ mod tests {
             gemm_dtype: DType::Bf16,
             attn_q_dtype: DType::Bf16,
             attn_kv_dtype: DType::Bf16,
+            query_kv_append: None,
+            qk_norm_rope_kv_write: None,
+            conv_residual_norm: None,
         }
     }
 
+    fn ffn_leaves(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2DraftFfnLocalWorklet::build(
+            "ffn".into(),
+            Dflash2DraftFfnLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| slot.name["ffn.".len()..].to_string())
+            .collect()
+    }
+
+    fn query_kv_append() -> KvCacheAppendKernelConfig {
+        KvCacheAppendKernelConfig {
+            backends: vec!["vllm_cuda"],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_kv_heads: 2.into(),
+            head_dim: HEAD_DIM.into(),
+            head_dim_v: None,
+            block_size: 64,
+            input_dtype: DType::Bf16,
+            kv_dtype: DType::Fp8E4m3,
+            cache_layout: "NHD".to_string(),
+            scale_granularity: "tensor".to_string(),
+        }
+    }
+
+    /// Each leaf's name under the attention section, in slot order.
+    fn attn_leaves(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Dflash2DraftAttnLocalWorklet::build(
+            "attn".into(),
+            Dflash2DraftAttnLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|slot| slot.name["attn.".len()..].to_string())
+            .collect()
+    }
+
+    /// Catches the query block's insert going missing or landing after the
+    /// attention call that reads it.
     #[test]
-    fn a_batch_of_rectangles_is_one_launch_with_the_same_work() {
-        assert_eq!(batched_rectangle(&[]), None);
-        assert_eq!(batched_rectangle(&[(0, 100)]), None);
-        assert_eq!(batched_rectangle(&[(8, 100)]), Some((8, 100)));
-        // 8*100 + 8*301 = 3208 query-key pairs over 16 rows: 200.5, rounded up.
-        assert_eq!(batched_rectangle(&[(8, 100), (8, 301)]), Some((16, 201)));
+    fn the_query_block_insert_precedes_the_attention() {
+        let mut with = cfg();
+        with.query_kv_append = Some(query_kv_append());
+        let leaves = attn_leaves(&with);
+        let insert = leaves.iter().position(|l| l == "query_kv_append").unwrap();
+        let attention = leaves.iter().position(|l| l == "attention").unwrap();
+        assert_eq!(insert + 1, attention);
+        assert!(!attn_leaves(&cfg()).contains(&"query_kv_append".to_string()));
+    }
+
+    fn shape(batch: Option<FlashinferAttnRectKernelInput>) -> Option<(u32, u32, u32)> {
+        batch.map(|b| (b.num_requests, b.q_len, b.kv_len))
+    }
+
+    /// Catches the batch collapsing back to one rectangle over one shared
+    /// context: two requests must stay two requests, each with its own keys.
+    #[test]
+    fn a_batch_of_rectangles_is_one_launch_over_every_request() {
+        assert_eq!(shape(batched_rectangles(&[])), None);
+        assert_eq!(shape(batched_rectangles(&[(0, 100)])), None);
+        assert_eq!(shape(batched_rectangles(&[(8, 100)])), Some((1, 8, 100)));
+        // Two blocks of 8; contexts 100 and 301 average 200.5, rounded up.
+        assert_eq!(
+            shape(batched_rectangles(&[(8, 100), (8, 301), (0, 50)])),
+            Some((2, 8, 201))
+        );
+    }
+
+    /// Catches the fused launch standing beside the four it replaces, or
+    /// running against a bf16 attention it cannot feed.
+    #[test]
+    fn the_fused_qk_write_replaces_norms_rope_and_insert() {
+        let mut fused = cfg();
+        fused.query_kv_append = Some(query_kv_append());
+        fused.qk_norm_rope_kv_write = Some((vec!["triton"], 16));
+        assert!(validate_config(&fused).is_err());
+        fused.attn_q_dtype = DType::Fp8E4m3;
+        fused.attn_kv_dtype = DType::Fp8E4m3;
+        let leaves = attn_leaves(&fused);
+        for gone in ["q_norm", "k_norm", "rope", "query_kv_append"] {
+            assert!(!leaves.iter().any(|l| l == gone), "{gone} still priced");
+        }
+        let write = leaves
+            .iter()
+            .position(|l| l == "qk_norm_rope_kv_write")
+            .unwrap();
+        assert_eq!(leaves[write + 1], "attention");
+        let resolved = Dflash2DraftAttnLocalWorklet::resolve_config(&fused);
+        let write = resolved.qk_norm_rope_kv_write.unwrap();
+        assert_eq!(write.num_qo_heads.get(), 16);
+        assert_eq!(write.num_kv_heads.get(), 2);
+        assert_eq!(write.page_size, 16);
+    }
+
+    /// Catches a residual norm priced twice (fused and separate) or not at
+    /// all: per layer, the two fused finishes stand for both conv finishes,
+    /// the post-attention norm and the next layer's input norm.
+    #[test]
+    fn the_fused_conv_finish_absorbs_both_residual_norms() {
+        let plain = cfg();
+        let mut fused = cfg();
+        fused.conv_residual_norm = Some((vec!["vllm_triton"], 8));
+        let (plain_attn, fused_attn) = (attn_leaves(&plain), attn_leaves(&fused));
+        assert_eq!(plain_attn[0], "input_add_rms_norm");
+        assert_eq!(fused_attn, plain_attn[1..].to_vec());
+        assert_eq!(
+            ffn_leaves(&plain),
+            [
+                "attn_conv_finish",
+                "post_attn_add_rms_norm",
+                "mlp_conv_projection",
+                "mlp_conv_prepare",
+                "gate_up_proj",
+                "silu_and_mul",
+                "down_proj",
+                "mlp_conv_finish",
+            ]
+        );
+        assert_eq!(
+            ffn_leaves(&fused),
+            [
+                "attn_conv_finish_residual_norm",
+                "mlp_conv_projection",
+                "mlp_conv_prepare",
+                "gate_up_proj",
+                "silu_and_mul",
+                "down_proj",
+                "mlp_conv_finish_residual_norm",
+            ]
+        );
+        let resolved = Dflash2DraftFfnLocalWorklet::resolve_config(&fused);
+        let conv = resolved.conv_residual_norm.unwrap();
+        assert_eq!(conv.block_len, 8);
+        assert_eq!(conv.hidden.get(), HIDDEN_DIM);
+    }
+
+    /// Catches the gate replacing the small-batch attention instead of
+    /// standing beside it, or changing the section when it is off.
+    #[test]
+    fn the_large_batch_attention_is_the_same_call_at_other_backends() {
+        let mut gated = cfg();
+        gated.attention_large_batch = Some((16, vec!["vllm_fa4_nosplit"]));
+        let leaves = attn_leaves(&gated);
+        let attention = leaves.iter().position(|l| l == "attention").unwrap();
+        assert_eq!(leaves[attention + 1], "attention_large_batch");
+        assert!(!attn_leaves(&cfg()).contains(&"attention_large_batch".to_string()));
+        let resolved = Dflash2DraftAttnLocalWorklet::resolve_config(&gated);
+        let (min_requests, large) = resolved.attention_large_batch.expect("gated");
+        assert_eq!(min_requests, 16);
+        assert_eq!(large.backends, vec!["vllm_fa4_nosplit"]);
+        assert_eq!(resolved.attention.backends, vec!["flashinfer"]);
+        assert_eq!(
+            large.num_qo_heads.get(),
+            resolved.attention.num_qo_heads.get()
+        );
+        assert_eq!(large.q_dtype, resolved.attention.q_dtype);
     }
 
     #[test]

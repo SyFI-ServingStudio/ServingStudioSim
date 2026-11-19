@@ -13,14 +13,18 @@
 //! is taken on the T > 16 branch where the post is its own launch. The result
 //! is clamped at zero so an interpolation crossing cannot mint negative time.
 //!
+//! After an MoE layer whose shared + routed add is folded into the post kernel
+//! ([`MhcTerminalPostOp::build_after_moe_sum`]) the fused side is that kernel's
+//! `mhc_fused_sum_post_pre_rms_norm` row instead: `fused_sum(T') - pre(T')`.
+//!
 //! One leaf, carrying the fused kind's identity: the slot is the post launch
 //! that kind contains.
 
 use std::sync::Arc;
 
 use crate::timing::kernels::{
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput,
+    MhcFusedPostPreRmsNormKernel, MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel,
+    MhcPreRmsNormKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -42,9 +46,16 @@ pub struct MhcTerminalPostInput {
     pub num_tokens: u32,
 }
 
+/// The measured boundary the post is the fused side of.
+pub enum TerminalFused {
+    PostPre(Arc<MhcFusedPostPreRmsNormKernel>),
+    /// The post also adds the MoE's shared and routed outputs.
+    SumPostPre(Arc<MhcFusedSumPostPreRmsNormKernel>),
+}
+
 pub struct MhcTerminalPostOp {
     pub name: String,
-    pub fused: Arc<MhcFusedPostPreRmsNormKernel>,
+    pub fused: TerminalFused,
     pub pre: Arc<MhcPreRmsNormKernel>,
 }
 
@@ -58,16 +69,43 @@ impl MhcTerminalPostOp {
             backends: cfg.fused_backends.clone(),
             ..cfg.mhc.clone()
         };
+        let fused = TerminalFused::PostPre(Arc::new(MhcFusedPostPreRmsNormKernel::build(
+            format!("{name}.fused_reference"),
+            fused,
+            bridge,
+        )?));
+        Self::with_fused(name, cfg, fused, bridge)
+    }
+
+    /// The last layer's post after an MoE layer with the shared + routed add
+    /// in the post kernel: priced as `fused_sum(T') - pre(T')`. `cfg`'s
+    /// `fused_backends` are unused; `sum` carries the fused side.
+    pub fn build_after_moe_sum(
+        name: String,
+        cfg: MhcTerminalPostConfig,
+        sum: MhcFusedSumKernelConfig,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let fused = TerminalFused::SumPostPre(Arc::new(MhcFusedSumPostPreRmsNormKernel::build(
+            format!("{name}.fused_sum_reference"),
+            sum,
+            bridge,
+        )?));
+        Self::with_fused(name, cfg, fused, bridge)
+    }
+
+    fn with_fused(
+        name: String,
+        cfg: MhcTerminalPostConfig,
+        fused: TerminalFused,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
         let pre = MhcRmsNormKernelConfig {
             backends: cfg.pre_backends.clone(),
             ..cfg.mhc
         };
         Ok(Self {
-            fused: Arc::new(MhcFusedPostPreRmsNormKernel::build(
-                format!("{name}.fused_reference"),
-                fused,
-                bridge,
-            )?),
+            fused,
             pre: Arc::new(MhcPreRmsNormKernel::build(
                 format!("{name}.pre_reference"),
                 pre,
@@ -78,11 +116,14 @@ impl MhcTerminalPostOp {
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        builder.leaf(
-            self.name.clone(),
-            self.fused.kind(),
-            self.fused.describe_config(),
-        )
+        match &self.fused {
+            TerminalFused::PostPre(k) => {
+                builder.leaf(self.name.clone(), k.kind(), k.describe_config())
+            }
+            TerminalFused::SumPostPre(k) => {
+                builder.leaf(self.name.clone(), k.kind(), k.describe_config())
+            }
+        }
     }
 
     pub fn eval(&self, input: &MhcTerminalPostInput, ev: &mut Evaluator) {
@@ -92,7 +133,11 @@ impl MhcTerminalPostOp {
         let metrics = if input.num_tokens == 0 {
             LeafMetrics::ZERO
         } else {
-            post_only(self.fused.eval(&shape), self.pre.eval(&shape))
+            let fused = match &self.fused {
+                TerminalFused::PostPre(k) => k.eval(&shape),
+                TerminalFused::SumPostPre(k) => k.eval(&shape),
+            };
+            post_only(fused, self.pre.eval(&shape))
         };
         ev.push(metrics, || shape.clone().into());
     }
@@ -139,30 +184,68 @@ mod tests {
         assert_eq!(crossed.m.time_ms, 0.0);
     }
 
+    fn cfg() -> MhcTerminalPostConfig {
+        MhcTerminalPostConfig {
+            mhc: MhcRmsNormKernelConfig {
+                backends: Vec::new(),
+                gpu_name: "NVIDIA B200".into(),
+                hidden_size: 4096.into(),
+                hc_mult: 4,
+                hidden_dtype: crate::timing::bridge::DType::Bf16,
+            },
+            pre_backends: vec!["vllm_tilelang"],
+            fused_backends: vec!["vllm_tilelang"],
+        }
+    }
+
+    fn slots(op: &MhcTerminalPostOp) -> Vec<(String, String)> {
+        let mut builder = CostTreeBuilder::new();
+        let root = op.compile(&mut builder);
+        let tree = builder.finish(root);
+        tree.slots
+            .iter()
+            .map(|s| (s.name.clone(), s.kind.clone()))
+            .collect()
+    }
+
     #[test]
     fn compile_mints_one_slot_under_the_op_name() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let op = MhcTerminalPostOp::build(
-            "m.final_mhc_post".into(),
-            MhcTerminalPostConfig {
-                mhc: MhcRmsNormKernelConfig {
-                    backends: Vec::new(),
-                    gpu_name: "NVIDIA B200".into(),
-                    hidden_size: 4096.into(),
-                    hc_mult: 4,
-                    hidden_dtype: crate::timing::bridge::DType::Bf16,
-                },
-                pre_backends: vec!["vllm_tilelang"],
-                fused_backends: vec!["vllm_tilelang"],
-            },
-            &bridge,
-        )
-        .unwrap();
-        let mut builder = CostTreeBuilder::new();
-        let root = op.compile(&mut builder);
-        let tree = builder.finish(root);
-        assert_eq!(tree.slots.len(), 1);
-        assert_eq!(tree.slots[0].name, "m.final_mhc_post");
+        let op = MhcTerminalPostOp::build("m.final_mhc_post".into(), cfg(), &bridge).unwrap();
+        assert_eq!(
+            slots(&op),
+            [(
+                "m.final_mhc_post".to_string(),
+                "mhc_fused_post_pre_rms_norm".to_string()
+            )]
+        );
+    }
+
+    /// Catches the post after a summing MoE layer keeping the plain fused
+    /// boundary's identity.
+    #[test]
+    fn after_a_summing_moe_the_slot_is_the_sum_kind() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sum = MhcFusedSumKernelConfig {
+            backends: vec!["vllm_tilelang"],
+            gpu_name: "NVIDIA B200".into(),
+            hidden_size: 4096.into(),
+            hc_mult: 4,
+            hidden_dtype: crate::timing::bridge::DType::Bf16,
+            num_partials: 1,
+            shared_addend: true,
+        };
+        let op =
+            MhcTerminalPostOp::build_after_moe_sum("m.final_mhc_post".into(), cfg(), sum, &bridge)
+                .unwrap();
+        assert_eq!(
+            slots(&op),
+            [(
+                "m.final_mhc_post".to_string(),
+                "mhc_fused_sum_post_pre_rms_norm".to_string()
+            )]
+        );
     }
 }

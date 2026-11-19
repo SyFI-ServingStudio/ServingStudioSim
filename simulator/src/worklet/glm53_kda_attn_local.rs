@@ -18,29 +18,56 @@
 //! instead launches once per prefill sequence and runs the iteration's
 //! decode tokens through `causal_conv1d_update`, so its short conv is the sum of
 //! the `(1, L_i)` rows plus one decode launch.
-//! Only prefill-bearing iterations gather and scatter the fp32 SSM state.
+//! Only prefill-bearing iterations gather and scatter the SSM state.
+//!
+//! The state pool is fp32 (vLLM's default) or bf16 (`--mamba-ssm-cache-dtype
+//! bfloat16`). The pool dtype sizes the per-request state and its gather and
+//! scatter, and keys the recurrent-decode and verify rows. The chunked-prefill
+//! rows carry no state-dtype axis and stay fp32-pool measurements.
+//!
+//! A speculative verify graph (`decode_query_len` = `1 + k` rows per decode
+//! request) keeps its decode requests off the chunk path: vLLM chunks only the
+//! prefill requests and runs the verify core over the spec decodes. That core
+//! is one of two ([`KdaSpecVerify`]). RecoverSSM reads each request's state
+//! once and caches a correction and key/gate per row; a commit, which the arch
+//! bills once per KDA cache group, folds the accepted rows into the one state
+//! the request keeps. Its kernels are the ones the fork selects (`kda.py`
+//! `can_use_cute_recoverssm`): where its CuTe kernels run, the short conv and
+//! the verify in one launch and the CuTe commit fold; otherwise
+//! `causal_conv1d_update` in its varlen form, the Triton verify and the Triton
+//! commit. The per-position core is `fused_recurrent_kda` over `[B, 1 + k]`
+//! state slots, which writes a full state at every position and so holds
+//! `1 + k` state pages per request and needs no commit.
 //!
 //! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
 //! scratch fills run inside the call `kda_chunk_prefill` times, so they have no
 //! leaf here. FLA's chunk-index setup (about 11 small launches, ~17 us) runs
 //! once per step and is cached across layers; it is left out.
 //!
-//! Placeholders (elementwise, byte-sized): the beta sigmoid, the gated
-//! RMSNorm (`gdn_gated_rms_norm` is H200-only and a different entry point),
-//! and the state gather/scatter. State movement is expressed in 4-KiB transfer
-//! units, as in `qwen36_gdn_local`, so one 1-MiB state is 256 units.
+//! The output norm is the fork's `FusedRMSNormGated(activation="sigmoid")`
+//! `forward_cuda`: FLA's `rms_norm_gated`, one launch over tokens x
+//! rank-local heads rows (`sigmoid_gated_rms_norm`).
+//!
+//! Placeholders (elementwise, byte-sized): the beta sigmoid and the state
+//! gather/scatter. State movement is expressed in 4-KiB transfer units, as in
+//! `qwen36_gdn_local`, so one 1-MiB state is 256 units.
 
+use crate::common::gpu::compute_capability;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
 use crate::timing::kernels::kda_chunk_prefill::takes_beta_logits;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelInput, GdnCausalConvDecodeKernel,
-    GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel,
-    GdnCausalConvPrefillKernelConfig, GdnCausalConvPrefillKernelInput, KdaChunkPrefillKernel,
-    KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput, KdaRecurrentDecodeKernel,
-    KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, ElementwiseKernel,
+    ElementwiseKernelInput, GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig,
+    GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel, GdnCausalConvPrefillKernelConfig,
+    GdnCausalConvPrefillKernelInput, KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig,
+    KdaChunkPrefillKernelInput, KdaRecoverSSMCommitKernelConfig, KdaRecoverSSMConvVerifyKernel,
+    KdaRecoverSSMConvVerifyKernelConfig, KdaRecoverSSMConvVerifyKernelInput,
+    KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput,
+    KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
+    SigmoidGatedRmsNormKernel, SigmoidGatedRmsNormKernelConfig, SigmoidGatedRmsNormKernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, GdnCausalConvPrefillLog, LeafMetrics,
@@ -50,10 +77,47 @@ use crate::timing::{
 use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
+/// `FusedRMSNormGated.forward_cuda`: FLA's `rms_norm_gated` Triton kernel.
+const SIGMOID_GATED_NORM_BACKENDS: &[&str] = &["vllm_fla_triton"];
+/// `f_b` and `g_b` as one `torch.bmm` over their packed low-rank inputs
+/// (`merge_gate_b`).
+const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
+/// The fork's RecoverSSM kernels where its CuTe ones cannot run: the Triton
+/// verify after `causal_conv1d_update`, and the Triton commit.
+const RECOVERSSM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's CuTe RecoverSSM kernels (`kda.py` `recoverssm_backend = "cute"`):
+/// the conv and the verify in one launch on its `[state_len, dim]` conv pages,
+/// and the commit fold. The default of `conv_verify_backends` and
+/// `commit_backends`.
+pub const RECOVERSSM_CUTE_BACKENDS: &[&str] = &["vllm_cute"];
+/// The fork creates the KDA conv taps in fp32 (`glm5next/common/kda.py`
+/// `conv1d`, `params_dtype=torch.float32`).
+const CONV_WEIGHT_DTYPE: DType = DType::Fp32;
+/// `can_use_cute_recoverssm`: head dim 128, a width-4 conv and a 1..8-token
+/// window (`recoverssm/kernels.py` `K`, `MAX_WINDOW`).
+const CUTE_RECOVERSSM_HEAD_DIM: u32 = 128;
+const CUTE_RECOVERSSM_CONV_WIDTH: u32 = 4;
+const CUTE_RECOVERSSM_MAX_WINDOW: u32 = 8;
 /// Beta sigmoid ahead of a prefill core that takes beta already passed
 /// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
 const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;
 const BETA_SIGMOID_OUT_BYTES_PER_HEAD: u32 = 4;
+
+/// How a speculative verify advances the KDA state.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaSpecVerify {
+    /// RecoverSSM: a verify that reads each request's state once, and a
+    /// commit that folds the accepted rows into it.
+    #[default]
+    Recoverssm,
+    /// The vLLM fork's GLM path (`kda.py` spec branch): `fused_recurrent_kda`
+    /// reads the last accepted state and stores the state after every
+    /// position into that position's slot.
+    RecurrentPerPosition,
+}
 
 #[derive(Clone, Debug)]
 pub struct Glm53KdaAttnLocalWorkletConfig {
@@ -66,7 +130,10 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub conv_kernel_size: Dim,
     pub activation_dtype: DType,
     pub gpu_name: String,
+    /// The low-rank gate GEMMs (`f_b`, `g_b`).
     pub bf16_gemm_backends: Vec<&'static str>,
+    /// The two wide projections, `in_proj` and `o_proj`.
+    pub in_out_proj_backends: Vec<&'static str>,
     /// Short-conv prefill backends (`gdn_causal_conv_prefill`).
     pub conv_prefill_backends: Vec<&'static str>,
     /// Short-conv decode backends (`gdn_causal_conv_decode`).
@@ -76,6 +143,23 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
     pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// The CuTe RecoverSSM path's conv + verify launch (`kda_recoverssm_conv_verify`).
+    pub conv_verify_backends: Vec<&'static str>,
+    /// The CuTe RecoverSSM path's commit fold (`kda_recoverssm_commit`); the
+    /// Triton path keeps the fork's Triton commit.
+    pub commit_backends: Vec<&'static str>,
+    /// Element type of the recurrent state pool (fp32 or bf16).
+    pub ssm_state_dtype: DType,
+    /// Query rows per decode request: 1 for plain decode, `1 + k` for a
+    /// speculative verify, whose decode core `spec_verify` selects.
+    pub decode_query_len: u32,
+    /// The verify core of a graph with `decode_query_len > 1`.
+    pub spec_verify: KdaSpecVerify,
+    /// Not the fork's path: run `f_b` and `g_b` as one batched GEMM over the
+    /// two adjacent `gate_rank`-wide slices of the `in_proj` output (one
+    /// launch instead of two). Their two leaves then bill zero and the
+    /// `gate_b_proj` leaf bills the batched call.
+    pub merge_gate_b: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -84,19 +168,45 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub in_proj: SingleGemmKernelConfig,
     pub f_b: SingleGemmKernelConfig,
     pub g_b: SingleGemmKernelConfig,
+    /// `f_b` + `g_b` as one batched GEMM when `merge_gate_b`.
+    pub gate_b: Option<BatchedGemmKernelConfig>,
     pub conv_prefill: GdnCausalConvPrefillKernelConfig,
     pub conv_decode: GdnCausalConvDecodeKernelConfig,
     pub prefill_small_glue: crate::timing::kernels::ElementwiseKernelConfig,
     pub state_gather: crate::timing::kernels::ElementwiseKernelConfig,
     pub chunk_prefill: KdaChunkPrefillKernelConfig,
-    pub recurrent_decode: KdaRecurrentDecodeKernelConfig,
+    /// Plain decode's core, or a per-position verify's, keyed at
+    /// `decode_query_len` tokens per request. Exactly one of this,
+    /// `recoverssm_verify` and `recoverssm_conv_verify` is set.
+    pub recurrent_decode: Option<KdaRecurrentDecodeKernelConfig>,
+    /// A RecoverSSM verify graph's core after `conv_decode`, where the fork's
+    /// CuTe kernels cannot run.
+    pub recoverssm_verify: Option<KdaRecoverSSMVerifyKernelConfig>,
+    /// A RecoverSSM verify graph's core with the short conv inside it (the
+    /// fork's CuTe kernel); `conv_decode` then bills nothing for the decode requests.
+    pub recoverssm_conv_verify: Option<KdaRecoverSSMConvVerifyKernelConfig>,
+    /// The commit that goes with a RecoverSSM verify, for the arch to bill
+    /// per KDA cache group: it sets `num_layers` to each group's layer count;
+    /// here it is 1.
+    pub recoverssm_commit: Option<KdaRecoverSSMCommitKernelConfig>,
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
-    pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
+    pub gated_norm: SigmoidGatedRmsNormKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
-    /// fp32 `[H, K, V]` recurrent state of one request on this rank.
+    /// `[H, K, V]` recurrent state of one request on this rank, at the pool
+    /// dtype.
     pub ssm_state_bytes_per_request: u32,
-    /// bf16 `(kernel_size - 1)`-token conv window of one request on this rank.
+    /// Activation-dtype `(kernel_size - 1 + decode_query_len - 1)`-token conv
+    /// window of one request on this rank.
     pub conv_state_bytes_per_request: u32,
+    /// State pages (SSM state + conv window) one request holds per layer: 1,
+    /// or `decode_query_len` for a per-position verify (vLLM `MambaSpec`
+    /// `1 + num_speculative_blocks`).
+    pub state_pages_per_request: u32,
+    /// RecoverSSM's per-row verify records of one request on this rank: an
+    /// fp32 correction `[H, rows, V]` and an activation-dtype key/gate
+    /// `[H, rows, 2K]` (vLLM `append_kda_recoverssm_record`). Zero without a
+    /// RecoverSSM verify.
+    pub verify_cache_bytes_per_request: u32,
 }
 
 /// One iteration's KDA work on this rank.
@@ -112,14 +222,17 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub in_proj: Op<SingleGemmKernel>,
     pub f_b: Op<SingleGemmKernel>,
     pub g_b: Op<SingleGemmKernel>,
+    pub gate_b: Option<Op<BatchedGemmKernel>>,
     pub conv_prefill: Op<GdnCausalConvPrefillKernel>,
     pub conv_decode: Op<GdnCausalConvDecodeKernel>,
     pub prefill_small_glue: Op<ElementwiseKernel>,
     pub state_gather: Op<ElementwiseKernel>,
     pub chunk_prefill: Op<KdaChunkPrefillKernel>,
-    pub recurrent_decode: Op<KdaRecurrentDecodeKernel>,
+    pub recurrent_decode: Option<Op<KdaRecurrentDecodeKernel>>,
+    pub recoverssm_verify: Option<Op<KdaRecoverSSMVerifyKernel>>,
+    pub recoverssm_conv_verify: Option<Op<KdaRecoverSSMConvVerifyKernel>>,
     pub state_scatter: Op<ElementwiseKernel>,
-    pub gated_norm: Op<ElementwiseKernel>,
+    pub gated_norm: Op<SigmoidGatedRmsNormKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     /// The short-conv prefill backends launch once per sequence
     /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
@@ -142,8 +255,8 @@ impl Glm53KdaAttnLocalWorklet {
         // q, k, v, one beta per head, then the f_a and g_a gate factors.
         let in_proj_width = 3 * value_width + heads + 2 * cfg.gate_rank;
         let conv_channels = 3 * value_width;
-        let gemm = |n: Dim, k: Dim| SingleGemmKernelConfig {
-            backends: cfg.bf16_gemm_backends.clone(),
+        let gemm = |backends: &Vec<&'static str>, n: Dim, k: Dim| SingleGemmKernelConfig {
+            backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             n,
             k,
@@ -152,17 +265,47 @@ impl Glm53KdaAttnLocalWorklet {
         let ew = |input: u32, output: u32| {
             elementwise(&cfg.elementwise_backends, &cfg.gpu_name, input, output)
         };
-        let per_head_bytes = value_width * bpe;
-        let ssm_state_bytes_per_request = heads * head_dim * head_dim * DType::Fp32.size_bytes();
+        assert!(
+            matches!(cfg.ssm_state_dtype, DType::Fp32 | DType::Bf16),
+            "KDA state pool must be fp32 or bf16, got {:?}",
+            cfg.ssm_state_dtype
+        );
+        let ssm_state_bytes_per_request =
+            heads * head_dim * head_dim * cfg.ssm_state_dtype.size_bytes();
+        assert!(cfg.decode_query_len >= 1, "decode_query_len must be >= 1");
+        let verify = cfg.decode_query_len > 1;
+        let per_position = verify && cfg.spec_verify == KdaSpecVerify::RecurrentPerPosition;
+        let recoverssm = verify && cfg.spec_verify == KdaSpecVerify::Recoverssm;
+        let cute = recoverssm && cute_recoverssm(cfg);
         assert_eq!(
             ssm_state_bytes_per_request % STATE_TRANSFER_UNIT_BYTES,
             0,
             "KDA state must be a whole number of transfer units"
         );
         Glm53KdaAttnLocalWorkletResolved {
-            in_proj: gemm(in_proj_width.into(), cfg.hidden.clone()),
-            f_b: gemm(value_width.into(), cfg.gate_rank.into()),
-            g_b: gemm(value_width.into(), cfg.gate_rank.into()),
+            in_proj: gemm(
+                &cfg.in_out_proj_backends,
+                in_proj_width.into(),
+                cfg.hidden.clone(),
+            ),
+            f_b: gemm(
+                &cfg.bf16_gemm_backends,
+                value_width.into(),
+                cfg.gate_rank.into(),
+            ),
+            g_b: gemm(
+                &cfg.bf16_gemm_backends,
+                value_width.into(),
+                cfg.gate_rank.into(),
+            ),
+            gate_b: cfg.merge_gate_b.then(|| BatchedGemmKernelConfig {
+                backends: GATE_B_BMM_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_batches: 2.into(),
+                n: value_width.into(),
+                k: cfg.gate_rank.into(),
+                dtype: cfg.activation_dtype,
+            }),
             conv_prefill: GdnCausalConvPrefillKernelConfig {
                 backends: cfg.conv_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -178,7 +321,9 @@ impl Glm53KdaAttnLocalWorklet {
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.activation_dtype,
-                tokens_per_request: None,
+                // A verify runs `causal_conv1d_update` in its varlen form over
+                // `decode_query_len` rows per request.
+                tokens_per_request: verify.then(|| cfg.decode_query_len.into()),
             },
             prefill_small_glue: ew(
                 heads * BETA_SIGMOID_IN_BYTES_PER_HEAD,
@@ -192,19 +337,77 @@ impl Glm53KdaAttnLocalWorklet {
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
             },
-            recurrent_decode: KdaRecurrentDecodeKernelConfig {
+            recurrent_decode: (!recoverssm).then(|| KdaRecurrentDecodeKernelConfig {
                 backends: cfg.core_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
-            },
+                state_dtype: cfg.ssm_state_dtype,
+                tokens_per_request: per_position.then(|| cfg.decode_query_len.into()),
+            }),
+            recoverssm_verify: (recoverssm && !cute).then(|| KdaRecoverSSMVerifyKernelConfig {
+                backends: RECOVERSSM_TRITON_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
+            }),
+            recoverssm_conv_verify: cute.then(|| KdaRecoverSSMConvVerifyKernelConfig {
+                backends: cfg.conv_verify_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                dtype: cfg.activation_dtype,
+                conv_weight_dtype: CONV_WEIGHT_DTYPE,
+            }),
+            recoverssm_commit: recoverssm.then(|| KdaRecoverSSMCommitKernelConfig {
+                backends: if cute {
+                    cfg.commit_backends.clone()
+                } else {
+                    RECOVERSSM_TRITON_BACKENDS.to_vec()
+                },
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                num_layers: 1.into(),
+                dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
+            }),
             state_scatter: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
-            // rmsnorm(o) * w * sigmoid(g): reads o and g, writes the gated o.
-            gated_norm: ew(2 * per_head_bytes, per_head_bytes),
-            o_proj: gemm(cfg.hidden.clone(), value_width.into()),
+            // rmsnorm(o) * w * sigmoid(g) per head row (`o_norm`).
+            gated_norm: SigmoidGatedRmsNormKernelConfig {
+                backends: SIGMOID_GATED_NORM_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden: cfg.head_dim.clone(),
+                dtype: cfg.activation_dtype,
+            },
+            o_proj: gemm(
+                &cfg.in_out_proj_backends,
+                cfg.hidden.clone(),
+                value_width.into(),
+            ),
             ssm_state_bytes_per_request,
-            conv_state_bytes_per_request: conv_channels * (cfg.conv_kernel_size.get() - 1) * bpe,
+            // vLLM `kda_state_shape`: the window grows by the drafted rows.
+            conv_state_bytes_per_request: conv_channels
+                * (cfg.conv_kernel_size.get() - 1 + cfg.decode_query_len - 1)
+                * bpe,
+            state_pages_per_request: if per_position {
+                cfg.decode_query_len
+            } else {
+                1
+            },
+            verify_cache_bytes_per_request: if recoverssm {
+                heads
+                    * cfg.decode_query_len
+                    * (head_dim * DType::Fp32.size_bytes() + 2 * head_dim * bpe)
+            } else {
+                0
+            },
             raw_cfg: cfg.clone(),
         }
     }
@@ -220,6 +423,10 @@ impl Glm53KdaAttnLocalWorklet {
             in_proj: atomic(n, "in_proj", r.in_proj, SingleGemmKernel::build, bridge)?,
             f_b: atomic(n, "f_b_proj", r.f_b, SingleGemmKernel::build, bridge)?,
             g_b: atomic(n, "g_b_proj", r.g_b, SingleGemmKernel::build, bridge)?,
+            gate_b: r
+                .gate_b
+                .map(|c| atomic(n, "gate_b_proj", c, BatchedGemmKernel::build, bridge))
+                .transpose()?,
             conv_prefill: atomic(
                 n,
                 "short_conv_prefill",
@@ -255,13 +462,42 @@ impl Glm53KdaAttnLocalWorklet {
                 KdaChunkPrefillKernel::build,
                 bridge,
             )?,
-            recurrent_decode: atomic(
-                n,
-                "recurrent_decode",
-                r.recurrent_decode,
-                KdaRecurrentDecodeKernel::build,
-                bridge,
-            )?,
+            recurrent_decode: r
+                .recurrent_decode
+                .map(|c| {
+                    atomic(
+                        n,
+                        "recurrent_decode",
+                        c,
+                        KdaRecurrentDecodeKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            recoverssm_verify: r
+                .recoverssm_verify
+                .map(|c| {
+                    atomic(
+                        n,
+                        "recoverssm_verify",
+                        c,
+                        KdaRecoverSSMVerifyKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            recoverssm_conv_verify: r
+                .recoverssm_conv_verify
+                .map(|c| {
+                    atomic(
+                        n,
+                        "recoverssm_conv_verify",
+                        c,
+                        KdaRecoverSSMConvVerifyKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             state_scatter: atomic(
                 n,
                 "state_scatter",
@@ -273,7 +509,7 @@ impl Glm53KdaAttnLocalWorklet {
                 n,
                 "gated_norm",
                 r.gated_norm,
-                ElementwiseKernel::build,
+                SigmoidGatedRmsNormKernel::build,
                 bridge,
             )?,
             o_proj: atomic(n, "o_proj", r.o_proj, SingleGemmKernel::build, bridge)?,
@@ -304,39 +540,67 @@ impl Glm53KdaAttnLocalWorklet {
                 "{} (Glm53KdaAttnLocalWorklet) [TP rank; H={}, D={}]",
                 self.name, cfg.num_heads, cfg.head_dim
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.in_proj.compile(builder),
-                self.f_b.compile(builder),
-                self.g_b.compile(builder),
-                self.conv_prefill.compile(builder),
-                self.conv_decode.compile(builder),
-                repeated(
-                    &self.prefill_small_glue,
-                    self.beta_sigmoid_launches,
-                    builder,
-                ),
-                self.state_gather.compile(builder),
-                self.chunk_prefill.compile(builder),
-                self.recurrent_decode.compile(builder),
-                self.state_scatter.compile(builder),
-                self.gated_norm.compile(builder),
-                self.o_proj.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(
+                [
+                    self.in_proj.compile(builder),
+                    self.f_b.compile(builder),
+                    self.g_b.compile(builder),
+                ]
+                .into_iter()
+                .chain(self.gate_b.as_ref().map(|op| op.compile(builder)))
+                .chain([
+                    self.conv_prefill.compile(builder),
+                    self.conv_decode.compile(builder),
+                    repeated(
+                        &self.prefill_small_glue,
+                        self.beta_sigmoid_launches,
+                        builder,
+                    ),
+                    self.state_gather.compile(builder),
+                    self.chunk_prefill.compile(builder),
+                ])
+                // The decode core: exactly one of the three.
+                .chain(self.recurrent_decode.as_ref().map(|op| op.compile(builder)))
+                .chain(
+                    self.recoverssm_verify
+                        .as_ref()
+                        .map(|op| op.compile(builder)),
+                )
+                .chain(
+                    self.recoverssm_conv_verify
+                        .as_ref()
+                        .map(|op| op.compile(builder)),
+                )
+                .chain([
+                    self.state_scatter.compile(builder),
+                    self.gated_norm.compile(builder),
+                    self.o_proj.compile(builder),
+                ])
+                .collect(),
+            )),
         }
     }
 
     pub fn eval(&self, input: &Glm53KdaAttnLocalWorkletInput, ev: &mut Evaluator) {
-        let w = derive_work(input, self.resolved.ssm_state_bytes_per_request)
-            .unwrap_or_else(|reason| panic!("invalid Glm53KdaAttnLocalWorkletInput: {reason}"));
+        let w = derive_work(
+            input,
+            self.resolved.raw_cfg.decode_query_len,
+            self.resolved.ssm_state_bytes_per_request,
+        )
+        .unwrap_or_else(|reason| panic!("invalid Glm53KdaAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
-        let tokens = ElementwiseKernelInput {
-            num_tokens: w.total_tokens,
-        };
+        let no_decodes = input.decode_batch_size == 0;
+        // The chunk path runs over every token of a prefill-bearing
+        // plain-decode iteration, or over a verify's prefill requests alone.
         let decode_only = !w.prefill_bearing;
         let per_sequence = self.conv_per_sequence;
         push_or_zero(&self.in_proj, rows.clone(), false, ev);
-        push_or_zero(&self.f_b, rows.clone(), false, ev);
-        push_or_zero(&self.g_b, rows.clone(), false, ev);
+        let merged = self.gate_b.is_some();
+        push_or_zero(&self.f_b, rows.clone(), merged, ev);
+        push_or_zero(&self.g_b, rows.clone(), merged, ev);
+        if let Some(op) = &self.gate_b {
+            push_or_zero(op, BatchedGemmKernelInput { m: w.total_tokens }, false, ev);
+        }
         if per_sequence {
             push_conv_per_sequence(&self.conv_prefill, &input.prefill_sequence_lengths, ev);
         } else {
@@ -344,7 +608,7 @@ impl Glm53KdaAttnLocalWorklet {
                 &self.conv_prefill,
                 GdnCausalConvPrefillKernelInput {
                     batch_size: 1,
-                    sequence_length: w.total_tokens,
+                    sequence_length: w.chunk_tokens,
                 },
                 decode_only,
                 ev,
@@ -355,10 +619,22 @@ impl Glm53KdaAttnLocalWorklet {
             GdnCausalConvDecodeKernelInput {
                 batch_size: input.decode_batch_size,
             },
-            !decode_conv_runs(per_sequence, w.prefill_bearing, input.decode_batch_size),
+            !if w.verify {
+                // Beside any prefill; the fused conv + verify runs it inside.
+                !no_decodes && self.recoverssm_conv_verify.is_none()
+            } else {
+                decode_conv_runs(per_sequence, w.prefill_bearing, input.decode_batch_size)
+            },
             ev,
         );
-        push_or_zero(&self.prefill_small_glue, tokens.clone(), decode_only, ev);
+        push_or_zero(
+            &self.prefill_small_glue,
+            ElementwiseKernelInput {
+                num_tokens: w.chunk_tokens,
+            },
+            decode_only,
+            ev,
+        );
         let state = ElementwiseKernelInput {
             num_tokens: w.state_units,
         };
@@ -366,25 +642,68 @@ impl Glm53KdaAttnLocalWorklet {
         push_or_zero(
             &self.chunk_prefill,
             KdaChunkPrefillKernelInput {
-                num_tokens: w.total_tokens,
+                num_tokens: w.chunk_tokens,
                 max_sequence_length: w.max_prefill_length,
-                num_decode_sequences: input.decode_batch_size,
+                num_decode_sequences: w.chunk_decodes,
             },
             decode_only,
             ev,
         );
-        push_or_zero(
-            &self.recurrent_decode,
-            KdaRecurrentDecodeKernelInput {
-                batch_size: input.decode_batch_size,
-            },
-            w.prefill_bearing,
-            ev,
-        );
+        // Plain decode: a prefill-bearing iteration chunks its decodes. A
+        // verify keeps its spec decodes on its own kernel beside any prefill.
+        if let Some(op) = &self.recurrent_decode {
+            push_or_zero(
+                op,
+                KdaRecurrentDecodeKernelInput {
+                    batch_size: input.decode_batch_size,
+                },
+                if w.verify {
+                    no_decodes
+                } else {
+                    w.prefill_bearing
+                },
+                ev,
+            );
+        }
+        if let Some(op) = &self.recoverssm_verify {
+            push_or_zero(
+                op,
+                KdaRecoverSSMVerifyKernelInput {
+                    batch_size: input.decode_batch_size,
+                },
+                no_decodes,
+                ev,
+            );
+        }
+        if let Some(op) = &self.recoverssm_conv_verify {
+            push_or_zero(
+                op,
+                KdaRecoverSSMConvVerifyKernelInput {
+                    batch_size: input.decode_batch_size,
+                },
+                no_decodes,
+                ev,
+            );
+        }
         push_or_zero(&self.state_scatter, state, decode_only, ev);
-        push_or_zero(&self.gated_norm, tokens, false, ev);
+        let norm_rows = SigmoidGatedRmsNormKernelInput {
+            m: w.total_tokens * self.resolved.raw_cfg.num_heads.get(),
+        };
+        push_or_zero(&self.gated_norm, norm_rows, false, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
     }
+}
+
+/// Whether the fork's CuTe RecoverSSM kernels serve this layer
+/// (`can_use_cute_recoverssm`): an SM10x GPU, head dim 128, a width-4 conv, a
+/// 1..8-token window, and bf16 activations, conv state and SSM state.
+fn cute_recoverssm(cfg: &Glm53KdaAttnLocalWorkletConfig) -> bool {
+    matches!(compute_capability(&cfg.gpu_name), Some((10, _)))
+        && cfg.head_dim.get() == CUTE_RECOVERSSM_HEAD_DIM
+        && cfg.conv_kernel_size.get() == CUTE_RECOVERSSM_CONV_WIDTH
+        && cfg.decode_query_len <= CUTE_RECOVERSSM_MAX_WINDOW
+        && cfg.activation_dtype == DType::Bf16
+        && cfg.ssm_state_dtype == DType::Bf16
 }
 
 /// Whether the decode short conv launches: in a decode-only iteration, and in
@@ -427,13 +746,23 @@ fn sum_per_sequence(
 
 struct Work {
     total_tokens: u32,
+    /// Whether the chunk path runs this iteration.
     prefill_bearing: bool,
     max_prefill_length: u32,
-    /// 4-KiB units of every chunked request's state (prefills and decodes).
+    /// 4-KiB units of every chunked request's state.
     state_units: u32,
+    /// A verify graph (`decode_query_len > 1`).
+    verify: bool,
+    /// Tokens and decode sequences the chunk path covers.
+    chunk_tokens: u32,
+    chunk_decodes: u32,
 }
 
-fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Result<Work, String> {
+fn derive_work(
+    input: &Glm53KdaAttnLocalWorkletInput,
+    decode_query_len: u32,
+    state_bytes: u32,
+) -> Result<Work, String> {
     let mut prefill_tokens = 0_u32;
     let mut max_prefill_length = 0_u32;
     for (index, &length) in input.prefill_sequence_lengths.iter().enumerate() {
@@ -445,14 +774,26 @@ fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Resul
             .ok_or("prefill token sum overflows u32")?;
         max_prefill_length = max_prefill_length.max(length);
     }
+    let decode_tokens = input
+        .decode_batch_size
+        .checked_mul(decode_query_len)
+        .ok_or("decode token count overflows u32")?;
     let total_tokens = prefill_tokens
-        .checked_add(input.decode_batch_size)
+        .checked_add(decode_tokens)
         .ok_or("token sum overflows u32")?;
     if total_tokens == 0 {
         return Err("an iteration must carry at least one token".into());
     }
-    let requests = input.prefill_sequence_lengths.len() as u32 + input.decode_batch_size;
-    let state_units = requests
+    // A plain-decode iteration with any prefill chunks every token; a verify
+    // chunks only its prefill requests.
+    let verify = decode_query_len > 1;
+    let (chunk_tokens, chunk_decodes) = if verify {
+        (prefill_tokens, 0)
+    } else {
+        (total_tokens, input.decode_batch_size)
+    };
+    let chunked_requests = input.prefill_sequence_lengths.len() as u32 + chunk_decodes;
+    let state_units = chunked_requests
         .checked_mul(state_bytes / STATE_TRANSFER_UNIT_BYTES)
         .ok_or("state transfer units overflow u32")?;
     Ok(Work {
@@ -460,6 +801,9 @@ fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Resul
         prefill_bearing: prefill_tokens > 0,
         max_prefill_length,
         state_units,
+        verify,
+        chunk_tokens,
+        chunk_decodes,
     })
 }
 
@@ -479,12 +823,34 @@ mod tests {
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
+            in_out_proj_backends: vec!["torch_linear_vllm"],
             conv_prefill_backends: vec!["vllm_triton"],
             conv_decode_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
+            conv_verify_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            commit_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            ssm_state_dtype: DType::Fp32,
+            decode_query_len: 1,
+            spec_verify: KdaSpecVerify::Recoverssm,
+            merge_gate_b: false,
         }
+    }
+
+    fn slot_names(cfg: &Glm53KdaAttnLocalWorkletConfig) -> Vec<String> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Glm53KdaAttnLocalWorklet::build(
+            "m.kda".into(),
+            Glm53KdaAttnLocalWorklet::resolve_config(cfg),
+            &bridge,
+        )
+        .unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        let tree = builder.finish(root);
+        tree.slots.iter().map(|slot| slot.name.clone()).collect()
     }
 
     #[test]
@@ -576,6 +942,20 @@ mod tests {
         assert_eq!(r.conv_state_bytes_per_request, 6144 * 3 * 2);
     }
 
+    /// Catches a bf16 pool sized or keyed as the fp32 one: the state a
+    /// prefill gathers and scatters halves, and the recurrent call reads the
+    /// bf16-pool rows.
+    #[test]
+    fn a_bf16_pool_halves_the_state_and_keys_the_recurrent_rows() {
+        let mut bf16 = cfg();
+        bf16.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&bf16);
+        assert_eq!(r.ssm_state_bytes_per_request, 1 << 19);
+        assert_eq!(r.recurrent_decode.unwrap().state_dtype, DType::Bf16);
+        let fp32 = Glm53KdaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(fp32.recurrent_decode.unwrap().state_dtype, DType::Fp32);
+    }
+
     #[test]
     fn prefill_bearing_iteration_chunks_every_token() {
         let w = derive_work(
@@ -583,6 +963,7 @@ mod tests {
                 prefill_sequence_lengths: vec![2019],
                 decode_batch_size: 29,
             },
+            1,
             1 << 20,
         )
         .unwrap();
@@ -594,28 +975,142 @@ mod tests {
                 prefill_sequence_lengths: Vec::new(),
                 decode_batch_size: 32,
             },
+            1,
             1 << 20,
         )
         .unwrap();
         assert!(!decode.prefill_bearing);
-        assert!(derive_work(&Glm53KdaAttnLocalWorkletInput::default(), 1 << 20).is_err());
+        assert!(derive_work(&Glm53KdaAttnLocalWorkletInput::default(), 1, 1 << 20).is_err());
     }
 
     #[test]
     fn compile_has_fixed_slots_for_both_core_paths() {
-        let bridge = PerfApiBridge::new_uninit_for_test();
-        bridge.enable_enumerate();
-        let worklet = Glm53KdaAttnLocalWorklet::build(
-            "m.kda".into(),
-            Glm53KdaAttnLocalWorklet::resolve_config(&cfg()),
-            &bridge,
+        let slots = slot_names(&cfg());
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots[7], "m.kda.chunk_prefill");
+        assert_eq!(slots[8], "m.kda.recurrent_decode");
+    }
+
+    #[test]
+    fn a_verify_chunks_only_its_prefills_and_steps_every_decode_row() {
+        // vLLM keeps spec decodes on their own kernel: the chunk path and its
+        // state copies cover the prefill requests alone, while the
+        // projections see every verify row.
+        let w = derive_work(
+            &Glm53KdaAttnLocalWorkletInput {
+                prefill_sequence_lengths: vec![100],
+                decode_batch_size: 4,
+            },
+            8,
+            1 << 20,
         )
         .unwrap();
-        let mut builder = CostTreeBuilder::new();
-        let root = worklet.compile(&mut builder);
-        let tree = builder.finish(root);
-        assert_eq!(tree.slots.len(), 12);
-        assert_eq!(tree.slots[7].name, "m.kda.chunk_prefill");
-        assert_eq!(tree.slots[8].name, "m.kda.recurrent_decode");
+        assert!(w.verify && w.prefill_bearing);
+        assert_eq!(w.total_tokens, 132);
+        assert_eq!((w.chunk_tokens, w.chunk_decodes), (100, 0));
+        assert_eq!(w.state_units, 256);
+    }
+
+    #[test]
+    fn a_verify_graph_swaps_the_decode_core_for_recoverssm() {
+        let mut verify = cfg();
+        verify.decode_query_len = 8;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&verify);
+        // Correction fp32 [16, 8, 128] plus key/gate bf16 [16, 8, 256].
+        assert_eq!(
+            r.verify_cache_bytes_per_request,
+            16 * 8 * (128 * 4 + 256 * 2)
+        );
+        assert_eq!(r.conv_state_bytes_per_request, 6144 * (3 + 7) * 2);
+        // The conv keys the varlen verify rows (R requests x 8 tokens), not
+        // 8R one-token updates; plain decode keys the one-token rows.
+        assert_eq!(r.conv_decode.tokens_per_request, Some(8.into()));
+        let plain = Glm53KdaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(plain.conv_decode.tokens_per_request, None);
+        assert_eq!(plain.verify_cache_bytes_per_request, 0);
+        assert!(plain.recoverssm_commit.is_none());
+        // An fp32 pool: the Triton conv + verify, and the Triton commit.
+        assert_eq!(r.recoverssm_commit.unwrap().backends, ["vllm_triton"]);
+        let slots = slot_names(&verify);
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots[8], "m.kda.recoverssm_verify");
+    }
+
+    #[test]
+    fn a_bf16_sm100_verify_runs_the_fused_conv_verify_and_others_fall_back() {
+        // can_use_cute_recoverssm: SM10x, bf16 state and activations, a
+        // window up to 8. Anything else keeps the Triton conv + verify.
+        let mut fused = cfg();
+        fused.decode_query_len = 8;
+        fused.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fused);
+        assert!(r.recoverssm_verify.is_none());
+        assert_eq!(r.recoverssm_conv_verify.unwrap().backends, ["vllm_cute"]);
+        assert_eq!(r.recoverssm_commit.unwrap().backends, ["vllm_cute"]);
+        assert_eq!(slot_names(&fused)[8], "m.kda.recoverssm_conv_verify");
+
+        let mut fp32 = fused.clone();
+        fp32.ssm_state_dtype = DType::Fp32;
+        assert_eq!(slot_names(&fp32)[8], "m.kda.recoverssm_verify");
+        let mut hopper = fused.clone();
+        hopper.gpu_name = "NVIDIA H100 80GB HBM3".into();
+        assert_eq!(slot_names(&hopper)[8], "m.kda.recoverssm_verify");
+        let mut wide = fused.clone();
+        wide.decode_query_len = 9;
+        assert_eq!(slot_names(&wide)[8], "m.kda.recoverssm_verify");
+    }
+
+    #[test]
+    fn a_per_position_verify_keeps_the_recurrent_call_and_one_page_per_position() {
+        let mut fork = cfg();
+        fork.decode_query_len = 8;
+        fork.spec_verify = KdaSpecVerify::RecurrentPerPosition;
+        fork.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fork);
+        assert!(r.recoverssm_verify.is_none() && r.recoverssm_conv_verify.is_none());
+        let recurrent = r.recurrent_decode.as_ref().unwrap();
+        assert_eq!(recurrent.tokens_per_request, Some(8.into()));
+        assert_eq!(recurrent.state_dtype, DType::Bf16);
+        // 1 + k pages, no RecoverSSM records and no commit.
+        assert_eq!(r.state_pages_per_request, 8);
+        assert_eq!(r.verify_cache_bytes_per_request, 0);
+        assert!(r.recoverssm_commit.is_none());
+        assert_eq!(slot_names(&fork)[8], "m.kda.recurrent_decode");
+        // RecoverSSM keeps one page.
+        fork.spec_verify = KdaSpecVerify::Recoverssm;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fork);
+        assert_eq!(r.state_pages_per_request, 1);
+        assert!(r.recurrent_decode.is_none());
+    }
+
+    /// Catches the merged gate projection landing outside the f_b / g_b
+    /// position or keyed as anything but two [value_width, gate_rank] GEMMs.
+    #[test]
+    fn merged_gate_b_adds_one_batched_gemm_after_the_two_gate_leaves() {
+        let mut merged = cfg();
+        merged.merge_gate_b = true;
+        let gate_b = Glm53KdaAttnLocalWorklet::resolve_config(&merged)
+            .gate_b
+            .unwrap();
+        assert_eq!(
+            (gate_b.num_batches.get(), gate_b.n.get(), gate_b.k.get()),
+            (2, 2048, 128)
+        );
+        assert_eq!(gate_b.backends, ["torch_bmm_packed_lhs"]);
+        let slots = slot_names(&merged);
+        assert_eq!(slots.len(), 13);
+        assert_eq!(
+            slots[1..4],
+            ["m.kda.f_b_proj", "m.kda.g_b_proj", "m.kda.gate_b_proj"]
+        );
+    }
+
+    /// Catches the norm keyed on the hidden width or the token count: the
+    /// fork norms head_dim-wide rows, one per token and rank-local head.
+    #[test]
+    fn the_output_norm_is_one_row_per_token_and_head() {
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(r.gated_norm.hidden.get(), 128);
+        assert_eq!(r.gated_norm.backends, ["vllm_fla_triton"]);
     }
 }

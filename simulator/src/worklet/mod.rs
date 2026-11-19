@@ -28,6 +28,7 @@ mod deepseek_v41_iteration_tests;
 pub mod deepseek_v41_moe_ffn_dp_ep;
 pub mod deepseek_v41_moe_ffn_ep;
 pub mod deepseek_v41_prologue_tp;
+pub mod dflash2_checkpoint;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
 pub mod dflash2_selector_local;
@@ -205,12 +206,12 @@ pub use glm52_shared_expert_local::{
 };
 pub use glm53_common::{Glm53ActivationQuant, Glm53ActivationQuantConfig, Glm53WeightPrecision};
 pub use glm53_dsa_attn_local::{
-    Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
-    Glm53DsaAttnLocalWorkletResolved,
+    DsaDecodeIndexer, DsaGlue, Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig,
+    Glm53DsaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletResolved, Glm53DsaFront,
 };
 pub use glm53_kda_attn_local::{
     Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
-    Glm53KdaAttnLocalWorkletResolved,
+    Glm53KdaAttnLocalWorkletResolved, KdaSpecVerify, RECOVERSSM_CUTE_BACKENDS,
 };
 pub use glm53_mlp_local::{
     Glm53MlpLocalWorklet, Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput,

@@ -137,6 +137,8 @@ _FP4_ARCHS = frozenset(
         "glm53_flash_vllm_nvfp4_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+        "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2",
         # Inkling NVFP4 (routed experts only; layer 2's stay BF16).
         "inkling_vllm_nvfp4_rel_attn_moe",
         # Qwen3.8-27B ModelOpt MIXED_PRECISION: NVFP4 MLPs and lm_head, FP8 attention
@@ -155,6 +157,8 @@ _SPECULATIVE_ARCHS = frozenset(
         "deepseek_v41_vllm_dp_attn_ep_moe_dspark",
         "glm52_vllm_nvfp4_dsa_moe_speculative",
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+        "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2",
         "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
     }
 )
@@ -167,13 +171,19 @@ _DEFAULT_DRAFT_TOKENS = {
     "deepseek_v41_vllm_dp_attn_ep_moe_dspark": 5,
     "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
     "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
+    "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2": 7,
+    "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2": 7,
     "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,
 }
 
 #: The proposer of a speculative arch that ships as its own checkpoint, by the
 #: draft's ``config.json`` under the repo root. The run's params name only the
 #: target's config; the draft is fixed by the arch.
-_DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash2.json"}
+_DRAFT_CONFIGS = {
+    "glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash2.json",
+    "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2": "model/config/glm53_flash_dflash2.json",
+    "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2": "model/config/glm53_flash_dflash2.json",
+}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 

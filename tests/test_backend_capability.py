@@ -96,6 +96,7 @@ def test_supported_backends_filters_options_by_dtype():
         "torch_linear",
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
+        "flashinfer_cutedsl_bf16",
     ]
     assert supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3) == ["fa3"]
     assert set(supported_backends("flashinfer_attn_prefill", DType.BF16)) == {

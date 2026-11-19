@@ -43,10 +43,11 @@ use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm52_model_cfg::Glm52MtpMode;
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     fit_failed, kv_cache_layout, normalize_speculative_input, Glm52TargetForward,
-    Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch,
+    Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch, VerifyDecodeSplit,
 };
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::op::Op;
+use crate::timing::bridge::DType;
 use crate::timing::kernels::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput};
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
@@ -60,6 +61,117 @@ use crate::worklet::{
     Dflash2DraftFfnLocalWorkletResolved, Dflash2SelectorLocalWorklet,
     Dflash2SelectorLocalWorkletInput, Dflash2SelectorLocalWorkletResolved,
 };
+
+/// The DFlash2 draft attention leaf (`draft_attention`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftAttention {
+    /// FlashInfer `fa2` ragged rect at bf16 query and KV: the only rect
+    /// backend measured on B200 before the FA4 runner; it reads twice the
+    /// engine's KV bytes.
+    #[default]
+    Fa2Bf16,
+    /// vLLM's FA4 over the fp8 paged cache with `num_splits = 32`, the FULL
+    /// CUDA graph's default (`max_num_splits`): the engine's call. Forward plus
+    /// the split combine.
+    Fa4Fp8Split32,
+    /// `num_splits = 1` (one forward launch) when a launch carries at least
+    /// [`NOSPLIT_MIN_REQUESTS`] requests, where it is bit-identical to 32
+    /// splits; 32 splits below.
+    Fa4Fp8NosplitFrom16,
+}
+
+/// Requests per launch from which `fa4_fp8_nosplit_from16` drops the splits.
+pub const NOSPLIT_MIN_REQUESTS: u32 = 16;
+
+/// The `draft_attention` choices the launcher schema advertises.
+pub const DRAFT_ATTENTIONS: [&str; 3] = ["fa2_bf16", "fa4_fp8_split32", "fa4_fp8_nosplit_from16"];
+
+impl DraftAttention {
+    pub fn backends(self) -> Vec<&'static str> {
+        vec![match self {
+            Self::Fa2Bf16 => "fa2",
+            Self::Fa4Fp8Split32 | Self::Fa4Fp8NosplitFrom16 => "vllm_fa4_split32",
+        }]
+    }
+
+    /// `Some((min_requests, backends))`: launches of at least `min_requests`
+    /// requests run these backends instead of [`Self::backends`].
+    pub fn large_batch(self) -> Option<(u32, Vec<&'static str>)> {
+        match self {
+            Self::Fa4Fp8NosplitFrom16 => Some((NOSPLIT_MIN_REQUESTS, vec!["vllm_fa4_nosplit"])),
+            _ => None,
+        }
+    }
+
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::Fa2Bf16 => DType::Bf16,
+            Self::Fa4Fp8Split32 | Self::Fa4Fp8NosplitFrom16 => DType::Fp8E4m3,
+        }
+    }
+}
+
+/// The DFlash2 draft vocabulary top-k (`draft_topk`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftTopk {
+    /// FlashInfer's deterministic radix top-k (the engine's).
+    #[default]
+    Flashinfer,
+    /// Exact threshold top-k (slice maxima, a per-row threshold, an exact
+    /// select over the candidates at or above it) up to
+    /// [`THRESHOLD_MAX_ROWS`] rows per launch, where it reproduces FlashInfer's
+    /// tie order; FlashInfer above.
+    ThresholdSmallRows,
+}
+
+/// Rows per launch up to which the threshold top-k reproduces FlashInfer's
+/// deterministic tie order (job 22385: ids identical at 512-576 rows, 31% at
+/// 640 and 768, where FlashInfer takes another path).
+pub const THRESHOLD_MAX_ROWS: u32 = 560;
+
+/// The `draft_topk` choices the launcher schema advertises.
+pub const DRAFT_TOPKS: [&str; 2] = ["flashinfer", "threshold_small_rows"];
+
+impl DraftTopk {
+    /// `small_rows` of the selector config: launches of at most `max_rows`
+    /// rows run these backends instead of FlashInfer's.
+    pub fn small_rows(self) -> Option<(u32, Vec<&'static str>)> {
+        match self {
+            Self::Flashinfer => None,
+            Self::ThresholdSmallRows => Some((THRESHOLD_MAX_ROWS, vec!["triton_threshold"])),
+        }
+    }
+}
+
+/// The DFlash2 draft-chain options (all off by default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dflash2DraftChain {
+    pub attention: DraftAttention,
+    pub topk: DraftTopk,
+    /// `draft_context_kv_store`: one launch normalizes, rotates and writes
+    /// every draft layer's context K/V.
+    pub context_kv_store: bool,
+    /// `draft_qk_norm_rope_kv_write`: one launch for q/k norm, RoPE, the fp8
+    /// query quant and the block's K/V write.
+    pub qk_norm_rope_kv_write: bool,
+    /// `draft_conv_residual_norm`: each conv finish fused with the residual
+    /// RMSNorm after it.
+    pub conv_residual_norm: bool,
+}
+
+impl Dflash2DraftChain {
+    /// Fail on a combination no engine runs.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.qk_norm_rope_kv_write || self.attention != DraftAttention::Fa2Bf16,
+            "draft_qk_norm_rope_kv_write emits an fp8 query and fp8 K/V for the FA4 call; \
+             it needs an fa4_fp8_* draft_attention, not fa2_bf16"
+        );
+        Ok(())
+    }
+}
 
 /// Everything the proposer needs that the target config does not carry. The
 /// draft is a separate checkpoint, so none of it can be derived from the GLM-5.2
@@ -80,7 +192,7 @@ pub struct Dflash2DraftResolved {
 
 /// The proposer: one context-KV precomputation, `num_draft_layers` identical
 /// decoder layers, and the selector head.
-struct Dflash2DraftStage {
+pub(crate) struct Dflash2DraftStage {
     name: String,
     num_draft_layers: u32,
     sliding_window: u32,
@@ -88,14 +200,16 @@ struct Dflash2DraftStage {
     draft_attn: Dflash2DraftAttnLocalWorklet,
     draft_ffn: Dflash2DraftFfnLocalWorklet,
     selector: Dflash2SelectorLocalWorklet,
-    attn_allreduce: Op<AllReduceKernel>,
-    ffn_allreduce: Op<AllReduceKernel>,
+    /// `None` on a single-rank draft (an attention-DP rank), which reduces
+    /// nothing.
+    attn_allreduce: Option<Op<AllReduceKernel>>,
+    ffn_allreduce: Option<Op<AllReduceKernel>>,
     /// Each collective reduces one hidden vector per query row.
     allreduce_bytes_per_token: u32,
 }
 
 impl Dflash2DraftStage {
-    fn build(
+    pub(crate) fn build(
         name: String,
         resolved: &Dflash2DraftResolved,
         bridge: &PerfApiBridge,
@@ -120,18 +234,21 @@ impl Dflash2DraftStage {
             resolved.selector.clone(),
             bridge,
         )?;
-        let attn_allreduce = build_atomic(
-            format!("{name}.layer.attn_allreduce"),
-            resolved.tp_allreduce.clone(),
-            AllReduceKernel::build,
-            bridge,
-        )?;
-        let ffn_allreduce = build_atomic(
-            format!("{name}.layer.ffn_allreduce"),
-            resolved.tp_allreduce.clone(),
-            AllReduceKernel::build,
-            bridge,
-        )?;
+        let reduces = resolved.tp_allreduce.num_gpus > 1;
+        let allreduce = |suffix: &str| {
+            reduces
+                .then(|| {
+                    build_atomic(
+                        format!("{name}.layer.{suffix}"),
+                        resolved.tp_allreduce.clone(),
+                        AllReduceKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()
+        };
+        let attn_allreduce = allreduce("attn_allreduce")?;
+        let ffn_allreduce = allreduce("ffn_allreduce")?;
         Ok(Self {
             name,
             num_draft_layers: resolved.context_kv.raw_cfg.num_draft_layers,
@@ -154,15 +271,21 @@ impl Dflash2DraftStage {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let layers = self.num_draft_layers;
+        // Slots are positional: minted in the order `eval_group` pushes.
+        let context_kv = self.context_kv.compile(builder);
+        let mut layer = vec![self.draft_attn.compile(builder)];
+        layer.extend(self.attn_allreduce.as_ref().map(|op| op.compile(builder)));
+        layer.push(self.draft_ffn.compile(builder));
+        layer.extend(self.ffn_allreduce.as_ref().map(|op| op.compile(builder)));
         CostNode::Sum(vec![
             CostNode::Labeled {
                 label: format!(
                     "{}.context_kv [prefill-shaped; target rows this step]",
                     self.name
                 ),
-                child: Box::new(self.context_kv.compile(builder)),
+                child: Box::new(context_kv),
             },
             CostNode::Labeled {
                 label: format!(
@@ -175,12 +298,7 @@ impl Dflash2DraftStage {
                 // over advancing contexts the way a recurrent proposer needs.
                 child: Box::new(CostNode::Scale {
                     n: layers,
-                    child: Box::new(CostNode::Sum(vec![
-                        self.draft_attn.compile(builder),
-                        self.attn_allreduce.compile(builder),
-                        self.draft_ffn.compile(builder),
-                        self.ffn_allreduce.compile(builder),
-                    ])),
+                    child: Box::new(CostNode::Sum(layer)),
                 }),
             },
             CostNode::Labeled {
@@ -192,22 +310,41 @@ impl Dflash2DraftStage {
 
     fn eval(&self, batch: &NormalizedBatch, draft_tokens: u32, ev: &mut Evaluator) {
         let group = &batch.groups[0];
+        self.eval_group(
+            group.request_count,
+            group.batch_tokens,
+            &group.endpoint_context_lens,
+            draft_tokens,
+            ev,
+        );
+    }
+
+    /// One rank's draft call: `request_count` requests drafting over
+    /// `batch_tokens` target rows this step, each ending at the matching entry
+    /// of `endpoint_context_lens`.
+    pub(crate) fn eval_group(
+        &self,
+        request_count: u32,
+        batch_tokens: u32,
+        endpoint_context_lens: &[u32],
+        draft_tokens: u32,
+        ev: &mut Evaluator,
+    ) {
         let query_width = draft_tokens.saturating_add(1);
-        let query_tokens = group.request_count.saturating_mul(query_width);
+        let query_tokens = request_count.saturating_mul(query_width);
 
         // The proposer consumes the target's hidden states for every row this
         // step scheduled -- prefilling and verifying alike.
         self.context_kv.eval(
             &Dflash2ContextKvLocalWorkletInput {
-                context_tokens: group.batch_tokens,
+                context_tokens: batch_tokens,
             },
             ev,
         );
 
         // One rectangle per request: the whole query block against the context
         // the sliding window admits.
-        let rectangles = group
-            .endpoint_context_lens
+        let rectangles = endpoint_context_lens
             .iter()
             .map(|&context| (query_width, context.min(self.sliding_window)))
             .collect::<Vec<_>>();
@@ -218,26 +355,30 @@ impl Dflash2DraftStage {
             },
             ev,
         );
-        eval_atomic_or_zero(
-            &self.attn_allreduce,
-            self.allreduce_input(query_tokens),
-            query_tokens == 0,
-            ev,
-        );
+        if let Some(op) = &self.attn_allreduce {
+            eval_atomic_or_zero(
+                op,
+                self.allreduce_input(query_tokens),
+                query_tokens == 0,
+                ev,
+            );
+        }
         self.draft_ffn
             .eval(&Dflash2DraftFfnLocalWorkletInput { query_tokens }, ev);
-        eval_atomic_or_zero(
-            &self.ffn_allreduce,
-            self.allreduce_input(query_tokens),
-            query_tokens == 0,
-            ev,
-        );
+        if let Some(op) = &self.ffn_allreduce {
+            eval_atomic_or_zero(
+                op,
+                self.allreduce_input(query_tokens),
+                query_tokens == 0,
+                ev,
+            );
+        }
 
         // Only drafted positions reach the selector; the bonus token is the
         // target's, not a proposal.
         self.selector.eval(
             &Dflash2SelectorLocalWorkletInput {
-                scored_rows: group.request_count.saturating_mul(draft_tokens),
+                scored_rows: request_count.saturating_mul(draft_tokens),
             },
             ev,
         );
@@ -296,10 +437,15 @@ impl Glm53VllmNvfp4DsaMoeDflash2Model {
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
-        let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
-            .unwrap_or_else(|reason| {
-                panic!("invalid Glm53VllmNvfp4DsaMoeDflash2Model input: {reason}")
-            });
+        let batch = normalize_speculative_input(
+            input,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::ByQueryLength,
+        )
+        .unwrap_or_else(|reason| {
+            panic!("invalid Glm53VllmNvfp4DsaMoeDflash2Model input: {reason}")
+        });
         self.target.eval(&batch, ev);
         self.draft.eval(&batch, self.draft_tokens, ev);
     }
@@ -307,7 +453,13 @@ impl Glm53VllmNvfp4DsaMoeDflash2Model {
 
 impl SpeculativeUnifiedModel for Glm53VllmNvfp4DsaMoeDflash2Model {
     fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
-        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+        normalize_speculative_input(
+            batch,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::ByQueryLength,
+        )
+        .map(|_| ())
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {

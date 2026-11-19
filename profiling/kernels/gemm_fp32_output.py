@@ -37,7 +37,8 @@ DOC = KernelDoc(
         "torch_cublas. SGLang's MoE router computes router logits in fp32, "
         "measured by sglang_router_auto. The alignment vLLM fork's "
         "_linear_with_fp32_out, which picks cute-DSL ll_bf16 or cuBLAS by m, is "
-        "measured by vllm_ll_bf16_auto. m is the tokens; n "
+        "measured by vllm_ll_bf16_auto; vLLM's MoE GateLinear (ll_bf16 up to 16 "
+        "tokens, cuBLAS above) by vllm_gate_linear. m is the tokens; n "
         "and k are the output and input features."
     ),
     category="GEMM",
@@ -150,6 +151,34 @@ register(
                 "out_dtype=float32."
             ),
             url=None,
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_gate_linear",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.gemm_fp32_output_vllm_gate_linear",
+            function_name="profile_gemm_fp32_output_vllm_gate_linear",
+        ),
+        table_name=KIND,
+        args_schema=GemmFp32OutputArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # The runner refuses below SM90, where GateLinear takes F.linear.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+        ),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's MoE GateLinear with a bf16 weight and fp32 logits: cute-DSL "
+                "ll_bf16_gemm when m ≤ 16 (LL_BF16_MAX_TOKENS) on SM90+, otherwise "
+                "torch.mm with out_dtype=float32."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/router/gate_linear.py",
         ),
     )
 )
