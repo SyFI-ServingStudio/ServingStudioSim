@@ -55,6 +55,12 @@
 //!   finish fused with the residual RMSNorm after it.
 //! * **Shared + routed add in the next mHC post.** The MoE block's add runs
 //!   inside the next mHC post kernel.
+//! * **One-launch mHC boundary.** Every mHC post + pre boundary, and the
+//!   after-MoE boundary that also sums the MoE outputs, runs the one-launch
+//!   CUDA kernel where its measured row beats TileLang's at the boundary's
+//!   rows per rank (`cuda_one_launch`; on B200 that is a few dozen rows and
+//!   below). The after-MoE boundary is one kernel either way: the add is
+//!   inside it, priced once, by whichever kernel's row is faster.
 //! * **Router gate.** Once per MoE layer, on the fork's GateLinear.
 //! * **KDA prefill.** FlashInfer's CuTe persistent chunked prefill and Dao's
 //!   channel-last short conv.
@@ -71,6 +77,7 @@
 //! | exchange dispatch + combine | measured (`moe_ep_quantized_all_gather` / `moe_ep_reduce_scatter` `mnnvl_lamport`, B200 EP8) |
 //! | shared-expert exposure | measured table (`model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json`) |
 //! | DFlash2 draft (TP1 per rank) | measured |
+//! | mHC boundaries | measured, faster of `vllm_tilelang(_post_addend)` and `cuda_one_launch` per row count |
 
 use anyhow::{bail, ensure, Result};
 
@@ -97,6 +104,10 @@ pub const DESIGN_KERNELS: Glm53FlashDflash2Kernels = Glm53FlashDflash2Kernels {
     kda_commit: &["cuda_persistent_ws"],
     routed_moe: &["cutedsl_routed_fused_fc1_fc2_sm100"],
     dsa_topk_decode: &["deep_select"],
+    // Each boundary prices at the faster measured row of the TileLang kernel
+    // and the one-launch CUDA kernel at its rows per rank.
+    mhc_post_pre: &["vllm_tilelang", "cuda_one_launch"],
+    mhc_sum_post_pre: &["vllm_tilelang_post_addend", "cuda_one_launch"],
 };
 
 /// `sel` (this tag) as the `glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`

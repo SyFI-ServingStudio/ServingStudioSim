@@ -92,6 +92,13 @@ pub struct Glm53FlashDflash2Kernels {
     pub routed_moe: &'static [&'static str],
     /// DSA decode top-k (`dsa.indexer.topk_decode`).
     pub dsa_topk_decode: &'static [&'static str],
+    /// The mHC post + pre boundary between sublayers (`*mhc_post_pre`,
+    /// `mhc_fused_post_pre_rms_norm`).
+    pub mhc_post_pre: &'static [&'static str],
+    /// The after-MoE boundary that also sums the shared + routed outputs
+    /// (`attn_mhc_sum_post_pre` and the terminal post after an MoE layer,
+    /// `mhc_fused_sum_post_pre_rms_norm`), under `moe_combine_add_in_mhc_post`.
+    pub mhc_sum_post_pre: &'static [&'static str],
 }
 
 /// What the vLLM fork (79838a5a, the DFlash2 serving fork) calls; the source
@@ -117,6 +124,11 @@ pub const VLLM_FORK_KERNELS: Glm53FlashDflash2Kernels = Glm53FlashDflash2Kernels
     routed_moe: &["flashinfer_trtllm_routed_sm100"],
     // `persistent_topk` (vLLM's "auto" top-k chain).
     dsa_topk_decode: &["vllm_cuda"],
+    // `glm5next/common/model.py:405-408` `MHCFusedPostPreOp`, vLLM's TileLang
+    // mHC kernels. The add into the post is not a fork path; its TileLang
+    // addend variant is the nearest.
+    mhc_post_pre: &["vllm_tilelang"],
+    mhc_sum_post_pre: &["vllm_tilelang_post_addend"],
 };
 
 impl Glm53FlashDflash2Kernels {
@@ -134,6 +146,10 @@ impl Glm53FlashDflash2Kernels {
             routed.fused_moe_backends = self.routed_moe.to_vec();
         }
         configs.local.dsa.topk_backends = self.dsa_topk_decode.to_vec();
+        configs.local.mhc_fused.backends = self.mhc_post_pre.to_vec();
+        if let Some(sum) = &mut configs.mhc_post_addend {
+            sum.backends = self.mhc_sum_post_pre.to_vec();
+        }
     }
 }
 
