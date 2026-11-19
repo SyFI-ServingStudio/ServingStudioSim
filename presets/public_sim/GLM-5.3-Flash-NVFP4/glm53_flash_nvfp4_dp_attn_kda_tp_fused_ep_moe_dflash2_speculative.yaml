@@ -1,0 +1,23 @@
+# Our GLM-5.3-Flash NVFP4 + DFlash2 design on one 8x B200 node, with the same worker, KV budget
+# and request placement as glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_speculative. Pick the
+# KDA group size for the load: 8 below about 64 concurrent requests, 2 near 128, 1 from 256.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: 1
+        arch:
+          preset: glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2
+          kda_tp_gpus: ${kda_tp_gpus}
+          max_model_len: ${max_model_len}
+        worker:
+          type: speculative
+          max_batch_tokens: 8192
+          batch_policy: mix
+          draft_tokens: 7
+          gpu_time_multiplier: 1.0
+          attn_gpu_memory_gb: 110.12
+          dp_placement: vllm-least-loaded
+sweep:
+  kda_tp_gpus: [1, 2, 4, 8]
+  max_model_len: [1048576]
