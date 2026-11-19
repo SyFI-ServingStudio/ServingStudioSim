@@ -96,7 +96,7 @@ use crate::worklet::{
     Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput, Glm53MlpLocalWorkletResolved,
     Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
-    Glm53RoutedMoeLocalWorkletResolved, Glm53WeightPrecision,
+    Glm53RoutedMoeLocalWorkletResolved, Glm53WeightPrecision, RECOVERSSM_CUTE_BACKENDS,
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe";
@@ -718,11 +718,14 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
+            in_out_proj_backends: BF16_GEMM_BACKENDS.to_vec(),
             conv_prefill_backends: CONV_PREFILL_BACKENDS.to_vec(),
             conv_decode_backends: CONV_DECODE_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            conv_verify_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            commit_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
             ssm_state_dtype: DType::Fp32,
             decode_query_len: 1,
             spec_verify: crate::worklet::KdaSpecVerify::Recoverssm,

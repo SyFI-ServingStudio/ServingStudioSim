@@ -87,8 +87,9 @@ const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
 const RECOVERSSM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
 /// The fork's CuTe RecoverSSM kernels (`kda.py` `recoverssm_backend = "cute"`):
 /// the conv and the verify in one launch on its `[state_len, dim]` conv pages,
-/// and the commit fold.
-const RECOVERSSM_CUTE_BACKENDS: &[&str] = &["vllm_cute"];
+/// and the commit fold. The default of `conv_verify_backends` and
+/// `commit_backends`.
+pub const RECOVERSSM_CUTE_BACKENDS: &[&str] = &["vllm_cute"];
 /// The fork creates the KDA conv taps in fp32 (`glm5next/common/kda.py`
 /// `conv1d`, `params_dtype=torch.float32`).
 const CONV_WEIGHT_DTYPE: DType = DType::Fp32;
@@ -129,7 +130,10 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub conv_kernel_size: Dim,
     pub activation_dtype: DType,
     pub gpu_name: String,
+    /// The low-rank gate GEMMs (`f_b`, `g_b`).
     pub bf16_gemm_backends: Vec<&'static str>,
+    /// The two wide projections, `in_proj` and `o_proj`.
+    pub in_out_proj_backends: Vec<&'static str>,
     /// Short-conv prefill backends (`gdn_causal_conv_prefill`).
     pub conv_prefill_backends: Vec<&'static str>,
     /// Short-conv decode backends (`gdn_causal_conv_decode`).
@@ -139,6 +143,11 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
     pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// The CuTe RecoverSSM path's conv + verify launch (`kda_recoverssm_conv_verify`).
+    pub conv_verify_backends: Vec<&'static str>,
+    /// The CuTe RecoverSSM path's commit fold (`kda_recoverssm_commit`); the
+    /// Triton path keeps the fork's Triton commit.
+    pub commit_backends: Vec<&'static str>,
     /// Element type of the recurrent state pool (fp32 or bf16).
     pub ssm_state_dtype: DType,
     /// Query rows per decode request: 1 for plain decode, `1 + k` for a
@@ -246,8 +255,8 @@ impl Glm53KdaAttnLocalWorklet {
         // q, k, v, one beta per head, then the f_a and g_a gate factors.
         let in_proj_width = 3 * value_width + heads + 2 * cfg.gate_rank;
         let conv_channels = 3 * value_width;
-        let gemm = |n: Dim, k: Dim| SingleGemmKernelConfig {
-            backends: cfg.bf16_gemm_backends.clone(),
+        let gemm = |backends: &Vec<&'static str>, n: Dim, k: Dim| SingleGemmKernelConfig {
+            backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             n,
             k,
@@ -274,9 +283,21 @@ impl Glm53KdaAttnLocalWorklet {
             "KDA state must be a whole number of transfer units"
         );
         Glm53KdaAttnLocalWorkletResolved {
-            in_proj: gemm(in_proj_width.into(), cfg.hidden.clone()),
-            f_b: gemm(value_width.into(), cfg.gate_rank.into()),
-            g_b: gemm(value_width.into(), cfg.gate_rank.into()),
+            in_proj: gemm(
+                &cfg.in_out_proj_backends,
+                in_proj_width.into(),
+                cfg.hidden.clone(),
+            ),
+            f_b: gemm(
+                &cfg.bf16_gemm_backends,
+                value_width.into(),
+                cfg.gate_rank.into(),
+            ),
+            g_b: gemm(
+                &cfg.bf16_gemm_backends,
+                value_width.into(),
+                cfg.gate_rank.into(),
+            ),
             gate_b: cfg.merge_gate_b.then(|| BatchedGemmKernelConfig {
                 backends: GATE_B_BMM_BACKENDS.to_vec(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -335,7 +356,7 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.ssm_state_dtype,
             }),
             recoverssm_conv_verify: cute.then(|| KdaRecoverSSMConvVerifyKernelConfig {
-                backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+                backends: cfg.conv_verify_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
@@ -345,11 +366,10 @@ impl Glm53KdaAttnLocalWorklet {
             }),
             recoverssm_commit: recoverssm.then(|| KdaRecoverSSMCommitKernelConfig {
                 backends: if cute {
-                    RECOVERSSM_CUTE_BACKENDS
+                    cfg.commit_backends.clone()
                 } else {
-                    RECOVERSSM_TRITON_BACKENDS
-                }
-                .to_vec(),
+                    RECOVERSSM_TRITON_BACKENDS.to_vec()
+                },
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
@@ -366,7 +386,11 @@ impl Glm53KdaAttnLocalWorklet {
                 hidden: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
             },
-            o_proj: gemm(cfg.hidden.clone(), value_width.into()),
+            o_proj: gemm(
+                &cfg.in_out_proj_backends,
+                cfg.hidden.clone(),
+                value_width.into(),
+            ),
             ssm_state_bytes_per_request,
             // vLLM `kda_state_shape`: the window grows by the drafted rows.
             conv_state_bytes_per_request: conv_channels
@@ -799,11 +823,14 @@ mod tests {
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
+            in_out_proj_backends: vec!["torch_linear_vllm"],
             conv_prefill_backends: vec!["vllm_triton"],
             conv_decode_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
+            conv_verify_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
+            commit_backends: RECOVERSSM_CUTE_BACKENDS.to_vec(),
             ssm_state_dtype: DType::Fp32,
             decode_query_len: 1,
             spec_verify: KdaSpecVerify::Recoverssm,
