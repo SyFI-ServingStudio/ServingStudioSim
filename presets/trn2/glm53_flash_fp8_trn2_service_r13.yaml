@@ -14,8 +14,10 @@
 # 32.4 s, against the official round-13 measure's 419.45 @ 19.82 (TPOT 50.44 ms, TTFT 31.9 s; same-code samples
 # 419.45-420.86). The 16-row step stays above the cap (round 13: 55 ms; round 14: 49 ms), so the service runs C 64.
 # `c128_cap16` is the C 128 what-if (560.6 @ 16.19). `r14_dsa_x05` / `r14_dsa_x07` are round 14's hypothesis: the
-# DSA decode front in NKI at 0.5x / 0.7x of today's DSA decode time (473.1 @ 22.12 / 453.1 @ 21.19 at C 64).
-# doc/pr/trn2-glm53-flash/ALIGNMENT.md has the alignment record.
+# DSA decode front in NKI at 0.5x / 0.7x of today's DSA decode time, decode rows only (447.9 @ 22.12 / 435.4 @ 21.19 at
+# C 64). `kind_time_scale` entries are cumulative (a call multiplies every entry of its kind with min_rows <= rows), so
+# a decode-only what-if scales `dsa` by f and `dsa@512` by 1/f. Round 14 measured the x0.6 case
+# (glm53_flash_fp8_trn2_service_r14.yaml). doc/pr/trn2-glm53-flash/ALIGNMENT.md has the alignment record.
 deployment: unified
 
 workload:
@@ -72,5 +74,5 @@ compound:
   point:
     r13_official: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.7313", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=2.0946", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
     c128_cap16: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.7313", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=2.0946", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 4112}
-    r14_dsa_x05: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.3656", "dsa@9=0.3747", "dsa@17=0.4355", "dsa@512=2.0946", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
-    r14_dsa_x07: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.5119", "dsa@9=0.5246", "dsa@17=0.6098", "dsa@512=2.0946", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
+    r14_dsa_x05: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.36565", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=4.1892", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
+    r14_dsa_x07: {kts: ["moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.9540", "dsa=0.51191", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=2.99229", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "kda=0.3300", "kda@9=0.79", "kda@129=3.8358"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}

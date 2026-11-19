@@ -300,9 +300,46 @@ The round-13 prediction was made before the run (Tick 13: 419.0 @ 19.93). It lan
 **Round 14 what-ifs** (`r14_dsa_x05`, `r14_dsa_x07`): the DSA decode front in NKI. The DSA phase of a decode layer
 measured ~0.82 ms at 8 rows and ~0.89 ms at 16 on the round-13 code.
 
-| DSA decode time | C 64 |
+| DSA decode time (decode rows only) | C 64 |
 |---|---|
-| 0.5x | 473.1 @ 22.12 |
-| 0.7x | 453.1 @ 21.19 |
+| 0.5x | 447.9 @ 22.12 |
+| 0.7x | 435.4 @ 21.19 |
 
 At C 128 the 16-row step stays above round 14's 49 ms cap (TPOT <= 50 ms at the target of 20 tok/s/user).
+
+## Re-alignment on the round-14 service (official measurement, 2026-11-19)
+
+**Source.** Official round-14 measure of the R14 service (`aed9477`; glm5-trn2 `campaigns/glm8k1k/round14/`):
+
+| | measured |
+|---|---|
+| C 64 | 443.65 tok/s/chip @ 21.61 tok/s/user |
+| median TPOT | 46.28 ms |
+| median TTFT | 31.6 s |
+| 8 / 16-row decode steps (evaluator warm-up) | 45.3 / 58.9 ms, from 48.9 / 62.5 |
+| 16-row cap probe | 58.1 ms |
+
+Round 14 changed only the DSA decode front: scores, exact top-512 and the gather list now run in one NKI kernel.
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r14.yaml`): the R13 model with DSA decode x0.6.
+
+| | measured (official) | Sim |
+|---|---|---|
+| tok/s per chip | 443.65 | 441.9 |
+| interactivity | 21.61 | 21.64 |
+| median TPOT (ms) | 46.28 | 46.2 |
+| median TTFT (s) | 31.6 | 32.1 |
+
+**What-if construction (a correction).** `kind_time_scale` entries are cumulative: a call with `rows` multiplies every
+entry of its kind whose `min_rows` is at most `rows`. The calibrated lists rely on that:
+- the decode buckets carry the measured ratios;
+- the `@65` / `@129` / `@512` entries bring prefill back to ~1.0.
+
+To scale only rows in [lo, hi), multiply the entry at `lo` by f and the entry at `hi` by 1/f.
+
+The round-14 prediction instead scaled `dsa`, `dsa@9` and `dsa@17` by 0.5 each. That gave 16-row decode 0.25x and
+prefill DSA 0.125x. The phantom prefill gain cut the model's TTFT by ~4 s and inflated the prediction to 450-475. Built
+correctly, the model gives 447.9 @ 22.12 at x0.5 and 441.9 @ 21.64 at the measured x0.6.
+
+The engine's waves start on an empty replica, so TTFT is the wave's prefill plus a short tail, and decode speed barely
+moves it. The model reproduces that.

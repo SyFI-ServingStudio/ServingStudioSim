@@ -1,0 +1,65 @@
+# The glm5-trn2 R14 service (round 14 retained, `aed9477`): the R13 service
+# (presets/trn2/glm53_flash_fp8_trn2_service_r13.yaml) with round 14's NKI DSA decode front (scores, exact top-512
+# selection and the gather list in one kernel, `ops/dsa_front_nki.py`). Prefill keeps round 13's DSA path.
+# The measured effect is DSA decode x0.6 (decode rows only: `dsa` x0.6, `dsa@512` /0.6; the entries are cumulative).
+# The 8- and 16-row decode steps both fell 3.6 ms in the evaluator's warm-up (48.9 -> 45.3 / 62.5 -> 58.9 ms).
+# `r14_official` replays the official C 64 request list: 441.9 tok/s/chip @ 21.64 tok/s/user, TPOT 46.2 ms, TTFT
+# 32.1 s, against the official round-14 measure's 443.65 @ 21.61 (TPOT 46.28 ms, TTFT 31.6 s). The 16-row cap probe
+# measured 58.1 ms, above round 14's 49 ms cap (target 20 tok/s/user), so the service runs C 64. `c128_cap16` is the
+# C 128 what-if (583.4 @ 17.48).
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_service_r14/{point}"
+  cost_log_mode: stride
+  cost_log_stride_iterations: 16
+
+pools:
+  main:
+    placement: least-loaded
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [4096]
+          decode_buckets: ${decode_buckets}
+          context_buckets: [2048, 4096, 6144, 6656, 7168, 7680, 8192, 8704, 9216]
+          slots: ${slots}
+          cmax: 9216
+          max_model_len: 9216
+          kind_time_scale: ${kts}
+          region_gap_ms: 0.05
+          host_time_scale: 0.28
+          prefill_device_factor: 1.53
+          region_device_factor: 1.1052
+          spmd_padding: true
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: ${mbt}
+          max_prefill_chunk_tokens: 4096
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: ${maxreq}
+          dp_placement: vllm-least-loaded
+          wave_admission: true
+          wave_quiet_ms: 100
+          wave_cap_ms: 2000
+          wave_first_token_from_decode: true
+          batch_policy: mix
+
+compound:
+  point:
+    r14_official: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.33", "kda@9=0.79", "kda@129=3.8358", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.954"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
+    c128_cap16: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.33", "kda@9=0.79", "kda@129=3.8358", "mhc_post=0.45", "mhc_post@2=0.52", "mhc_post@129=4.2735", "mhc_pre=0.45", "mhc_pre@2=0.87", "mhc_pre@129=2.5543", "moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.954"], conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 4112}
