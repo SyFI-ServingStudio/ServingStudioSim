@@ -265,3 +265,44 @@ kernel rounds the KDA gate GEMM products to bf16, as the torch source reads. The
 (neuronx-cc drops the cast). That doubled passkey misses (15 against 7 of 128 prompt-group pairs). With fp32 gate
 products the kernel matches the compiled torch block (state 3.6e-6) and the miss rate returns to 7 / 128. Round 10
 carries the repaired kernel; the prefill step model above stands.
+
+## Re-alignment on the round-11 and round-13 services (official measurements, 2026-11-18 / 2026-11-19)
+
+**Sources** (glm5-trn2 `campaigns/glm8k1k/round{10,11,13}/`), all at C 64:
+
+| round | change | official |
+|---|---|---|
+| 10 (`fe7d0e4`) | round 9's KDA prefill kernel with fp32 gate products, round 8's sparse DSA decode | 382.47 @ 18.48 |
+| 11 (`e4f3578`) | KDA decode as an NKI kernel | 398.54 @ 19.74 (TPOT 50.66 ms, 16-row cap probe 62.5-62.8 ms) |
+| 13 (`990cfa2`) | deterministic expert placement (9 per EP rank), fp32 cross-rank partials, prefill chunk 4096 | 419.45 @ 19.82 (TPOT 50.44 ms, TTFT 31.9 s); same-code samples 419.45-420.86 |
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r13.yaml`): the calibrated round-11 model of the campaign's
+layout study, with round 13's changes.
+- The round-11 per-kind ratios: `kda` 0.33 is round 11's decode kernel; `prefill_device_factor` 1.53 is round 10's.
+- The measured host floor (`host_time_scale` 0.28), the wave scheduler and the lockstep first token.
+- A decode `region_device_factor`:
+  - 1.12 reproduces round 11.
+  - The excess is mostly the wait at the MoE combine. Expert load is imbalanced, and the rank with the most active
+    local experts sets the layer: ~170 us per layer at 8 rows (Ticks 12-13, measured on the evaluator's prompts).
+  - Round 13's placement removes 30 us of it; its fp32 partials add ~0.3 ms per step. That gives 1.1052.
+
+| | round 11 measured | Sim | round 13 measured | Sim |
+|---|---|---|---|---|
+| tok/s per chip | 398.54 | 394.9 | 419.45 | 419.0 |
+| interactivity | 19.74 | 19.69 | 19.82 | 19.93 |
+| median TPOT (ms) | 50.66 | 50.8 | 50.44 | 50.2 |
+| median TTFT (s) | 36.1 | - | 31.9 | 32.4 |
+| 16-row decode step (ms) | 62.7 | 62.5 | 62.9 | - |
+
+The round-13 prediction was made before the run (Tick 13: 419.0 @ 19.93). It landed within 0.1% on throughput and
+0.6% on interactivity.
+
+**Round 14 what-ifs** (`r14_dsa_x05`, `r14_dsa_x07`): the DSA decode front in NKI. The DSA phase of a decode layer
+measured ~0.82 ms at 8 rows and ~0.89 ms at 16 on the round-13 code.
+
+| DSA decode time | C 64 |
+|---|---|
+| 0.5x | 473.1 @ 22.12 |
+| 0.7x | 453.1 @ 21.19 |
+
+At C 128 the 16-row step stays above round 14's 49 ms cap (TPOT <= 50 ms at the target of 20 tok/s/user).
