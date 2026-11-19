@@ -366,6 +366,9 @@ pub struct DsaForkGlueConfigs {
     pub seq_lens_plus_one: ElementwiseKernelConfig,
     /// `topk_indices_buffer[:rows, :window] = out`.
     pub topk_buffer_copy: ElementwiseKernelConfig,
+    /// The causal indices a short decode writes in place of its top-k
+    /// ([`SHORT_DECODE_CAUSAL_FILL_LAUNCHES`] launches, per launch).
+    pub short_decode_causal_fill: ElementwiseKernelConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -420,6 +423,12 @@ pub struct Glm53DsaAttnLocalWorkletInput {
     /// KV length per decode request, including every query row it presents
     /// (`decode_next_n` of them, ending at this length).
     pub decode_kv_lens: Vec<u32>,
+    /// The iteration replays a full CUDA graph (a uniform decode batch within
+    /// the captured sizes). The graph was captured on the decode indexer's
+    /// long path, so a replay runs its MQA logits and top-k at any context;
+    /// an eager or piecewise iteration takes the indexer's host-side
+    /// short-context branch ([`Glm53DsaAttnLocalWorklet::eval`]).
+    pub decode_graph_replay: bool,
 }
 
 pub struct Glm53DsaAttnLocalWorklet {
@@ -486,7 +495,14 @@ pub struct DsaForkGlue {
     pub pool_ids_to_int64: Op<ElementwiseKernel>,
     pub seq_lens_plus_one: Op<ElementwiseKernel>,
     pub topk_buffer_copy: Op<ElementwiseKernel>,
+    pub short_decode_causal_fill: Op<ElementwiseKernel>,
 }
+
+/// `_fill_causal_indices` over a short decode's `[rows, selected_k]` top-k
+/// buffer rows: `arange`, the broadcast copy of that range into every row, the
+/// `range > position` compare, and the masked fill of `-1`. The fork's cast of
+/// the positions to int32 is the second of [`POSITION_CASTS`].
+const SHORT_DECODE_CAUSAL_FILL_LAUNCHES: u32 = 4;
 
 /// The fork casts the decode positions to int32 twice per step: for the kpool
 /// update and for the top-k sequence lengths.
@@ -730,6 +746,13 @@ impl Glm53DsaAttnLocalWorklet {
                 pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
                 seq_lens_plus_one: ew(4, 4),
                 topk_buffer_copy: ew(4 * window, 4 * window),
+                // Per row over the four launches: the copy writes 4 bytes a
+                // lane, the compare a 1-byte mask, the masked fill reads that
+                // mask and the int32 row and writes the row.
+                short_decode_causal_fill: ew(
+                    5 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
+                    9 * cfg.selected_k / SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
+                ),
             }),
             // [q_a | kv_a | k | gate score | head weights] in fp32.
             hidden_gemm: front
@@ -930,6 +953,10 @@ impl Glm53DsaAttnLocalWorklet {
                         pool_ids_to_int64: ew("glue.pool_ids_to_int64", g.pool_ids_to_int64)?,
                         seq_lens_plus_one: ew("glue.seq_lens_plus_one", g.seq_lens_plus_one)?,
                         topk_buffer_copy: ew("glue.topk_buffer_copy", g.topk_buffer_copy)?,
+                        short_decode_causal_fill: ew(
+                            "glue.short_decode_causal_fill",
+                            g.short_decode_causal_fill,
+                        )?,
                     })
                 })
                 .transpose()?,
@@ -1116,6 +1143,11 @@ impl Glm53DsaAttnLocalWorklet {
                 g.pool_ids_to_int64.compile(builder),
                 g.seq_lens_plus_one.compile(builder),
                 g.topk_buffer_copy.compile(builder),
+                repeated(
+                    &g.short_decode_causal_fill,
+                    SHORT_DECODE_CAUSAL_FILL_LAUNCHES,
+                    builder,
+                ),
             ]);
         }
         slots
@@ -1130,6 +1162,14 @@ impl Glm53DsaAttnLocalWorklet {
         let all = tokens(w.total_tokens);
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
+        // vLLM's kpool indexer (`_fill_short_decode_causal_indices`) skips the
+        // decode MQA logits and top-k when no request in the batch holds more
+        // than `index_topk` tokens: every causal index is selected, so it
+        // writes them directly. The branch is host-side, so a full-graph
+        // replay keeps the captured long path.
+        let short_decode =
+            !no_decode && !input.decode_graph_replay && w.max_seq_len <= cfg.index_topk;
+        let no_decode_topk = no_decode || short_decode;
         let front = cfg.front;
         // The split state writer takes the decode rows' q/kv norm, cache
         // append, kpool position cast and kpool update; prefill rows keep them.
@@ -1212,12 +1252,17 @@ impl Glm53DsaAttnLocalWorklet {
                     DsaDecodeIndexer::PerRequest => w.decode_mean_pools,
                 },
             },
-            no_decode,
+            no_decode_topk,
             ev,
         );
-        self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
+        self.eval_decode_topk(&input.decode_kv_lens, &w, short_decode, ev);
         self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
-        let expand_rows = w.prefill_indexer_rows + if page_table { 0 } else { w.decode_rows };
+        let expand_rows = w.prefill_indexer_rows
+            + if page_table || short_decode {
+                0
+            } else {
+                w.decode_rows
+            };
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
@@ -1305,12 +1350,14 @@ impl Glm53DsaAttnLocalWorklet {
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
             let post_topk_gone = no_decode || page_table;
+            let topk_out_gone = post_topk_gone || short_decode;
             push_or_zero(&g.hidden_fp32_cast, all, split_writer, ev);
             push_or_zero(&g.topk_buffer_fill, decode.clone(), post_topk_gone, ev);
             push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
-            push_or_zero(&g.pool_ids_to_int64, decode.clone(), post_topk_gone, ev);
-            push_or_zero(&g.seq_lens_plus_one, decode.clone(), post_topk_gone, ev);
-            push_or_zero(&g.topk_buffer_copy, decode, post_topk_gone, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), topk_out_gone, ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), topk_out_gone, ev);
+            push_or_zero(&g.topk_buffer_copy, decode.clone(), topk_out_gone, ev);
+            push_or_zero(&g.short_decode_causal_fill, decode, !short_decode, ev);
         }
     }
 }
@@ -1402,12 +1449,17 @@ impl Glm53DsaAttnLocalWorklet {
     /// Against real B200 batches of 120-644 rows this lands within +1..+6%
     /// median and +9% p90, where the max context overprices by up to 2.4x and
     /// the mean context underprices by 10-43%.
-    fn eval_decode_topk(&self, kv_lens: &[u32], w: &Work, ev: &mut Evaluator) {
+    ///
+    /// `skipped` (a short decode outside a graph replay) bills it zero.
+    fn eval_decode_topk(&self, kv_lens: &[u32], w: &Work, skipped: bool, ev: &mut Evaluator) {
         let input = |batch_size, context_len| DsaPersistentTopkDecodeKernelInput {
             batch_size,
             context_len,
         };
         let longest = input(w.decode_requests, w.decode_pools);
+        if skipped {
+            return push_or_zero(&self.topk_decode, longest, true, ev);
+        }
         if let Some(cooperative) = &self.topk_decode_cooperative {
             if w.decode_rows > 0 && w.decode_rows <= COOPERATIVE_MAX_ROWS {
                 // One wave of CTA clusters over every row: the longest row
@@ -1514,6 +1566,9 @@ struct Work {
     prefill_indexer_rows: u32,
     /// The logits + top-k launches over those rows (empty when skipped).
     prefill_indexer_chunks: Vec<IndexerChunk>,
+    /// vLLM's `max_seq_len`: the longest context of any request in the
+    /// batch, prefill or decode.
+    max_seq_len: u32,
 }
 
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
@@ -1675,6 +1730,7 @@ fn derive_work(
     let (index_topk, index_kpool) = (budget.index_topk, budget.index_kpool);
     let mut prefill_tokens = 0_u32;
     let mut needs_prefill_indexer = false;
+    let mut max_prefill_seq_len = 0_u32;
     for (index, &(prefix, append)) in input.prefill_chunk_pairs.iter().enumerate() {
         if append == 0 {
             return Err(format!("prefill request {index} append must be positive"));
@@ -1686,6 +1742,7 @@ fn derive_work(
             .checked_add(append)
             .ok_or("prefill token sum overflows u32")?;
         needs_prefill_indexer |= context > index_topk;
+        max_prefill_seq_len = max_prefill_seq_len.max(context);
     }
     let (prefill_indexer_rows, prefill_indexer_chunks) = if needs_prefill_indexer {
         (
@@ -1731,6 +1788,7 @@ fn derive_work(
         decode_mean_pools,
         prefill_indexer_rows,
         prefill_indexer_chunks,
+        max_seq_len: max_decode.max(max_prefill_seq_len),
     })
 }
 
@@ -1821,6 +1879,7 @@ mod tests {
             &Glm53DsaAttnLocalWorkletInput {
                 prefill_chunk_pairs,
                 decode_kv_lens,
+                decode_graph_replay: true,
             },
             1,
             &budget(),
@@ -1928,6 +1987,7 @@ mod tests {
         let input = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: vec![(0, 5)],
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         let placeholder = build_with(|c| c.decode_next_n = 4, &[]).unwrap();
         let measured = build_with(
@@ -1998,6 +2058,7 @@ mod tests {
         let input = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: vec![1000, 4001],
+            decode_graph_replay: true,
         };
         let w = derive_work(&input, 8, &budget()).unwrap();
         assert_eq!(
@@ -2014,6 +2075,7 @@ mod tests {
         let short = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: vec![7],
+            decode_graph_replay: true,
         };
         assert!(derive_work(&short, 8, &budget()).is_err());
         let mut config = cfg();
@@ -2215,8 +2277,8 @@ mod tests {
     }
 
     /// Catches a launch list that loses a launch: seven fork launches (the
-    /// two position casts folded into one scaled leaf), decode rows only
-    /// except the hidden cast.
+    /// two position casts folded into one scaled leaf) and the short decode's
+    /// causal fill in their place, decode rows only except the hidden cast.
     #[test]
     fn fork_glue_lists_the_seven_decode_launches() {
         let w = build_with(|c| c.glue = DsaGlue::ForkLaunchList, &[]).unwrap();
@@ -2234,6 +2296,7 @@ mod tests {
                 "m.dsa.glue.pool_ids_to_int64",
                 "m.dsa.glue.seq_lens_plus_one",
                 "m.dsa.glue.topk_buffer_copy",
+                "m.dsa.glue.short_decode_causal_fill",
             ]
         );
         let g = w.resolved.fork_glue.as_ref().unwrap();
@@ -2244,6 +2307,7 @@ mod tests {
             &Glm53DsaAttnLocalWorkletInput {
                 prefill_chunk_pairs: vec![(0, 5)],
                 decode_kv_lens: vec![4000, 5000],
+                decode_graph_replay: true,
             },
         );
         assert_eq!(inputs["m.dsa.glue.hidden_fp32_cast"]["num_tokens"], 7);
@@ -2289,6 +2353,7 @@ mod tests {
         let input = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: vec![(0, 5)],
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         assert_eq!(
             newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
@@ -2394,6 +2459,7 @@ mod tests {
         let decode = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         let mixed = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: vec![(0, 5)],
@@ -2504,6 +2570,7 @@ mod tests {
         let decode = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         let mut union: Vec<String> = parts
             .into_iter()
@@ -2572,6 +2639,7 @@ mod tests {
         let decode = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         let mut zeroed = newly_zeroed(&w, &fork, &decode);
         zeroed.sort();
@@ -2591,6 +2659,7 @@ mod tests {
         let one_long = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: vec![(0, 8000)],
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         let inputs = eval_inputs(&w, &one_long);
         let fork_inputs = eval_inputs(&fork, &one_long);
@@ -2649,6 +2718,7 @@ mod tests {
         let input = Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: vec![(0, 5)],
             decode_kv_lens: vec![4000, 5000],
+            decode_graph_replay: true,
         };
         assert_eq!(
             newly_zeroed(&w, &build_with(|_| {}, &[]).unwrap(), &input),
@@ -2747,5 +2817,72 @@ mod tests {
             build(Some(vec!["deep_select"])),
             Err(BuildError::NoBackendForLaunch { .. })
         ));
+    }
+
+    /// Catches the decode indexer billed on a batch the fork's host-side
+    /// short-context branch skips (no request past `index_topk` tokens, no
+    /// full-graph replay), or skipped where it runs: inside a graph replay,
+    /// or when any request in the batch, a prefill included, is longer.
+    #[test]
+    fn a_short_eager_decode_skips_the_indexer_logits_and_top_k() {
+        let w = build_with(|c| c.glue = DsaGlue::ForkLaunchList, &[]).unwrap();
+        let zeroed = |input: &Glm53DsaAttnLocalWorkletInput| -> Vec<String> {
+            let names = slots(&w);
+            let mut metrics = vec![LeafMetrics::MISS; names.len()];
+            let mut ev = Evaluator::new(&mut metrics);
+            w.eval(input, &mut ev);
+            names
+                .into_iter()
+                .zip(metrics)
+                .filter(|(_, m)| m.coverage == CoverageFlags::EMPTY)
+                .map(|((name, _), _)| name)
+                .collect()
+        };
+        let index_topk = cfg().index_topk;
+        let replay = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![100, index_topk],
+            decode_graph_replay: true,
+        };
+        let eager = Glm53DsaAttnLocalWorkletInput {
+            decode_graph_replay: false,
+            ..replay.clone()
+        };
+        let base = zeroed(&replay);
+        assert!(base.contains(&"m.dsa.glue.short_decode_causal_fill".to_string()));
+        let mut skipped: Vec<String> = zeroed(&eager)
+            .into_iter()
+            .filter(|name| !base.contains(name))
+            .collect();
+        skipped.sort();
+        assert_eq!(
+            skipped,
+            [
+                "m.dsa.glue.pool_ids_to_int64",
+                "m.dsa.glue.seq_lens_plus_one",
+                "m.dsa.glue.topk_buffer_copy",
+                "m.dsa.indexer.expand_pools",
+                "m.dsa.indexer.mqa_logits_decode",
+                "m.dsa.indexer.topk_decode",
+            ]
+        );
+        assert!(!zeroed(&eager).contains(&"m.dsa.glue.short_decode_causal_fill".to_string()));
+
+        // One longer request anywhere in the batch keeps the long path.
+        for long in [
+            Glm53DsaAttnLocalWorkletInput {
+                decode_kv_lens: vec![100, index_topk + 1],
+                ..eager.clone()
+            },
+            Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs: vec![(index_topk, 64)],
+                ..eager.clone()
+            },
+        ] {
+            let z = zeroed(&long);
+            assert!(!z.contains(&"m.dsa.indexer.topk_decode".to_string()));
+            assert!(!z.contains(&"m.dsa.indexer.mqa_logits_decode".to_string()));
+            assert!(z.contains(&"m.dsa.glue.short_decode_causal_fill".to_string()));
+        }
     }
 }

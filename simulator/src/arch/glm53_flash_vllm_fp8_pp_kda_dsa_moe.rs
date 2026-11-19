@@ -607,15 +607,15 @@ impl Glm53FlashVllmFp8PpStageModel {
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> NormalizedBatch {
-        normalize_input(input, self.max_model_len).unwrap_or_else(|reason| {
-            panic!("invalid Glm53FlashVllmFp8PpStageModel input: {reason}")
-        })
+        normalize_input(input, self.max_model_len, &self.cudagraph_capture_sizes).unwrap_or_else(
+            |reason| panic!("invalid Glm53FlashVllmFp8PpStageModel input: {reason}"),
+        )
     }
 }
 
 impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpStageModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, &self.cudagraph_capture_sizes).map(|_| ())
     }
 
     /// This stage's layers only: vLLM allocates cache per stage.
@@ -742,8 +742,13 @@ impl Glm53FlashVllmFp8PpModel {
         builder.finish(root)
     }
 
+    /// Every stage captures the same graph sizes.
+    fn capture_sizes(&self) -> &[u32] {
+        &self.stages[0].cudagraph_capture_sizes
+    }
+
     fn normalize(&self, input: &UnifiedArchInput) -> NormalizedBatch {
-        normalize_input(input, self.max_model_len)
+        normalize_input(input, self.max_model_len, self.capture_sizes())
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmFp8PpModel input: {reason}"))
     }
 
@@ -756,7 +761,7 @@ impl Glm53FlashVllmFp8PpModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, self.capture_sizes()).map(|_| ())
     }
 
     /// The physical total over all stages: each stage caches only its own

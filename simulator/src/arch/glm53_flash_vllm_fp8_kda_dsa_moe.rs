@@ -1540,7 +1540,7 @@ impl Glm53FlashVllmModel {
     }
 
     fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
-        let batch = normalize_input(input, self.max_model_len)
+        let batch = normalize_input(input, self.max_model_len, &self.cudagraph_capture_sizes)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
         push(
@@ -1600,7 +1600,7 @@ impl Glm53FlashVllmModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, &self.cudagraph_capture_sizes).map(|_| ())
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
@@ -1712,13 +1712,32 @@ pub(crate) fn attention_inputs(
         Glm53DsaAttnLocalWorkletInput {
             prefill_chunk_pairs: prefills,
             decode_kv_lens: decodes,
+            decode_graph_replay: false,
         },
     )
+}
+
+/// Whether vLLM replays a batch of `rows` as one full CUDA graph: a uniform
+/// decode batch (no prefill once short appends join the decodes, see
+/// [`attention_inputs`]) within the largest captured size. vLLM's default
+/// `FULL_AND_PIECEWISE` mode runs any other batch on the piecewise graphs,
+/// attention eager. The DSA indexer's short-context skip is host-side, so it
+/// happens only outside a full replay ([`Glm53DsaAttnLocalWorkletInput`]).
+pub(crate) fn replays_full_graph(
+    sorted_capture_sizes: &[u32],
+    rows: u32,
+    dsa: &Glm53DsaAttnLocalWorkletInput,
+) -> bool {
+    dsa.prefill_chunk_pairs.is_empty()
+        && sorted_capture_sizes
+            .last()
+            .is_some_and(|&largest| rows <= largest)
 }
 
 pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     max_model_len: u32,
+    sorted_capture_sizes: &[u32],
 ) -> std::result::Result<NormalizedBatch, String> {
     let [group] = input.groups.as_slice() else {
         return Err(format!(
@@ -1773,7 +1792,8 @@ pub(crate) fn normalize_input(
     if total_tokens == 0 {
         return Err("an iteration must carry at least one token".into());
     }
-    let (kda, dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
+    let (kda, mut dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
+    dsa.decode_graph_replay = replays_full_graph(sorted_capture_sizes, total_tokens, &dsa);
     Ok(NormalizedBatch {
         total_tokens,
         request_count: group.request_count(),
@@ -2404,13 +2424,13 @@ mod tests {
             }],
             tokens_per_source_rank: Vec::new(),
         };
-        let batch = normalize_input(&input, 8192).unwrap();
+        let batch = normalize_input(&input, 8192, &[]).unwrap();
         assert_eq!((batch.total_tokens, batch.request_count), (2048, 30));
         assert_eq!(batch.kda.prefill_sequence_lengths, [2019]);
         assert_eq!(batch.kda.decode_batch_size, 29);
         assert_eq!(batch.dsa.decode_kv_lens.len(), 29);
         let mut bad = input.clone();
         bad.groups[0].decode_kv_lens = vec![9000; 29];
-        assert!(normalize_input(&bad, 8192).is_err());
+        assert!(normalize_input(&bad, 8192, &[]).is_err());
     }
 }
