@@ -1992,9 +1992,28 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
 
 /// GLM-5.3-Flash NVFP4 (DP-attention/EP graph) verifying the
 /// `incoai/GLM-5.3-Flash-DFlash2` proposer: one TP1 draft per attention DP
-/// rank, the target compiled at verify width `draft_tokens + 1`.
+/// rank, the target compiled at verify width `draft_tokens + 1`, on the
+/// kernels the vLLM fork calls.
 pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
     sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashDflash2Model> {
+    glm53_flash_nvfp4_dflash2_on(
+        sel,
+        &glm53_flash_vllm_nvfp4_dflash2::VLLM_FORK_KERNELS,
+        gpu,
+        name,
+        bridge,
+    )
+}
+
+/// [`glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`]'s selector built on
+/// `kernels`.
+pub fn glm53_flash_nvfp4_dflash2_on(
+    sel: &IterArchSel,
+    kernels: &glm53_flash_vllm_nvfp4_dflash2::Glm53FlashDflash2Kernels,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -2154,6 +2173,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
     let mut configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
             .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
+    kernels.apply(&mut configs);
     // The verify: every decode request presents `verify_width` rows to DSA and
     // KDA, on the KDA pool's dtype and verify mode.
     for kda in [&mut configs.local.kda, &mut configs.kda_tp1] {
@@ -2199,9 +2219,10 @@ pub fn glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashDflash2Model> {
-    let target =
-        crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::target_selector(sel)?;
-    glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(&target, gpu, name, bridge)
+    use crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::{
+        target_selector, DESIGN_KERNELS,
+    };
+    glm53_flash_nvfp4_dflash2_on(&target_selector(sel)?, &DESIGN_KERNELS, gpu, name, bridge)
 }
 
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.

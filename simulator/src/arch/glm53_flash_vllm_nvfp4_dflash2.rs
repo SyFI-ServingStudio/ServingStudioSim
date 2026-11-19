@@ -13,17 +13,30 @@
 //! - the DSA indexer scores a request's rows in one DeepGEMM paged MQA-logits
 //!   group (`next_n` = width), reading the request's index keys once; top-k,
 //!   sparse MLA and every projection run per row;
-//! - KDA verifies with RecoverSSM: the verify reads the request's checkpoint
-//!   state once and caches a correction and a key/gate vector per row, and a
-//!   commit folds the accepted rows into the state with one read and one write.
-//!   vLLM commits once per KDA KV-cache group (9, 9, 8 and 8 layers), and the
-//!   commit of a rank's requests costs their mean committed rows (the target
-//!   token plus the accepted drafts). Under `recurrent_per_position` the
-//!   verify stores a state per row instead and nothing is committed;
+//! - KDA verifies per position by default (`kda_spec_verify:
+//!   recurrent_per_position`, the fork's GLM path): the verify stores a state
+//!   per row and nothing is committed. Under `recoverssm` the verify reads the
+//!   request's checkpoint state once and caches a correction and a key/gate
+//!   vector per row, and a commit folds the accepted rows into the state with
+//!   one read and one write. vLLM commits once per KDA KV-cache group (9, 9, 8
+//!   and 8 layers), and the commit of a rank's requests costs their mean
+//!   committed rows (the target token plus the accepted drafts);
 //! - MoE routing groups the request's consecutive rows (`verify_width` of the
 //!   expert demand).
 //!
 //! Nothing here was aligned against a speculative Flash capture.
+//!
+//! # The fork as it runs
+//!
+//! The selector's defaults are the vLLM fork's deployment: per-position KDA
+//! verify on an fp32 state pool, the router gate once per layer on GateLinear,
+//! no routed-input copy, the DSA glue as the fork's launch list, FA4 over the
+//! fp8 draft cache at 32 splits, no sparse-MLA layout copies, and the shared
+//! expert's measured exposure (the `production` column of
+//! `model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json`). Where a
+//! worklet takes a kernel choice, [`VLLM_FORK_KERNELS`] names the fork's call.
+//! The DSA glue launches are still priced on Triton rows; the fork runs them
+//! as eager torch ops.
 //!
 //! # The proposer
 //!
@@ -37,7 +50,9 @@ use crate::arch::contract::{
     ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
     UnifiedArchInput,
 };
-use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel;
+use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::{
+    Glm53FlashDpAttnEpConfigs, Glm53FlashDpAttnEpModel,
+};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{atomic, push};
 use crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::{
     draft_kv_bytes_per_token, Dflash2DraftResolved, Dflash2DraftStage,
@@ -53,6 +68,74 @@ use crate::timing::{
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2";
+
+/// The kernels a GLM-5.3-Flash NVFP4 DFlash2 graph runs where its worklets
+/// take a backend choice. Each arch fixes its own set: [`VLLM_FORK_KERNELS`]
+/// here, the design's in
+/// [`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`]. A
+/// run config's `backends` map still overrides any role.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glm53FlashDflash2Kernels {
+    /// The MoE router gate GEMM (`moe.router.gate`).
+    pub router_gate: &'static [&'static str],
+    /// KDA chunked prefill (`kda.chunk_prefill`).
+    pub kda_chunk_prefill: &'static [&'static str],
+    /// KDA short causal conv over prefill tokens (`kda.short_conv_prefill`).
+    pub kda_conv_prefill: &'static [&'static str],
+    /// KDA `in_proj` and `o_proj`.
+    pub kda_in_out_proj: &'static [&'static str],
+    /// KDA RecoverSSM conv + verify (`kda.recoverssm_conv_verify`).
+    pub kda_conv_verify: &'static [&'static str],
+    /// KDA RecoverSSM commit (`kda_recoverssm_commit_group*`).
+    pub kda_commit: &'static [&'static str],
+    /// The routed experts (`moe.routed_rank*.fused_moe`).
+    pub routed_moe: &'static [&'static str],
+    /// DSA decode top-k (`dsa.indexer.topk_decode`).
+    pub dsa_topk_decode: &'static [&'static str],
+}
+
+/// What the vLLM fork (79838a5a, the DFlash2 serving fork) calls; the source
+/// line is beside each field.
+pub const VLLM_FORK_KERNELS: Glm53FlashDflash2Kernels = Glm53FlashDflash2Kernels {
+    // `glm5next/nvidia/model.py:181` `self.gate = GateLinear(...)`: the CuTe
+    // `ll_bf16_gemm` up to 16 tokens, `torch.mm` above
+    // (`fused_moe/router/gate_linear.py:177-221`); the 2026-09 TP4 capture
+    // shows `cute_dsl_ll_bf16_dotprod`.
+    router_gate: &["vllm_gate_linear"],
+    // `glm5next/nvidia/kda.py:539` `chunk_kda_with_fused_gate`, FLA's Triton
+    // chunk KDA (`chunk_kda_scaled_dot_kkt_fwd_kernel_*` in the capture).
+    kda_chunk_prefill: &["vllm_triton"],
+    // `glm5next/nvidia/kda.py:456` `causal_conv1d_fn` from
+    // `mamba/ops/causal_conv1d.py`, Triton (`_causal_conv1d_fwd_kernel`).
+    kda_conv_prefill: &["vllm_triton"],
+    // `ReplicatedLinear` / `RowParallelLinear` at TP1: torch's linear.
+    kda_in_out_proj: &["torch_linear_vllm"],
+    // `kda.py` `recoverssm_backend = "cute"` on B200 with a bf16 state.
+    kda_conv_verify: crate::worklet::RECOVERSSM_CUTE_BACKENDS,
+    kda_commit: crate::worklet::RECOVERSSM_CUTE_BACKENDS,
+    // The ModelOpt NVFP4 MoE on SM100: FlashInfer's TRT-LLM routed kernel.
+    routed_moe: &["flashinfer_trtllm_routed_sm100"],
+    // `persistent_topk` (vLLM's "auto" top-k chain).
+    dsa_topk_decode: &["vllm_cuda"],
+};
+
+impl Glm53FlashDflash2Kernels {
+    /// Set these kernels on the target's worklet configs.
+    pub fn apply(&self, configs: &mut Glm53FlashDpAttnEpConfigs) {
+        configs.local.router.gemm_backends = self.router_gate.to_vec();
+        for kda in [&mut configs.local.kda, &mut configs.kda_tp1] {
+            kda.chunk_prefill_backends = self.kda_chunk_prefill.to_vec();
+            kda.conv_prefill_backends = self.kda_conv_prefill.to_vec();
+            kda.in_out_proj_backends = self.kda_in_out_proj.to_vec();
+            kda.conv_verify_backends = self.kda_conv_verify.to_vec();
+            kda.commit_backends = self.kda_commit.to_vec();
+        }
+        for routed in &mut configs.routed {
+            routed.fused_moe_backends = self.routed_moe.to_vec();
+        }
+        configs.local.dsa.topk_backends = self.dsa_topk_decode.to_vec();
+    }
+}
 
 /// The draft's KV part of the layout.
 const DRAFT_KV_PART: &str = "dflash2_draft";
