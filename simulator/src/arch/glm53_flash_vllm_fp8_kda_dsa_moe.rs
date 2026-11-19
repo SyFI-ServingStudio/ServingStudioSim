@@ -69,7 +69,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{split_short_appends, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
@@ -1689,27 +1689,21 @@ pub(crate) fn verify_width(cfg: &Glm53FlashVllmConfigs) -> std::result::Result<u
 }
 
 /// The KDA and DSA sublayer inputs for one attention group, with each request
-/// classified the way vLLM's attention metadata does.
+/// classified the way vLLM's attention metadata does
+/// ([`crate::arch::contract::runs_as_decode`]).
 ///
-/// `split_decodes_and_prefills` (`vllm/v1/attention/backends/utils.py`) calls a
-/// request a decode when it schedules one query token on top of prior state,
-/// so a one-token append after a cached prefix (the step an engine runs after
-/// a full prefix hit or a P/D KV transfer) runs the decode kernels: KDA's
-/// recurrent step instead of `chunk_kda`, and the DSA decode indexer and
-/// sparse MLA.
+/// A one-token append after a cached prefix runs the decode kernels: KDA's
+/// recurrent step instead of `chunk_kda` (the GDN builder splits at a decode
+/// threshold of 1, `v1/attention/backends/gdn_attn.py`), and the DSA decode
+/// indexer and sparse MLA (the indexer and sparse-MLA builders keep
+/// `treat_short_extends_as_decodes` on without prefill context parallelism).
 pub(crate) fn attention_inputs(
     prefill_chunk_pairs: &[(u32, u32)],
     decode_kv_lens: &[u32],
 ) -> (Glm53KdaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletInput) {
-    let mut prefills = Vec::with_capacity(prefill_chunk_pairs.len());
+    let (prefills, appended) = split_short_appends(prefill_chunk_pairs);
     let mut decodes = decode_kv_lens.to_vec();
-    for &(prefix, append) in prefill_chunk_pairs {
-        if append == 1 && prefix > 0 {
-            decodes.push(prefix + 1);
-        } else {
-            prefills.push((prefix, append));
-        }
-    }
+    decodes.extend(appended);
     (
         Glm53KdaAttnLocalWorkletInput {
             prefill_sequence_lengths: prefills.iter().map(|&(_, append)| append).collect(),
@@ -1779,21 +1773,12 @@ pub(crate) fn normalize_input(
     if total_tokens == 0 {
         return Err("an iteration must carry at least one token".into());
     }
+    let (kda, dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
     Ok(NormalizedBatch {
         total_tokens,
         request_count: group.request_count(),
-        kda: Glm53KdaAttnLocalWorkletInput {
-            prefill_sequence_lengths: group
-                .prefill_chunk_pairs
-                .iter()
-                .map(|&(_, append)| append)
-                .collect(),
-            decode_batch_size: decode_tokens,
-        },
-        dsa: Glm53DsaAttnLocalWorkletInput {
-            prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
-            decode_kv_lens: group.decode_kv_lens.clone(),
-        },
+        kda,
+        dsa,
     })
 }
 

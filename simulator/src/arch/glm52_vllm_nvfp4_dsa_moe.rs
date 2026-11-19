@@ -23,8 +23,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::arch::contract::{
-    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
-    UnifiedArchInput,
+    runs_as_decode, ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
@@ -2155,10 +2155,15 @@ impl Glm52VllmNvfp4DsaMoeSpeculativeModel {
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
-        let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
-            .unwrap_or_else(|reason| {
-                panic!("invalid Glm52VllmNvfp4DsaMoeSpeculativeModel input: {reason}")
-            });
+        let batch = normalize_speculative_input(
+            input,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::UniformQueryLength,
+        )
+        .unwrap_or_else(|reason| {
+            panic!("invalid Glm52VllmNvfp4DsaMoeSpeculativeModel input: {reason}")
+        });
         self.target.eval(&batch, ev);
         self.draft
             .eval(&batch, self.target.ep_size, self.max_model_len, ev);
@@ -2167,7 +2172,13 @@ impl Glm52VllmNvfp4DsaMoeSpeculativeModel {
 
 impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
     fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
-        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+        normalize_speculative_input(
+            batch,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::UniformQueryLength,
+        )
+        .map(|_| ())
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
@@ -2375,14 +2386,12 @@ pub(crate) fn normalize_group(
             group.decode_tokens
         ));
     }
-    let mut decode_context = None;
     for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
         if !(1..=max_model_len).contains(&context) {
             return Err(format!(
                 "group {group_index} decode request {request_index} context {context} must be in 1..={max_model_len}"
             ));
         }
-        decode_context = Some(decode_context.map_or(context, |current: u32| current.max(context)));
         endpoint_context_lens.push(context);
     }
     let batch_tokens = prefill_tokens
@@ -2404,17 +2413,79 @@ pub(crate) fn normalize_group(
         // so the sampler scores exactly one row per request.
         logits_rows: request_count,
         endpoint_context_lens,
-        attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-            num_new_tokens: batch_tokens,
+        attention_input: attention_input(
             prefill_query_cache_pairs,
-            decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                batch_size: decode_tokens,
-                context_len,
-                context_lens: Some(group.decode_kv_lens.clone()),
-                requires_padding: false,
-            }),
-        },
+            group.decode_kv_lens.clone(),
+            1,
+            true,
+        ),
     })
+}
+
+/// One group's attention input, with each request classified the way vLLM's
+/// DSA indexer metadata does ([`runs_as_decode`]).
+///
+/// `prefill_query_cache_pairs` are `(append, prefix + append)`. A one-token
+/// append after a cached prefix joins the decodes when `appends_join_decodes`:
+/// always without speculation, and under a verify when the deployment's
+/// indexer splits by query length ([`VerifyDecodeSplit::ByQueryLength`]). It then runs the paged decode indexer
+/// instead of the prefill indexer over its whole context. The decode launch
+/// here is uniform, so under a verify that request is billed a whole
+/// `verify_width` row group.
+fn attention_input(
+    prefill_query_cache_pairs: Vec<(u32, u32)>,
+    mut decode_context_lens: Vec<u32>,
+    verify_width: u32,
+    appends_join_decodes: bool,
+) -> VllmGlm52DsaAttnLocalWorkletInput {
+    let mut prefills = Vec::with_capacity(prefill_query_cache_pairs.len());
+    for (append, cache) in prefill_query_cache_pairs {
+        if appends_join_decodes && runs_as_decode(cache - append, append) {
+            decode_context_lens.push(cache.max(verify_width));
+        } else {
+            prefills.push((append, cache));
+        }
+    }
+    let prefill_rows: u32 = prefills.iter().map(|&(append, _)| append).sum();
+    let decode_requests = decode_context_lens.len() as u32;
+    let decode = decode_context_lens
+        .iter()
+        .copied()
+        .max()
+        .map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+            batch_size: decode_requests,
+            context_len,
+            context_lens: Some(decode_context_lens),
+            requires_padding: false,
+        });
+    VllmGlm52DsaAttnLocalWorkletInput {
+        num_new_tokens: prefill_rows + decode_requests * verify_width,
+        prefill_query_cache_pairs: prefills,
+        decode,
+    }
+}
+
+/// How a deployment's DSA indexer metadata splits a speculative batch into
+/// decodes and prefills (`DeepseekV32IndexerMetadataBuilder.build` calling
+/// `split_decodes_and_prefills` with `decode_threshold = 1 + k`).
+///
+/// It decides where a one-token append after a cached prefix runs while the
+/// batch also carries `1 + k`-row verifies. The sparse-MLA builder on these
+/// deployments (FlashInfer sparse) does not require uniform decodes, but the
+/// indexer's decode launch is the one the append's context makes expensive,
+/// so the indexer's split decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifyDecodeSplit {
+    /// `require_uniform`: a request whose query length differs from the
+    /// leading verify is a prefill, so the append runs the prefill indexer.
+    /// Fork 4b0cab646 (the GLM-5.2 NVFP4 MTP capture) on B200 without the FP4
+    /// indexer cache (`require_uniform = not use_flattening`).
+    UniformQueryLength,
+    /// Every request with at most `1 + k` query tokens is a decode, so the
+    /// append joins the decodes. Fork 79838a5a18 (the GLM-5.3 NVFP4 DFlash2
+    /// capture) on B200 (`require_uniform = not (use_flattening or
+    /// supports_varlen)`, varlen paged MQA logits on SM100).
+    ByQueryLength,
 }
 
 /// vLLM runs sparse attention as one FlashInfer launch over every token row of
@@ -2433,6 +2504,7 @@ pub(crate) fn normalize_speculative_input(
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
+    verify_decodes: VerifyDecodeSplit,
 ) -> std::result::Result<NormalizedBatch, String> {
     // The compiled tree already assumes a depth. An iteration that drafted a
     // different one would be billed against the wrong measured identities, so
@@ -2486,9 +2558,8 @@ pub(crate) fn normalize_speculative_input(
         let decode_request_count = u32::try_from(group.decode_requests.len())
             .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
         let mut decode_tokens = 0_u32;
-        let mut decode_context = None;
         let mut decode_context_lens = Vec::with_capacity(group.decode_requests.len());
-        let mut uniform_decode_count = 0_u32;
+        let mut ragged_verify_pairs = Vec::new();
         for (request_index, decode) in group.decode_requests.iter().enumerate() {
             // A full verify window runs the uniform `k + 1`-row decode kernels;
             // acceptance truncates the output after this compute, not the
@@ -2507,13 +2578,9 @@ pub(crate) fn normalize_speculative_input(
                 .ok_or_else(|| format!("group {group_index} decode token sum overflows u32"))?;
             endpoint_context_lens.push(decode.kv_len);
             if clipped {
-                prefill_query_cache_pairs.push((decode.query_len, decode.kv_len));
+                ragged_verify_pairs.push((decode.query_len, decode.kv_len));
                 continue;
             }
-            uniform_decode_count += 1;
-            decode_context = Some(
-                decode_context.map_or(decode.kv_len, |current: u32| current.max(decode.kv_len)),
-            );
             decode_context_lens.push(decode.kv_len);
         }
         if group.decode_tokens != decode_tokens {
@@ -2550,15 +2617,18 @@ pub(crate) fn normalize_speculative_input(
             request_count,
             logits_rows,
             endpoint_context_lens,
-            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-                num_new_tokens: batch_tokens,
-                prefill_query_cache_pairs,
-                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                    batch_size: uniform_decode_count,
-                    context_len,
-                    context_lens: Some(decode_context_lens),
-                    requires_padding: false,
-                }),
+            attention_input: {
+                let mut attention = attention_input(
+                    prefill_query_cache_pairs,
+                    decode_context_lens,
+                    draft_tokens + 1,
+                    verify_decodes == VerifyDecodeSplit::ByQueryLength,
+                );
+                for &(query, cache) in &ragged_verify_pairs {
+                    attention.num_new_tokens += query;
+                    attention.prefill_query_cache_pairs.push((query, cache));
+                }
+                attention
             },
         });
     }
@@ -3523,7 +3593,9 @@ mod tests {
         // rows. Billing the output head one row per request -- which is right
         // when a decode step produces one token -- would undercount it by ten.
         let input = speculative_input(5, vec![(3, 2), (0, 3)], vec![64, 91]);
-        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let normalized =
+            normalize_speculative_input(&input, 5, 8_192, VerifyDecodeSplit::UniformQueryLength)
+                .unwrap();
         let group = &normalized.groups[0];
 
         assert_eq!(group.batch_tokens, 5 + 12);
@@ -3554,7 +3626,9 @@ mod tests {
         group.decode_tokens += 2;
         group.batch_tokens += 2;
         group.total_kv_len += 8_189;
-        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let normalized =
+            normalize_speculative_input(&input, 5, 8_192, VerifyDecodeSplit::UniformQueryLength)
+                .unwrap();
         let group = &normalized.groups[0];
 
         assert_eq!(group.batch_tokens, 14);
@@ -3574,7 +3648,9 @@ mod tests {
     #[test]
     fn a_recurrent_draft_pass_forwards_one_row_per_request_at_an_advanced_context() {
         let input = speculative_input(5, vec![(3, 2)], vec![64]);
-        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let normalized =
+            normalize_speculative_input(&input, 5, 8_192, VerifyDecodeSplit::UniformQueryLength)
+                .unwrap();
         // Prefill request holds 5 tokens after its chunk, decode request 64.
         assert_eq!(normalized.groups[0].endpoint_context_lens, vec![5, 64]);
 
@@ -3599,7 +3675,13 @@ mod tests {
     #[test]
     fn speculative_input_must_match_the_depth_the_tree_was_compiled_for() {
         let input = speculative_input(5, vec![], vec![64]);
-        assert!(normalize_speculative_input(&input, 3, 8_192).is_err());
+        assert!(normalize_speculative_input(
+            &input,
+            3,
+            8_192,
+            VerifyDecodeSplit::UniformQueryLength
+        )
+        .is_err());
 
         // A ragged verify row away from max_model_len is not a shape the
         // scheduler produces.
@@ -3607,12 +3689,24 @@ mod tests {
         ragged.groups[0].decode_requests[1].query_len = 4;
         ragged.groups[0].decode_tokens = 10;
         ragged.groups[0].batch_tokens = 10;
-        assert!(normalize_speculative_input(&ragged, 5, 8_192).is_err());
+        assert!(normalize_speculative_input(
+            &ragged,
+            5,
+            8_192,
+            VerifyDecodeSplit::UniformQueryLength
+        )
+        .is_err());
 
         // A request cannot verify further back than it has KV for.
         let mut short = speculative_input(5, vec![], vec![64]);
         short.groups[0].decode_requests[0].kv_len = 5;
-        assert!(normalize_speculative_input(&short, 5, 8_192).is_err());
+        assert!(normalize_speculative_input(
+            &short,
+            5,
+            8_192,
+            VerifyDecodeSplit::UniformQueryLength
+        )
+        .is_err());
     }
 
     #[test]
@@ -3868,5 +3962,30 @@ mod tests {
         };
         let reason = normalize_input(&over, 4, 202_752).unwrap_err();
         assert!(reason.contains("65536 token rows"), "{reason}");
+    }
+
+    /// Catches a one-token append after a cached prefix (a full prefix hit or
+    /// a P/D-transferred request) billed as a prefill, which runs the DSA
+    /// prefill indexer over its whole context.
+    #[test]
+    fn a_one_token_append_after_a_prefix_runs_as_a_decode() {
+        let plain = attention_input(vec![(1, 70_001), (1, 1), (64, 564)], vec![9_000], 1, true);
+        assert_eq!(plain.prefill_query_cache_pairs, [(1, 1), (64, 564)]);
+        let decode = plain.decode.unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_len, 70_001);
+        assert_eq!(decode.context_lens, Some(vec![9_000, 70_001]));
+        assert_eq!(plain.num_new_tokens, 1 + 64 + 2);
+
+        // A varlen verify bills the admitted request a whole uniform row group.
+        let verify = attention_input(vec![(1, 70_001)], vec![9_000], 4, true);
+        assert!(verify.prefill_query_cache_pairs.is_empty());
+        assert_eq!(verify.decode.unwrap().batch_size, 2);
+        assert_eq!(verify.num_new_tokens, 8);
+
+        // A uniform-length verify keeps it a prefill.
+        let uniform = attention_input(vec![(1, 70_001)], vec![9_000], 4, false);
+        assert_eq!(uniform.prefill_query_cache_pairs, [(1, 70_001)]);
+        assert_eq!(uniform.num_new_tokens, 1 + 4);
     }
 }
