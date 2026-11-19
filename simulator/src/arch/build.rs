@@ -2076,9 +2076,12 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         (MoeSharedOverlap::Exposed, Some(path), Some(column)) => {
             Some(MoeSharedPair::load_exposed(path, column)?)
         }
-        (MoeSharedOverlap::Exposed, _, _) => bail!(
-            "moe_shared_overlap: exposed needs moe_shared_pair_file and moe_shared_pair_column"
-        ),
+        (MoeSharedOverlap::Exposed, None, column) => Some(MoeSharedPair::measured_b200_ep8(
+            column.as_deref().unwrap_or(MoeSharedPair::VLLM_FORK),
+        )?),
+        (MoeSharedOverlap::Exposed, Some(_), None) => {
+            bail!("moe_shared_pair_file needs moe_shared_pair_column")
+        }
         (MoeSharedOverlap::Chain, None, None) => None,
         (MoeSharedOverlap::Chain, _, _) => {
             bail!("moe_shared_pair_file / moe_shared_pair_column need moe_shared_overlap: exposed")

@@ -1,0 +1,25 @@
+{
+ "source": "Time the aux-stream shared expert adds to one GLM-5.3-Flash NVFP4 MoE layer on 8x B200 (attention DP8, MoE EP8), us per layer at `rows` tokens per rank: the MoE block's CUDA-graph replay time with the shared expert minus without it, max over the 8 ranks. production: the vLLM fork's routed call and NCCL all-gather / reduce-scatter exchange, shared expert uncapped; mean of 3 alternating passes, Slurm job 21674. fused_cap64_trig: the fused routed-MoE kernel behind the fixed-pattern MNNVL exchange with the dispatch trigger (griddepcontrol.launch_dependents) and a PDL-launched router, shared-expert GEMMs capped at 64 SMs; the capped+triggered block (job 21728, mean of 2 passes) minus the uncapped untriggered block (job 21710, mean of 2 passes), so it folds the trigger's ~1 us launch saving into the term.",
+ "points": [
+  {
+   "rows": 8,
+   "production_us": 8.3,
+   "fused_cap64_trig_us": 4.52
+  },
+  {
+   "rows": 32,
+   "production_us": 8.1,
+   "fused_cap64_trig_us": 6.54
+  },
+  {
+   "rows": 128,
+   "production_us": 9.6,
+   "fused_cap64_trig_us": 5.26
+  },
+  {
+   "rows": 256,
+   "production_us": 17.3,
+   "fused_cap64_trig_us": 6.12
+  }
+ ]
+}

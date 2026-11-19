@@ -229,17 +229,45 @@ pub struct MoeSharedPairPoint {
 }
 
 impl MoeSharedPair {
+    /// The measured 8x B200 EP8 table shipped with the repo
+    /// (`model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json`; its
+    /// `source` says how each column was measured).
+    const MEASURED_B200_EP8: &'static str =
+        include_str!("../../../model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json");
+    /// Column of [`Self::measured_b200_ep8`]: the vLLM fork's MoE block.
+    pub const VLLM_FORK: &'static str = "production";
+    /// Column of [`Self::measured_b200_ep8`]: the fused routed MoE behind the
+    /// triggered fixed-pattern exchange, shared expert capped at 64 SMs.
+    pub const FUSED_CAP64_TRIGGER: &'static str = "fused_cap64_trig";
+
+    /// Column `<column>_us` of the shipped 8x B200 EP8 table.
+    pub fn measured_b200_ep8(column: &str) -> Result<Self> {
+        Self::parse_exposed(
+            "model/glm53_flash_nvfp4_b200_ep8_moe_shared_exposure.json",
+            Self::MEASURED_B200_EP8,
+            column,
+        )
+    }
+
     /// Reads column `<column>_us` of an exposure table
-    /// `{"points": [{"rows", "<column>_us", ...}, ...]}`.
+    /// `{"source"?, "points": [{"rows", "<column>_us", ...}, ...]}`.
     pub fn load_exposed(path: &str, column: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("moe_shared_pair_file {path}: {e}"))?;
+        Self::parse_exposed(path, &text, column)
+    }
+
+    fn parse_exposed(path: &str, text: &str, column: &str) -> Result<Self> {
         let err = |e: String| anyhow::anyhow!("moe_shared_pair_file {path}: {e}");
-        let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Table {
+            /// How the table was measured; not read.
+            #[serde(default, rename = "source")]
+            _source: Option<String>,
             points: Vec<std::collections::BTreeMap<String, f64>>,
         }
-        let table: Table = serde_json::from_str(&text).map_err(|e| err(e.to_string()))?;
+        let table: Table = serde_json::from_str(text).map_err(|e| err(e.to_string()))?;
         let key = format!("{column}_us");
         let points = table
             .points
