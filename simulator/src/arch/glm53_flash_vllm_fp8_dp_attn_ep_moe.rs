@@ -72,9 +72,9 @@ use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
-    self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, AttnKind, Boundary,
-    FfnKind, Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
-    Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
+    self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, replays_full_graph,
+    AttnKind, Boundary, FfnKind, Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant,
+    Glm53FlashVllmConfigs, Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
     SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
 use crate::arch::kv_layout::KvCacheLayout;
@@ -1643,6 +1643,7 @@ fn normalize_input(
                 Glm53DsaAttnLocalWorkletInput {
                     prefill_chunk_pairs: Vec::new(),
                     decode_kv_lens: vec![verify_width],
+                    decode_graph_replay: false,
                 },
             )
         } else {
@@ -1671,6 +1672,14 @@ fn normalize_input(
         let padded = graph_padded_tokens(sorted_capture_sizes, busiest);
         ranks.iter_mut().for_each(|rank| rank.rows = padded);
     }
+    // The ranks agree on one CUDA-graph mode (`coordinate_batch_across_dp`):
+    // a full replay only when every rank holds a uniform decode batch.
+    let full_graph = ranks
+        .iter()
+        .all(|rank| replays_full_graph(sorted_capture_sizes, busiest, &rank.dsa));
+    ranks
+        .iter_mut()
+        .for_each(|rank| rank.dsa.decode_graph_replay = full_graph);
     let kda_groups = if kda_tp_gpus > 1 {
         ranks
             .chunks(usize::from(kda_tp_gpus))

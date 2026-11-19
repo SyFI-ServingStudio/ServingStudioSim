@@ -43,7 +43,7 @@ use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm52_model_cfg::Glm52MtpMode;
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     fit_failed, kv_cache_layout, normalize_speculative_input, Glm52TargetForward,
-    Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch,
+    Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch, VerifyDecodeSplit,
 };
 use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::op::Op;
@@ -437,10 +437,15 @@ impl Glm53VllmNvfp4DsaMoeDflash2Model {
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
-        let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
-            .unwrap_or_else(|reason| {
-                panic!("invalid Glm53VllmNvfp4DsaMoeDflash2Model input: {reason}")
-            });
+        let batch = normalize_speculative_input(
+            input,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::ByQueryLength,
+        )
+        .unwrap_or_else(|reason| {
+            panic!("invalid Glm53VllmNvfp4DsaMoeDflash2Model input: {reason}")
+        });
         self.target.eval(&batch, ev);
         self.draft.eval(&batch, self.draft_tokens, ev);
     }
@@ -448,7 +453,13 @@ impl Glm53VllmNvfp4DsaMoeDflash2Model {
 
 impl SpeculativeUnifiedModel for Glm53VllmNvfp4DsaMoeDflash2Model {
     fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
-        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+        normalize_speculative_input(
+            batch,
+            self.draft_tokens,
+            self.max_model_len,
+            VerifyDecodeSplit::ByQueryLength,
+        )
+        .map(|_| ())
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
