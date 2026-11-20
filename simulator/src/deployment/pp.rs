@@ -235,6 +235,7 @@ impl Deployment for PpDeployment {
                 engine,
                 yoco_keep_tokens,
                 engram_fetch,
+                engram_cpu_threads,
                 ..
             } => {
                 let pipeline = arch_build::deepseek_v41_vllm_pp(
@@ -260,6 +261,7 @@ impl Deployment for PpDeployment {
                         0,
                     )?,
                     *engram_fetch,
+                    *engram_cpu_threads,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

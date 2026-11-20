@@ -784,8 +784,14 @@ pub enum IterArchSel {
         yoco_keep_tokens: u32,
         /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
         #[serde(default)]
-        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "cpu_gather_prefetch", "off"], cache_key)]
+        #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// Host gather threads per rank under `engram_fetch: cpu_threads` /
+        /// `prefetch`; priced at the nearest measured count (1, 2, 4, 8, 14;
+        /// `arch::deepseek_v41_engram_fetch`).
+        #[serde(default = "default_engram_cpu_threads")]
+        #[param(default = 8, cache_key)]
+        engram_cpu_threads: u32,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

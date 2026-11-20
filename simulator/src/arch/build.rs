@@ -1225,6 +1225,7 @@ pub fn deepseek_v41_vllm_pp(
     cut_handoff: deepseek_v41_vllm_pp::CutHandoff,
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     engram_fetch: EngramFetch,
+    engram_cpu_threads: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1263,7 +1264,7 @@ pub fn deepseek_v41_vllm_pp(
         configs.engram_prefetch = None;
     }
     let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
-        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, prefetch),
+        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),
         _ => None,
     };
     let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
@@ -2897,6 +2898,7 @@ pub fn build_iter_model(
             engine,
             yoco_keep_tokens,
             engram_fetch,
+            engram_cpu_threads,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
             *pp_size,
@@ -2920,6 +2922,7 @@ pub fn build_iter_model(
                 0,
             )?,
             *engram_fetch,
+            *engram_cpu_threads,
             gpu,
             name,
             bridge,

@@ -799,6 +799,7 @@ pub fn build_configs(
             weight_dtype: DType::Fp8E4m3,
             gpu_name: gpu.clone(),
             backends: tp_arch::ENGRAM_LOOKUP_BACKENDS.to_vec(),
+            token_scale: 1,
         }),
         head: DeepseekV41HeadTpWorkletConfig {
             tp_size: 1,
@@ -952,6 +953,8 @@ pub struct DeepseekV41VllmPpStageModel {
     engram_hash: Option<Op<ElementwiseKernel>>,
     /// One lookup per Engram layer this stage holds.
     engram_lookups: Vec<Op<EngramLookupKernel>>,
+    /// Lookup tokens per scheduled token (the prefetch config's `token_scale`).
+    engram_lookup_scale: u32,
     layer0: Option<DeepseekV41LayerBody>,
     bodies: Vec<DeepseekV41LayerBody>,
     plan: Vec<PlanNode>,
@@ -1043,6 +1046,7 @@ impl DeepseekV41VllmPpStageModel {
                 true => None,
             },
             engram_lookups,
+            engram_lookup_scale: ctx.engram_prefetch.map_or(1, |p| p.raw_cfg.token_scale),
             layer0: match stage.layer0 {
                 Some(layer0) => Some(DeepseekV41LayerBody::build(name, layer0, bridge)?),
                 None => None,
@@ -1297,7 +1301,9 @@ impl DeepseekV41VllmPpStageModel {
         for lookup in &self.engram_lookups {
             eval_or_zero(
                 lookup,
-                EngramLookupKernelInput { num_tokens: rows },
+                EngramLookupKernelInput {
+                    num_tokens: rows * self.engram_lookup_scale,
+                },
                 zero,
                 ev,
             );
