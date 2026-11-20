@@ -89,6 +89,8 @@ use crate::worklet::{
     DeepseekV41PrologueTpWorkletConfig,
 };
 
+use crate::op::attention::DeepseekV41CandidateRole;
+
 const ARCH_KIND: &str = "deepseek_v41_vllm_pp";
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
@@ -630,6 +632,14 @@ pub fn build_configs(
             "a PP stage holds every expert (EP1): no redundant expert slots",
         ));
     }
+    if parallel.deepinfer.is_some() {
+        // The mega MoE prices each layer from its own routes.
+        for layer in 0..model.num_layers {
+            demand
+                .layer(layer as usize)
+                .map_err(|err| fit_failed(format!("mega MoE demand: {err:#}")))?;
+        }
+    }
     let graphs = DeepseekV41CudaGraphs::new(
         &parallel.cudagraph_capture_sizes,
         tp_arch::MAX_NUM_SEQS,
@@ -641,7 +651,7 @@ pub fn build_configs(
     let stage_layer = |kind: LayerKind, layers: Vec<u32>| {
         let mut config = layer_config(model, &local, demand, kind, layers);
         if let Some(engine) = &parallel.deepinfer {
-            dp_arch::deepinfer_layer(&mut config, engine, max_gpu_tokens);
+            dp_arch::deepinfer_layer(&mut config, model, &kind, engine, max_gpu_tokens);
         }
         config
     };
@@ -684,9 +694,19 @@ pub fn build_configs(
         let mut plan = Vec::new();
         let mut front_nodes = 0;
         for &(start, end) in &segments {
-            let tail: Vec<(u32, LayerKind)> = (start.max(1)..end)
+            let mut tail: Vec<(u32, LayerKind)> = (start.max(1)..end)
                 .map(|layer| (layer, model.layer_kind(layer)))
                 .collect();
+            if parallel.deepinfer.is_some() {
+                // As in the DP arch: a forward's first candidate consumer
+                // builds the sparse schedule the later ones reuse. Each
+                // segment is its own forward on this GPU.
+                if let Some((_, kind)) = tail.iter_mut().find(|(_, kind)| {
+                    kind.attention.candidate == DeepseekV41CandidateRole::Consumer
+                }) {
+                    kind.candidate_metadata = true;
+                }
+            }
             let nodes = index_plan(&fold_layers(&tail), &mut |kind, layers| {
                 bodies.push(stage_layer(kind, layers.to_vec()));
                 bodies.len() - 1
@@ -789,6 +809,9 @@ pub fn build_configs(
             lm_head_backends: tp_arch::LM_HEAD_BACKENDS.to_vec(),
             all_gather_backends: tp_arch::ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: tp_arch::ELEMENTWISE_BACKENDS.to_vec(),
+            mhc_post_backends: parallel
+                .deepinfer
+                .map(|_| dp_arch::DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
         },
         fork_accepts: fork_accepts_lists(model, &lists, rule.is_some()),
         stages,
@@ -1994,6 +2017,8 @@ mod tests {
             num_redundant_experts: 0,
             yoco_keep_tokens: Some(140),
             engram_fetch: false,
+            force_load_balance: false,
+            prefill_chunk_tokens: None,
         };
         let fold = DeepseekV41VllmPpParallel {
             deepinfer: Some(engine),
@@ -2006,8 +2031,20 @@ mod tests {
                 let mega = body.mega.as_ref().expect("every DeepInfer body runs the mega MoE");
                 assert_eq!((mega.ep_size, mega.num_physical_experts), (1, 384));
                 assert_eq!(body.attention.gemm_backends, vec!["deepgemm_mxfp8"]);
+                assert!(body.attention.deepinfer.is_some(), "DeepInfer attention kinds");
             }
         }
+        assert!(cfgs.head.mhc_post_backends.is_some());
+        // Each stage's back segment is its own forward: its first candidate
+        // consumer builds the sparse schedule (24 on GPU0, 32 on GPU1).
+        let metadata: Vec<Vec<u32>> = cfgs
+            .stages
+            .iter()
+            .flat_map(|stage| &stage.bodies)
+            .filter(|body| body.attention.deepinfer.as_ref().unwrap().candidate_metadata)
+            .map(|body| body.layers.clone())
+            .collect();
+        assert_eq!(metadata, [vec![24], vec![32]]);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let model = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();

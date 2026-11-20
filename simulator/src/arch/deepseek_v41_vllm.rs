@@ -1401,7 +1401,7 @@ impl DeepseekV41LayerBody {
             // One GPU is the whole group: its local launches, then the kernel.
             LayerFfn::Mega(mega) => {
                 children.extend(mega.compile_local(builder));
-                children.push(mega.compile_exchange(1, builder));
+                children.push(mega.compile_exchange(builder));
             }
         }
         CostNode::Labeled {

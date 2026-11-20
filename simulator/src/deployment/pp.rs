@@ -256,6 +256,8 @@ impl Deployment for PpDeployment {
                         0,
                         *yoco_keep_tokens,
                         *engram_fetch,
+                        false,
+                        0,
                     )?,
                     *engram_fetch,
                     &gpu_name,
