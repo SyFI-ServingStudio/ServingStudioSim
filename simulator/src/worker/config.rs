@@ -902,6 +902,73 @@ impl ForceScheduleSpec {
     }
 }
 
+/// Squared-lateness ranked prefill order (`prefill_rank.rs`). Flattened into
+/// both chunked selectors; `square_lambda_per_s > 0` turns it on and replaces
+/// `pending_order`, `srpt` and the force-schedule bound. Not vLLM.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, ParamStruct)]
+pub struct SquareCostSpec {
+    /// Penalty per squared second a request's TTFT runs past its bound
+    /// `max(square_d0_ms, square_k * isolated prefill time)` (`0`: off).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    square_lambda_per_s: f64,
+    /// Floor of the bound (ms).
+    #[serde(default)]
+    #[param(default = 10000.0)]
+    square_d0_ms: Option<f64>,
+    /// Multiple of the isolated prefill time in the bound.
+    #[serde(default)]
+    #[param(default = 3.0)]
+    square_k: Option<f64>,
+    /// Prefill throughput of one rank (tokens/s) used for isolated and
+    /// remaining prefill times.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    square_tokens_per_s: f64,
+    /// Pad rule: a chunk that does not finish its request joins a step only
+    /// when its delay weight exceeds the step's finishing count.
+    #[serde(default)]
+    #[param(default = false)]
+    square_pad: bool,
+}
+
+impl SquareCostSpec {
+    /// The rank, `None` when off.
+    pub(crate) fn resolve(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::worker::admission::PrefillRank>> {
+        let lambda = self.square_lambda_per_s;
+        ensure!(
+            lambda.is_finite() && lambda >= 0.0,
+            "{owner}: square_lambda_per_s ({lambda}) must be a finite value >= 0"
+        );
+        if lambda == 0.0 {
+            return Ok(None);
+        }
+        let d0_ms = self.square_d0_ms.unwrap_or(10_000.0);
+        let k = self.square_k.unwrap_or(3.0);
+        let mu = self.square_tokens_per_s;
+        ensure!(
+            d0_ms.is_finite() && d0_ms >= 0.0 && k.is_finite() && k >= 0.0,
+            "{owner}: square_d0_ms ({d0_ms}) and square_k ({k}) must be finite values >= 0"
+        );
+        ensure!(
+            mu.is_finite() && mu > 0.0,
+            "{owner}: square_tokens_per_s ({mu}) must be > 0 when square_lambda_per_s is set"
+        );
+        Ok(Some(crate::worker::admission::PrefillRank::Square(
+            crate::worker::admission::SquareCost {
+                lambda_per_s: lambda,
+                d0_s: d0_ms / 1e3,
+                k,
+                tokens_per_s: mu,
+                pad: self.square_pad,
+            },
+        )))
+    }
+}
+
 const PENDING_ORDER_CHOICES: [&str; 5] = [
     "session-start",
     "fifo",
@@ -1133,6 +1200,9 @@ pub enum IterWorkerSel {
         /// sticky to their rank; see [`PrefixTierSpec`].
         #[serde(flatten)]
         prefix_tiers: PrefixTierSpec,
+        /// Per-rank squared-lateness order; see [`SquareCostSpec`].
+        #[serde(flatten)]
+        square_cost: SquareCostSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -1254,6 +1324,9 @@ pub enum IterWorkerSel {
         /// [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Squared-lateness order; see [`SquareCostSpec`].
+        #[serde(flatten)]
+        square_cost: SquareCostSpec,
         /// Decode runs elsewhere: a request completes at its first token, and
         /// its decode hands the context back, every output but the last
         /// extending the prompt's context in HBM and in the tiers (a round
@@ -1357,40 +1430,51 @@ impl IterWorkerSel {
         owner: &str,
         config: &mut WorkerConfig,
     ) -> Result<()> {
-        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, state_retention, pipelined) =
-            match self {
-                Self::ChunkedPrefill {
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    ..
-                } => (
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    false,
-                ),
-                Self::PipelineChunkedPrefill {
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    ..
-                } => (
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    true,
-                ),
-                _ => return Ok(()),
-            };
+        let (
+            max_batch_tokens,
+            srpt,
+            microbatch_budget,
+            force_schedule,
+            state_retention,
+            square_cost,
+            pipelined,
+        ) = match self {
+            Self::ChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                false,
+            ),
+            Self::PipelineChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                true,
+            ),
+            _ => return Ok(()),
+        };
         config.microbatch_budget =
             microbatch_budget.resolve(owner, *max_batch_tokens, pipelined)?;
         config.started_order = if *srpt {
@@ -1401,6 +1485,14 @@ impl IterWorkerSel {
         config.force_schedule = force_schedule.resolve(owner, *srpt)?;
         config.state_retention = state_retention.resolve(owner)?;
         config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
+        config.prefill_rank = square_cost.resolve(owner)?;
+        if config.prefill_rank.is_some() {
+            ensure!(
+                config.force_schedule.is_none(),
+                "{owner}: square_lambda_per_s replaces force_schedule_after_ms; set one"
+            );
+            config.started_order = StartedOrder::Ranked;
+        }
         Ok(())
     }
 

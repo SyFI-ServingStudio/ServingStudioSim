@@ -16,6 +16,7 @@ mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod prefill_rank;
 mod read_wait;
 mod started_order;
 mod token_budget;
@@ -38,6 +39,7 @@ pub use policy::{
     PendingOrder, PendingOrderKind, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub use prefill_rank::{PrefillRank, SquareCost};
 pub use read_wait::{ReadWait, ReadWaitPolicy};
 pub use started_order::StartedOrder;
 pub(crate) use token_budget::prefill_fits_budget;

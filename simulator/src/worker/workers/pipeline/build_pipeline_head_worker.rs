@@ -148,6 +148,9 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
     if let Some(schedule) = config.force_schedule {
         admission = admission.with_force_schedule(schedule);
     }
+    if let Some(rank) = config.prefill_rank {
+        admission = admission.with_prefill_rank(rank);
+    }
     if let Some(read_wait) = config.prefix_tier_read_wait {
         admission = admission.with_read_wait(read_wait);
     }
@@ -156,15 +159,14 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
     }
     if let Some(spec) = config.back_batching {
         let probe = back_probe.expect("back batching on a pipeline needs the pipeline's probe");
-        admission =
-            admission.with_back_stash(BackStash::new(
-                spec,
-                stage_model
-                    .back_pass_window()
-                    .unwrap_or_else(|| back_window(kv_cache_layout)),
-                1,
-                probe,
-            ));
+        admission = admission.with_back_stash(BackStash::new(
+            spec,
+            stage_model
+                .back_pass_window()
+                .unwrap_or_else(|| back_window(kv_cache_layout)),
+            1,
+            probe,
+        ));
     }
 
     let head = PipelineHeadWorker::from_components(

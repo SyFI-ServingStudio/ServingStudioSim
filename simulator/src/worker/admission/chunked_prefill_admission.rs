@@ -51,8 +51,9 @@ use super::external_decode::ExternalDecode;
 use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::{MicrobatchBudget, PrefillSplit};
 use super::policy::{ForceSchedule, Queued};
+use super::prefill_rank::{PrefillRank, Rank};
 use super::read_wait::ReadWait;
-use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
+use super::started_order::{Admitted, FillPrefillBudget, FreshGate, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
@@ -399,6 +400,16 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         self
     }
 
+    /// Order every partition's started and queued prompts by `rank`. Not vLLM.
+    pub(crate) fn with_prefill_rank(mut self, rank: PrefillRank) -> Self {
+        self.partition_policies = std::mem::take(&mut self.partition_policies)
+            .into_iter()
+            .map(|(policy, context)| (policy.with_rank(rank), context))
+            .collect();
+        self.started_order = StartedOrder::Ranked;
+        self
+    }
+
     /// `partition`'s prefill backlog: its started prompts' unscheduled tokens
     /// plus its queued prompts' tokens, before any prefix hit.
     fn partition_backlog_tokens<K: ChunkedPrefillKv>(&self, kv_store: &K, partition: usize) -> u64 {
@@ -673,6 +684,22 @@ where
             .splits_by_class()
     }
 
+    fn rank_of(
+        &self,
+        partition: u16,
+        request: RequestId,
+        remaining: u32,
+        now: Time,
+    ) -> Option<Rank> {
+        self.partition_policies[usize::from(partition)]
+            .0
+            .rank_of(request, remaining, now)
+    }
+
+    fn pads(&self, partition: u16) -> bool {
+        self.partition_policies[usize::from(partition)].0.pads()
+    }
+
     fn started_prefills_mut(&mut self, partition: u16) -> &mut Vec<AdmissionCandidate> {
         &mut self.started_prefills[usize::from(partition)]
     }
@@ -687,7 +714,8 @@ where
         budget: u32,
         now: Time,
         gate: FreshGate,
-    ) -> u32 {
+    ) -> Admitted {
+        let mut finished = 0;
         let bounded_config = self.bounded_config();
         let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
         let query_width = self.decode_completion.query_tokens_per_request();
@@ -730,9 +758,15 @@ where
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
+            // A landed read goes first, whatever the rank.
+            let head_rank = match source {
+                FreshSource::Landed => None,
+                FreshSource::Queued(_) => policy.head_rank(),
+            };
             if !gate.admits(
                 source == FreshSource::Queued(Queued::Pending),
                 resolved_prefill.remaining_prefill_tokens(),
+                head_rank,
             ) {
                 break;
             }
@@ -745,7 +779,14 @@ where
                 self.chunk_end_alignment,
                 self.max_batch_tokens,
             );
-            if chunk_tokens == 0 {
+            if chunk_tokens == 0
+                || gate.pads_out(
+                    finished,
+                    chunk_tokens,
+                    resolved_prefill.remaining_prefill_tokens(),
+                    head_rank,
+                )
+            {
                 break;
             }
             let footprint = match bounded_config {
@@ -818,11 +859,16 @@ where
             remaining_budget -= chunk_tokens + drafting_slots;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
                 self.started_prefills[partition_index].push(candidate);
+            } else {
+                finished += 1;
             }
         }
         let (policy, policy_context) = &mut self.partition_policies[partition_index];
         FreshReads::return_passed_over(policy, policy_context, passed_over);
-        budget - remaining_budget
+        Admitted {
+            taken: budget - remaining_budget,
+            finished,
+        }
     }
 
     fn schedule_started_chunk(

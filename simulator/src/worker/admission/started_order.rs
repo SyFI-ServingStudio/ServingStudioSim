@@ -12,6 +12,9 @@
 //! ones, then started ones by arrival. While the queue splits by cost class
 //! (`HitsFirst`), srpt runs that order once per class, hits (a context held in
 //! HBM or a tier) before misses ([`FillPrefillBudget::fill_prefill_by_class`]).
+//! Under [`StartedOrder::Ranked`] one time-varying key (`prefill_rank.rs`)
+//! orders started and queued prompts alike, optionally with the pad rule on
+//! chunks that do not finish their request.
 //!
 //! One partition at a time. The pipeline head (one partition) and the
 //! whole-iteration chunked-prefill lifecycle (one per attention DP rank, each
@@ -23,6 +26,7 @@ use crate::worker::kv::ChunkedPrefillKv;
 use crate::worker::shared::context::WorkerContext;
 
 use super::policy::QueueAccess;
+use super::prefill_rank::Rank;
 use super::AdmissionCandidate;
 
 /// Started-prompt order of a chunked-prefill lifecycle.
@@ -33,6 +37,9 @@ pub enum StartedOrder {
     StartOrder,
     /// Shortest remaining prefill first across started and queued prompts.
     ShortestRemaining,
+    /// Smallest rank key first across started and queued prompts; the pending
+    /// queue must be in ranked mode (`Deadline::with_rank`).
+    Ranked,
 }
 
 /// Started prompts with their sort key.
@@ -46,6 +53,27 @@ pub(super) struct FreshGate {
     pub(super) queues: QueueAccess,
     /// A pending prompt with more prefill tokens left stops the pass.
     pub(super) no_longer_than: Option<u32>,
+    /// Ranked mode; see [`RankedGate`].
+    pub(super) ranked: Option<RankedGate>,
+}
+
+/// Ranked mode's gate: queued prompts with a key of at most `bound`. With
+/// `finished` (the pad rule), the number of requests the step already
+/// finishes: a prompt whose chunk would not finish it and whose weight is at
+/// most the step's finishing count stops the pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RankedGate {
+    pub(super) bound: u64,
+    pub(super) finished: Option<u32>,
+}
+
+/// What one fresh-admission pass took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Admitted {
+    /// Budget taken.
+    pub taken: u32,
+    /// Admitted prompts whose whole prefill is in this step.
+    pub finished: u32,
 }
 
 impl FreshGate {
@@ -58,6 +86,15 @@ impl FreshGate {
         Self {
             queues,
             no_longer_than: None,
+            ranked: None,
+        }
+    }
+
+    /// Ranked mode: every queued request, keyed (see [`RankedGate`]).
+    pub(super) const fn ranked(bound: u64, finished: Option<u32>) -> Self {
+        Self {
+            ranked: Some(RankedGate { bound, finished }),
+            ..Self::ANY
         }
     }
 
@@ -70,9 +107,36 @@ impl FreshGate {
     }
 
     /// Whether the pass may take a queued head with `remaining` prefill
-    /// tokens; `pending`: it comes from the pending order.
-    pub(super) fn admits(self, pending: bool, remaining: u32) -> bool {
+    /// tokens; `pending`: it comes from the pending order. `head` is the
+    /// queued head's rank in ranked mode.
+    pub(super) fn admits(self, pending: bool, remaining: u32, head: Option<Rank>) -> bool {
+        if let Some(ranked) = self.ranked {
+            return head.is_none_or(|rank| rank.key <= ranked.bound);
+        }
         !pending || self.no_longer_than.is_none_or(|bound| remaining <= bound)
+    }
+
+    /// Whether the pad rule refuses a chunk of `chunk_tokens` out of
+    /// `remaining` for a head of rank `head`, `finished_now` prompts into this
+    /// pass.
+    pub(super) fn pads_out(
+        self,
+        finished_now: u32,
+        chunk_tokens: u32,
+        remaining: u32,
+        head: Option<Rank>,
+    ) -> bool {
+        let Some(RankedGate {
+            finished: Some(before),
+            ..
+        }) = self.ranked
+        else {
+            return false;
+        };
+        let finishing = before + finished_now;
+        chunk_tokens < remaining
+            && finishing > 0
+            && head.map_or(1.0, |rank| rank.weight) <= f64::from(finishing)
     }
 }
 
@@ -90,11 +154,23 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
     /// (`Deadline::splits_by_class`).
     fn splits_by_class(&self, partition: u16) -> bool;
 
+    /// Ranked mode: the rank of `request` with `remaining` prefill tokens at `now`.
+    fn rank_of(
+        &self,
+        partition: u16,
+        request: crate::common::RequestId,
+        remaining: u32,
+        now: Time,
+    ) -> Option<Rank>;
+
+    /// Ranked mode with the pad rule on.
+    fn pads(&self, partition: u16) -> bool;
+
     /// `partition`'s started prompts, in start order.
     fn started_prefills_mut(&mut self, partition: u16) -> &mut Vec<AdmissionCandidate>;
 
     /// Admit queued prompts into `budget` as `gate` allows. An admitted prompt
-    /// that does not finish joins the started list. Returns the budget taken.
+    /// that does not finish joins the started list.
     #[allow(clippy::too_many_arguments)]
     fn admit_fresh_prompts(
         &mut self,
@@ -105,7 +181,7 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
         budget: u32,
         now: Time,
         gate: FreshGate,
-    ) -> u32;
+    ) -> Admitted;
 
     /// Schedule `candidate`'s next chunk within `budget`; returns the chunk's
     /// tokens and the budget it took (`(0, 0)`: it cannot run now).
@@ -163,6 +239,74 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
                 *self.started_prefills_mut(partition) = started;
                 self.fill_prefill_by_class(kv_store, context, partition, step, budget, now);
             }
+            StartedOrder::Ranked => {
+                let pads = self.pads(partition);
+                let gate = |bound, finished| FreshGate::ranked(bound, pads.then_some(finished));
+                let mut keyed: Vec<(Rank, AdmissionCandidate)> = started
+                    .into_iter()
+                    .map(|candidate| {
+                        let remaining = remaining_of(kv_store, &candidate);
+                        let rank = self
+                            .rank_of(partition, candidate.request_id, remaining, now)
+                            .unwrap_or(Rank {
+                                key: u64::from(remaining),
+                                weight: 1.0,
+                            });
+                        (rank, candidate)
+                    })
+                    .collect();
+                keyed.sort_by_key(|(rank, _)| rank.key);
+                let mut finished = 0;
+                for (rank, candidate) in keyed {
+                    let remaining = remaining_of(kv_store, &candidate);
+                    if budget > 0 {
+                        let admitted = self.admit_fresh_prompts(
+                            kv_store,
+                            context,
+                            partition,
+                            step,
+                            budget,
+                            now,
+                            gate(rank.key, finished),
+                        );
+                        budget -= admitted.taken;
+                        finished += admitted.finished;
+                    }
+                    // The started chunk is bounded by the budget; whether it
+                    // finishes is judged on the remaining tokens.
+                    if gate(rank.key, finished).pads_out(
+                        0,
+                        remaining.min(budget),
+                        remaining,
+                        Some(rank),
+                    ) {
+                        still_started.push(candidate);
+                        continue;
+                    }
+                    let (chunk_tokens, charged) =
+                        self.schedule_started_chunk(kv_store, partition, candidate, budget);
+                    budget -= charged;
+                    if chunk_tokens < remaining {
+                        still_started.push(candidate);
+                    } else {
+                        finished += 1;
+                    }
+                }
+                if budget > 0 {
+                    self.admit_fresh_prompts(
+                        kv_store,
+                        context,
+                        partition,
+                        step,
+                        budget,
+                        now,
+                        gate(u64::MAX, finished),
+                    );
+                }
+                let admitted_now = self.started_prefills_mut(partition);
+                still_started.append(admitted_now);
+                *admitted_now = still_started;
+            }
             StartedOrder::ShortestRemaining => {
                 let mut keyed: Vec<(bool, u64, AdmissionCandidate)> = {
                     let store = context.requests.borrow();
@@ -184,28 +328,32 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
                 };
                 keyed.sort_by_key(|&(not_overdue, key, _)| (not_overdue, key));
                 if budget > 0 {
-                    budget -= self.admit_fresh_prompts(
-                        kv_store,
-                        context,
-                        partition,
-                        step,
-                        budget,
-                        now,
-                        FreshGate::OVERDUE,
-                    );
-                }
-                for (not_overdue, _, candidate) in keyed {
-                    let remaining = remaining_of(kv_store, &candidate);
-                    if not_overdue && budget > 0 {
-                        budget -= self.admit_fresh_prompts(
+                    budget -= self
+                        .admit_fresh_prompts(
                             kv_store,
                             context,
                             partition,
                             step,
                             budget,
                             now,
-                            FreshGate::ANY.no_longer_than(remaining),
-                        );
+                            FreshGate::OVERDUE,
+                        )
+                        .taken;
+                }
+                for (not_overdue, _, candidate) in keyed {
+                    let remaining = remaining_of(kv_store, &candidate);
+                    if not_overdue && budget > 0 {
+                        budget -= self
+                            .admit_fresh_prompts(
+                                kv_store,
+                                context,
+                                partition,
+                                step,
+                                budget,
+                                now,
+                                FreshGate::ANY.no_longer_than(remaining),
+                            )
+                            .taken;
                     }
                     let (chunk_tokens, charged) =
                         self.schedule_started_chunk(kv_store, partition, candidate, budget);
@@ -291,15 +439,17 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
                 (FreshGate::OVERDUE, FreshGate::of(QueueAccess::Pending))
             };
             if budget > 0 {
-                budget -= self.admit_fresh_prompts(
-                    kv_store,
-                    context,
-                    partition,
-                    step,
-                    budget,
-                    now,
-                    overdue_gate,
-                );
+                budget -= self
+                    .admit_fresh_prompts(
+                        kv_store,
+                        context,
+                        partition,
+                        step,
+                        budget,
+                        now,
+                        overdue_gate,
+                    )
+                    .taken;
             }
             for (is_overdue, (_, candidate)) in overdue
                 .into_iter()
@@ -308,15 +458,17 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
             {
                 let remaining = remaining_of(kv_store, &candidate);
                 if !is_overdue && budget > 0 {
-                    budget -= self.admit_fresh_prompts(
-                        kv_store,
-                        context,
-                        partition,
-                        step,
-                        budget,
-                        now,
-                        pending_gate.no_longer_than(remaining),
-                    );
+                    budget -= self
+                        .admit_fresh_prompts(
+                            kv_store,
+                            context,
+                            partition,
+                            step,
+                            budget,
+                            now,
+                            pending_gate.no_longer_than(remaining),
+                        )
+                        .taken;
                 }
                 let (chunk_tokens, charged) =
                     self.schedule_started_chunk(kv_store, partition, candidate, budget);
@@ -326,15 +478,17 @@ pub(super) trait FillPrefillBudget<K: ChunkedPrefillKv> {
                 }
             }
             if budget > 0 {
-                budget -= self.admit_fresh_prompts(
-                    kv_store,
-                    context,
-                    partition,
-                    step,
-                    budget,
-                    now,
-                    pending_gate,
-                );
+                budget -= self
+                    .admit_fresh_prompts(
+                        kv_store,
+                        context,
+                        partition,
+                        step,
+                        budget,
+                        now,
+                        pending_gate,
+                    )
+                    .taken;
             }
         }
         let admitted_now = self.started_prefills_mut(partition);

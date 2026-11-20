@@ -113,6 +113,9 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(schedule) => admission.with_force_schedule(schedule),
         None => admission,
     };
+    if let Some(rank) = config.prefill_rank {
+        admission = admission.with_prefill_rank(rank);
+    }
     if !config.prefix_tiers.is_empty() || config.external_decode {
         admission = admission.with_sticky_sessions();
     }

@@ -597,6 +597,8 @@ pub struct WorkerConfig {
     /// Pipeline back batching: dispatch each back pass as its own unit
     /// (virtual stages) instead of inside the front's stage steps.
     pub pipeline_split_back: bool,
+    /// Ranked prefill order (`square_*` options); `None`: off.
+    pub prefill_rank: Option<crate::worker::admission::PrefillRank>,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -684,6 +686,7 @@ impl Default for WorkerConfig {
             back_batching: None,
             pipeline_extra_in_flight: 0,
             pipeline_split_back: false,
+            prefill_rank: None,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,

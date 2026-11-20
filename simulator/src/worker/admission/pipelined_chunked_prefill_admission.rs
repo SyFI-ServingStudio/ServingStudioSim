@@ -70,7 +70,8 @@ use super::fresh_reads::{AtHead, FreshReads, FreshSource};
 use super::microbatch_budget::MicrobatchBudget;
 use super::policy::{ForceSchedule, Queued};
 use super::read_wait::ReadWait;
-use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
+use super::prefill_rank::{PrefillRank, Rank};
+use super::started_order::{Admitted, FillPrefillBudget, FreshGate, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy,
 };
@@ -232,6 +233,13 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
+    /// Order started and queued prompts by `rank`. Not vLLM.
+    pub(crate) fn with_prefill_rank(mut self, rank: PrefillRank) -> Self {
+        self.policy = self.policy.with_rank(rank);
+        self.started_order = StartedOrder::Ranked;
+        self
+    }
+
     /// End every non-final chunk on a checkpoint boundary of `alignment`.
     pub(crate) fn with_chunk_end_alignment(mut self, alignment: ChunkEndAlignment) -> Self {
         assert!(alignment.quantum > 0, "chunk-end quantum must be positive");
@@ -279,6 +287,20 @@ where
         self.policy.splits_by_class()
     }
 
+    fn rank_of(
+        &self,
+        _partition: u16,
+        request: RequestId,
+        remaining: u32,
+        now: Time,
+    ) -> Option<Rank> {
+        self.policy.rank_of(request, remaining, now)
+    }
+
+    fn pads(&self, _partition: u16) -> bool {
+        self.policy.pads()
+    }
+
     fn started_prefills_mut(&mut self, _partition: u16) -> &mut Vec<AdmissionCandidate> {
         &mut self.started_prefills
     }
@@ -292,7 +314,8 @@ where
         budget: u32,
         now: Time,
         gate: FreshGate,
-    ) -> u32 {
+    ) -> Admitted {
+        let mut finished = 0;
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
         let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
@@ -326,9 +349,15 @@ where
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
+            // A landed read goes first, whatever the rank.
+            let head_rank = match source {
+                FreshSource::Landed => None,
+                FreshSource::Queued(_) => policy.head_rank(),
+            };
             if !gate.admits(
                 source == FreshSource::Queued(Queued::Pending),
                 resolved_prefill.remaining_prefill_tokens(),
+                head_rank,
             ) {
                 break;
             }
@@ -338,7 +367,14 @@ where
                 self.chunk_end_alignment,
                 self.max_batch_tokens,
             );
-            if chunk_tokens == 0 {
+            if chunk_tokens == 0
+                || gate.pads_out(
+                    finished,
+                    chunk_tokens,
+                    resolved_prefill.remaining_prefill_tokens(),
+                    head_rank,
+                )
+            {
                 break;
             }
             let footprint = kv_store.footprint(
@@ -369,10 +405,15 @@ where
             remaining_budget -= chunk_tokens;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
                 self.started_prefills.push(candidate);
+            } else {
+                finished += 1;
             }
         }
         FreshReads::return_passed_over(policy, policy_context, passed_over);
-        budget - remaining_budget
+        Admitted {
+            taken: budget - remaining_budget,
+            finished,
+        }
     }
 
     fn schedule_started_chunk(
@@ -543,14 +584,12 @@ where
                 let resolved = kv_store.resolved_prefill_context(request);
                 let (prefix, chunk) = resolved.active_chunk();
                 let finishes = chunk == resolved.remaining_prefill_tokens();
-                if let Some((prefix, rows)) =
-                    stash.chunk_entry(
+                if let Some((prefix, rows)) = stash.chunk_entry(
                     prefix,
                     chunk,
                     resolved.resident_prefix_tokens(),
                     prefix + resolved.remaining_prefill_tokens(),
-                )
-                {
+                ) {
                     ticket.back_entries.push(BackEntry {
                         group: 0,
                         prefix,

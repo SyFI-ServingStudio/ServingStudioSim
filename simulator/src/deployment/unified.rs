@@ -1504,6 +1504,7 @@ mod tests {
             external_decode: false,
             state_retention: Default::default(),
             prefix_tiers: Default::default(),
+            square_cost: Default::default(),
         }
     }
 

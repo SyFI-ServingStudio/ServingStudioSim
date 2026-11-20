@@ -33,7 +33,7 @@ use crate::schema::ParamDef;
 use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
 use crate::worker::config::{
     AttnWorkerSel, FfnWorkerSel, ForceScheduleSpec, IterWorkerSel, KvAccountingSpec,
-    KvAdmissionSpec, MicrobatchBudgetSpec, PrefixTierSpec, StateRetentionSpec,
+    KvAdmissionSpec, MicrobatchBudgetSpec, PrefixTierSpec, SquareCostSpec, StateRetentionSpec,
 };
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -93,6 +93,7 @@ pub fn list_params() -> Value {
                         ("chunked_prefill", ForceScheduleSpec::PARAMS),
                         ("chunked_prefill", StateRetentionSpec::PARAMS),
                         ("chunked_prefill", PrefixTierSpec::PARAMS),
+                        ("chunked_prefill", SquareCostSpec::PARAMS),
                         ("speculative", KvAccountingSpec::PARAMS),
                         ("speculative", KvAdmissionSpec::PARAMS),
                         ("pipeline_chunked_prefill", KvAccountingSpec::PARAMS),
@@ -100,6 +101,7 @@ pub fn list_params() -> Value {
                         ("pipeline_chunked_prefill", ForceScheduleSpec::PARAMS),
                         ("pipeline_chunked_prefill", StateRetentionSpec::PARAMS),
                         ("pipeline_chunked_prefill", PrefixTierSpec::PARAMS),
+                        ("pipeline_chunked_prefill", SquareCostSpec::PARAMS),
                         ("pd_prefill", KvAccountingSpec::PARAMS),
                         ("pd_decode", KvAccountingSpec::PARAMS),
                     ],
@@ -357,6 +359,8 @@ mod tests {
                 "force_schedule_after_ms",
                 "force_schedule_hits_first",
                 "force_schedule_hits_first_when_at_risk",
+                "square_lambda_per_s",
+                "square_pad",
             ] {
                 assert_eq!(
                     params.iter().filter(|param| param["name"] == name).count(),
