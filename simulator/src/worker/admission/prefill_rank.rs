@@ -17,6 +17,23 @@
 //! the step, a non-finishing chunk of a request with weight `w` is worth adding
 //! only when `w > n` (it advances that request by as much as it delays each of
 //! the `n`).
+//!
+//! [`SquareCost`] keeps the queue in keys that do not change with time, so a
+//! formation costs O(log n) in the queue length, never a pass over the queue.
+//! A queued request has not started, so its remaining tokens are its size and
+//! its lateness starts at a fixed instant, `arrival + tau - size / mu`
+//! ([`SquareCost::late_at`]). Until then its key is its size (shortest first);
+//! from then on it is in the late tier, earliest deadline (`arrival + tau`)
+//! first. The head is whichever tier head has the smaller index key, the late
+//! head's computed at the formation. Once late, a request's cost is in its
+//! convex part; when many are late at once (a backlog), spreading the
+//! lateness by deadline costs less than the index, which keeps passing the
+//! small late requests ahead of the larger late ones: each such swap is right
+//! for the pair, but under a lasting backlog the larger request's work is only
+//! deferred, not avoided (TraceLab v3.1, fold, warm-up backlog: 16-100k
+//! requests waited 49 s and >= 100k 213 s under the index, 15 s for every class
+//! under fcfs). Started prompts (at most the worker's sequence limit) are keyed
+//! by the index at each formation.
 
 use crate::common::Time;
 
@@ -39,6 +56,19 @@ impl SquareCost {
     /// Lateness bound of a request with `size` prefill tokens (s).
     pub fn tau_s(&self, size: u32) -> f64 {
         self.d0_s.max(self.k * f64::from(size) / self.tokens_per_s)
+    }
+
+    /// When a queued request (nothing computed yet) starts to project past
+    /// its bound: `arrival + tau - size / mu`.
+    pub fn late_at(&self, size: u32, arrival: Time) -> Time {
+        Time::from_s(
+            (arrival.as_s() + self.tau_s(size) - f64::from(size) / self.tokens_per_s).max(0.0),
+        )
+    }
+
+    /// The request's deadline, `arrival + tau`.
+    pub fn due(&self, size: u32, arrival: Time) -> Time {
+        Time::from_s(arrival.as_s() + self.tau_s(size))
     }
 
     /// Marginal cost of delay, `1 + 2 * lambda * projected lateness`.
@@ -108,6 +138,15 @@ mod tests {
                 weight: 1.0
             }
         );
+    }
+
+    #[test]
+    fn a_queued_request_turns_late_when_its_projected_finish_passes_tau() {
+        // 600k at 100k tok/s: tau = max(10, 18) = 18 s, 6 s of work: late from
+        // 12 s, due at 18 s; 1k: tau 10 s, late from 9.99 s.
+        assert_eq!(COST.late_at(600_000, Time::ZERO), Time::from_s(12.0));
+        assert_eq!(COST.due(600_000, Time::ZERO), Time::from_s(18.0));
+        assert_eq!(COST.late_at(1_000, Time::from_s(5.0)), Time::from_s(14.99));
     }
 
     #[test]

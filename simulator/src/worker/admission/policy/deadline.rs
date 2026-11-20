@@ -10,10 +10,12 @@
 //! each formation; `PendingOrderPolicy` itself is unchanged. Without a bound the
 //! wrapper forwards every call to the inner order.
 //!
-//! Ranked mode ([`Deadline::with_rank`], not vLLM) replaces both orders: every
-//! queued request is keyed by a [`PrefillRank`] that changes with time, so
-//! `promote(now)` re-keys and sorts the whole queue, and the wrapper offers the
-//! smallest key. Nothing is overdue in this mode; lateness is in the key.
+//! Ranked mode ([`Deadline::with_rank`], not vLLM) replaces both orders with a
+//! [`PrefillRank`] (see `prefill_rank`): queued requests sit in ordered maps
+//! under keys that do not change with time, `promote(now)` moves only the
+//! requests that turned late since the last call, and the head is the better of
+//! two map heads, so every operation is O(log n) in the queue length. Nothing
+//! is overdue in this mode; the head is offered as the overdue (miss) head.
 //!
 //! Only requests entered through [`Deadline::push_arrived`] carry an arrival and
 //! can become overdue; a request pushed back through the trait (a retraction)
@@ -34,7 +36,7 @@
 //! compute ([`Deadline::at_risk_horizon`]) and each session's latest queued
 //! request ([`Deadline::queued_in_session`]).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::common::{RequestId, SessionInput, Time};
 
@@ -94,14 +96,141 @@ pub enum Queued {
     Pending,
 }
 
+/// Map key: (time-free key, enqueue sequence).
+type Slot = (u64, u64);
+
+/// A queued request in ranked mode.
+struct RankedItem {
+    candidate: AdmissionCandidate,
+    arrival: Time,
+    size: u32,
+    /// Its slots in `Ranked::waiting` and `Ranked::onset` until it turns
+    /// late, then in `Ranked::late`.
+    waiting: Option<Slot>,
+    onset: Option<Slot>,
+    late: Option<Slot>,
+}
+
 /// Ranked-mode state.
 struct Ranked {
     rank: PrefillRank,
     /// Arrival and prefill size of every request entered with an arrival; read
     /// for started prompts too, so entries outlive the queue.
     entries: HashMap<RequestId, (Time, u32)>,
-    /// Ranks of `overdue`'s requests, same order.
-    ranks: VecDeque<Rank>,
+    /// The queue, by request.
+    queued: HashMap<RequestId, RankedItem>,
+    /// Not (yet) late, by size.
+    waiting: BTreeMap<Slot, RequestId>,
+    /// `waiting`'s requests by the instant they turn late.
+    onset: BTreeMap<Slot, RequestId>,
+    /// Late requests by deadline.
+    late: BTreeMap<Slot, RequestId>,
+    /// The last `promote`'s time, at which the late head is ranked.
+    now: Time,
+}
+
+fn ns(time: Time) -> u64 {
+    time.as_ns()
+}
+
+impl Ranked {
+    fn new(rank: PrefillRank) -> Self {
+        Self {
+            rank,
+            entries: HashMap::new(),
+            queued: HashMap::new(),
+            waiting: BTreeMap::new(),
+            onset: BTreeMap::new(),
+            late: BTreeMap::new(),
+            now: Time::ZERO,
+        }
+    }
+
+    fn rank_of(&self, item: &RankedItem) -> Rank {
+        self.rank.rank(item.size, item.arrival, item.size, self.now)
+    }
+
+    /// The head of the queue and its rank: the smaller index key of the two
+    /// tier heads (the late one on a tie).
+    fn head(&self) -> Option<(RequestId, Rank)> {
+        let of =
+            |(_, &request): (&Slot, &RequestId)| (request, self.rank_of(&self.queued[&request]));
+        let waiting = self.waiting.first_key_value().map(of);
+        let late = self.late.first_key_value().map(of);
+        match (waiting, late) {
+            (Some(w), Some(l)) => Some(if w.1.key < l.1.key { w } else { l }),
+            (w, l) => l.or(w),
+        }
+    }
+
+    fn insert(&mut self, candidate: AdmissionCandidate) {
+        let size = prefill_size(&candidate);
+        let (arrival, size) = *self
+            .entries
+            .entry(candidate.request_id)
+            .or_insert((self.now, size));
+        let request = candidate.request_id;
+        let seq = candidate.enqueue_sequence;
+        let mut item = RankedItem {
+            candidate,
+            arrival,
+            size,
+            waiting: None,
+            onset: None,
+            late: None,
+        };
+        let PrefillRank::Square(cost) = self.rank;
+        if cost.late_at(size, arrival) <= self.now {
+            let slot = (ns(cost.due(size, arrival)), seq);
+            item.late = Some(slot);
+            self.late.insert(slot, request);
+        } else {
+            let waiting = (u64::from(size), seq);
+            let onset = (ns(cost.late_at(size, arrival)), seq);
+            item.waiting = Some(waiting);
+            item.onset = Some(onset);
+            self.waiting.insert(waiting, request);
+            self.onset.insert(onset, request);
+        }
+        self.queued.insert(request, item);
+    }
+
+    fn take(&mut self, request: RequestId) -> Option<AdmissionCandidate> {
+        let item = self.queued.remove(&request)?;
+        if let Some(slot) = item.waiting {
+            self.waiting.remove(&slot);
+        }
+        if let Some(slot) = item.onset {
+            self.onset.remove(&slot);
+        }
+        if let Some(slot) = item.late {
+            self.late.remove(&slot);
+        }
+        Some(item.candidate)
+    }
+
+    /// Move the requests that turned late by `now` to the late tier.
+    fn advance(&mut self, now: Time) {
+        self.now = self.now.max(now);
+        let PrefillRank::Square(cost) = self.rank;
+        while let Some((&slot, &request)) = self.onset.first_key_value() {
+            if slot.0 > ns(self.now) {
+                break;
+            }
+            self.onset.remove(&slot);
+            let item = self
+                .queued
+                .get_mut(&request)
+                .expect("onset entries are queued");
+            item.onset = None;
+            if let Some(waiting) = item.waiting.take() {
+                self.waiting.remove(&waiting);
+            }
+            let late = (ns(cost.due(item.size, item.arrival)), slot.1);
+            item.late = Some(late);
+            self.late.insert(late, request);
+        }
+    }
 }
 
 /// Prefill tokens to compute for a queued candidate (as `JobSize::PrefillTokens`).
@@ -133,7 +262,7 @@ pub struct Deadline<P> {
     /// Inner requests a [`QueueAccess::PendingHits`] pass went past; empty
     /// between passes.
     set_aside: Vec<AdmissionCandidate>,
-    /// Ranked mode: every queued request is in `overdue`, smallest key first.
+    /// Ranked mode: the queue, in place of `inner` and the bound.
     ranked: Option<Ranked>,
 }
 
@@ -193,11 +322,7 @@ impl<P> Deadline<P> {
 
     /// Rank every request by `rank` instead of `inner`'s order and the bound.
     pub fn with_rank(mut self, rank: PrefillRank) -> Self {
-        self.ranked = Some(Ranked {
-            rank,
-            entries: HashMap::new(),
-            ranks: VecDeque::new(),
-        });
+        self.ranked = Some(Ranked::new(rank));
         self
     }
 
@@ -217,7 +342,7 @@ impl<P> Deadline<P> {
     /// Ranked mode: the rank of [`PendingOrderPolicy::peek`]'s request as of
     /// the last `promote`.
     pub fn head_rank(&self) -> Option<Rank> {
-        self.ranked.as_ref()?.ranks.front().copied()
+        self.ranked.as_ref()?.head().map(|(_, rank)| rank)
     }
 
     /// Ranked mode with the pad rule on.
@@ -283,6 +408,10 @@ impl<P> Deadline<P> {
 
     /// The overdue head, hits first; `hits_only` offers hits alone.
     fn overdue_head(&self, hits_only: bool) -> Option<(AdmissionCandidate, bool)> {
+        if let Some(ranked) = &self.ranked {
+            let head = ranked.head().filter(|_| !hits_only)?;
+            return Some((ranked.queued[&head.0].candidate, false));
+        }
         if let Some(&candidate) = self.overdue_hits.front() {
             return Some((candidate, true));
         }
@@ -305,23 +434,26 @@ impl<P> Deadline<P> {
         }
     }
 
-    /// Ranked mode: append `candidate` (ranked at the next `promote`).
+    /// Ranked mode: enqueue `candidate`.
     fn push_ranked(&mut self, candidate: AdmissionCandidate) {
-        let ranked = self.ranked.as_mut().expect("ranked mode");
-        ranked.ranks.push_back(Rank {
-            key: u64::MAX,
-            weight: 1.0,
-        });
         self.overdue_kv_tokens += candidate.queued_kv_tokens();
         self.overdue_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
-        self.overdue.push_back(candidate);
+        self.ranked.as_mut().expect("ranked mode").insert(candidate);
+    }
+
+    /// Ranked mode: dequeue `request`.
+    fn take_ranked(&mut self, request: RequestId) -> Option<AdmissionCandidate> {
+        let candidate = self.ranked.as_mut().expect("ranked mode").take(request)?;
+        self.overdue_kv_tokens -= candidate.queued_kv_tokens();
+        self.overdue_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
+        Some(candidate)
     }
 
     /// Put an overdue request taken out this pass back at the front of its
     /// class's queue.
     pub fn push_front_overdue(&mut self, candidate: AdmissionCandidate, hit: bool) {
         if self.ranked.is_some() {
-            // Ranked mode: rejoin the queue, keyed at the next `promote`.
+            // Ranked mode: back under its own key.
             self.push_ranked(candidate);
             return;
         }
@@ -338,15 +470,16 @@ impl<P> Deadline<P> {
     }
 
     fn take_overdue(&mut self, hit: bool, index: usize) -> AdmissionCandidate {
+        if let Some((request, _)) = self.ranked.as_ref().and_then(Ranked::head) {
+            debug_assert!(!hit && index == 0, "ranked mode takes its head");
+            return self.take_ranked(request).expect("the head is queued");
+        }
         let candidate = if hit {
             self.overdue_hits.remove(index)
         } else {
             self.overdue.remove(index)
         }
         .expect("index is in range");
-        if let Some(ranked) = self.ranked.as_mut().filter(|_| !hit) {
-            ranked.ranks.remove(index);
-        }
         if !hit {
             if let Some(at_risk) = self.at_risk.as_mut() {
                 at_risk.track_out(&candidate);
@@ -395,8 +528,8 @@ impl<P: PendingOrderPolicy> Deadline<P> {
     /// under [`HitsFirst::WhenAtRisk`], to count what a miss computes (and it
     /// then replaces the request's frozen `resident_prefix_tokens`).
     pub fn promote(&mut self, now: Time, mut held: impl FnMut(AdmissionCandidate) -> u32) {
-        if self.ranked.is_some() {
-            self.rerank(now);
+        if let Some(ranked) = self.ranked.as_mut() {
+            ranked.advance(now);
             return;
         }
         while let Some(&(arrival, request)) = self.arrivals.front() {
@@ -480,27 +613,6 @@ impl<P: PendingOrderPolicy> Deadline<P> {
             self.inner.push_front(candidate, context);
         }
     }
-
-    /// Ranked mode: re-key every queued request at `now` and sort, smallest
-    /// key first, ties in enqueue order.
-    fn rerank(&mut self, now: Time) {
-        let ranked = self.ranked.as_mut().expect("ranked mode");
-        let mut keyed: Vec<(Rank, AdmissionCandidate)> = self
-            .overdue
-            .drain(..)
-            .map(|candidate| {
-                let size = prefill_size(&candidate);
-                let (arrival, size) = *ranked
-                    .entries
-                    .entry(candidate.request_id)
-                    .or_insert((now, size));
-                (ranked.rank.rank(size, arrival, size, now), candidate)
-            })
-            .collect();
-        keyed.sort_by_key(|(rank, candidate)| (rank.key, candidate.enqueue_sequence));
-        ranked.ranks = keyed.iter().map(|&(rank, _)| rank).collect();
-        self.overdue = keyed.into_iter().map(|(_, candidate)| candidate).collect();
-    }
 }
 
 impl<P: PendingOrderPolicy> PendingOrderPolicy for Deadline<P> {
@@ -544,6 +656,9 @@ impl<P: PendingOrderPolicy> PendingOrderPolicy for Deadline<P> {
     }
 
     fn remove(&mut self, request: RequestId) -> Option<AdmissionCandidate> {
+        if self.rank_active() {
+            return self.take_ranked(request);
+        }
         for hit in [false, true] {
             let queue = if hit {
                 &self.overdue_hits
@@ -561,6 +676,9 @@ impl<P: PendingOrderPolicy> PendingOrderPolicy for Deadline<P> {
     }
 
     fn contains(&self, request: RequestId) -> bool {
+        if let Some(ranked) = &self.ranked {
+            return ranked.queued.contains_key(&request);
+        }
         self.overdue
             .iter()
             .chain(&self.overdue_hits)
@@ -569,7 +687,10 @@ impl<P: PendingOrderPolicy> PendingOrderPolicy for Deadline<P> {
     }
 
     fn len(&self) -> usize {
-        self.overdue.len() + self.overdue_hits.len() + self.inner.len()
+        self.ranked.as_ref().map_or(0, |ranked| ranked.queued.len())
+            + self.overdue.len()
+            + self.overdue_hits.len()
+            + self.inner.len()
     }
 
     fn queued_kv_tokens(&self) -> u64 {
@@ -853,5 +974,56 @@ mod tests {
         assert!(deadline
             .rank_of(RequestId(0), 300_000, Time::from_ms(20_000.0))
             .is_some());
+    }
+
+    #[test]
+    fn late_requests_go_by_deadline_and_the_tier_heads_compare_by_index() {
+        use crate::worker::admission::prefill_rank::{PrefillRank, SquareCost};
+        let rank = PrefillRank::Square(SquareCost {
+            lambda_per_s: 1.0,
+            d0_s: 10.0,
+            k: 3.0,
+            tokens_per_s: 100_000.0,
+            pad: false,
+        });
+        let mut sequence = EnqueueSequence::default();
+        let mut deadline =
+            Deadline::new(ShortestJobFirst::by(JobSize::PrefillTokens)).with_rank(rank);
+        // 0: 600k at 0 s (late from 12 s, due 18 s); 1: 1k at 1 s (late from
+        // 10.99 s, due 11 s); 2: 50k at 30 s (on time until 39.5 s).
+        enqueue(
+            &mut deadline,
+            &mut sequence,
+            &[
+                (0, 600_000, 0.0),
+                (1, 1_000, 1_000.0),
+                (2, 50_000, 30_000.0),
+            ],
+        );
+        deadline.promote(Time::from_ms(30_000.0), |_| 0);
+        // Both 0 and 1 are late: 1 is due first. Its index key (1k / (1 + 2 *
+        // 19.01)) = 26 beats 2's 50k.
+        assert_eq!(deadline.peek().map(|c| c.request_id), Some(RequestId(1)));
+        assert_eq!(
+            deadline.pop(&mut ()).map(|c| c.request_id),
+            Some(RequestId(1))
+        );
+        // 0 heads the late tier: weight 1 + 2 * (30 + 6 - 18) = 37, key
+        // 16_217 < 50_000.
+        assert_eq!(deadline.head_rank().map(|r| r.key), Some(16_217));
+        assert_eq!(
+            deadline.pop(&mut ()).map(|c| c.request_id),
+            Some(RequestId(0))
+        );
+        assert_eq!(
+            (deadline.len(), deadline.queued_prompt_tokens()),
+            (1, 50_000)
+        );
+        assert!(deadline.contains(RequestId(2)));
+        assert_eq!(
+            deadline.remove(RequestId(2)).map(|c| c.request_id),
+            Some(RequestId(2))
+        );
+        assert_eq!((deadline.len(), deadline.queued_prompt_tokens()), (0, 0));
     }
 }
