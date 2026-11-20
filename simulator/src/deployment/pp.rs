@@ -237,6 +237,9 @@ impl Deployment for PpDeployment {
                 engram_fetch,
                 engram_cpu_threads,
                 deepinfer_host_step_us,
+                deepinfer_step_gap_us,
+                deepinfer_max_num_seqs,
+                deepinfer_host_first_stage_only,
                 ..
             } => {
                 let pipeline = arch_build::deepseek_v41_vllm_pp(
@@ -260,7 +263,12 @@ impl Deployment for PpDeployment {
                         *engram_fetch,
                         false,
                         0,
-                        *deepinfer_host_step_us,
+                        crate::arch::config::DeepInferStepCfg {
+                            host_step_us: *deepinfer_host_step_us,
+                            step_gap_us: *deepinfer_step_gap_us,
+                            host_first_stage_only: *deepinfer_host_first_stage_only,
+                            max_num_seqs: *deepinfer_max_num_seqs,
+                        },
                     )?,
                     *engram_fetch,
                     *engram_cpu_threads,

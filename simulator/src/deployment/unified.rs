@@ -673,6 +673,7 @@ impl Deployment for UnifiedDeployment {
                         crate::arch::config::DeepInferStepCfg {
                             host_step_us: *deepinfer_host_step_us,
                             step_gap_us: *deepinfer_step_gap_us,
+                            host_first_stage_only: false,
                             max_num_seqs: *deepinfer_max_num_seqs,
                         },
                     )?,

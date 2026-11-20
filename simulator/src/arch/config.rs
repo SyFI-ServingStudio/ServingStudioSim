@@ -138,10 +138,11 @@ pub fn deepseek_v41_dp_engine(
                     && !force_load_balance
                     && prefill_chunk_tokens == 0
                     && step.host_step_us == 0
-                    && step.step_gap_us == 0,
+                    && step.step_gap_us == 0
+                    && !step.host_first_stage_only,
                 "num_redundant_experts, yoco_keep_tokens, force_load_balance, \
-                 prefill_chunk_tokens, deepinfer_host_step_us and deepinfer_step_gap_us are \
-                 DeepInfer options; set engine: deepinfer"
+                 prefill_chunk_tokens, deepinfer_host_step_us, deepinfer_step_gap_us and \
+                 deepinfer_host_first_stage_only are DeepInfer options; set engine: deepinfer"
             );
             Ok(None)
         }
@@ -154,6 +155,7 @@ pub fn deepseek_v41_dp_engine(
                 prefill_chunk_tokens: (prefill_chunk_tokens > 0).then_some(prefill_chunk_tokens),
                 host_step_us: step.host_step_us,
                 step_gap_us: step.step_gap_us,
+                host_first_stage_only: step.host_first_stage_only,
                 max_num_seqs: step.max_num_seqs,
             },
         )),
@@ -166,6 +168,7 @@ pub fn deepseek_v41_dp_engine(
 pub struct DeepInferStepCfg {
     pub host_step_us: u32,
     pub step_gap_us: u32,
+    pub host_first_stage_only: bool,
     pub max_num_seqs: u32,
 }
 
@@ -799,6 +802,26 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = 0, cache_key)]
         deepinfer_host_step_us: u32,
+        /// DeepInfer only: GPU idle inside one engine step, in microseconds:
+        /// the sum of the short (< 1 ms) gaps between the kernels of one eager
+        /// prefill forward. Measured, not tuned: set it from a capture and cite
+        /// the capture in the preset. 0 = not modeled.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        deepinfer_step_gap_us: u32,
+        /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
+        /// the per-sequence state slots DeepInfer reserves out of the KV budget
+        /// (`cache_engine.py`), so it moves the token capacity.
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
+        /// DeepInfer only: price the host step and the in-step gaps on the
+        /// first stage's step alone (one per pipeline round: the lower bound)
+        /// instead of on every stage's step (false: the upper bound). DeepInfer
+        /// has no PP, so neither is measured.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        deepinfer_host_first_stage_only: bool,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

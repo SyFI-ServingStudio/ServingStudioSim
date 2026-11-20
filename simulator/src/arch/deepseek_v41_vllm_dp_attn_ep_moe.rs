@@ -166,6 +166,9 @@ pub struct DeepInferEngine {
     /// an eager prefill forward, summed. One `step_gaps` leaf per step; 0 =
     /// not modeled.
     pub step_gap_us: u32,
+    /// PP only: the host step and in-step gaps on the first stage's step
+    /// alone (one per pipeline round) instead of on every stage's step.
+    pub host_first_stage_only: bool,
     /// `max_num_seqs`: sizes the reserved state slots
     /// ([`deepinfer_kv_cache_layout`]).
     pub max_num_seqs: u32,
@@ -1987,6 +1990,7 @@ mod tests {
             prefill_chunk_tokens: None,
             host_step_us: 0,
             step_gap_us: 0,
+            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
@@ -2012,6 +2016,7 @@ mod tests {
             prefill_chunk_tokens: None,
             host_step_us: 0,
             step_gap_us: 0,
+            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
@@ -2041,6 +2046,7 @@ mod tests {
             prefill_chunk_tokens: None,
             host_step_us: 0,
             step_gap_us: 0,
+            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
@@ -2432,6 +2438,7 @@ mod tests {
             prefill_chunk_tokens: None,
             host_step_us: 0,
             step_gap_us: 0,
+            host_first_stage_only: false,
             max_num_seqs,
         };
         const BLOCK: u64 = 114_048;

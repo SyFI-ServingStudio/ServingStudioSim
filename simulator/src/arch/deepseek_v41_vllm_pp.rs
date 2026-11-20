@@ -815,7 +815,31 @@ pub fn build_configs(
             send: (index != last).then(|| geometry.forward(index as u16)),
             return_hop: (index == last).then(|| return_hop.clone()).flatten(),
             deferred_only,
-            kv_cache_layout: stage_kv_cache_layout(model, &held, &copies),
+            kv_cache_layout: match &parallel.deepinfer {
+                Some(engine) => {
+                    let own: Vec<u32> = model
+                        .kv_source_layer_ids
+                        .iter()
+                        .copied()
+                        .filter(|source| held.contains(source))
+                        .collect();
+                    let copied: Vec<u32> = copies.iter().map(|&(source, _)| source).collect();
+                    // DeepInfer's MTP layers keep their sliding windows on
+                    // the stage holding the last body layer.
+                    let mtp = match index == last {
+                        true => u64::from(tp_arch::MTP_LAYERS),
+                        false => 0,
+                    };
+                    dp_arch::deepinfer_kv_cache_layout(
+                        model,
+                        &own,
+                        &copied,
+                        held.len() as u64 + mtp,
+                        engine,
+                    )
+                }
+                None => stage_kv_cache_layout(model, &held, &copies),
+            },
             copied_sources: copies,
         });
     }
@@ -989,6 +1013,10 @@ struct StageContext<'a> {
     host_gather: Option<EngramHostGather>,
     /// DeepInfer's host time per stage step (ms; 0 = not modeled).
     host_step_ms: f32,
+    /// DeepInfer's GPU idle inside a stage step (ms; 0 = not modeled).
+    step_gap_ms: f32,
+    /// Both fixed per-step times on stage 0 alone (one per pipeline round).
+    first_stage_only: bool,
 }
 
 /// One pipeline stage: one GPU and its layer ranges.
@@ -1032,6 +1060,9 @@ pub struct DeepseekV41VllmPpStageModel {
     /// DeepInfer's host time per step with this GPU idle (ms), one
     /// `host_step` leaf per stage step; 0 = no leaf.
     host_step_ms: f32,
+    /// DeepInfer's GPU idle inside a stage step (ms), one `step_gaps` leaf
+    /// per stage step; 0 = no leaf.
+    step_gap_ms: f32,
     /// Per local Engram layer, the stage's layers that run before it.
     engram_layers_ahead: Vec<u32>,
 }
@@ -1143,7 +1174,14 @@ impl DeepseekV41VllmPpStageModel {
             cost_flat: Vec::new(),
             n_slots: 0,
             host_gather: ctx.host_gather.filter(|_| !local_engram.is_empty()),
-            host_step_ms: ctx.host_step_ms,
+            host_step_ms: match ctx.first_stage_only && stage_index > 0 {
+                true => 0.0,
+                false => ctx.host_step_ms,
+            },
+            step_gap_ms: match ctx.first_stage_only && stage_index > 0 {
+                true => 0.0,
+                false => ctx.step_gap_ms,
+            },
             engram_layers_ahead: Vec::new(),
         };
         let order: Vec<u32> = model
@@ -1267,6 +1305,19 @@ impl DeepseekV41VllmPpStageModel {
                 child: Box::new(builder.leaf(
                     format!("{}.stage{}.host_step", self.name, self.stage_index),
                     "host_step",
+                    serde_json::json!({}),
+                )),
+            });
+        }
+        if self.step_gap_ms > 0.0 {
+            children.push(CostNode::Labeled {
+                label: format!(
+                    "{}.stage{}.step_gaps [GPU idle between the kernels of one eager forward]",
+                    self.name, self.stage_index
+                ),
+                child: Box::new(builder.leaf(
+                    format!("{}.stage{}.step_gaps", self.name, self.stage_index),
+                    "step_gaps",
                     serde_json::json!({}),
                 )),
             });
@@ -1414,6 +1465,18 @@ impl DeepseekV41VllmPpStageModel {
                 ..LeafMetrics::ZERO
             };
             ev.push(host, || {
+                SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
+            });
+        }
+        if self.step_gap_ms > 0.0 {
+            let gaps = LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.step_gap_ms,
+                    ..Metrics4::ZERO
+                },
+                ..LeafMetrics::ZERO
+            };
+            ev.push(gaps, || {
                 SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
             });
         }
@@ -1682,6 +1745,12 @@ pub fn build_with_engram_fetch(
         host_step_ms: parallel
             .deepinfer
             .map_or(0.0, |engine| engine.host_step_us as f32 / 1000.0),
+        step_gap_ms: parallel
+            .deepinfer
+            .map_or(0.0, |engine| engine.step_gap_us as f32 / 1000.0),
+        first_stage_only: parallel
+            .deepinfer
+            .is_some_and(|engine| engine.host_first_stage_only),
         name: &name,
         num_stages: stages.len() as u16,
         engram_layer_ids: &engram_layer_ids,
@@ -2126,6 +2195,9 @@ mod tests {
             force_load_balance: false,
             prefill_chunk_tokens: None,
             host_step_us: 0,
+            step_gap_us: 0,
+            host_first_stage_only: false,
+            max_num_seqs: 256,
         };
         let fold = DeepseekV41VllmPpParallel {
             deepinfer: Some(engine),
@@ -2190,6 +2262,9 @@ mod tests {
         let host = DeepseekV41VllmPpParallel {
             deepinfer: Some(DeepInferEngine {
                 host_step_us: 6490,
+                step_gap_us: 0,
+                host_first_stage_only: false,
+                max_num_seqs: 256,
                 ..engine
             }),
             ..fold_parallel(30, CutHandoff::V3)
@@ -2199,8 +2274,46 @@ mod tests {
         for stage in hosted.stages() {
             assert_eq!(stage.host_step_ms, 6.49);
             let manifest = format!("{:?}", stage.cost_log_manifest());
-            assert_eq!(manifest.matches(".host_step\"").count(), 1, "one host_step leaf per stage");
+            assert_eq!(
+                manifest.matches(".host_step\"").count(),
+                1,
+                "one host_step leaf per stage"
+            );
         }
+        // The lower bound: host step and in-step gaps on stage 0 alone.
+        let first = DeepseekV41VllmPpParallel {
+            deepinfer: Some(DeepInferEngine {
+                host_step_us: 6490,
+                step_gap_us: 1570,
+                host_first_stage_only: true,
+                ..engine
+            }),
+            ..fold_parallel(30, CutHandoff::V3)
+        };
+        let cfgs = build_configs(&model_cfg(), &first, &uniform()).unwrap();
+        let first = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
+        let fixed: Vec<(f32, f32)> = first
+            .stages()
+            .iter()
+            .map(|stage| (stage.host_step_ms, stage.step_gap_ms))
+            .collect();
+        assert_eq!(fixed, [(6.49, 1.57), (0.0, 0.0)]);
+        let manifest = format!("{:?}", first.stages()[0].cost_log_manifest());
+        assert_eq!(manifest.matches(".step_gaps\"").count(), 1);
+        // DeepInfer's cache per stage: the KV sources a stage's layers read
+        // (2, 8, 20 on GPU0; 14 and copies of 8 and 20 on GPU1): two ratio-2
+        // and one ratio-1 source, 178 + 178 + 356 B per token each; GPU1 also
+        // holds the MTP layers' windows.
+        let stage_bytes: Vec<u64> = cfgs
+            .stages
+            .iter()
+            .map(|stage| stage.kv_cache_layout.per_token_bytes())
+            .collect();
+        assert_eq!(stage_bytes, [712, 712]);
+        assert!(
+            cfgs.stages[1].kv_cache_layout.engine.fixed_device_bytes
+                > cfgs.stages[0].kv_cache_layout.engine.fixed_device_bytes
+        );
         // Redundant slots have no meaning when one GPU holds every expert.
         let redundant = DeepseekV41VllmPpParallel {
             deepinfer: Some(DeepInferEngine {
