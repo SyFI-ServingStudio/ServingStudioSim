@@ -10,9 +10,10 @@
 #   1048576) and the scheduler study simulated it (wt-dsv41-sched/logs/
 #   20261118_73_final_matrix/*_dp4_*.yaml). Its host and in-step GPU idle is
 #   the sim preset's worker gpu_time_multiplier, not part of the arch.
-#   engram_fetch off: DeepInfer reads the Engram tables over GPU-initiated
-#   RDMA, overlapped with the forward, so the fetch is priced out; the Engram
-#   blocks' compute stays.
+#   engram_fetch off: the fetch is priced out, the Engram blocks' compute
+#   stays. DeepInfer reads the tables over GPU-initiated RDMA; that this read
+#   hides behind the forward is an assumption, not measured (the RDMA path did
+#   not run on the B200 host: no data NIC link).
 # Routing: the 1017 checkpoint's own capture (vLLM TP4/EP4 + DSpark). Its routes
 # are accepted generated tokens only, no rejected draft routes (the capture's
 # provenance.json), so they are what a non-speculative run of the same weights

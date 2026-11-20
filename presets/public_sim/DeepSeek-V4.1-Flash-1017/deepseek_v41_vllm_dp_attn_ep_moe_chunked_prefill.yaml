@@ -10,8 +10,10 @@
 #   pack: gpu_time_multiplier 1.0 (pure kernel sum).
 # - deepinfer: DeepInfer as it runs, 16384 tokens per DP rank per step, FCFS,
 #   the back pass (layers 20-40 over the rows YoCo keeps, each prompt's last
-#   140) in the step that finishes the prompt (back_flush every-step, no
-#   deferral). attn_gpu_memory_gb 67.498 GB (GB = 1e9 B): KV plus per-sequence
+#   140) in every step, no deferral (back_flush every-step); back_rows
+#   chunk-tail as DeepInfer truncates: per chunk, its rows inside the prompt's
+#   last 140 and at least one placeholder row (prepare_tensor_input_v4.cpp
+#   fill_yoco_truncation_metadata). attn_gpu_memory_gb 67.498 GB (GB = 1e9 B): KV plus per-sequence
 #   state per GPU that DeepInfer itself sized on DP4/EP4 B200 at MBT 16384
 #   (kv_cache_size 60.30 + state_size 2.56 GiB, deepinfer-cpu-engram/exp/logs/
 #   bench_off_true_16384.22968.log; wt-dsv41-pp-fold/logs/20261115_31_b200_memory/
@@ -58,5 +60,5 @@ pools:
 compound:
   member:
     vllm: {engine: vllm, max_batch_tokens: 2048, gpu_time_multiplier: 1.0, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 75.215615, back_flush: "off", back_rows: vllm-chunk}
-    deepinfer: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: prompt-tail}
-    deepinfer_best: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 83000.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: prompt-tail}
+    deepinfer: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}
+    deepinfer_best: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 83000.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}
