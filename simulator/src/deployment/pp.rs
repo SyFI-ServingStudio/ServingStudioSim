@@ -31,9 +31,9 @@ use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::kv::TierBytes;
 use crate::worker::{
-    build_pipeline_head_worker, build_pipeline_head_worker_with_back, build_pipeline_stage_worker, resolve_prefix_cache_config,
-    CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    build_pipeline_head_worker, build_pipeline_head_worker_with_back, build_pipeline_stage_worker,
+    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent,
+    PipelineHeadMsg, PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -282,6 +282,14 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: TierBytes::of_stages(
+                        &pipeline
+                            .stages()
+                            .iter()
+                            .map(|stage| TierBytes::of_layout(&stage.kv_cache_layout()))
+                            .collect::<Vec<_>>(),
+                        worker_config.prefix_tier_balanced_load,
+                    ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let back_probe = worker_config.back_batching.map(|_| {
@@ -291,6 +299,7 @@ impl Deployment for PpDeployment {
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
                 let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
                     store,
@@ -311,7 +320,7 @@ impl Deployment for PpDeployment {
                             layout,
                             &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
-                            worker_config,
+                            head_config.clone(),
                             head_log_dir.clone(),
                             PP_STAGE_POOL,
                             &head_gpu,
@@ -377,7 +386,8 @@ fn worker_config(
             *back_cap,
         ),
         pipeline_extra_in_flight: *extra_in_flight_microbatches,
-        pipeline_split_back: *back_dispatch == crate::worker::config::BackDispatchKind::VirtualStages,
+        pipeline_split_back: *back_dispatch
+            == crate::worker::config::BackDispatchKind::VirtualStages,
         prefill_chunk_alignment: *prefill_chunk_alignment,
         external_decode: *external_decode,
         max_model_len,

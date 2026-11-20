@@ -162,7 +162,7 @@ pub fn deepseek_v41_dp_engine(
     }
 }
 
-/// The DeepInfer per-step fields of the DP selector, passed through
+/// The DeepInfer per-step fields of the DP and PP selectors, passed through
 /// [`deepseek_v41_dp_engine`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeepInferStepCfg {

@@ -296,7 +296,7 @@ const DEEPINFER_ENGRAM_GATE_BACKENDS: &[&str] = &["tile_kernels"];
 /// DeepGEMM `mega_mhc` with the FP8 cast (DeepInfer `hc.py` `_mega_mhc`).
 const DEEPINFER_MEGA_MHC_BACKENDS: &[&str] = &["deepgemm_sm100"];
 /// TileKernels' unfused `mhc_post_fwd` and shifted pre (DeepInfer `hc.py`).
-const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
+pub(crate) const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
 /// FlashMLA `fused_norm_rope_attn_rope_cast.prefill`.
 const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
@@ -574,7 +574,8 @@ pub(crate) fn dp_layer_config(
 }
 
 /// One GPU's layer under DeepInfer: its EP group is the GPU itself (the PP
-/// arch's stages), so the mega MoE spans `ffn.ep_size` GPUs.
+/// arch's stages), so the mega MoE spans `ffn.ep_size` GPUs. The same
+/// DeepInfer kinds as a DP rank's layer (`deepinfer_backends`).
 pub(crate) fn deepinfer_layer(
     tp1: &mut DeepseekV41LayerConfig,
     model: &DeepseekV41ModelCfg,
@@ -1781,7 +1782,11 @@ fn normalize_dp_deferred(
         .zip(back)
         .map(|(step, back)| {
             back.iter().map(|&(q, _)| q).sum::<u32>()
-                + step.decode.iter().map(|&(q, _)| q.min(rule.window)).sum::<u32>()
+                + step
+                    .decode
+                    .iter()
+                    .map(|&(q, _)| q.min(rule.window))
+                    .sum::<u32>()
         })
         .collect();
     let late_rows = match kept.iter().copied().max().unwrap_or(0) {
