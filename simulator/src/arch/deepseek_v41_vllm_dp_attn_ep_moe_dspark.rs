@@ -658,6 +658,7 @@ mod tests {
             max_num_batched_tokens: 2048,
             cudagraph_capture_sizes: vllm_default_cudagraph_capture_sizes(2048),
             deepinfer: None,
+            dp_size: DP_SIZE,
         }
     }
 

@@ -97,7 +97,11 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
-const fn default_decoder_swa_bounded_replay() -> bool {
+const fn default_deepseek_v41_dp_size() -> u32 {
+    4
+}
+
+fn default_decoder_swa_bounded_replay() -> bool {
     true
 }
 
@@ -623,6 +627,12 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// DP ranks per replica, which are also its EP group (2, 4 or 8; the
+        /// captured deployment is 4). A pool of `replicas` such groups places
+        /// sessions by prefix affinity like the PP replicas.
+        #[serde(default = "default_deepseek_v41_dp_size")]
+        #[param(default = 4, cache_key)]
+        dp_size: u32,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

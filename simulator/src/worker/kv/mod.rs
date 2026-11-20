@@ -336,6 +336,9 @@ pub trait IterWorkerKv: KvStore {
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
+    /// Retained tokens of `session_input`'s prefix on this store's best
+    /// partition (0 when none): what pool-level session-affine placement reads.
+    fn retained_prefix_tokens(&self, session_input: SessionInput) -> u32;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.
     fn visit_prefill_admits(&self, partition: PartitionId, visitor: impl FnMut(RequestId));

@@ -87,8 +87,8 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "deepseek_v41_vllm_dp_attn_ep_moe";
-/// DP ranks, which are also the EP group (the captured deployment; the
-/// selector takes no size, as the TP arch takes none).
+/// DP ranks of the captured deployment (also its EP group); the default of
+/// [`DeepseekV41VllmDpParallel::dp_size`] and the DSpark wrapper's size.
 pub(crate) const DP_SIZE: u32 = 4;
 const COLLECTIVE_BACKENDS: &[&str] = &["vllm_pynccl"];
 /// Rows of the whole Engram table at TP1 (DP4 server log `engram.py:1134`,
@@ -116,6 +116,8 @@ pub struct DeepseekV41VllmDpParallel {
     pub cudagraph_capture_sizes: Vec<u32>,
     /// `Some`: the DeepInfer engine's kernels on the same layer skeleton.
     pub deepinfer: Option<DeepInferEngine>,
+    /// DP ranks of one replica, which are also its EP group.
+    pub dp_size: u32,
 }
 
 /// DeepInfer (deepseek-ai/DeepInfer a679bb8) on the DP4/EP4 skeleton: the MoE
@@ -195,18 +197,19 @@ pub fn build_configs(
             model.max_position_embeddings, parallel.max_model_len
         )));
     }
-    if model.num_experts % DP_SIZE != 0 {
+    let dp_size = parallel.dp_size;
+    if model.num_experts % dp_size != 0 {
         return Err(fit_failed(format!(
-            "{} routed experts must split over {DP_SIZE} EP ranks",
+            "{} routed experts must split over {dp_size} EP ranks",
             model.num_experts
         )));
     }
     if let Some(engine) = &parallel.deepinfer {
         let slots = model.num_experts + engine.num_redundant_experts;
-        if slots % DP_SIZE != 0 {
+        if slots % dp_size != 0 {
             return Err(fit_failed(format!(
                 "{slots} physical expert slots ({} experts + {} redundant) must split over \
-                 {DP_SIZE} EP ranks",
+                 {dp_size} EP ranks",
                 model.num_experts, engine.num_redundant_experts
             )));
         }
@@ -226,7 +229,7 @@ pub fn build_configs(
     // routed experts split over the DP group.
     let local = DeepseekV41VllmParallel {
         tp_size: 1,
-        ep_size: DP_SIZE,
+        ep_size: dp_size,
         gpu_name: parallel.gpu_name.clone(),
         serialize_streams: false,
         decoder_swa_bounded_replay: false,
@@ -408,6 +411,8 @@ fn mega_ffn_config(
 
 pub struct DeepseekV41DpLayerResolved {
     pub(crate) layers: Vec<u32>,
+    /// DP ranks (the FFN's EP group).
+    pub(crate) ranks: usize,
     pub(crate) engram: Option<DeepseekV41EngramTpWorkletResolved>,
     pub(crate) attention: DeepseekV41AttentionTpWorkletResolved,
     pub(crate) ffn: DpFfnResolved,
@@ -450,6 +455,7 @@ pub struct DpReplayResolved {
 pub(crate) fn resolve_layer(config: &DeepseekV41DpLayerConfig) -> DeepseekV41DpLayerResolved {
     DeepseekV41DpLayerResolved {
         layers: config.layers.clone(),
+        ranks: config.ffn.ffn.ep_size as usize,
         engram: config
             .engram
             .as_ref()
@@ -491,6 +497,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmDpConfigs) -> DeepseekV41VllmDpR
 pub(crate) struct DpLayerBody {
     name: String,
     layers: Vec<u32>,
+    ranks: usize,
     engram: Option<DeepseekV41EngramTpWorklet>,
     attention: DeepseekV41AttentionTpWorklet,
     ffn: DpFfn,
@@ -528,6 +535,7 @@ impl DpLayerBody {
                 )?),
             },
             layers: resolved.layers,
+            ranks: resolved.ranks,
             name,
         })
     }
@@ -548,7 +556,7 @@ impl DpLayerBody {
 
     /// The exchange and every rank's post-combine add.
     fn compile_tail(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
-        let ranks = DP_SIZE as usize;
+        let ranks = self.ranks;
         match &self.ffn {
             DpFfn::Vllm(ffn) => vec![
                 ffn.compile_exchange(ranks, b),
@@ -569,7 +577,7 @@ impl DpLayerBody {
         boundary: Option<&DpReplayBoundary>,
         b: &mut CostTreeBuilder,
     ) -> CostNode {
-        let ranks = (0..DP_SIZE)
+        let ranks = (0..self.ranks)
             .map(|_| {
                 let mut leaves = Vec::new();
                 if let Some(boundary) = boundary {
@@ -821,12 +829,13 @@ impl DeepseekV41VllmDpModel {
         }
         let root = CostNode::Labeled {
             label: format!(
-                "{} (DeepseekV41VllmDpModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} experts \
+                "{} (DeepseekV41VllmDpModel) [DP{dp} attention at TP1, EP{dp} experts \
                  behind MXFP8 all_gatherv / bf16 reduce_scatterv; {} unique bodies over 40 \
                  layers; bounded_replay={}]",
                 self.name,
                 self.bodies.len() + 1,
                 self.replay.is_some(),
+                dp = self.layer0.ranks,
             ),
             child: Box::new(CostNode::Sum(sections)),
         };
@@ -840,7 +849,7 @@ impl DeepseekV41VllmDpModel {
         // Layer 0's rank segment opens with the prologue and closes with the
         // two Engram lookups, which contend with it on the same device
         // (`compile_joined`) and finish before the first dispatch.
-        let layer0_ranks = (0..DP_SIZE)
+        let layer0_ranks = (0..self.layer0.ranks)
             .map(|_| {
                 let mut main = vec![self.prologue.compile(b)];
                 main.extend(self.layer0.compile_rank(b));
@@ -864,7 +873,7 @@ impl DeepseekV41VllmDpModel {
             child: Box::new(CostNode::Sum(layer0)),
         }];
         sections.extend(self.compile_plan(&self.plan, b));
-        let heads = (0..DP_SIZE)
+        let heads = (0..self.layer0.ranks)
             .map(|_| {
                 let mut leaves = Vec::new();
                 if let Some(replay) = &self.replay {
@@ -984,9 +993,10 @@ impl DeepseekV41VllmDpModel {
     }
 
     fn normalize(&self, batch: &UnifiedArchInput) -> std::result::Result<DpStep, String> {
-        normalize_input(
+        normalize_ranks(
             &self.graphs,
             batch,
+            self.layer0.ranks,
             self.max_model_len,
             self.replay_rule.as_ref(),
         )
@@ -1076,12 +1086,12 @@ impl IterwiseUnifiedModel for DeepseekV41VllmDpModel {
     }
 
     fn gpus_per_replica(&self) -> u16 {
-        DP_SIZE as u16
+        self.layer0.ranks as u16
     }
 
     /// One KV partition and one scheduler per engine core.
     fn num_attn_dp_groups(&self) -> u16 {
-        DP_SIZE as u16
+        self.layer0.ranks as u16
     }
 
     /// Each partition is one GPU's cache.
@@ -1308,13 +1318,23 @@ pub(crate) fn normalize_dp_steps(
 }
 
 /// A no-spec DP batch: one group per rank.
+#[cfg(test)]
 fn normalize_input(
     graphs: &DeepseekV41CudaGraphs,
     input: &UnifiedArchInput,
     max_model_len: u32,
     replay: Option<&BoundedReplay>,
 ) -> std::result::Result<DpStep, String> {
-    let dp = DP_SIZE as usize;
+    normalize_ranks(graphs, input, DP_SIZE as usize, max_model_len, replay)
+}
+
+fn normalize_ranks(
+    graphs: &DeepseekV41CudaGraphs,
+    input: &UnifiedArchInput,
+    dp: usize,
+    max_model_len: u32,
+    replay: Option<&BoundedReplay>,
+) -> std::result::Result<DpStep, String> {
     if input.groups.len() != dp {
         return Err(format!(
             "expected one attention group per DP rank ({dp}), got {}",
@@ -1376,6 +1396,7 @@ mod tests {
             max_num_batched_tokens: 2048,
             cudagraph_capture_sizes: tp_arch::vllm_default_cudagraph_capture_sizes(2048),
             deepinfer: None,
+            dp_size: DP_SIZE,
         }
     }
 

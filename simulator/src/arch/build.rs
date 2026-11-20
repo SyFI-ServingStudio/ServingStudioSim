@@ -1143,6 +1143,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     cudagraph_capture_sizes: &[u32],
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     engram_fetch: EngramFetch,
+    dp_size: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1159,13 +1160,14 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         deepinfer,
+        dp_size,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
         seed: routing_seed,
         num_experts: model_cfg.num_experts,
         experts_per_token: model_cfg.top_k,
-        ep_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16,
+        ep_size: dp_size as u16,
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: model_cfg.num_layers,
@@ -1173,7 +1175,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
     let mut configs =
         deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
-            .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+            .context("expanding DeepSeek-V4.1-Flash DP/EP architecture configs")?;
     if engram_fetch == EngramFetch::Off {
         configs.engram_prefetch = None;
     }
@@ -1223,6 +1225,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         deepinfer: None,
+        dp_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE,
     };
     let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
     let (target_demand, draft_demand) = dspark_demands(
@@ -2812,6 +2815,7 @@ pub fn build_iter_model(
             num_redundant_experts,
             yoco_keep_tokens,
             engram_fetch,
+            dp_size,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2829,6 +2833,7 @@ pub fn build_iter_model(
                 *engram_fetch,
             )?,
             *engram_fetch,
+            *dp_size,
             gpu,
             name,
             bridge,

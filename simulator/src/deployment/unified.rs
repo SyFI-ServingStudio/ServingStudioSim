@@ -627,10 +627,11 @@ impl Deployment for UnifiedDeployment {
                 num_redundant_experts,
                 yoco_keep_tokens,
                 engram_fetch,
+                dp_size,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
-                ensure_chunked_prefill_worker("DeepSeek-V4.1 vLLM DP4/EP4", &g.worker)?;
+                ensure_chunked_prefill_worker("DeepSeek-V4.1 vLLM DP/EP", &g.worker)?;
                 let model = Arc::new(arch_build::deepseek_v41_vllm_dp_attn_ep_moe(
                     model_spec,
                     *routing,
@@ -648,6 +649,7 @@ impl Deployment for UnifiedDeployment {
                         *engram_fetch,
                     )?,
                     *engram_fetch,
+                    *dp_size,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
