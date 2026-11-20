@@ -784,7 +784,7 @@ pub enum IterArchSel {
         yoco_keep_tokens: u32,
         /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
         #[serde(default)]
-        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]
+        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "cpu_gather_prefetch", "off"], cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A

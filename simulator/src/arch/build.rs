@@ -1263,7 +1263,7 @@ pub fn deepseek_v41_vllm_pp(
         configs.engram_prefetch = None;
     }
     let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
-        (EngramFetch::CpuGather, Some(prefetch)) => Some(EngramHostGather::from_prefetch(prefetch)),
+        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, prefetch),
         _ => None,
     };
     let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
