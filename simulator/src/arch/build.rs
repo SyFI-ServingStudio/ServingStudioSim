@@ -1194,15 +1194,9 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
     let model = deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")?;
-    let model = match host_gather {
+    Ok(match host_gather {
         Some(gather) => model.with_engram_host_gather(gather),
         None => model,
-    };
-    Ok(match deepinfer {
-        Some(engine) if engine.host_step_us > 0 || engine.step_gap_us > 0 => {
-            model.with_step_overheads(engine.host_step_us, engine.step_gap_us)
-        }
-        _ => model,
     })
 }
 
@@ -2908,10 +2902,7 @@ pub fn build_iter_model(
             yoco_keep_tokens,
             engram_fetch,
             engram_cpu_threads,
-            deepinfer_host_step_us,
-            deepinfer_step_gap_us,
             deepinfer_max_num_seqs,
-            deepinfer_host_first_stage_only,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
             *pp_size,
@@ -2933,12 +2924,7 @@ pub fn build_iter_model(
                 *engram_fetch,
                 false,
                 0,
-                crate::arch::config::DeepInferStepCfg {
-                    host_step_us: *deepinfer_host_step_us,
-                    step_gap_us: *deepinfer_step_gap_us,
-                    host_first_stage_only: *deepinfer_host_first_stage_only,
-                    max_num_seqs: *deepinfer_max_num_seqs,
-                },
+                *deepinfer_max_num_seqs,
             )?,
             *engram_fetch,
             *engram_cpu_threads,
@@ -2964,8 +2950,6 @@ pub fn build_iter_model(
             dp_size,
             force_load_balance,
             prefill_chunk_tokens,
-            deepinfer_host_step_us,
-            deepinfer_step_gap_us,
             deepinfer_max_num_seqs,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
@@ -2984,12 +2968,7 @@ pub fn build_iter_model(
                 *engram_fetch,
                 *force_load_balance,
                 *prefill_chunk_tokens,
-                crate::arch::config::DeepInferStepCfg {
-                    host_step_us: *deepinfer_host_step_us,
-                    step_gap_us: *deepinfer_step_gap_us,
-                    host_first_stage_only: false,
-                    max_num_seqs: *deepinfer_max_num_seqs,
-                },
+                *deepinfer_max_num_seqs,
             )?,
             *engram_fetch,
             *engram_cpu_threads,

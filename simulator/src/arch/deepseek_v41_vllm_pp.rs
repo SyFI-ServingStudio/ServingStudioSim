@@ -79,7 +79,6 @@ use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, EngramLookupKernel,
     EngramLookupKernelInput,
 };
-use crate::timing::Metrics4;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
@@ -1024,12 +1023,6 @@ struct StageContext<'a> {
     window: u32,
     /// The `cpu_gather` Engram fetch; `None` is UVA.
     host_gather: Option<EngramHostGather>,
-    /// DeepInfer's host time per stage step (ms; 0 = not modeled).
-    host_step_ms: f32,
-    /// DeepInfer's GPU idle inside a stage step (ms; 0 = not modeled).
-    step_gap_ms: f32,
-    /// Both fixed per-step times on stage 0 alone (one per pipeline round).
-    first_stage_only: bool,
 }
 
 /// One pipeline stage: one GPU and its layer ranges.
@@ -1070,12 +1063,6 @@ pub struct DeepseekV41VllmPpStageModel {
     /// Engram layer: the last slot is the GPU time a microbatch waits for its
     /// host-gathered rows.
     host_gather: Option<EngramHostGather>,
-    /// DeepInfer's host time per step with this GPU idle (ms), one
-    /// `host_step` leaf per stage step; 0 = no leaf.
-    host_step_ms: f32,
-    /// DeepInfer's GPU idle inside a stage step (ms), one `step_gaps` leaf
-    /// per stage step; 0 = no leaf.
-    step_gap_ms: f32,
     /// Per local Engram layer, the stage's layers that run before it.
     engram_layers_ahead: Vec<u32>,
     /// Decoder layers of each root section of the stage's cost tree, in
@@ -1190,14 +1177,6 @@ impl DeepseekV41VllmPpStageModel {
             cost_flat: Vec::new(),
             n_slots: 0,
             host_gather: ctx.host_gather.filter(|_| !local_engram.is_empty()),
-            host_step_ms: match ctx.first_stage_only && stage_index > 0 {
-                true => 0.0,
-                false => ctx.host_step_ms,
-            },
-            step_gap_ms: match ctx.first_stage_only && stage_index > 0 {
-                true => 0.0,
-                false => ctx.step_gap_ms,
-            },
             engram_layers_ahead: Vec::new(),
             section_layers: Vec::new(),
         };
@@ -1240,16 +1219,9 @@ impl DeepseekV41VllmPpStageModel {
         }
         out.extend(self.scatter.iter().map(|_| 0));
         out.extend(self.head.iter().map(|_| 0));
-        out.extend(
-            [
-                self.host_step_ms > 0.0,
-                self.step_gap_ms > 0.0,
-                self.host_gather.is_some(),
-            ]
-            .into_iter()
-            .filter(|&on| on)
-            .map(|_| 0),
-        );
+        if self.host_gather.is_some() {
+            out.push(0);
+        }
         let layers: u32 = self.layer_ranges.iter().map(|&(s, e)| e - s).sum();
         assert_eq!(
             out.iter().sum::<u32>(),
@@ -1276,8 +1248,7 @@ impl DeepseekV41VllmPpStageModel {
         let (_, input) = self
             .normalize(batch)
             .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 PP stage input: {reason}"));
-        // GPU time only: the host step runs before the forward.
-        let gpu_ms = f64::from(total.m.time_ms - self.host_step_ms);
+        let gpu_ms = f64::from(total.m.time_ms);
         let available = deepseek_v41_engram_fetch::time_ahead_ms(
             &self.cost_flat,
             scratch,
@@ -1359,29 +1330,6 @@ impl DeepseekV41VllmPpStageModel {
         }
         if let Some(head) = &self.head {
             children.push(head.compile(builder));
-        }
-        if self.host_step_ms > 0.0 {
-            children.push(CostNode::Labeled {
-                label: format!("{}.stage{}.host_step [engine host time per step, GPU idle: schedule, input prep, post-process]", self.name, self.stage_index),
-                child: Box::new(builder.leaf(
-                    format!("{}.stage{}.host_step", self.name, self.stage_index),
-                    "host_step",
-                    serde_json::json!({}),
-                )),
-            });
-        }
-        if self.step_gap_ms > 0.0 {
-            children.push(CostNode::Labeled {
-                label: format!(
-                    "{}.stage{}.step_gaps [GPU idle between the kernels of one eager forward]",
-                    self.name, self.stage_index
-                ),
-                child: Box::new(builder.leaf(
-                    format!("{}.stage{}.step_gaps", self.name, self.stage_index),
-                    "step_gaps",
-                    serde_json::json!({}),
-                )),
-            });
         }
         if self.host_gather.is_some() {
             children.push(CostNode::Labeled {
@@ -1516,30 +1464,6 @@ impl DeepseekV41VllmPpStageModel {
                 },
                 ev,
             );
-        }
-        if self.host_step_ms > 0.0 {
-            let host = LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.host_step_ms,
-                    ..Metrics4::ZERO
-                },
-                ..LeafMetrics::ZERO
-            };
-            ev.push(host, || {
-                SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
-            });
-        }
-        if self.step_gap_ms > 0.0 {
-            let gaps = LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.step_gap_ms,
-                    ..Metrics4::ZERO
-                },
-                ..LeafMetrics::ZERO
-            };
-            ev.push(gaps, || {
-                SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
-            });
         }
         if self.host_gather.is_some() {
             // Filled after the stage's total is known (`add_host_gather_wait`);
@@ -1804,15 +1728,6 @@ pub fn build_with_engram_fetch(
     let hc = u64::from(hc_mult);
     let ctx = StageContext {
         host_gather,
-        host_step_ms: parallel
-            .deepinfer
-            .map_or(0.0, |engine| engine.host_step_us as f32 / 1000.0),
-        step_gap_ms: parallel
-            .deepinfer
-            .map_or(0.0, |engine| engine.step_gap_us as f32 / 1000.0),
-        first_stage_only: parallel
-            .deepinfer
-            .is_some_and(|engine| engine.host_first_stage_only),
         name: &name,
         num_stages: stages.len() as u16,
         engram_layer_ids: &engram_layer_ids,
@@ -2270,9 +2185,6 @@ mod tests {
             engram_fetch: false,
             force_load_balance: false,
             prefill_chunk_tokens: None,
-            host_step_us: 0,
-            step_gap_us: 0,
-            host_first_stage_only: false,
             max_num_seqs: 256,
         };
         let fold = DeepseekV41VllmPpParallel {
@@ -2334,48 +2246,6 @@ mod tests {
         assert_eq!(model.back_pass_window(), Some(140));
         let manifest = format!("{:?}", model.stages()[0].cost_log_manifest());
         assert!(manifest.contains("mega_moe"), "no mega_moe leaf on stage 0");
-        // DeepInfer's host time per step: one leaf on every stage.
-        let host = DeepseekV41VllmPpParallel {
-            deepinfer: Some(DeepInferEngine {
-                host_step_us: 6490,
-                step_gap_us: 0,
-                host_first_stage_only: false,
-                max_num_seqs: 256,
-                ..engine
-            }),
-            ..fold_parallel(30, CutHandoff::V3)
-        };
-        let cfgs = build_configs(&model_cfg(), &host, &uniform()).unwrap();
-        let hosted = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
-        for stage in hosted.stages() {
-            assert_eq!(stage.host_step_ms, 6.49);
-            let manifest = format!("{:?}", stage.cost_log_manifest());
-            assert_eq!(
-                manifest.matches(".host_step\"").count(),
-                1,
-                "one host_step leaf per stage"
-            );
-        }
-        // The lower bound: host step and in-step gaps on stage 0 alone.
-        let first = DeepseekV41VllmPpParallel {
-            deepinfer: Some(DeepInferEngine {
-                host_step_us: 6490,
-                step_gap_us: 1570,
-                host_first_stage_only: true,
-                ..engine
-            }),
-            ..fold_parallel(30, CutHandoff::V3)
-        };
-        let cfgs = build_configs(&model_cfg(), &first, &uniform()).unwrap();
-        let first = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
-        let fixed: Vec<(f32, f32)> = first
-            .stages()
-            .iter()
-            .map(|stage| (stage.host_step_ms, stage.step_gap_ms))
-            .collect();
-        assert_eq!(fixed, [(6.49, 1.57), (0.0, 0.0)]);
-        let manifest = format!("{:?}", first.stages()[0].cost_log_manifest());
-        assert_eq!(manifest.matches(".step_gaps\"").count(), 1);
         // DeepInfer's cache per stage: the KV sources a stage's layers read
         // (2, 8, 20 on GPU0; 14 and copies of 8 and 20 on GPU1): two ratio-2
         // and one ratio-1 source, 178 + 178 + 356 B per token each; GPU1 also

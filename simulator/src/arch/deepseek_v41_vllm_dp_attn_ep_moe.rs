@@ -67,7 +67,6 @@ use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::expert_placement::SlotPlacement;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
-use crate::timing::Metrics4;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
@@ -156,19 +155,6 @@ pub struct DeepInferEngine {
     /// contiguous corpus segments the mega MoE's routes are drawn in.
     /// `None`: independent tokens.
     pub prefill_chunk_tokens: Option<u32>,
-    /// Host time per engine step with the GPU idle (µs): the step's
-    /// `schedule`, input preparation and post-process run serially with the
-    /// forward on a prefill step (`worker.py`: prompt steps post-process in
-    /// place; `model_runner.py`: prompt steps never replay a CUDA graph).
-    /// Priced as one `host_step` leaf per step; 0 = not modeled.
-    pub host_step_us: u32,
-    /// GPU idle inside one step (µs): the short gaps between the kernels of
-    /// an eager prefill forward, summed. One `step_gaps` leaf per step; 0 =
-    /// not modeled.
-    pub step_gap_us: u32,
-    /// PP only: the host step and in-step gaps on the first stage's step
-    /// alone (one per pipeline round) instead of on every stage's step.
-    pub host_first_stage_only: bool,
     /// `max_num_seqs`: sizes the reserved state slots
     /// ([`deepinfer_kv_cache_layout`]).
     pub max_num_seqs: u32,
@@ -1042,12 +1028,6 @@ pub struct DeepseekV41VllmDpModel {
     /// `Some` under the `cpu_gather` Engram fetch: the last slot is the GPU
     /// time each step waits for host-gathered rows.
     host_gather: Option<EngramHostGather>,
-    /// DeepInfer's host time per step with the GPU idle (ms), one `host_step`
-    /// leaf per step; 0 = no leaf.
-    host_step_ms: f32,
-    /// DeepInfer's GPU idle inside one step (ms), one `step_gaps` leaf per
-    /// step; 0 = no leaf.
-    step_gap_ms: f32,
 }
 
 pub fn build(
@@ -1111,8 +1091,6 @@ pub fn build(
         n_slots: 0,
         section_layers: Vec::new(),
         host_gather: None,
-        host_step_ms: 0.0,
-        step_gap_ms: 0.0,
         name,
     };
     model.recompile();
@@ -1128,21 +1106,12 @@ impl DeepseekV41VllmDpModel {
         self
     }
 
-    /// Price DeepInfer's fixed per-step time: the host step and the in-step
-    /// gaps (`DeepInferEngine::{host_step_us, step_gap_us}`).
-    pub fn with_step_overheads(mut self, host_step_us: u32, step_gap_us: u32) -> Self {
-        self.host_step_ms = host_step_us as f32 / 1000.0;
-        self.step_gap_ms = step_gap_us as f32 / 1000.0;
-        self.recompile();
-        self
-    }
-
     fn recompile(&mut self) {
         let tree = self.cost_tree();
         self.cost_flat = tree.flatten();
         self.n_slots = tree.n_slots();
         // The root sections of `cost_tree`: layer 0, the plan's nodes, the
-        // head, then the optional host step, step gaps and host-gather wait.
+        // head, then the optional host-gather wait.
         let mut layers = vec![1];
         layers.extend(
             self.plan
@@ -1150,16 +1119,9 @@ impl DeepseekV41VllmDpModel {
                 .map(|node| deepseek_v41_engram_fetch::plan_layers(std::slice::from_ref(node))),
         );
         layers.push(0);
-        layers.extend(
-            [
-                self.host_step_ms > 0.0,
-                self.step_gap_ms > 0.0,
-                self.host_gather.is_some(),
-            ]
-            .into_iter()
-            .filter(|&on| on)
-            .map(|_| 0),
-        );
+        if self.host_gather.is_some() {
+            layers.push(0);
+        }
         assert_eq!(layers.iter().sum::<u32>(), tp_arch::BODY_LAYERS);
         self.section_layers = layers;
     }
@@ -1167,29 +1129,6 @@ impl DeepseekV41VllmDpModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let mut sections = self.compile_sections(&mut b);
-        if self.host_step_ms > 0.0 {
-            sections.push(CostNode::Labeled {
-                label: format!("{}.host_step [engine host time per step, GPU idle: schedule, input prep, post-process]", self.name),
-                child: Box::new(b.leaf(
-                    format!("{}.host_step", self.name),
-                    "host_step",
-                    serde_json::json!({}),
-                )),
-            });
-        }
-        if self.step_gap_ms > 0.0 {
-            sections.push(CostNode::Labeled {
-                label: format!(
-                    "{}.step_gaps [GPU idle between the kernels of one eager forward]",
-                    self.name
-                ),
-                child: Box::new(b.leaf(
-                    format!("{}.step_gaps", self.name),
-                    "step_gaps",
-                    serde_json::json!({}),
-                )),
-            });
-        }
         if self.host_gather.is_some() {
             sections.push(CostNode::Labeled {
                 label: format!(
@@ -1411,35 +1350,6 @@ impl DeepseekV41VllmDpModel {
             .map(|rank| rank.rows)
             .max()
             .unwrap_or(0);
-        if self.host_step_ms > 0.0 {
-            // The ranks step in lockstep; each spends the same host time.
-            let host = LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.host_step_ms,
-                    ..Metrics4::ZERO
-                },
-                ..LeafMetrics::ZERO
-            };
-            evaluator.push(host, || {
-                SlotInput::from(ElementwiseKernelInput {
-                    num_tokens: max_rows,
-                })
-            });
-        }
-        if self.step_gap_ms > 0.0 {
-            let gaps = LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.step_gap_ms,
-                    ..Metrics4::ZERO
-                },
-                ..LeafMetrics::ZERO
-            };
-            evaluator.push(gaps, || {
-                SlotInput::from(ElementwiseKernelInput {
-                    num_tokens: max_rows,
-                })
-            });
-        }
         if self.host_gather.is_some() {
             evaluator.push(LeafMetrics::ZERO, || {
                 SlotInput::from(ElementwiseKernelInput {
@@ -1457,10 +1367,9 @@ impl DeepseekV41VllmDpModel {
         if let Some(gather) = &self.host_gather {
             // The ranks run in lockstep: the step waits for its slowest rank's
             // rows. GPU time ahead of layer L: the priced sections before it
-            // (prologue, layer 0 ... layer L-1; the host step runs before the
-            // forward and the step gaps are not placed, so neither counts).
-            // `gpu_ms` (the prefetch head start) is the step's GPU time.
-            let gpu_ms = f64::from(total.m.time_ms - self.host_step_ms);
+            // (prologue, layer 0 ... layer L-1). `gpu_ms` (the prefetch head
+            // start) is the step's GPU time.
+            let gpu_ms = f64::from(total.m.time_ms);
             let available = deepseek_v41_engram_fetch::time_ahead_ms(
                 &self.cost_flat,
                 scratch,
@@ -1993,9 +1902,6 @@ mod tests {
             engram_fetch: false,
             force_load_balance: false,
             prefill_chunk_tokens: None,
-            host_step_us: 0,
-            step_gap_us: 0,
-            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
@@ -2019,9 +1925,6 @@ mod tests {
             engram_fetch: true,
             force_load_balance: false,
             prefill_chunk_tokens: None,
-            host_step_us: 0,
-            step_gap_us: 0,
-            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         assert!(build_configs(&cfg(), &p, &uniform_demand()).is_err());
@@ -2049,9 +1952,6 @@ mod tests {
             engram_fetch: false,
             force_load_balance: true,
             prefill_chunk_tokens: None,
-            host_step_us: 0,
-            step_gap_us: 0,
-            host_first_stage_only: false,
             max_num_seqs: 256,
         });
         let configs = build_configs(&cfg(), &p, &uniform_demand()).unwrap();
@@ -2390,43 +2290,6 @@ mod tests {
         assert_eq!(eager.full.exchange.collective_tokens, vec![2080, 5, 1, 1]);
     }
 
-    #[test]
-    fn host_step_adds_one_leaf_per_step() {
-        let plain = built();
-        let names = |model: &DeepseekV41VllmDpModel| -> Vec<String> {
-            model
-                .cost_tree()
-                .manifest()
-                .slots
-                .iter()
-                .map(|s| s.name.clone())
-                .collect()
-        };
-        assert!(!names(&plain).iter().any(|n| n.ends_with(".host_step")));
-        let with = built().with_step_overheads(6490, 0);
-        assert_eq!(with.host_step_ms, 6.49);
-        let with_names = names(&with);
-        assert_eq!(with_names.len(), names(&plain).len() + 1);
-        assert_eq!(
-            with_names
-                .iter()
-                .filter(|n| n.ends_with(".host_step"))
-                .count(),
-            1
-        );
-        let both = built().with_step_overheads(6490, 1570);
-        assert_eq!((both.host_step_ms, both.step_gap_ms), (6.49, 1.57));
-        let both_names = names(&both);
-        assert_eq!(both_names.len(), names(&plain).len() + 2);
-        assert_eq!(
-            both_names
-                .iter()
-                .filter(|n| n.ends_with(".step_gaps"))
-                .count(),
-            1
-        );
-    }
-
     /// DeepInfer's own layout on the 1017 config (`examples/benchmark.py`
     /// env: YoCo keep 140): `cache_engine.py` logs a 114,048 B block and a
     /// 9,213,600 B state slot (77 slots at max_num_seqs 64, 149 at 124), and
@@ -2441,9 +2304,6 @@ mod tests {
             engram_fetch: false,
             force_load_balance: false,
             prefill_chunk_tokens: None,
-            host_step_us: 0,
-            step_gap_us: 0,
-            host_first_stage_only: false,
             max_num_seqs,
         };
         const BLOCK: u64 = 114_048;

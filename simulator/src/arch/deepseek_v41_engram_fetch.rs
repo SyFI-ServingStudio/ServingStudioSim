@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn time_ahead_counts_the_priced_sections_before_each_consumer() {
         // Root sections: embedding (no layer) 0.5, layer 0 2.0, layer 1 1.0,
-        // a 3-layer repeat of layers 2..5 3.0, the head 0.25, the host step 9.
+        // a 3-layer repeat of layers 2..5 3.0, the head 0.25, a trailing section 9.
         let leaf = |ms: f32| {
             let mut m = LeafMetrics::ZERO;
             m.m.time_ms = ms;
@@ -390,7 +390,7 @@ mod tests {
         let ahead = time_ahead_ms(&flat, &scratch, &[0, 1, 1, 3, 0, 0], &[0, 1, 3, 4]);
         // Layer 0: what opens the step; layer 1: + layer 0; layers 3 and 4:
         // + layer 1 and one or two of the repeat's three layers; never the
-        // head or the host step.
+        // head or the trailing section.
         assert_eq!(ahead, vec![0.5, 2.5, 4.5, 5.5]);
     }
 
