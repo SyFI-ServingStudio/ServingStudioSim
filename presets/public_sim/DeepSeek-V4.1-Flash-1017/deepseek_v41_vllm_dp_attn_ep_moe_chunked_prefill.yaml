@@ -1,0 +1,52 @@
+# DeepSeek-V4.1-Flash-1017 without speculative decoding, one DP4/EP4 group on
+# four B200s. vLLM's DP coordinator places each request on the least-loaded
+# rank. Members:
+# - vllm: the vLLM fork, chunked prefill at 2048 tokens per DP rank.
+#   attn_gpu_memory_gb 75.215615: the KV pool per GPU the DSpark DP4 case
+#   measured (deepseek_v41_vllm_dp_attn_ep_moe_dspark_speculative.yaml, case
+#   20_dp4_diverse_100, --max-model-len 131072). That server also held the
+#   DSpark draft weights, so a non-speculative server has at least this much;
+#   no non-speculative DP4 server was measured.
+# - deepinfer_*: DeepInfer, 16384 tokens per DP rank per step, as the scheduler
+#   study ran it (wt-dsv41-sched/logs/20261118_73_final_matrix/
+#   *_dp4_*_knee_*.yaml) with the B200 memory budget in place of its assumed
+#   B300 or unlimited ones. attn_gpu_memory_gb 67.498 GB (GB = 1e9 B): KV plus
+#   per-sequence state per GPU that DeepInfer itself sized on DP4/EP4 B200 at
+#   MBT 16384 (kv_cache_size 60.30 + state_size 2.56 GiB, deepinfer-cpu-engram/
+#   exp/logs/bench_off_true_16384.22968.log; wt-dsv41-pp-fold/logs/
+#   20261115_31_b200_memory/budget.json b200_dp4_mbt16384). The sim subtracts
+#   DeepInfer's fixed state slots from it. Back pass (layers 20-40 over the
+#   rows YoCo keeps) deferred and flushed at the knee, its rows the prompt
+#   tails, as study 73 ran it. fcfs is vLLM's order; square_cost is the study's
+#   SquareCost policy (tier_l10: shortest prefill first, SRPT, lambda 10/s,
+#   default D0 10 s and k 3) at a fixed 16384 budget. square_tokens_per_s 83000
+#   is one DP4 rank's saturated prefill rate at B200 memory, 82.9 ktok/s
+#   (wt-dsv41-sched/logs/20261115_42_async/table.tsv,
+#   dp4_mbt16384_k16_b200_async_sjf60). The study's final scheduler adds a
+#   late-tier budget (late_budget_base_tokens 16384 under max_batch_tokens
+#   32768); budget.py has no B200 budget at MBT 32768 (it stops at 24576,
+#   extrapolated), so it is not offered here.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: 1
+        arch:
+          preset: deepseek_v41_vllm_dp_attn_ep_moe
+          engine: ${engine}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          dp_placement: vllm-least-loaded
+          pending_order: ${pending_order}
+          srpt: ${srpt}
+          square_lambda_per_s: ${square_lambda_per_s}
+          square_tokens_per_s: ${square_tokens_per_s}
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+          back_flush: ${back_flush}
+          back_rows: ${back_rows}
+compound:
+  member:
+    vllm: {engine: vllm, max_batch_tokens: 2048, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 75.215615, back_flush: "off", back_rows: vllm-chunk}
+    deepinfer_fcfs: {engine: deepinfer, max_batch_tokens: 16384, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 67.498, back_flush: knee, back_rows: prompt-tail}
+    deepinfer_square_cost: {engine: deepinfer, max_batch_tokens: 16384, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 83000.0, attn_gpu_memory_gb: 67.498, back_flush: knee, back_rows: prompt-tail}

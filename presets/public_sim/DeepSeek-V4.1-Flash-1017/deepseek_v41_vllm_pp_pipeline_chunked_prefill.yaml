@@ -1,0 +1,57 @@
+# DeepSeek-V4.1-Flash-1017 prefill, pipelined, on B200. Members:
+# - deepinfer_fold_*: two replicas of DeepInfer's folded two-stage pipeline
+#   (4 GPUs), 16384-token microbatches, as the scheduler study ran it
+#   (wt-dsv41-sched/logs/20261118_73_final_matrix/fill_fold_bal_*_knee_*.yaml)
+#   with its B200 memory budget in place of the assumed B300 one.
+#   attn_gpu_memory_gb 6.243 GB, small: two folded stages leave little HBM
+#   beside each GPU's 20 layers of experts. KV plus per-sequence state per GPU
+#   under DeepInfer's measured memory rule (0.95 x 178.36 GiB less weights,
+#   peak activation and non-torch memory), a fold stage's weights from the
+#   checkpoint headers: wt-dsv41-pp-fold/logs/20261115_31_b200_memory/
+#   budget.json b200_fold_mbt16384 (budget.py). Not verified: a fold stage's
+#   activation, non-torch memory and state equal DP4's measured ones at the
+#   same MBT. The sim subtracts DeepInfer's fixed state slots from it.
+#   Back pass (layers 20-40 over the kept rows, which a fold needs): deferred
+#   and flushed at the knee, its rows the prompt tails, run as its own unit
+#   behind the front microbatch on each GPU (virtual-stages), as study 73.
+#   balanced_retained_kv: a retained context is stored once over the two
+#   stages instead of each keeping the KV sources its layers read; a hit pulls
+#   the copies back from the peer by copy engine, priced from a 2x B200 NV18
+#   probe (wt-dsv41-sched/logs/20261115_61_balanced_kv/ce_probe/fit.json:
+#   29.0 us one-direction submit + sync, 0.7965 us per piece, 577.8 GB/s).
+#   fcfs is vLLM's order; square_cost is the study's SquareCost policy
+#   (tier_l10: shortest prefill first, SRPT, lambda 10/s, default D0 10 s and
+#   k 3) at a fixed 16384 budget, as study 59 ran it (wt-dsv41-sched/logs/
+#   20261115_59_late_budget/fold_base.yaml, bud f16). square_tokens_per_s
+#   169000 is one fold replica's saturated prefill rate, 2 GPUs x 84.6 ktok/s
+#   (wt-dsv41-sched/logs/20261115_42_async/table.tsv,
+#   fold_mbt16384_k16_unl_async_sjf60). The study's final scheduler adds a
+#   late-tier budget (late_budget_base_tokens 16384 under max_batch_tokens
+#   32768); budget.py has no B200 budget at MBT 32768 (it stops at 24576,
+#   extrapolated), so it is not offered here.
+deployment: pp
+pools:
+  stage:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: deepseek_v41_vllm_pp
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          pending_order: ${pending_order}
+          srpt: ${srpt}
+          square_lambda_per_s: ${square_lambda_per_s}
+          square_tokens_per_s: ${square_tokens_per_s}
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+          back_flush: ${back_flush}
+          back_rows: ${back_rows}
+          back_dispatch: ${back_dispatch}
+          balanced_retained_kv: ${balanced_retained_kv}
+          retained_copy_latency_us: ${retained_copy_latency_us}
+          retained_copy_us_per_piece: ${retained_copy_us_per_piece}
+          retained_copy_gb_per_s: ${retained_copy_gb_per_s}
+compound:
+  member:
+    deepinfer_fold_fcfs: {replicas: 2, max_batch_tokens: 16384, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 6.243, back_flush: knee, back_rows: prompt-tail, back_dispatch: virtual-stages, balanced_retained_kv: true, retained_copy_latency_us: 29.0, retained_copy_us_per_piece: 0.7965, retained_copy_gb_per_s: 577.8}
+    deepinfer_fold_square_cost: {replicas: 2, max_batch_tokens: 16384, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 169000.0, attn_gpu_memory_gb: 6.243, back_flush: knee, back_rows: prompt-tail, back_dispatch: virtual-stages, balanced_retained_kv: true, retained_copy_latency_us: 29.0, retained_copy_us_per_piece: 0.7965, retained_copy_gb_per_s: 577.8}

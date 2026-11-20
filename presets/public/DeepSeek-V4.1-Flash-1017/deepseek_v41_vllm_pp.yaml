@@ -1,0 +1,45 @@
+# DeepSeek-V4.1-Flash-1017 prefill pipelined over B200s, one GPU per stage at
+# TP1/EP1 (each stage holds all 384 experts of its layers). Only the DeepInfer
+# engine is offered: a vLLM plain-PP member (PP4 split 8/6/6/20 at 2048 batched
+# tokens) lacks 73 nvfp4_fused_moe rows (EP1) in profile.db.
+# The DeepInfer engine, two folded stages: stage 0 runs layers 0-10 and 20-30,
+# stage 1 layers 10-20 and 30-40, so each request passes both GPUs twice: layers
+# 0-20 over its prompt, then layers 20-40 over the rows YoCo keeps past the cut,
+# which the worker runs as a deferred back pass. As the scheduler study ran it
+# (wt-dsv41-sched/logs/20261118_73_final_matrix/fill_fold_*.yaml, deploy fold).
+# DeepInfer settings from its own B200 bench
+# (deepinfer-cpu-engram/exp/logs/bench_off_true_16384.22968.log): YoCo keeps 140
+# rows (yoco_clip=140), max_num_batched_tokens 16384, max_model_len unset there,
+# so the checkpoint's 1048576. deepinfer_step_gap_us 1019: half of 2038 us, the
+# per-step sum of in-step gaps DeepInfer's DP4 nsys measured over all 40 layers
+# (wt-dsv41-pp-fold/logs/20261115_36_engram_threads/hostparams.txt); a stage
+# runs 20 layers. Scaled, not measured on a stage. Host time per step not
+# modeled (deepinfer_host_step_us 0): hidden by async scheduling, as the study
+# assumed. engram_fetch off: the fetch priced out.
+# Routing: the 1017 checkpoint's own capture (vLLM TP4/EP4 + DSpark). Its routes
+# are accepted generated tokens only, no rejected draft routes (the capture's
+# provenance.json), so they are what a non-speculative run of the same weights
+# routes; routes are per token, so they fold to EP1. The non-DSpark capture
+# (DeepSeek-V4.1-Flash/deepseek_v41_vllm.yaml) is of the earlier
+# DeepSeek-V4.1-Flash checkpoint, other router weights.
+checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017
+gpu: NVIDIA B200
+arch:
+  type: deepseek_v41_vllm_pp
+  fp8: true
+  engine: deepinfer
+  pp_size: 2
+  stage_layers: "0-10,20-30;10-20,30-40"
+  cut_handoff: v3
+  yoco_keep_tokens: 140
+  engram_fetch: "off"
+  deepinfer_step_gap_us: 1019
+  max_model_len: 1048576
+  max_num_batched_tokens: 16384
+  routing: ${routing}
+  token_corpus_file: ${token_corpus_file}
+compound:
+  workload:
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
