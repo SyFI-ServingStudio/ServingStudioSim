@@ -772,6 +772,10 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "v1", choices = ["v1", "v2", "v3"], cache_key)]
         cut_handoff: crate::arch::deepseek_v41_vllm_pp::CutHandoff,
+        /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

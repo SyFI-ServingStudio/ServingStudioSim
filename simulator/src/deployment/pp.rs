@@ -230,8 +230,9 @@ impl Deployment for PpDeployment {
                 decoder_swa_bounded_replay,
                 max_num_batched_tokens,
                 cudagraph_capture_sizes,
-            stage_layers,
-            cut_handoff,
+                stage_layers,
+                cut_handoff,
+                engram_fetch,
                 ..
             } => {
                 let pipeline = arch_build::deepseek_v41_vllm_pp(
@@ -246,8 +247,9 @@ impl Deployment for PpDeployment {
                     *decoder_swa_bounded_replay,
                     *max_num_batched_tokens,
                     cudagraph_capture_sizes,
-            stage_layers,
-            *cut_handoff,
+                    stage_layers,
+                    *cut_handoff,
+                    *engram_fetch,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

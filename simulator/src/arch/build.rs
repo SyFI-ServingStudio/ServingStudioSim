@@ -1223,6 +1223,7 @@ pub fn deepseek_v41_vllm_pp(
     cudagraph_capture_sizes: &[u32],
     stage_layers: &str,
     cut_handoff: deepseek_v41_vllm_pp::CutHandoff,
+    engram_fetch: EngramFetch,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1254,10 +1255,16 @@ pub fn deepseek_v41_vllm_pp(
         num_routed_layers: model_cfg.num_layers,
     };
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
-    let configs = deepseek_v41_vllm_pp::build_configs(&model_cfg, &parallel, &demand)
+    let mut configs = deepseek_v41_vllm_pp::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding DeepSeek-V4.1-Flash PP architecture configs")?;
+    anyhow::ensure!(
+        engram_fetch != EngramFetch::Off,
+        "deepseek_v41_vllm_pp: engram_fetch off is not wired yet"
+    );
+    let host_gather = (engram_fetch == EngramFetch::CpuGather)
+        .then(|| EngramHostGather::from_prefetch(&mut configs.engram_prefetch));
     let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
-    deepseek_v41_vllm_pp::build(name.to_string(), resolved, bridge)
+    deepseek_v41_vllm_pp::build_with_engram_fetch(name.to_string(), resolved, host_gather, bridge)
         .context("building DeepSeek-V4.1-Flash PP model (often a missing profile.db row)")
 }
 
@@ -2884,6 +2891,7 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
             stage_layers,
             cut_handoff,
+            engram_fetch,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
             *pp_size,
@@ -2898,6 +2906,7 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
             stage_layers,
             *cut_handoff,
+            *engram_fetch,
             gpu,
             name,
             bridge,

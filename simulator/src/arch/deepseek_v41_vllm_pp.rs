@@ -62,6 +62,7 @@ use crate::arch::deepseek_v41_vllm::{
     DeepseekV41LayerConfig, DeepseekV41LayerResolved, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
     DeepseekV41Step, DeepseekV41VllmParallel, LayerKind, NormalizedInput, PlanNode,
 };
+use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
 use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::ENGRAM_TABLE_ROWS_TP1;
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
 use crate::arch::kv_layout::KvCacheLayout;
@@ -882,6 +883,8 @@ struct StageContext<'a> {
     /// that stops at the cut.
     collapsed_row_bytes: u64,
     window: u32,
+    /// The `cpu_gather` Engram fetch; `None` is UVA.
+    host_gather: Option<EngramHostGather>,
 }
 
 /// One pipeline stage: one GPU and its layer ranges.
@@ -913,6 +916,12 @@ pub struct DeepseekV41VllmPpStageModel {
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
+    /// `Some` under the `cpu_gather` Engram fetch on a stage holding an
+    /// Engram layer: the last slot is the GPU time a microbatch waits for its
+    /// host-gathered rows.
+    host_gather: Option<EngramHostGather>,
+    /// Per local Engram layer, the stage's layers that run before it.
+    engram_layers_ahead: Vec<u32>,
 }
 
 impl DeepseekV41VllmPpStageModel {
@@ -1018,11 +1027,50 @@ impl DeepseekV41VllmPpStageModel {
             kv_cache_layout: stage.kv_cache_layout,
             cost_flat: Vec::new(),
             n_slots: 0,
+            host_gather: ctx.host_gather.filter(|_| !local_engram.is_empty()),
+            engram_layers_ahead: Vec::new(),
         };
+        let order: Vec<u32> = model
+            .layer_ranges
+            .iter()
+            .flat_map(|&(start, end)| start..end)
+            .collect();
+        model.engram_layers_ahead = local_engram
+            .iter()
+            .map(|layer| order.iter().position(|l| l == layer).unwrap() as u32)
+            .collect();
         let tree = model.cost_tree();
         model.cost_flat = tree.flatten();
         model.n_slots = tree.n_slots();
         Ok(model)
+    }
+
+    /// Fill the `cpu_gather` wait slot (the last) of a stage evaluation and
+    /// add it to `total`: GPU time ahead of a local Engram layer is the
+    /// step's mean per-layer time on this stage times the layers before it.
+    fn add_host_gather_wait(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut [LeafMetrics],
+        mut total: LeafMetrics,
+    ) -> LeafMetrics {
+        let Some(gather) = &self.host_gather else {
+            return total;
+        };
+        let (_, input) = self
+            .normalize(batch)
+            .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 PP stage input: {reason}"));
+        let layers: u32 = self.layer_ranges.iter().map(|&(s, e)| e - s).sum();
+        let per_layer = f64::from(total.m.time_ms) / f64::from(layers);
+        let available: Vec<f64> = self
+            .engram_layers_ahead
+            .iter()
+            .map(|&ahead| per_layer * f64::from(ahead))
+            .collect();
+        let wait = gather.exposed_ms(input.full.rows, &available) as f32;
+        slots[self.n_slots - 1].m.time_ms = wait;
+        total.m.time_ms += wait;
+        total
     }
 
     pub fn stage_index(&self) -> u16 {
@@ -1094,6 +1142,19 @@ impl DeepseekV41VllmPpStageModel {
         }
         if let Some(head) = &self.head {
             children.push(head.compile(builder));
+        }
+        if self.host_gather.is_some() {
+            children.push(CostNode::Labeled {
+                label: format!(
+                    "{}.stage{}.engram_host_gather [GPU wait for CPU gather + H2D]",
+                    self.name, self.stage_index
+                ),
+                child: Box::new(builder.leaf(
+                    format!("{}.stage{}.engram_host_gather", self.name, self.stage_index),
+                    "engram_host_gather_wait",
+                    serde_json::json!({}),
+                )),
+            });
         }
         CostNode::Labeled {
             label: format!(
@@ -1207,6 +1268,13 @@ impl DeepseekV41VllmPpStageModel {
                 },
                 ev,
             );
+        }
+        if self.host_gather.is_some() {
+            // Filled after the stage's total is known (`add_host_gather_wait`);
+            // the whole-pipeline view keeps it at zero.
+            ev.push(LeafMetrics::ZERO, || {
+                SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
+            });
         }
     }
 
@@ -1383,9 +1451,10 @@ impl IterwiseUnifiedModel for DeepseekV41VllmPpStageModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        eval_compiled(&self.cost_flat, self.n_slots, slots, scratch, None, |ev| {
+        let total = eval_compiled(&self.cost_flat, self.n_slots, slots, scratch, None, |ev| {
             self.eval_batch(batch, ev)
-        })
+        });
+        self.add_host_gather_wait(batch, slots, total)
     }
 
     fn eval_iter_with_inputs(
@@ -1395,14 +1464,15 @@ impl IterwiseUnifiedModel for DeepseekV41VllmPpStageModel {
         scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
-        eval_compiled(
+        let total = eval_compiled(
             &self.cost_flat,
             self.n_slots,
             slots,
             scratch,
             Some(inputs),
             |ev| self.eval_batch(batch, ev),
-        )
+        );
+        self.add_host_gather_wait(batch, slots, total)
     }
 }
 
@@ -1410,6 +1480,17 @@ impl IterwiseUnifiedModel for DeepseekV41VllmPpStageModel {
 pub fn build(
     name: String,
     resolved: DeepseekV41VllmPpResolved,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmPpModel, BuildError> {
+    build_with_engram_fetch(name, resolved, None, bridge)
+}
+
+/// [`build`] with the Engram fetch: `Some` is `cpu_gather` (the configs carry
+/// the unpack's prefetch config, [`EngramHostGather::from_prefetch`]).
+pub fn build_with_engram_fetch(
+    name: String,
+    resolved: DeepseekV41VllmPpResolved,
+    host_gather: Option<EngramHostGather>,
     bridge: &PerfApiBridge,
 ) -> Result<DeepseekV41VllmPpModel, BuildError> {
     let DeepseekV41VllmPpResolved {
@@ -1429,6 +1510,7 @@ pub fn build(
     } = resolved;
     let hc = u64::from(hc_mult);
     let ctx = StageContext {
+        host_gather,
         name: &name,
         num_stages: stages.len() as u16,
         engram_layer_ids: &engram_layer_ids,
