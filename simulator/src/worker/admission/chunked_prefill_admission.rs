@@ -49,7 +49,7 @@ use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
 use super::external_decode::ExternalDecode;
 use super::fresh_reads::{AtHead, FreshReads, FreshSource};
-use super::microbatch_budget::{MicrobatchBudget, PrefillSplit};
+use super::microbatch_budget::{BudgetTally, MicrobatchBudget, PrefillSplit};
 use super::policy::{ForceSchedule, Queued};
 use super::prefill_rank::{PrefillRank, Rank};
 use super::read_wait::ReadWait;
@@ -92,6 +92,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     max_batch_tokens: u32,
     /// How much prefill each partition's share of an iteration takes.
     budget: MicrobatchBudget,
+    /// Per-minute share of full-cap budgets over every partition's decisions,
+    /// kept when the budget varies.
+    tally: Option<BudgetTally>,
     /// Order of started prompts against queued ones, per partition.
     started_order: StartedOrder,
     batch_policy: BatchPolicy,
@@ -210,6 +213,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
             budget: MicrobatchBudget::default(),
+            tally: None,
             started_order: StartedOrder::default(),
             batch_policy,
             kv_admission,
@@ -380,6 +384,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             "an even split needs a pipeline"
         );
         self.budget = budget;
+        self
+    }
+
+    /// Log the per-minute share of full-cap budgets (one decision per
+    /// partition per iteration) as worker `worker`'s, when the budget varies.
+    pub(crate) fn with_budget_tally(mut self, worker: u16) -> Self {
+        self.tally = self.budget.varies().then(|| BudgetTally::new(worker));
         self
     }
 
@@ -1028,12 +1039,27 @@ where
             })
             .collect();
 
-        if self.budget.follows_backlog() {
+        if self.budget.varies() {
+            // Each partition follows its own late tier, or any partition's.
+            let any_late = self.budget.late.is_some_and(|rule| rule.any_rank)
+                && self
+                    .partition_policies
+                    .iter()
+                    .any(|(policy, _)| policy.has_late());
             for (partition, budget) in remaining_budgets.iter_mut().enumerate() {
-                let backlog = self.partition_backlog_tokens(kv_store, partition);
-                *budget = self
+                let backlog = if self.budget.reads_round() {
+                    self.partition_backlog_tokens(kv_store, partition)
+                } else {
+                    0
+                };
+                let late = any_late || self.partition_policies[partition].0.has_late();
+                let rule = self
                     .budget
-                    .prefill_budget(*budget, backlog, 1, self.max_batch_tokens);
+                    .rule_budget(backlog, 1, late, self.max_batch_tokens);
+                if let Some(tally) = self.tally.as_mut() {
+                    tally.record(now, rule >= self.max_batch_tokens);
+                }
+                *budget = (*budget).min(rule);
             }
         }
         // Started prompts keep partition-local priority, in start order, until

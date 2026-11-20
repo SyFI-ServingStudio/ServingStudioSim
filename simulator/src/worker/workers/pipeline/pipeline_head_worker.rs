@@ -1102,6 +1102,7 @@ mod tests {
         split: PrefillSplit::Even { min_tokens: 0 },
         long_prefill_token_threshold: None,
         load: None,
+        late: None,
     };
 
     /// Prefill tokens of each launched microbatch, in order.

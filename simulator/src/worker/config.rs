@@ -19,8 +19,8 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use crate::common::Time;
 
 use super::admission::{
-    ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit,
-    ReadWait, ReadWaitPolicy, StartedOrder,
+    ForceSchedule, HitsFirst, LateBudget, LoadBudget, MicrobatchBudget, PendingOrderKind,
+    PrefillSplit, ReadWait, ReadWaitPolicy, StartedOrder,
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
@@ -766,6 +766,18 @@ pub struct MicrobatchBudgetSpec {
     #[serde(default)]
     #[param(default = 0)]
     load_budget_backlog_hi_tokens: u64,
+    /// Late-tier cap (`0`: off): the rules above work under this many tokens
+    /// while no queued request is late (SquareCost's late tier, so it needs
+    /// `square_lambda_per_s`), and under `max_batch_tokens` while one is. Per
+    /// attention DP rank unless `late_budget_any_rank`. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    late_budget_base_tokens: u32,
+    /// `chunked_prefill` with the late-tier cap: a late request on any
+    /// attention DP rank lifts every rank's cap. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    late_budget_any_rank: bool,
 }
 
 impl MicrobatchBudgetSpec {
@@ -829,11 +841,37 @@ impl MicrobatchBudgetSpec {
                 backlog_hi_tokens: self.load_budget_backlog_hi_tokens,
             })
         };
+        let late = if self.late_budget_base_tokens == 0 {
+            ensure!(
+                !self.late_budget_any_rank,
+                "{owner}: late_budget_any_rank needs late_budget_base_tokens"
+            );
+            None
+        } else {
+            let floor = self.load_budget_low_tokens.max(self.min_microbatch_tokens);
+            ensure!(
+                floor <= self.late_budget_base_tokens
+                    && self.late_budget_base_tokens < max_batch_tokens,
+                "{owner}: late_budget_base_tokens ({}) must be in [{floor}, max_batch_tokens \
+                 ({max_batch_tokens})), at least load_budget_low_tokens and \
+                 min_microbatch_tokens",
+                self.late_budget_base_tokens
+            );
+            ensure!(
+                !(self.late_budget_any_rank && pipelined),
+                "{owner}: late_budget_any_rank spans attention DP ranks; a pipeline head has one"
+            );
+            Some(LateBudget {
+                base_tokens: self.late_budget_base_tokens,
+                any_rank: self.late_budget_any_rank,
+            })
+        };
         Ok(MicrobatchBudget {
             split,
             long_prefill_token_threshold: (self.long_prefill_token_threshold > 0)
                 .then_some(self.long_prefill_token_threshold),
             load,
+            late,
         })
     }
 }
@@ -1486,6 +1524,15 @@ impl IterWorkerSel {
         config.state_retention = state_retention.resolve(owner)?;
         config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
         config.prefill_rank = square_cost.resolve(owner)?;
+        ensure!(
+            config.microbatch_budget.late.is_none()
+                || matches!(
+                    config.prefill_rank,
+                    Some(crate::worker::admission::PrefillRank::Square(_))
+                ),
+            "{owner}: late_budget_base_tokens follows SquareCost's late tier; it needs \
+             square_lambda_per_s > 0"
+        );
         if config.prefill_rank.is_some() {
             ensure!(
                 config.force_schedule.is_none(),
@@ -1729,6 +1776,47 @@ mod tests {
         assert!(
             chunked("force_schedule_after_ms: 2500\nforce_schedule_hits_first: true\n").is_err()
         );
+    }
+
+    fn budget_spec(yaml: &str) -> MicrobatchBudgetSpec {
+        serde_yaml::from_str(yaml).expect("parse budget spec")
+    }
+
+    #[test]
+    fn a_late_budget_resolves_off_by_default_and_validates_its_base() {
+        let off = budget_spec("{}").resolve("t", 32_768, true).unwrap();
+        assert_eq!(off.late, None);
+        let on = budget_spec("late_budget_base_tokens: 16384")
+            .resolve("t", 32_768, true)
+            .unwrap();
+        assert_eq!(
+            on.late,
+            Some(LateBudget {
+                base_tokens: 16_384,
+                any_rank: false
+            })
+        );
+        let any = budget_spec("{late_budget_base_tokens: 16384, late_budget_any_rank: true}");
+        assert!(
+            any.resolve("t", 32_768, false)
+                .unwrap()
+                .late
+                .unwrap()
+                .any_rank
+        );
+        // One partition per pipeline head: no rank to share with.
+        assert!(any.resolve("t", 32_768, true).is_err());
+        for bad in [
+            "late_budget_base_tokens: 32768",
+            "late_budget_any_rank: true",
+            "{late_budget_base_tokens: 2000, load_budget_low_tokens: 2374, \
+              load_budget_backlog_lo_tokens: 2374, load_budget_backlog_hi_tokens: 84500}",
+        ] {
+            assert!(
+                budget_spec(bad).resolve("t", 32_768, false).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

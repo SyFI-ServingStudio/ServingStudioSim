@@ -67,7 +67,7 @@ use crate::worker::types::IterBatchPlan;
 use super::chunked_prefill_admission::ChunkEndAlignment;
 use super::external_decode::ExternalDecode;
 use super::fresh_reads::{AtHead, FreshReads, FreshSource};
-use super::microbatch_budget::MicrobatchBudget;
+use super::microbatch_budget::{BudgetTally, MicrobatchBudget};
 use super::policy::{ForceSchedule, Queued};
 use super::read_wait::ReadWait;
 use super::prefill_rank::{PrefillRank, Rank};
@@ -88,6 +88,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     budget: MicrobatchBudget,
     /// Microbatches the pipeline holds, which an even split divides the round by.
     depth: u16,
+    /// Per-minute share of full-cap budgets, kept when the budget varies.
+    tally: Option<BudgetTally>,
     /// Order of started prompts against queued ones.
     started_order: StartedOrder,
     /// Where chunks may end, when the engine can only checkpoint recurrent
@@ -169,6 +171,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             max_batch_tokens,
             budget: MicrobatchBudget::default(),
             depth: 1,
+            tally: None,
             started_order: StartedOrder::default(),
             chunk_end_alignment: None,
             started_prefills: Vec::new(),
@@ -206,6 +209,13 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         assert!(depth > 0, "pipeline depth must be positive");
         self.budget = budget;
         self.depth = depth;
+        self
+    }
+
+    /// Log the per-minute share of full-cap budgets as worker `worker`'s,
+    /// when the budget varies.
+    pub(crate) fn with_budget_tally(mut self, worker: u16) -> Self {
+        self.tally = self.budget.varies().then(|| BudgetTally::new(worker));
         self
     }
 
@@ -530,13 +540,22 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
-        if self.budget.follows_backlog() {
-            remaining_budget = self.budget.prefill_budget(
-                remaining_budget,
-                self.prefill_round_tokens(kv_store),
+        if self.budget.varies() {
+            let round = if self.budget.reads_round() {
+                self.prefill_round_tokens(kv_store)
+            } else {
+                0
+            };
+            let rule = self.budget.rule_budget(
+                round,
                 self.depth,
+                self.policy.has_late(),
                 self.max_batch_tokens,
             );
+            if let Some(tally) = self.tally.as_mut() {
+                tally.record(now, rule >= self.max_batch_tokens);
+            }
+            remaining_budget = remaining_budget.min(rule);
         }
         self.fill_prefill(
             self.started_order,

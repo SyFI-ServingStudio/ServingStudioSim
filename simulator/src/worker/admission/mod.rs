@@ -29,7 +29,7 @@ pub use decode_completion::{
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
-pub use microbatch_budget::{LoadBudget, MicrobatchBudget, PrefillSplit};
+pub use microbatch_budget::{LateBudget, LoadBudget, MicrobatchBudget, PrefillSplit};
 pub use pipelined_chunked_prefill_admission::PipelinedChunkedPrefillAdmission;
 pub use placement::LoadBalance;
 pub(crate) use placement::PartitionLoad;

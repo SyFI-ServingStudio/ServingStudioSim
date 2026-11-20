@@ -356,6 +356,8 @@ mod tests {
                 "load_budget_low_tokens",
                 "load_budget_backlog_lo_tokens",
                 "load_budget_backlog_hi_tokens",
+                "late_budget_base_tokens",
+                "late_budget_any_rank",
                 "force_schedule_after_ms",
                 "force_schedule_hits_first",
                 "force_schedule_hits_first_when_at_risk",

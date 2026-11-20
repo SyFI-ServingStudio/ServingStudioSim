@@ -345,6 +345,14 @@ impl<P> Deadline<P> {
         self.ranked.as_ref()?.head().map(|(_, rank)| rank)
     }
 
+    /// Ranked SquareCost mode: whether a queued request is in the late tier
+    /// as of the last `promote` (O(1)). Started prompts have left the tier.
+    pub fn has_late(&self) -> bool {
+        self.ranked
+            .as_ref()
+            .is_some_and(|ranked| !ranked.late.is_empty())
+    }
+
     /// Ranked mode with the pad rule on.
     pub fn pads(&self) -> bool {
         self.ranked
@@ -1025,5 +1033,47 @@ mod tests {
             Some(RequestId(2))
         );
         assert_eq!((deadline.len(), deadline.queued_prompt_tokens()), (0, 0));
+    }
+
+    #[test]
+    fn has_late_reports_a_non_empty_late_tier_as_of_the_last_promote() {
+        use crate::worker::admission::prefill_rank::{PrefillRank, SquareCost};
+        let rank = PrefillRank::Square(SquareCost {
+            lambda_per_s: 10.0,
+            d0_s: 10.0,
+            k: 3.0,
+            tokens_per_s: 100_000.0,
+            pad: false,
+        });
+        let mut sequence = EnqueueSequence::default();
+        let mut deadline =
+            Deadline::new(ShortestJobFirst::by(JobSize::PrefillTokens)).with_rank(rank);
+        assert!(!deadline.has_late());
+        // 0: 1k at 0 s, late from 9.99 s; 1: 50k at 0 s, late from 9.5 s.
+        enqueue(
+            &mut deadline,
+            &mut sequence,
+            &[(0, 1_000, 0.0), (1, 50_000, 0.0)],
+        );
+        deadline.promote(Time::from_ms(9_000.0), |_| 0);
+        assert!(!deadline.has_late());
+        deadline.promote(Time::from_ms(9_600.0), |_| 0);
+        assert!(deadline.has_late());
+        // 0 is on time and shorter, so it goes first; 1 keeps the tier full.
+        assert_eq!(
+            deadline.pop(&mut ()).map(|c| c.request_id),
+            Some(RequestId(0))
+        );
+        assert!(deadline.has_late());
+        assert_eq!(
+            deadline.pop(&mut ()).map(|c| c.request_id),
+            Some(RequestId(1))
+        );
+        assert!(!deadline.has_late());
+        // Outside ranked mode there is no late tier.
+        let mut fifo = Deadline::new(FifoOrder::new());
+        enqueue(&mut fifo, &mut sequence, &[(2, 1_000, 0.0)]);
+        fifo.promote(Time::from_ms(60_000.0), |_| 0);
+        assert!(!fifo.has_late());
     }
 }

@@ -141,6 +141,7 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
         None => admission,
     }
     .with_microbatch_budget(config.microbatch_budget, layout.depth)
+    .with_budget_tally(id.0)
     .with_started_order(config.started_order);
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);

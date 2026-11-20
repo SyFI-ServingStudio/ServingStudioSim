@@ -108,6 +108,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         None => admission,
     }
     .with_microbatch_budget(config.microbatch_budget)
+    .with_budget_tally(id.0)
     .with_started_order(config.started_order);
     let mut admission = match config.force_schedule {
         Some(schedule) => admission.with_force_schedule(schedule),
