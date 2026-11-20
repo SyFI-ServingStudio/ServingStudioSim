@@ -1260,8 +1260,16 @@ pub fn deepseek_v41_vllm_pp(
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
     let mut configs = deepseek_v41_vllm_pp::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding DeepSeek-V4.1-Flash PP architecture configs")?;
-    if engram_fetch == EngramFetch::Off {
+    if !engram_fetch.fetches() {
         configs.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        for stage in &mut configs.stages {
+            let layers = stage.layer0.iter_mut().chain(stage.bodies.iter_mut());
+            for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+                engram.consumer = false;
+            }
+        }
     }
     let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
         (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),
