@@ -67,8 +67,66 @@ def _query(fields: tuple[str, ...], env: dict[str, str]) -> list[dict[str, str]]
     ]
 
 
+# The same identity fields from the CUDA driver API, for a process whose `nvidia-smi` does not
+# run. It runs in a child so this process's own cuInit (see `_cuda_device_attributes`, which
+# swaps in the server's CUDA_VISIBLE_DEVICES) is untouched, and in this process's environment so
+# its ordinals are the ones nvidia-smi would have printed. The driver version comes from NVML's
+# C library, which the GPU runtime injects with the driver; without it the field stays empty.
+_DRIVER_GPUS = r"""
+import ctypes, json
+cu = ctypes.CDLL("libcuda.so.1")
+assert cu.cuInit(0) == 0, "cuInit failed"
+driver = None
+try:
+    nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    if nvml.nvmlInit_v2() == 0:
+        buf = ctypes.create_string_buffer(96)
+        if nvml.nvmlSystemGetDriverVersion(buf, 96) == 0:
+            driver = buf.value.decode()
+except OSError:
+    pass
+count = ctypes.c_int()
+assert cu.cuDeviceGetCount(ctypes.byref(count)) == 0, "cuDeviceGetCount failed"
+gpus = []
+for ordinal in range(count.value):
+    device = ctypes.c_int()
+    cu.cuDeviceGet(ctypes.byref(device), ordinal)
+    name = ctypes.create_string_buffer(256)
+    cu.cuDeviceGetName(name, 256, device)
+    bus = ctypes.create_string_buffer(64)
+    cu.cuDeviceGetPCIBusId(bus, 64, device)
+    raw = (ctypes.c_ubyte * 16)()
+    cu.cuDeviceGetUuid_v2(raw, device)
+    h = bytes(raw).hex()
+    memory = ctypes.c_size_t()
+    cu.cuDeviceTotalMem_v2(ctypes.byref(memory), device)
+    gpus.append({
+        "index": str(ordinal),
+        "uuid": f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}",
+        "name": name.value.decode(),
+        "pci.bus_id": bus.value.decode(),
+        "driver_version": driver,
+        "memory.total": str(memory.value // (1 << 20)),
+        "source": "cuda_driver",
+    })
+print(json.dumps(gpus))
+"""
+
+
+def _driver_gpus() -> list[dict[str, str]]:
+    import sys
+
+    out = _run([sys.executable, "-c", _DRIVER_GPUS], dict(os.environ))
+    return json.loads(out) if out else []
+
+
 def _gpus(env: dict[str, str]) -> list[dict[str, str]]:
     gpus = _query(_GPU_FIELDS, env) or []
+    if not gpus:
+        # No usable nvidia-smi: the images ship none, and a CDI spec may inject a host wrapper
+        # that cannot run inside the container (cayenne's /usr/local/bin/nvidia-smi checks the
+        # Slurm cgroup, which a container does not see, then falls back to a host-only sudo).
+        return _driver_gpus()
     for field_name in _GPU_OPTIONAL_FIELDS:
         rows = _query(("index", field_name), env)
         values = {row["index"]: row[field_name] for row in rows or ()}
