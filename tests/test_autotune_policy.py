@@ -426,6 +426,8 @@ class _Cfg:
     python_runtime: PythonRuntimeConfig | None = None
     name: str = "smoke"
     log_dir: str = "/tmp/x"
+    profile_kind: str = "workload_metrics"
+    captures_expert_load: bool = False
 
 
 def _cfg(tmp_path: Path, **server) -> _Cfg:
@@ -480,6 +482,23 @@ def test_capture_preflight_admits_the_warmed_deployment_only(tmp_path) -> None:
     assert "just ref warm-caches vllm" in str(raised.value)
     with pytest.raises(AutotuneForbiddenError):
         warm_caches.preflight(warmed, tmp_path / "p.yaml", cache, "vllm-abc-sm103")
+
+
+def test_a_routing_pass_is_its_own_deployment(tmp_path) -> None:
+    # A token_corpus pass starts the server with routed-expert (and EPLB load)
+    # flags the workload pass does not; vLLM hashes its whole config into the
+    # FlashInfer autotune cache file, so that pass needs its own warm manifest.
+    workload = warm_caches.deployment_key(_cfg(tmp_path))
+    corpus = _cfg(tmp_path)
+    corpus.profile_kind = "token_corpus"
+    corpus.captures_expert_load = True
+    keyed = warm_caches.deployment_key(corpus)
+    assert "pass_server_args" not in workload
+    assert ["--enable-return-routed-experts", None] in keyed["pass_server_args"]
+    assert ["--enable-eplb", None] in keyed["pass_server_args"]
+    assert warm_caches.manifest_path(tmp_path, "k", keyed) != warm_caches.manifest_path(
+        tmp_path, "k", workload
+    )
 
 
 def test_warm_caches_cli_passes_its_startup_timeout(monkeypatch, tmp_path) -> None:
