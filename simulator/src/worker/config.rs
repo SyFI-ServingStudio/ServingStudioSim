@@ -81,6 +81,10 @@ fn default_back_flush_k() -> u32 {
     16
 }
 
+fn default_retained_copy_pieces_per_block() -> u32 {
+    1
+}
+
 /// The selector's back-batching fields as the worker's spec.
 /// Rows one back pass may carry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -1404,6 +1408,31 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "inline", choices = BACK_DISPATCH_CHOICES)]
         back_dispatch: BackDispatchKind,
+        /// Balanced retention (not vLLM): a retained context is stored once
+        /// over the stages, `1 / pp_size` of the model's per-token cache on
+        /// each, instead of every stage keeping each KV source its layers read
+        /// (copies of another stage's sources included). A hit pulls the
+        /// copies back from the peer stages with the copy engine before the
+        /// request's first chunk. Off: every stage keeps its copies.
+        #[serde(default)]
+        #[param(default = false)]
+        balanced_retained_kv: bool,
+        /// Balanced retention's pull, measured: submit and sync of one batch (us).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_latency_us: f64,
+        /// Copy-engine time per contiguous piece (us).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_us_per_piece: f64,
+        /// Contiguous peer-copy line rate (GB/s, 1e9 B/s); required when on.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_gb_per_s: f64,
+        /// Contiguous pieces a stage pulls per engine block.
+        #[serde(default = "default_retained_copy_pieces_per_block")]
+        #[param(default = 1)]
+        retained_copy_pieces_per_block: u32,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -1459,6 +1488,46 @@ impl IterWorkerSel {
             | Self::PdPrefill { kv_accounting, .. }
             | Self::PdDecode { kv_accounting, .. } => kv_accounting.clone(),
         }
+    }
+
+    /// A pipeline selector's balanced retention, validated; `None` when off
+    /// or for any other selector.
+    pub(crate) fn balanced_retention(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::worker::kv::BalancedRetentionSpec>> {
+        let Self::PipelineChunkedPrefill {
+            balanced_retained_kv: true,
+            retained_copy_latency_us,
+            retained_copy_us_per_piece,
+            retained_copy_gb_per_s,
+            retained_copy_pieces_per_block,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            retained_copy_gb_per_s.is_finite() && *retained_copy_gb_per_s > 0.0,
+            "{owner}: balanced_retained_kv needs a measured retained_copy_gb_per_s > 0"
+        );
+        ensure!(
+            retained_copy_latency_us.is_finite()
+                && *retained_copy_latency_us >= 0.0
+                && retained_copy_us_per_piece.is_finite()
+                && *retained_copy_us_per_piece >= 0.0
+                && *retained_copy_pieces_per_block > 0,
+            "{owner}: retained_copy_latency_us and retained_copy_us_per_piece must be >= 0, \
+             retained_copy_pieces_per_block > 0"
+        );
+        Ok(Some(crate::worker::kv::BalancedRetentionSpec {
+            copy_latency: crate::common::Time::from_ns(
+                (retained_copy_latency_us * 1e3).round() as u64
+            ),
+            copy_us_per_piece: *retained_copy_us_per_piece,
+            copy_bytes_per_us: retained_copy_gb_per_s * 1e3,
+            pieces_per_block: *retained_copy_pieces_per_block,
+        }))
     }
 
     /// Validate a chunked selector's scheduling options and set them on

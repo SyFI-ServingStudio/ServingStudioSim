@@ -298,6 +298,32 @@ impl Default for KvCacheLayout {
     }
 }
 
+/// One pipeline replica's KV, stage by stage and stored once: what balanced
+/// retention (`worker::kv::BalancedRetention`) splits a retained context by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineKvShares {
+    /// Each stage's cache: every KV source its layers read, its own and the
+    /// copies of sources another stage computes.
+    pub stages: Vec<KvCacheLayout>,
+    /// The whole model's per-token cache with each source once (no copies).
+    /// Only its per-token parts are read.
+    pub unique: KvCacheLayout,
+}
+
+impl PipelineKvShares {
+    /// Stages that copy no source: the model's cache is the stages' per-token
+    /// parts together.
+    pub fn without_copies(stages: Vec<KvCacheLayout>) -> Self {
+        let mut unique = KvCacheLayout::new();
+        for part in stages.iter().flat_map(|stage| &stage.parts) {
+            if matches!(part.growth, KvGrowth::PerToken { .. }) {
+                unique = unique.with_part(*part);
+            }
+        }
+        Self { stages, unique }
+    }
+}
+
 impl KvCachePart {
     /// Ordinary attention KV: one entry per token, kept for the whole request.
     pub fn per_token(name: &'static str, bytes_per_token: u64) -> Self {

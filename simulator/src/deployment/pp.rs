@@ -104,6 +104,7 @@ impl Deployment for PpDeployment {
                     ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -128,6 +129,7 @@ impl Deployment for PpDeployment {
                             Arc::clone(&head_model),
                             layout,
                             &kv_cache_layout,
+                            &kv_shares,
                             std::rc::Rc::clone(&head_store),
                             head_config.clone(),
                             head_log_dir.clone(),
@@ -185,6 +187,7 @@ impl Deployment for PpDeployment {
                     ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -209,6 +212,7 @@ impl Deployment for PpDeployment {
                             Arc::clone(&head_model),
                             layout,
                             &kv_cache_layout,
+                            &kv_shares,
                             std::rc::Rc::clone(&head_store),
                             head_config.clone(),
                             head_log_dir.clone(),
@@ -292,6 +296,7 @@ impl Deployment for PpDeployment {
                     ),
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
                 let back_probe = worker_config.back_batching.map(|_| {
                     crate::worker::shared::back_stash::model_probe(Arc::clone(&pipeline), 1)
                 });
@@ -319,6 +324,7 @@ impl Deployment for PpDeployment {
                             Arc::clone(&head_model),
                             layout,
                             &kv_cache_layout,
+                            &kv_shares,
                             std::rc::Rc::clone(&head_store),
                             head_config.clone(),
                             head_log_dir.clone(),
@@ -396,6 +402,7 @@ fn worker_config(
     worker.kv_accounting().apply("pp", &mut config)?;
     worker.apply_chunked_scheduling("pp", &mut config)?;
     prefix_tiers.apply("pp", &mut config)?;
+    config.balanced_retention = worker.balanced_retention("pp")?;
     Ok(config)
 }
 

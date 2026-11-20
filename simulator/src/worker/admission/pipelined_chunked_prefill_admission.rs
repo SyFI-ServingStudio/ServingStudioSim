@@ -53,13 +53,21 @@
 //! chunk on a state-checkpoint boundary (vLLM's `_mamba_block_aligned_split`,
 //! which does not change under PP), via the same rule as unified chunked
 //! prefill. One attention partition only.
+//!
+//! Under balanced retention (`with_balanced_retention`, not vLLM) a retained
+//! context lies once over the stages, and a hit first pulls each stage's
+//! copies back with the copy engine (`worker::kv::BalancedRetention`). The
+//! request is admitted as any other, its KV reserved and its prefix taken from
+//! the cache, but its first chunk waits in `copying` until the pull lands.
+//! Pulls run one after another on the pipeline's copy queue and overlap the
+//! stages' compute; a landed request joins the started prompts.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::worker::shared::back_stash::{BackEntry, BackStash};
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
+use crate::worker::kv::{BalancedRetention, ChunkedPrefillKv, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
@@ -116,6 +124,83 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     /// microbatch's back pass carries them; the request's first token is
     /// emitted when that microbatch exits.
     back: Option<PipelineBack>,
+    /// Balanced retention: hits whose copy-engine pull has not landed.
+    copies: Option<PrefixCopies>,
+}
+
+/// Hits waiting on their pull, and the pipeline's copy queue.
+struct PrefixCopies {
+    balanced: BalancedRetention,
+    /// When the copy queue is free again.
+    free_at: Time,
+    /// Admitted hits in landing order (the queue is FIFO), with when they land.
+    copying: VecDeque<(Time, AdmissionCandidate)>,
+    tally: CopyTally,
+}
+
+/// Per-minute log of the pulls ("prefix copy tally"): count, bytes, and how
+/// long each request waited from admission to the landing.
+#[derive(Default)]
+struct CopyTally {
+    worker: u16,
+    minute: u64,
+    copies: u64,
+    bytes: u64,
+    wait_us_sum: u64,
+    wait_us_max: u64,
+    /// Waits by upper edge [`COPY_WAIT_EDGES_US`], the last bucket open.
+    buckets: [u64; COPY_WAIT_EDGES_US.len() + 1],
+}
+
+const COPY_WAIT_EDGES_US: [u64; 12] = [
+    50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 1_000_000,
+];
+
+impl CopyTally {
+    fn record(&mut self, now: Time, bytes: u64, wait: Time) {
+        let minute = (now.as_ms() / 60_000.0) as u64;
+        if minute != self.minute {
+            self.flush();
+            self.minute = minute;
+        }
+        let wait_us = wait.as_ns() / 1_000;
+        self.copies += 1;
+        self.bytes += bytes;
+        self.wait_us_sum += wait_us;
+        self.wait_us_max = self.wait_us_max.max(wait_us);
+        let bucket = COPY_WAIT_EDGES_US
+            .iter()
+            .position(|&edge| wait_us <= edge)
+            .unwrap_or(COPY_WAIT_EDGES_US.len());
+        self.buckets[bucket] += 1;
+    }
+
+    fn flush(&mut self) {
+        if self.copies > 0 {
+            tracing::info!(
+                worker = self.worker,
+                minute = self.minute,
+                copies = self.copies,
+                bytes = self.bytes,
+                wait_us_sum = self.wait_us_sum,
+                wait_us_max = self.wait_us_max,
+                buckets = ?self.buckets,
+                "prefix copy tally"
+            );
+        }
+        // Field by field: assigning a fresh tally would drop (and flush) this one.
+        self.copies = 0;
+        self.bytes = 0;
+        self.wait_us_sum = 0;
+        self.wait_us_max = 0;
+        self.buckets = [0; COPY_WAIT_EDGES_US.len() + 1];
+    }
+}
+
+impl Drop for CopyTally {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 struct PipelineBack {
@@ -182,6 +267,41 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             reads: FreshReads::new(1),
             external_decode: None,
             back: None,
+            copies: None,
+        }
+    }
+
+    /// Store retained contexts once over the stages and pull each hit's
+    /// copies back before its first chunk (`balanced`). Not vLLM.
+    pub(crate) fn with_balanced_retention(
+        mut self,
+        balanced: BalancedRetention,
+        worker: u16,
+    ) -> Self {
+        self.copies = Some(PrefixCopies {
+            balanced,
+            free_at: Time::ZERO,
+            copying: VecDeque::new(),
+            tally: CopyTally {
+                worker,
+                ..CopyTally::default()
+            },
+        });
+        self
+    }
+
+    /// Move the hits whose pull has landed by `now` to the started prompts.
+    fn land_copies(&mut self, now: Time) {
+        let Some(copies) = self.copies.as_mut() else {
+            return;
+        };
+        while copies
+            .copying
+            .front()
+            .is_some_and(|&(ready, _)| ready <= now)
+        {
+            let (_, candidate) = copies.copying.pop_front().unwrap();
+            self.started_prefills.push(candidate);
         }
     }
 
@@ -278,7 +398,20 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 )
             })
             .sum();
-        started + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens
+        let copying: u64 = self.copies.as_ref().map_or(0, |copies| {
+            copies
+                .copying
+                .iter()
+                .map(|(_, candidate)| {
+                    u64::from(
+                        kv_store
+                            .resolved_prefill_context(candidate.request_id)
+                            .remaining_prefill_tokens(),
+                    )
+                })
+                .sum()
+        });
+        started + copying + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens
     }
 }
 
@@ -411,6 +544,21 @@ where
                 record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
                 context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
             }
+            // A retained hit's copies come back first; it takes no budget.
+            let pull = self.copies.as_ref().and_then(|copies| {
+                resolved_prefill.session_id().and_then(|_| {
+                    copies
+                        .balanced
+                        .copy(resolved_prefill.resident_prefix_tokens())
+                })
+            });
+            if let (Some(pull), Some(copies)) = (pull, self.copies.as_mut()) {
+                let ready = copies.free_at.max(now) + pull.duration;
+                copies.free_at = ready;
+                copies.copying.push_back((ready, candidate));
+                copies.tally.record(now, pull.bytes, ready - now);
+                continue;
+            }
             kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
             remaining_budget -= chunk_tokens;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
@@ -515,6 +663,7 @@ where
                 && FreshReads::held_context_at_risk(PARTITION, &self.policy, kv_store, horizon);
             self.policy.set_hits_first(at_risk);
         }
+        self.land_copies(now);
         let mut remaining_budget = self.max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
@@ -781,5 +930,17 @@ where
 
     fn next_read_landing(&self, kv_store: &K) -> Option<Time> {
         kv_store.next_tier_landing()
+    }
+
+    fn next_landing(&self) -> Option<Time> {
+        self.copies
+            .as_ref()
+            .and_then(|copies| copies.copying.front().map(|&(ready, _)| ready))
+    }
+
+    fn next_landing_after(&self, now: Time) -> Option<Time> {
+        let copying = &self.copies.as_ref()?.copying;
+        let first = copying.partition_point(|&(ready, _)| ready <= now);
+        copying.get(first).map(|&(ready, _)| ready)
     }
 }

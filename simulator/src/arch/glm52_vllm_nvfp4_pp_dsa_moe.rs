@@ -660,6 +660,17 @@ impl Glm52VllmNvfp4PpDsaMoeModel {
         self.stages.iter().map(|stage| &stage.kv_cache_layout)
     }
 
+    /// Each stage's cache and the model's per-token cache stored once: no
+    /// stage copies another's layers, so that is the stages' parts together.
+    pub fn pipeline_kv_shares(&self) -> crate::arch::kv_layout::PipelineKvShares {
+        crate::arch::kv_layout::PipelineKvShares::without_copies(
+            self.stages
+                .iter()
+                .map(|stage| stage.kv_cache_layout.clone())
+                .collect(),
+        )
+    }
+
     /// Bytes one token sends from one stage to the next: vLLM's PP
     /// `IntermediateTensors` carry `hidden_states` and `residual`, both BF16.
     pub fn activation_bytes_per_token(&self) -> u64 {

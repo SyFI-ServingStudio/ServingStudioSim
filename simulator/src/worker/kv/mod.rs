@@ -14,6 +14,8 @@ mod kv_cache_store;
 mod shared;
 
 pub use kv_cache_store::KvCacheStore;
+pub(crate) use shared::balanced_retention::RetainedScale;
+pub use shared::balanced_retention::{BalancedRetention, BalancedRetentionSpec};
 pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
 pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResumePoints};
 pub use shared::kv_cache_report::KvCacheReport;

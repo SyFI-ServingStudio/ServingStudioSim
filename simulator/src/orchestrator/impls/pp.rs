@@ -431,6 +431,9 @@ mod tests {
                     Arc::clone(&model),
                     layout,
                     &kv_cache_layout,
+                    &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![
+                        kv_cache_layout.clone(),
+                    ]),
                     Rc::clone(&store),
                     config.clone(),
                     None,

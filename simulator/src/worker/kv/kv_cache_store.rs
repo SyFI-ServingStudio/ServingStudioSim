@@ -1671,6 +1671,7 @@ mod tests {
         PrefixCacheBudget {
             max_retained_units,
             policy,
+            retained_scale: crate::worker::kv::shared::balanced_retention::RetainedScale::ONE,
         }
     }
 

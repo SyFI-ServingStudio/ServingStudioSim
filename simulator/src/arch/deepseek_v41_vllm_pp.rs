@@ -67,7 +67,7 @@ use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{
     self as dp_arch, DeepInferEngine, ENGRAM_TABLE_ROWS_TP1,
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
-use crate::arch::kv_layout::KvCacheLayout;
+use crate::arch::kv_layout::{KvCacheLayout, PipelineKvShares};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -575,6 +575,10 @@ pub struct DeepseekV41VllmPpConfigs {
     /// The whole model's cache, one copy over the stages (the stage copies
     /// of upstream KV sources are in the stage layouts only).
     pub kv_cache_layout: KvCacheLayout,
+    /// The stage layouts' family (DeepInfer or vLLM) over every KV source
+    /// once: what the stages store between them when a retained context keeps
+    /// no copies ([`DeepseekV41VllmPpModel::pipeline_kv_shares`]).
+    pub unique_kv_cache_layout: KvCacheLayout,
     pub graphs: DeepseekV41CudaGraphs,
     /// The sliding window (rows a request keeps past the cut).
     pub window: u32,
@@ -845,6 +849,12 @@ pub fn build_configs(
     }
     let kv_cache_layout =
         tp_arch::kv_cache_layout(model, 1, 0).sharded(u32::from(parallel.pp_size));
+    let unique_kv_cache_layout = match &parallel.deepinfer {
+        Some(engine) => {
+            dp_arch::deepinfer_kv_cache_layout(model, &model.kv_source_layer_ids, &[], 0, engine)
+        }
+        None => stage_kv_cache_layout(model, &(0..model.num_layers).collect::<Vec<_>>(), &[]),
+    };
     Ok(DeepseekV41VllmPpConfigs {
         parallel: parallel.clone(),
         engram_layer_ids: model.engram_layer_ids.clone(),
@@ -885,6 +895,7 @@ pub fn build_configs(
         fork_accepts: fork_accepts_lists(model, &lists, rule.is_some()),
         stages,
         kv_cache_layout,
+        unique_kv_cache_layout,
         window: rule.map_or(model.sliding_window, |rule| rule.window),
         graphs,
     })
@@ -923,6 +934,7 @@ pub struct DeepseekV41VllmPpResolved {
     stages: Vec<DeepseekV41PpStageResolved>,
     fork_accepts: bool,
     kv_cache_layout: KvCacheLayout,
+    unique_kv_cache_layout: KvCacheLayout,
     graphs: DeepseekV41CudaGraphs,
     hc_mult: u32,
     hidden: u32,
@@ -967,6 +979,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmPpConfigs) -> DeepseekV41VllmPpR
             .collect(),
         fork_accepts: configs.fork_accepts,
         kv_cache_layout: configs.kv_cache_layout.clone(),
+        unique_kv_cache_layout: configs.unique_kv_cache_layout.clone(),
         graphs: configs.graphs.clone(),
         hc_mult: configs.head.hc_mult,
         hidden: configs.head.hidden_size.get(),
@@ -1782,6 +1795,7 @@ pub fn build_with_engram_fetch(
         stages,
         fork_accepts,
         kv_cache_layout,
+        unique_kv_cache_layout,
         graphs,
         hc_mult,
         hidden,
@@ -1830,6 +1844,7 @@ pub fn build_with_engram_fetch(
         hidden_row_bytes,
         fork_accepts,
         kv_cache_layout,
+        unique_kv_cache_layout,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -1850,6 +1865,7 @@ pub struct DeepseekV41VllmPpModel {
     hidden_row_bytes: u64,
     fork_accepts: bool,
     kv_cache_layout: KvCacheLayout,
+    unique_kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1877,6 +1893,18 @@ impl DeepseekV41VllmPpModel {
             .max_by_key(|layout| layout.per_token_bytes())
             .expect("a pipeline has stages")
             .clone()
+    }
+
+    /// Each stage's cache (copies included) and the model's cache stored once.
+    pub fn pipeline_kv_shares(&self) -> PipelineKvShares {
+        PipelineKvShares {
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| stage.kv_cache_layout.clone())
+                .collect(),
+            unique: self.unique_kv_cache_layout.clone(),
+        }
     }
 
     /// Hidden-state bytes per row at a boundary; the stages' `send_bytes`

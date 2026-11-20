@@ -129,6 +129,15 @@ pub trait MicrobatchAdmission<K: KvStore> {
     fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
         None
     }
+    /// The earliest time something admitted becomes schedulable on its own
+    /// (a balanced-retention pull landing); `None`: nothing waits on time.
+    fn next_landing(&self) -> Option<Time> {
+        None
+    }
+    /// The first such time after `now`: when an idle head must wake.
+    fn next_landing_after(&self, _now: Time) -> Option<Time> {
+        None
+    }
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

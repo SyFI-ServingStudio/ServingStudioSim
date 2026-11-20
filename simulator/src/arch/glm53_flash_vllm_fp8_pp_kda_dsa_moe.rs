@@ -711,6 +711,17 @@ impl Glm53FlashVllmFp8PpModel {
         self.stages.iter().map(|stage| &stage.kv_cache_layout)
     }
 
+    /// Each stage's cache and the model's per-token cache stored once: no
+    /// stage copies another's layers, so that is the stages' parts together.
+    pub fn pipeline_kv_shares(&self) -> crate::arch::kv_layout::PipelineKvShares {
+        crate::arch::kv_layout::PipelineKvShares::without_copies(
+            self.stages
+                .iter()
+                .map(|stage| stage.kv_cache_layout.clone())
+                .collect(),
+        )
+    }
+
     /// vLLM's KDA cache-group count `G`; see [`kda_group_count`].
     pub fn kda_groups(&self) -> u32 {
         self.kda_groups

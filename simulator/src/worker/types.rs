@@ -579,6 +579,10 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// Balanced retention of a pipeline's retained prefixes and the measured
+    /// cost of the pull a hit makes (`None`: each stage keeps its copies).
+    /// Only the pipeline head recipe reads it.
+    pub balanced_retention: Option<crate::worker::kv::BalancedRetentionSpec>,
     /// How much prefill a pipeline microbatch, or a chunked-prefill DP rank's
     /// share of an iteration, takes. Only the two chunked recipes read it.
     pub microbatch_budget: crate::worker::admission::MicrobatchBudget,
@@ -680,6 +684,7 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            balanced_retention: None,
             microbatch_budget: crate::worker::admission::MicrobatchBudget::default(),
             started_order: crate::worker::admission::StartedOrder::StartOrder,
             force_schedule: None,

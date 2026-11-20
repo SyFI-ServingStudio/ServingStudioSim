@@ -30,6 +30,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
 
+use crate::worker::kv::shared::balanced_retention::RetainedScale;
 use crate::worker::kv::shared::kv_accounting::{KvAccounting, ResumePositions, SharedKvAccounting};
 use crate::worker::kv::shared::state_retention::{
     normalize, Carried, RoundState, StateRetention, StateTag,
@@ -91,13 +92,25 @@ impl Default for PrefixCacheConfig {
 pub(crate) struct PrefixCacheBudget {
     pub(crate) max_retained_units: u64,
     pub(crate) policy: PrefixCachePolicy,
+    /// What a retained entry costs relative to the partition's layout
+    /// ([`RetainedScale::ONE`] but under balanced pipeline retention).
+    pub(crate) retained_scale: RetainedScale,
 }
 
 impl PrefixCacheBudget {
     pub(crate) const DISABLED: Self = Self {
         max_retained_units: 0,
         policy: PrefixCachePolicy::Lru,
+        retained_scale: RetainedScale::ONE,
     };
+
+    /// The same budget with retained entries charged at `scale`.
+    pub(crate) fn with_retained_scale(self, scale: RetainedScale) -> Self {
+        Self {
+            retained_scale: scale,
+            ..self
+        }
+    }
 }
 
 impl PrefixCacheConfig {
@@ -127,6 +140,7 @@ impl PrefixCacheConfig {
                 PrefixCacheBudget {
                     max_retained_units,
                     policy,
+                    retained_scale: RetainedScale::ONE,
                 }
             }
         }
@@ -242,6 +256,8 @@ pub(crate) struct PrefixCache {
     /// ([`Self::states_added_per_round`]).
     added_per_round: u32,
     max_retained_units: u64,
+    /// An entry's charge relative to `accounting`'s.
+    retained_scale: RetainedScale,
     /// Units the entries occupy, the sum of their charges, plus the states
     /// running requests carry.
     used_units: u64,
@@ -265,6 +281,7 @@ impl PrefixCache {
             max_retained_units: budget.max_retained_units.min(accounting.capacity_units()),
             retention: accounting.state_retention(),
             added_per_round: 1,
+            retained_scale: budget.retained_scale,
             accounting,
             used_units: 0,
             used_tokens: 0,
@@ -543,9 +560,11 @@ impl PrefixCache {
         // exist only beside a single context-end position, which fits whole
         // or not at all.
         let earlier_units = self.state_units(earlier.len());
-        let positions = self
-            .accounting
-            .largest_fitting(&own, effective_capacity.saturating_sub(earlier_units));
+        let positions = self.accounting.largest_fitting(
+            &own,
+            self.retained_scale
+                .unscaled_within(effective_capacity.saturating_sub(earlier_units)),
+        );
         let retained_tokens = positions.end();
         let unkept = (retained_tokens < own.end()).then(|| LeavingContext {
             session_id,
@@ -560,7 +579,10 @@ impl PrefixCache {
                 unkept,
             };
         }
-        let charge = self.accounting.entry_charge(&positions) + earlier_units;
+        let charge = self
+            .retained_scale
+            .charge(self.accounting.entry_charge(&positions))
+            + earlier_units;
         while self.used_units.saturating_add(charge) > effective_capacity {
             let Some(victim) = self.victim() else {
                 break;
@@ -706,6 +728,7 @@ mod tests {
             PrefixCacheBudget {
                 max_retained_units,
                 policy,
+                retained_scale: RetainedScale::ONE,
             },
         )
     }
@@ -741,6 +764,7 @@ mod tests {
             PrefixCacheBudget {
                 max_retained_units: capacity,
                 policy: PrefixCachePolicy::Lru,
+                retained_scale: RetainedScale::ONE,
             },
         )
     }
@@ -760,6 +784,7 @@ mod tests {
             PrefixCacheBudget {
                 max_retained_units: 1_000,
                 policy: PrefixCachePolicy::Lru,
+                retained_scale: RetainedScale::ONE,
             }
         );
         assert_eq!(
@@ -771,6 +796,7 @@ mod tests {
             PrefixCacheBudget {
                 max_retained_units: 400,
                 policy: PrefixCachePolicy::Fifo,
+                retained_scale: RetainedScale::ONE,
             }
         );
     }
@@ -1219,5 +1245,40 @@ mod tests {
         cache.take(1, 2_001);
         assert_eq!(cache.used_units(), 0);
         assert!(cache.take_carried(1).states.is_empty());
+    }
+
+    #[test]
+    fn a_scaled_entry_costs_its_share_and_fits_the_scaled_capacity() {
+        // Balanced retention at 3/4: 40 retained tokens cost 30 units, so a
+        // 100-unit cache keeps three such sessions, and an entry is cut to the
+        // tokens whose scaled charge fits what is left.
+        let mut cache = PrefixCache::new(
+            KvAccounting::tokens_for_test(100),
+            PrefixCacheBudget {
+                max_retained_units: 100,
+                policy: PrefixCachePolicy::Lru,
+                retained_scale: RetainedScale { num: 3, den: 4 },
+            },
+        );
+        for session in 0..3 {
+            assert_eq!(cache.insert(session, 40, 40, 100, None).retained_tokens, 40);
+        }
+        assert_eq!((cache.used_units(), cache.used_tokens()), (90, 120));
+        // A fourth needs 30 of the 10 units left: the LRU session makes room.
+        assert_eq!(cache.insert(3, 40, 40, 100, None).retained_tokens, 40);
+        assert_eq!(cache.used_units(), 90);
+        let mut tight = PrefixCache::new(
+            KvAccounting::tokens_for_test(100),
+            PrefixCacheBudget {
+                max_retained_units: 10,
+                policy: PrefixCachePolicy::Lru,
+                retained_scale: RetainedScale { num: 3, den: 4 },
+            },
+        );
+        // 10 units: 13 tokens cost ceil(39 / 4) = 10, 14 would cost 11.
+        assert_eq!(tight.insert(0, 40, 40, 100, None).retained_tokens, 13);
+        assert_eq!(tight.used_units(), 10);
+        assert_eq!(tight.take(0, 40).hit_tokens, 13);
+        assert_eq!(tight.used_units(), 0);
     }
 }

@@ -216,6 +216,10 @@ where
         if std::mem::take(&mut self.request_arrived) {
             self.state_changed_at = self.state_changed_at.max(now);
         }
+        // A balanced-retention pull that landed by now changes what can form.
+        if let Some(landing) = self.admission.next_landing().filter(|&at| at <= now) {
+            self.state_changed_at = self.state_changed_at.max(landing);
+        }
         // Exits first: they release KV the next formation may need, and their
         // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
@@ -264,7 +268,7 @@ where
                 break;
             }
         }
-        self.next_wakeup()
+        self.next_wakeup(now)
     }
 
     fn complete_exited_microbatches(&mut self, events: &mut Vec<PipelineHeadEvent>) {
@@ -360,11 +364,11 @@ where
         }
     }
 
-    fn next_wakeup(&self) -> Option<Time> {
-        let compute = self
-            .computing
-            .as_ref()
-            .map(|computing| computing.compute_end);
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        let compute = match &self.computing {
+            Some(computing) => Some(computing.compute_end),
+            None => self.admission.next_landing_after(now),
+        };
         let landing = self.admission.next_read_landing(&self.kv_store);
         match (compute, landing) {
             (Some(compute), Some(landing)) => Some(compute.min(landing)),
@@ -440,6 +444,7 @@ mod tests {
             Arc::new(FakeModel::for_ms(1.0)),
             LAYOUT,
             &kv_layout(),
+            &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![kv_layout(); 2]),
             store,
             config,
             None,
@@ -532,6 +537,7 @@ mod tests {
             Arc::new(FakeModel::for_ms(1.0)),
             LAYOUT,
             &layout,
+            &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![layout.clone(); 2]),
             Rc::clone(&store),
             WorkerConfig {
                 max_batch_tokens: Some(4),
@@ -772,6 +778,10 @@ mod tests {
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 3, ..LAYOUT },
             &kv_cache_layout,
+            &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![
+                kv_cache_layout.clone();
+                3
+            ]),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(max_batch_tokens),
@@ -1078,6 +1088,7 @@ mod tests {
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
             &kv_layout(),
+            &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![kv_layout(); 2]),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1783,6 +1794,7 @@ mod tests {
                 ..LAYOUT
             },
             &kv_layout(),
+            &crate::arch::kv_layout::PipelineKvShares::without_copies(vec![kv_layout(); 2]),
             store,
             config,
             None,
@@ -1984,5 +1996,92 @@ mod tests {
             let position = |id| done.iter().position(|&request| request == RequestId(id));
             assert_eq!(position(3) < position(2), round1_first, "{label}: {done:?}");
         }
+    }
+
+    /// The 4-token prompt of a session's second request, whose 8-token prefix
+    /// the first left in the cache: its ready time, the hit, and what the
+    /// tick that admitted it asked to be woken at.
+    fn second_round(balanced: bool) -> (Time, u32, Option<Time>) {
+        use crate::arch::kv_layout::{KvCacheLayout, KvCachePart, PipelineKvShares};
+        use crate::common::SessionInput;
+        use crate::worker::kv::BalancedRetentionSpec;
+        let store = shared_with(&[(0, 8, 1), (1, 4, 1)]);
+        {
+            let mut requests = store.borrow_mut();
+            for (request, declared) in [(RequestId(0), 0), (RequestId(1), 8)] {
+                requests[request].request.definition.session = SessionInput::Session {
+                    session_id: 7,
+                    session_start_time: Time::ZERO,
+                    declared_prefix_tokens: declared,
+                };
+            }
+        }
+        // Each stage reads 4 B/token; the model stores 6 B/token once, so a
+        // retained token costs 3 B per stage and a hit pulls 1 B/token back.
+        let per_token = |bytes| KvCacheLayout::new().with_part(KvCachePart::per_token("kv", bytes));
+        let mut worker = build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            LAYOUT,
+            &per_token(4),
+            &PipelineKvShares {
+                stages: vec![per_token(4), per_token(4)],
+                unique: per_token(6),
+            },
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(16),
+                attn_kv_bytes: 1_000,
+                balanced_retention: balanced.then_some(BalancedRetentionSpec {
+                    copy_latency: Time::from_ms(1.0),
+                    copy_us_per_piece: 0.0,
+                    copy_bytes_per_us: 1e12,
+                    pieces_per_block: 1,
+                }),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+            microbatch: 1,
+            at: Time::from_ms(2.0),
+        });
+        worker.tick(Time::from_ms(2.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0)]);
+        events.clear();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let wake = worker.tick(Time::from_ms(3.0), &mut events);
+        for ms in [4.0, 5.0] {
+            worker.tick(Time::from_ms(ms), &mut events);
+        }
+        let launches = launched(&events);
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].1, 4);
+        let hit = store.borrow()[RequestId(1)]
+            .telemetry
+            .prefix_cache_hit_tokens
+            .unwrap_or(0);
+        (launches[0].2, hit, wake)
+    }
+
+    #[test]
+    fn a_balanced_hit_waits_for_its_pull_before_the_first_chunk() {
+        // Copies kept: the prompt forms at its arrival (3 ms), ready at 4 ms.
+        let (ready, hit, wake) = second_round(false);
+        assert_eq!((ready, hit), (Time::from_ms(4.0), 8));
+        assert_eq!(wake, Some(Time::from_ms(4.0)));
+        // Balanced: the 1 ms pull lands at 4 ms, the idle head wakes then and
+        // the chunk is ready a microbatch later.
+        let (ready, hit, wake) = second_round(true);
+        assert_eq!((ready, hit), (Time::from_ms(5.0), 8));
+        assert_eq!(wake, Some(Time::from_ms(4.0)));
     }
 }

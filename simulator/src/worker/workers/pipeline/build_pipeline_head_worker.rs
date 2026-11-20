@@ -4,16 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::kv_layout::KvCacheLayout;
+use crate::arch::kv_layout::{KvCacheLayout, PipelineKvShares};
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::kv::{BalancedRetention, RetainedScale};
 use crate::worker::shared::back_stash::{back_window, BackProbe, BackStash};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    kv_cache_store_with_retained_scale, prefill_chunk_end_quantum, prepare_iter_build_essentials,
     resolve_kv_accounting, with_host_tiers,
 };
 
@@ -36,6 +37,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     stage_model: Arc<M>,
     layout: PipelineLayout,
     kv_cache_layout: &KvCacheLayout,
+    kv_shares: &PipelineKvShares,
     requests: SharedRequests,
     config: WorkerConfig,
     cost_log_dir: Option<PathBuf>,
@@ -49,6 +51,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         stage_model,
         layout,
         kv_cache_layout,
+        kv_shares,
         requests,
         config,
         cost_log_dir,
@@ -69,6 +72,7 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
     stage_model: Arc<M>,
     layout: PipelineLayout,
     kv_cache_layout: &KvCacheLayout,
+    kv_shares: &PipelineKvShares,
     requests: SharedRequests,
     config: WorkerConfig,
     cost_log_dir: Option<PathBuf>,
@@ -115,13 +119,21 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
         cluster
             .borrow_mut()
             .register_comm_group(essentials.allocation_base, 1, pool_tag, id.0);
-    let kv_store = kv_cache_store(
+    let balanced = config.balanced_retention.map(|spec| {
+        let balanced =
+            BalancedRetention::resolve(kv_cache_layout, kv_shares, kv_accounting.options(), spec)
+                .unwrap_or_else(|error| panic!("balanced retention: {error:#}"));
+        tracing::info!(worker = id.0, ?balanced, "pipeline head balanced retention");
+        balanced
+    });
+    let kv_store = kv_cache_store_with_retained_scale(
         kv_accounting,
         1,
         1,
         &config,
         essentials.sampler,
         prefix_cache_logger,
+        balanced.map_or(RetainedScale::ONE, |balanced| balanced.scale()),
     );
     let kv_store = with_host_tiers(
         kv_store,
@@ -168,6 +180,9 @@ pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
             1,
             probe,
         ));
+    }
+    if let Some(balanced) = balanced {
+        admission = admission.with_balanced_retention(balanced, id.0);
     }
 
     let head = PipelineHeadWorker::from_components(
