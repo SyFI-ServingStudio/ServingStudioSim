@@ -132,11 +132,18 @@ def _phase1_pack(
     return load_pack(root)
 
 
-def _write_workload_pass(case_dir: Path, *, log: str = SERVER_LOG, engine: str = "vllm") -> None:
-    """A workload pass as `alignment profile` leaves it, recorded from elsewhere."""
+def _write_workload_pass(
+    case_dir: Path, *, log: str = SERVER_LOG, engine: str = "vllm", relative: bool = False
+) -> None:
+    """A workload pass as `alignment profile` leaves it, recorded from elsewhere.
+
+    `relative` records the artifacts as the runner does now (`artifact_paths.record`):
+    relative to the pass directory; otherwise as an older result, absolute.
+    """
     directory = case_dir / "profile_workload"
     (directory / engine).mkdir(parents=True, exist_ok=True)
     recorded = "/elsewhere/campaign/90_diverse_100/profile_workload"
+    prefix = "" if relative else f"{recorded}/"
     (directory / "spec_decode_metrics.json").write_text(json.dumps(SPEC_METRICS))
     (directory / engine / "p1_server.log").write_text(log)
     (directory / engine / "p1_metrics.jsonl").write_text(
@@ -146,9 +153,9 @@ def _write_workload_pass(case_dir: Path, *, log: str = SERVER_LOG, engine: str =
         "engine": engine,
         "profile_kind": "workload_metrics",
         "log_dir": recorded,
-        "server_log": f"{recorded}/{engine}/p1_server.log",
-        "spec_decode_metrics_json": f"{recorded}/spec_decode_metrics.json",
-        "metrics_jsonl": f"{recorded}/{engine}/p1_metrics.jsonl",
+        "server_log": f"{prefix}{engine}/p1_server.log",
+        "spec_decode_metrics_json": f"{prefix}spec_decode_metrics.json",
+        "metrics_jsonl": f"{prefix}{engine}/p1_metrics.jsonl",
     }))
 
 
@@ -380,6 +387,17 @@ def test_simulation_waits_for_the_workload_pass(tmp_path):
     assert "simulation.yaml" not in documents
     with pytest.raises(PackError, match="from_capture"):
         simulation_document(pack, case, pack.variant_of(case), rendered.directory, REPO_ROOT)
+
+
+def test_calibration_reads_artifacts_recorded_relative_to_the_pass(tmp_path):
+    pack = _phase1_pack(tmp_path)
+    case = _phase1_case(pack)
+    case_dir = _render(pack, case, tmp_path / "runs").directory
+    _write_workload_pass(case_dir, relative=True)
+
+    fields = calibration.resolve(pack, case, case_dir)
+    assert fields["attn_gpu_memory_gb"]["value"] == EXPECTED_KV_GB
+    assert fields["attn_gpu_memory_gb"]["source"] == "profile_workload/vllm/p1_server.log"
 
 
 def test_run_reads_the_capture_and_writes_calibration_json(tmp_path, monkeypatch):
