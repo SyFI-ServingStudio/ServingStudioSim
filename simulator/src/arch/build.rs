@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::arch::deepseek_v41_engram_fetch::{EngramFetch, EngramHostGather};
+use crate::arch::deepseek_v41_engram_fetch::EngramFetch;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -1144,7 +1144,6 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     cudagraph_capture_sizes: &[u32],
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     engram_fetch: EngramFetch,
-    engram_cpu_threads: u32,
     dp_size: u32,
     gpu: &str,
     name: &str,
@@ -1187,17 +1186,9 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
             engram.consumer = false;
         }
     }
-    let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
-        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),
-        _ => None,
-    };
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
-    let model = deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
-        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")?;
-    Ok(match host_gather {
-        Some(gather) => model.with_engram_host_gather(gather),
-        None => model,
-    })
+    deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
 }
 
 /// Build DeepSeek-V4.1-Flash under plain pipeline parallelism (B200, one
@@ -1220,7 +1211,6 @@ pub fn deepseek_v41_vllm_pp(
     cut_handoff: deepseek_v41_vllm_pp::CutHandoff,
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
     engram_fetch: EngramFetch,
-    engram_cpu_threads: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1266,12 +1256,8 @@ pub fn deepseek_v41_vllm_pp(
             }
         }
     }
-    let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
-        (fetch, Some(prefetch)) => EngramHostGather::for_fetch(fetch, engram_cpu_threads, prefetch),
-        _ => None,
-    };
     let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
-    deepseek_v41_vllm_pp::build_with_engram_fetch(name.to_string(), resolved, host_gather, bridge)
+    deepseek_v41_vllm_pp::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash PP model (often a missing profile.db row)")
 }
 
@@ -2901,7 +2887,6 @@ pub fn build_iter_model(
             engine,
             yoco_keep_tokens,
             engram_fetch,
-            engram_cpu_threads,
             deepinfer_max_num_seqs,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
@@ -2927,7 +2912,6 @@ pub fn build_iter_model(
                 *deepinfer_max_num_seqs,
             )?,
             *engram_fetch,
-            *engram_cpu_threads,
             gpu,
             name,
             bridge,
@@ -2946,7 +2930,6 @@ pub fn build_iter_model(
             num_redundant_experts,
             yoco_keep_tokens,
             engram_fetch,
-            engram_cpu_threads,
             dp_size,
             force_load_balance,
             prefill_chunk_tokens,
@@ -2971,7 +2954,6 @@ pub fn build_iter_model(
                 *deepinfer_max_num_seqs,
             )?,
             *engram_fetch,
-            *engram_cpu_threads,
             *dp_size,
             gpu,
             name,

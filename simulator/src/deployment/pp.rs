@@ -248,7 +248,6 @@ impl Deployment for PpDeployment {
                 engine,
                 yoco_keep_tokens,
                 engram_fetch,
-                engram_cpu_threads,
                 deepinfer_max_num_seqs,
                 ..
             } => {
@@ -276,7 +275,6 @@ impl Deployment for PpDeployment {
                         *deepinfer_max_num_seqs,
                     )?,
                     *engram_fetch,
-                    *engram_cpu_threads,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

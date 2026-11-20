@@ -68,10 +68,6 @@ pub struct DeepseekV41EngramPrefetchLocalWorkletConfig {
     pub weight_dtype: DType,
     pub gpu_name: String,
     pub backends: Vec<&'static str>,
-    /// Lookup tokens priced per scheduled token: 1, or (a device-resident
-    /// stand-in for a wider column set, `arch::deepseek_v41_engram_fetch`)
-    /// the columns per token over the profiled 6, the same row count.
-    pub token_scale: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +164,7 @@ impl DeepseekV41EngramPrefetchLocalWorklet {
             eval_or_zero(
                 op,
                 EngramLookupKernelInput {
-                    num_tokens: input.num_tokens * self.resolved.raw_cfg.token_scale,
+                    num_tokens: input.num_tokens,
                 },
                 input.num_tokens == 0,
                 ev,
@@ -192,7 +188,6 @@ pub(crate) mod tests {
             weight_dtype: DType::Fp8E4m3,
             gpu_name: "NVIDIA B200".into(),
             backends: vec!["vllm_triton"],
-            token_scale: 1,
         }
     }
 

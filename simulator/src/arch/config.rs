@@ -159,10 +159,6 @@ const fn default_deepinfer_max_num_seqs() -> u32 {
     256
 }
 
-const fn default_engram_cpu_threads() -> u32 {
-    8
-}
-
 const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
     crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS
 }
@@ -637,23 +633,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = 0, cache_key)]
         yoco_keep_tokens: u32,
-        /// How Engram rows reach the GPU: `uva` (vLLM's host-UVA lookup),
-        /// `cpu_threads` (host gather on `engram_cpu_threads` threads per rank
-        /// + one H2D copy per layer + device unpack;
-        /// `arch::deepseek_v41_engram_fetch`), `prefetch` (the same, started
-        /// during the previous step), `gpu` (the table in HBM, device lookup; a
-        /// bound only, it OOMs on B200), or `off` (the fetch priced out, the
-        /// Engram blocks' compute stays). `cpu_gather` / `cpu_gather_prefetch`
-        /// are the earlier names; `true`/`false` read as uva/off.
+        /// How Engram rows reach the GPU: `uva` (vLLM's host-UVA lookup; under
+        /// `engine: deepinfer` an approximation, see
+        /// `arch::deepseek_v41_engram_fetch`), `off` (the fetch priced out,
+        /// the Engram blocks' compute stays) or `none` (Engram fully off).
+        /// `true`/`false` read as uva/off.
         #[serde(default)]
         #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
-        /// Host gather threads per rank under `engram_fetch: cpu_threads` /
-        /// `prefetch`; priced at the nearest measured count (1, 2, 4, 8, 14;
-        /// `arch::deepseek_v41_engram_fetch`).
-        #[serde(default = "default_engram_cpu_threads")]
-        #[param(default = 8, cache_key)]
-        engram_cpu_threads: u32,
         /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
         /// the per-sequence state slots DeepInfer reserves out of the KV budget
         /// (`cache_engine.py`), so it moves the token capacity.
@@ -758,12 +745,6 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
         engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
-        /// Host gather threads per rank under `engram_fetch: cpu_threads` /
-        /// `prefetch`; priced at the nearest measured count (1, 2, 4, 8, 14;
-        /// `arch::deepseek_v41_engram_fetch`).
-        #[serde(default = "default_engram_cpu_threads")]
-        #[param(default = 8, cache_key)]
-        engram_cpu_threads: u32,
         /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
         /// the per-sequence state slots DeepInfer reserves out of the KV budget
         /// (`cache_engine.py`), so it moves the token capacity.

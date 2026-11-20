@@ -879,7 +879,6 @@ pub fn build_configs(
             weight_dtype: DType::Fp8E4m3,
             gpu_name: gpu.clone(),
             backends: ENGRAM_LOOKUP_BACKENDS.to_vec(),
-            token_scale: 1,
         },
         layer0: layer_config(model, parallel, demand, layer0_kind, vec![0]),
         bodies,
