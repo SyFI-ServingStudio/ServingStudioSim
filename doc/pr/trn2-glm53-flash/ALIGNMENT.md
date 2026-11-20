@@ -343,3 +343,60 @@ correctly, the model gives 447.9 @ 22.12 at x0.5 and 441.9 @ 21.64 at the measur
 
 The engine's waves start on an empty replica, so TTFT is the wave's prefill plus a short tail, and decode speed barely
 moves it. The model reproduces that.
+
+## Re-alignment on rounds 15-18 (official measurements, 2026-11-19 / 2026-11-20)
+
+**Sources** (glm5-trn2 `campaigns/glm8k1k/round{15..18}/`), all at C 64:
+
+| round | change | official | decision |
+|---|---|---|---|
+| 15 | FP8 prefill MoE kernel (no BF16 weight copy) | none: the kernel did not compile in its region | reject |
+| 16 | the same kernel, SBUF-bounded | 442.77 @ 21.67; the composed prefill step did not move | inconclusive |
+| 17 (`23718f7`) | KDA decode fused into one kernel; RMS norms folded into mHC, `hc_post` fused with the next `hc_pre` | 452.37 @ 22.23 (TPOT 44.98 ms, TTFT 31.5 s) | inconclusive (bar 452.52) |
+| 18 (`ce90d05`) | round 17 + round 16's prefill MoE kernel, made faster on device | 456.14 @ 22.20 (TPOT 45.04 ms, TTFT 30.8 s) | retained |
+
+Measured components:
+- Round 17: the decode step fell 41.96 -> 40.28 ms at 8 rows and 55.43 -> 52.53 ms at 16 (region probe, rank 0,
+  ctx 8192); prefill was unchanged.
+- Round 18: the 4096-token prefill step fell 1,690.9 -> 1,650.2 ms (-2.4%; warm-up prefill_4096x8192 1,786 ->
+  1,742 ms); decode was unchanged from round 17.
+
+**Model** (`presets/trn2/glm53_flash_fp8_trn2_service_r18.yaml`): R14 with two factors, each set from a measured
+component, not from the official throughput.
+- Decode: `kda`, `mhc_pre` and `mhc_post` x0.9 at decode rows (< 129). This gives TPOT 45.0 ms (measured
+  44.98-45.04).
+- Prefill: `moe_partial` x0.93 at prefill rows (>= 65). The model's TTFT, the wave's prefill, then falls 2.4%, as the
+  measured prefill step did.
+
+| | round 17 measured | Sim (decode only) | round 18 measured | Sim (R18) |
+|---|---|---|---|---|
+| tok/s per chip | 452.37 | 449.1 | 456.14 | 453.8 |
+| interactivity | 22.23 | 22.22 | 22.20 | 22.22 |
+| median TPOT (ms) | 44.98 | 45.0 | 45.04 | 45.0 |
+| median TTFT (s) | 31.5 | 32.0 | 30.8 | 31.2 |
+
+**The residual (-0.5 to -0.7%) is a TTFT bias.** The model's TTFT has been 0.4-0.5 s high since R14 (32.1 vs 31.6 s).
+- Fitting the prefill factor to the official throughput instead gives x0.9 and 455.9 @ 22.22.
+- That factor would double the measured prefill change. It absorbs the bias rather than modeling the kernel.
+
+**What the pre-round predictions missed.** Both predictions used the right construction, but assumed the handoff's
+component targets would be met:
+- Tick 17 predicted 465-473 @ 23-24 from a decode-step cut of ~3.5 ms. The kernel delivered a third of it at 8 rows and
+  half at 16.
+- Tick 18 predicted ~465-478 from a ~8% prefill-step cut. The kernel delivered 2.4%.
+- With the measured components, the model lands within 0.7% both times.
+
+**Round 19 what-ifs** (made before its measurement): the routed decode-MoE kernel. `moe_partial` is scaled at decode
+rows only (M < 65; 8 rows route M 32, 16 rows M 64). The measured per-call cost is 0.588 ms at M 32 and 0.733 ms at
+M 64 (layer 3, critical rank).
+
+| decode MoE time | C 64 | C 128 |
+|---|---|---|
+| 1.0x (R18) | 453.8 @ 22.22 | 597.6 @ 17.86 |
+| 0.9x | 468.1 @ 23.36 | 614.7 @ 18.91 |
+| 0.8x | 483.4 @ 24.63 | 633.5 @ 20.10 (TPOT 49.7 ms) |
+| 0.7x | 499.6 @ 26.03 | 652.6 @ 21.46 |
+
+- The engine runs C 128 only when its 16-row cap probe is <= 49 ms (TPOT <= 50 ms at 20 tok/s/user). That takes about
+  0.8x.
+- At C 64, 0.9x clears round 19's retain bar (465.3) by ~0.6% in the model, or ~1.1% after the residual.

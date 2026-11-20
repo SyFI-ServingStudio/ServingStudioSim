@@ -1,0 +1,72 @@
+# The glm5-trn2 R18 service (round 18 retained, `ce90d05`): the R14 service
+# (presets/trn2/glm53_flash_fp8_trn2_service_r14.yaml) with
+# - round 17's fused KDA decode kernel and the RMS norms folded into the mHC kernels (`hc_post` fused with the next
+#   `hc_pre`): `kda`, `mhc_pre` and `mhc_post` x0.9 at decode rows (< 129), fixed by the measured TPOT;
+# - round 16/18's FP8 prefill MoE kernel (no BF16 weight copy): `moe_partial` x0.93 at prefill rows (>= 65), fixed by
+#   the measured prefill step (-2.4%: region probe 1,690.9 -> 1,650.2 ms, warm-up 1,786 -> 1,742 ms).
+# The entries are cumulative; each change scales the entry at its low row bound by f and the one at its high bound by
+# 1/f (glm5-trn2 `campaigns/glm8k1k/round15/tick15/sim/whatif.py`).
+# `r18_official` replays the official C 64 request list: 453.8 tok/s/chip @ 22.22 tok/s/user, TPOT 45.0 ms, TTFT
+# 31.2 s, against the official round-18 measure's 456.14 @ 22.20 (TPOT 45.04 ms, TTFT 30.8 s). The -0.5% residual is
+# the model's TTFT bias (+0.4-0.5 s since R14). The 16-row cap probe measured 55.5 ms, above the 49 ms cap, so the
+# service runs C 64; `c128_cap16` is the C 128 what-if (597.6 @ 17.86).
+# `r19_moe_x08` / `r19_moe_x08_c128` are round 19's target, the routed decode MoE x0.8 at decode rows (M < 65):
+# 483.4 @ 24.63 at C 64, 633.5 @ 20.10 at C 128.
+deployment: unified
+
+workload:
+  trace_files: ${traces}
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: true
+
+io:
+  log_dir: "logs/trn2/glm53_flash_fp8_trn2_service_r18/{point}"
+  cost_log_mode: stride
+  cost_log_stride_iterations: 16
+
+pools:
+  main:
+    placement: least-loaded
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 2
+        arch:
+          type: glm53_flash_neuron_fp8
+          model_config: model/config/glm53_flash.json
+          world: 32
+          attn_tp: 8
+          region_granularity: layer
+          prefill_buckets: [4096]
+          decode_buckets: ${decode_buckets}
+          context_buckets: [2048, 4096, 6144, 6656, 7168, 7680, 8192, 8704, 9216]
+          slots: ${slots}
+          cmax: 9216
+          max_model_len: 9216
+          kind_time_scale: ${kts}
+          region_gap_ms: 0.05
+          host_time_scale: 0.28
+          prefill_device_factor: 1.53
+          region_device_factor: 1.1052
+          spmd_padding: true
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: ${mbt}
+          max_prefill_chunk_tokens: 4096
+          max_prefill_chunks_per_partition: 1
+          max_requests_per_partition: ${maxreq}
+          dp_placement: vllm-least-loaded
+          wave_admission: true
+          wave_quiet_ms: 100
+          wave_cap_ms: 2000
+          wave_first_token_from_decode: true
+          batch_policy: mix
+
+compound:
+  point:
+    r18_official: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.297", "kda@9=0.79", "kda@129=4.262", "mhc_post=0.405", "mhc_post@2=0.52", "mhc_post@129=4.74833", "mhc_pre=0.405", "mhc_pre@2=0.87", "mhc_pre@129=2.83811", "moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.81722"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
+    c128_cap16: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.297", "kda@9=0.79", "kda@129=4.262", "mhc_post=0.405", "mhc_post@2=0.52", "mhc_post@129=4.74833", "mhc_pre=0.405", "mhc_pre@2=0.87", "mhc_pre@129=2.83811", "moe_partial=0.3945", "moe_partial@33=1.2973", "moe_partial@65=1.81722"], conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 4112}
+    r19_moe_x08: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.297", "kda@9=0.79", "kda@129=4.262", "mhc_post=0.405", "mhc_post@2=0.52", "mhc_post@129=4.74833", "mhc_pre=0.405", "mhc_pre@2=0.87", "mhc_pre@129=2.83811", "moe_partial=0.3156", "moe_partial@33=1.2973", "moe_partial@65=2.27153"], conc: 64, traces: [presets/trn2/inferencex_8k1k_c64.csv], decode_buckets: [8], maxreq: 8, slots: 9, mbt: 4104}
+    r19_moe_x08_c128: {kts: ["dsa=0.43878", "dsa@9=0.7494", "dsa@17=0.8711", "dsa@512=3.491", "kda=0.297", "kda@9=0.79", "kda@129=4.262", "mhc_post=0.405", "mhc_post@2=0.52", "mhc_post@129=4.74833", "mhc_pre=0.405", "mhc_pre@2=0.87", "mhc_pre@129=2.83811", "moe_partial=0.3156", "moe_partial@33=1.2973", "moe_partial@65=2.27153"], conc: 128, traces: [presets/trn2/inferencex_8k1k_c128.csv], decode_buckets: [8, 16], maxreq: 16, slots: 17, mbt: 4112}
