@@ -114,7 +114,7 @@ class Member:
             "gpus_per_replica": self.gpus_per_replica,
             "predict": self.predict,
             "leaves": len(slots),
-            "configs": len({slot["config"] for slot in slots} - {None}),
+            "configs": len({slot["config"] for slot in slots}),
             "error": self.error,
             "missing": self.missing,
         }
@@ -442,9 +442,6 @@ class DeploymentIndex:
         configs = {}
         for section in member.sections:
             for slot in section["slots"]:
-                if slot["config"] is None:
-                    # A leaf the arch prices itself (DeepInfer's host step).
-                    continue
                 config = self.configs[slot["config"]]
                 scalars, structured = scalar_identity(config.identity)
                 configs[config.id] = {
