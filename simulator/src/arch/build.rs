@@ -2899,6 +2899,7 @@ pub fn build_iter_model(
             yoco_keep_tokens,
             engram_fetch,
             engram_cpu_threads,
+            deepinfer_host_step_us,
         } => Box::new(deepseek_v41_vllm_pp(
             model,
             *pp_size,
@@ -2920,6 +2921,7 @@ pub fn build_iter_model(
                 *engram_fetch,
                 false,
                 0,
+                *deepinfer_host_step_us,
             )?,
             *engram_fetch,
             *engram_cpu_threads,

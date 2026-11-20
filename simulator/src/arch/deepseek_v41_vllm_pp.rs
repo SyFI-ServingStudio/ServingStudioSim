@@ -56,25 +56,30 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
 use crate::arch::deepseek_v41_vllm::{
     self as tp_arch, fold_layers, index_plan, layer_config, normalize_step, resolve_layer,
     stage_kv_cache_layout, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerBody,
     DeepseekV41LayerConfig, DeepseekV41LayerResolved, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
     DeepseekV41Step, DeepseekV41VllmParallel, LayerKind, NormalizedInput, PlanNode,
 };
-use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
-use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{self as dp_arch, DeepInferEngine, ENGRAM_TABLE_ROWS_TP1};
+use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{
+    self as dp_arch, DeepInferEngine, ENGRAM_TABLE_ROWS_TP1,
+};
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
-use crate::timing::kernels::compressed_sparse_mla_rope_cast::{MXFP8_RECORD_BYTES, NVFP4_RECORD_BYTES};
+use crate::timing::kernels::compressed_sparse_mla_rope_cast::{
+    MXFP8_RECORD_BYTES, NVFP4_RECORD_BYTES,
+};
 use crate::timing::kernels::kv_compress_store::FP8_INDEXER_ROW_BYTES;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, EngramLookupKernel,
     EngramLookupKernelInput,
 };
+use crate::timing::Metrics4;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
@@ -222,10 +227,9 @@ pub fn parse_stage_layers(text: &str) -> anyhow::Result<Vec<Vec<(u32, u32)>>> {
             stage
                 .split(',')
                 .map(|range| {
-                    let (start, end) = range
-                        .trim()
-                        .split_once('-')
-                        .ok_or_else(|| anyhow::anyhow!("stage_layers range {range:?} is not start-end"))?;
+                    let (start, end) = range.trim().split_once('-').ok_or_else(|| {
+                        anyhow::anyhow!("stage_layers range {range:?} is not start-end")
+                    })?;
                     Ok((start.trim().parse()?, end.trim().parse()?))
                 })
                 .collect()
@@ -456,8 +460,7 @@ impl HopGeometry<'_> {
                 .copied()
                 .filter(|&l| self.is_front(l) == front)
                 .collect();
-            (has_up && !downs.is_empty())
-                .then(|| self.extra_row_bytes(downs[0], &up, &downs))
+            (has_up && !downs.is_empty()).then(|| self.extra_row_bytes(downs[0], &up, &downs))
         };
         let handoff = self.cut.and_then(|cut| {
             let (from, to) = (self.place[cut as usize - 1], self.place[cut as usize]);
@@ -513,11 +516,13 @@ impl HopGeometry<'_> {
                 "KV source {source} is read on a stage after the first but before its writer"
             )));
         }
-        Ok((handoff.is_some() || !kv_entries.is_empty()).then_some(HopPayload {
-            handoff,
-            kv_entries,
-            ..HopPayload::default()
-        }))
+        Ok(
+            (handoff.is_some() || !kv_entries.is_empty()).then_some(HopPayload {
+                handoff,
+                kv_entries,
+                ..HopPayload::default()
+            }),
+        )
     }
 }
 
@@ -617,7 +622,10 @@ pub fn build_configs(
     };
     let rule = if replay_on {
         let mut rule = BoundedReplay::from_model(model)?;
-        if let Some(keep) = parallel.deepinfer.and_then(|engine| engine.yoco_keep_tokens) {
+        if let Some(keep) = parallel
+            .deepinfer
+            .and_then(|engine| engine.yoco_keep_tokens)
+        {
             if keep < rule.window {
                 return Err(fit_failed(format!(
                     "yoco_keep_tokens {keep} must cover the sliding window {}",
@@ -630,7 +638,10 @@ pub fn build_configs(
     } else {
         None
     };
-    if parallel.deepinfer.is_some_and(|engine| engine.num_redundant_experts > 0) {
+    if parallel
+        .deepinfer
+        .is_some_and(|engine| engine.num_redundant_experts > 0)
+    {
         return Err(fit_failed(
             "a PP stage holds every expert (EP1): no redundant expert slots",
         ));
@@ -673,10 +684,19 @@ pub fn build_configs(
     let place = &geometry.place;
     // Front layers, and late layers, each run in stage order.
     for (name, layers) in [
-        ("front", (0..geometry.cut.unwrap_or(model.num_layers)).collect::<Vec<_>>()),
-        ("late", (geometry.cut.unwrap_or(model.num_layers)..model.num_layers).collect()),
+        (
+            "front",
+            (0..geometry.cut.unwrap_or(model.num_layers)).collect::<Vec<_>>(),
+        ),
+        (
+            "late",
+            (geometry.cut.unwrap_or(model.num_layers)..model.num_layers).collect(),
+        ),
     ] {
-        if layers.windows(2).any(|w| place[w[0] as usize] > place[w[1] as usize]) {
+        if layers
+            .windows(2)
+            .any(|w| place[w[0] as usize] > place[w[1] as usize])
+        {
             return Err(fit_failed(format!(
                 "the {name} layers must run in stage order: {lists:?}"
             )));
@@ -691,8 +711,7 @@ pub fn build_configs(
     let mut stages = Vec::with_capacity(lists.len());
     for (index, list) in lists.iter().enumerate() {
         let segments = stage_segments(list, geometry.cut);
-        let layer0 = (segments[0].0 == 0)
-            .then(|| stage_layer(layer0_kind, vec![0]));
+        let layer0 = (segments[0].0 == 0).then(|| stage_layer(layer0_kind, vec![0]));
         let mut bodies = Vec::new();
         let mut plan = Vec::new();
         let mut front_nodes = 0;
@@ -730,30 +749,31 @@ pub fn build_configs(
                 .collect::<Result<Vec<_>, _>>()?,
             None => vec![false; bodies.len()],
         };
-        let cut_body = match rule.filter(|rule| geometry.place[rule.cut_layer as usize] == index as u16) {
-            Some(rule) => {
-                let body = bodies
-                    .iter()
-                    .position(|body| body.layers == [rule.cut_layer])
-                    .ok_or_else(|| {
-                        fit_failed(format!(
-                            "decoder SWA bounded replay: cut layer {} shares its body",
-                            rule.cut_layer
-                        ))
-                    })?;
-                // As in the DP arch: DeepInfer rebuilds `kv_swa_full_index`
-                // for the compact rows at the cut.
-                if let Some(di) = bodies[body].attention.deepinfer.as_mut() {
-                    di.builds_swa_index = true;
+        let cut_body =
+            match rule.filter(|rule| geometry.place[rule.cut_layer as usize] == index as u16) {
+                Some(rule) => {
+                    let body = bodies
+                        .iter()
+                        .position(|body| body.layers == [rule.cut_layer])
+                        .ok_or_else(|| {
+                            fit_failed(format!(
+                                "decoder SWA bounded replay: cut layer {} shares its body",
+                                rule.cut_layer
+                            ))
+                        })?;
+                    // As in the DP arch: DeepInfer rebuilds `kv_swa_full_index`
+                    // for the compact rows at the cut.
+                    if let Some(di) = bodies[body].attention.deepinfer.as_mut() {
+                        di.builds_swa_index = true;
+                    }
+                    Some(body)
                 }
-                Some(body)
-            }
-            None => None,
-        };
+                None => None,
+            };
         let cut = match rule.filter(|_| cut_stage == Some(index as u16)) {
             Some(rule) => {
-                let write_kv = stage_layer(model.layer_kind(rule.cut_layer), vec![rule.cut_layer])
-                    .attention;
+                let write_kv =
+                    stage_layer(model.layer_kind(rule.cut_layer), vec![rule.cut_layer]).attention;
                 Some(DeepseekV41ReplayConfig::new(rule, 0, write_kv, model, &gpu))
             }
             None => None,
@@ -967,6 +987,8 @@ struct StageContext<'a> {
     window: u32,
     /// The `cpu_gather` Engram fetch; `None` is UVA.
     host_gather: Option<EngramHostGather>,
+    /// DeepInfer's host time per stage step (ms; 0 = not modeled).
+    host_step_ms: f32,
 }
 
 /// One pipeline stage: one GPU and its layer ranges.
@@ -1007,6 +1029,9 @@ pub struct DeepseekV41VllmPpStageModel {
     /// Engram layer: the last slot is the GPU time a microbatch waits for its
     /// host-gathered rows.
     host_gather: Option<EngramHostGather>,
+    /// DeepInfer's host time per step with this GPU idle (ms), one
+    /// `host_step` leaf per stage step; 0 = no leaf.
+    host_step_ms: f32,
     /// Per local Engram layer, the stage's layers that run before it.
     engram_layers_ahead: Vec<u32>,
 }
@@ -1118,6 +1143,7 @@ impl DeepseekV41VllmPpStageModel {
             cost_flat: Vec::new(),
             n_slots: 0,
             host_gather: ctx.host_gather.filter(|_| !local_engram.is_empty()),
+            host_step_ms: ctx.host_step_ms,
             engram_layers_ahead: Vec::new(),
         };
         let order: Vec<u32> = model
@@ -1151,14 +1177,15 @@ impl DeepseekV41VllmPpStageModel {
             .normalize(batch)
             .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 PP stage input: {reason}"));
         let layers: u32 = self.layer_ranges.iter().map(|&(s, e)| e - s).sum();
-        let per_layer = f64::from(total.m.time_ms) / f64::from(layers);
+        // GPU time only: the host step runs before the forward.
+        let gpu_ms = f64::from(total.m.time_ms - self.host_step_ms);
+        let per_layer = gpu_ms / f64::from(layers);
         let available: Vec<f64> = self
             .engram_layers_ahead
             .iter()
             .map(|&ahead| per_layer * f64::from(ahead))
             .collect();
-        let wait = gather.exposed_ms(input.full.rows, &available, f64::from(total.m.time_ms))
-            as f32;
+        let wait = gather.exposed_ms(input.full.rows, &available, gpu_ms) as f32;
         slots[self.n_slots - 1].m.time_ms = wait;
         total.m.time_ms += wait;
         total
@@ -1233,6 +1260,16 @@ impl DeepseekV41VllmPpStageModel {
         }
         if let Some(head) = &self.head {
             children.push(head.compile(builder));
+        }
+        if self.host_step_ms > 0.0 {
+            children.push(CostNode::Labeled {
+                label: format!("{}.stage{}.host_step [engine host time per step, GPU idle: schedule, input prep, post-process]", self.name, self.stage_index),
+                child: Box::new(builder.leaf(
+                    format!("{}.stage{}.host_step", self.name, self.stage_index),
+                    "host_step",
+                    serde_json::json!({}),
+                )),
+            });
         }
         if self.host_gather.is_some() {
             children.push(CostNode::Labeled {
@@ -1368,6 +1405,18 @@ impl DeepseekV41VllmPpStageModel {
                 ev,
             );
         }
+        if self.host_step_ms > 0.0 {
+            let host = LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.host_step_ms,
+                    ..Metrics4::ZERO
+                },
+                ..LeafMetrics::ZERO
+            };
+            ev.push(host, || {
+                SlotInput::from(ElementwiseKernelInput { num_tokens: rows })
+            });
+        }
         if self.host_gather.is_some() {
             // Filled after the stage's total is known (`add_host_gather_wait`);
             // the whole-pipeline view keeps it at zero.
@@ -1462,7 +1511,12 @@ impl DeepseekV41VllmPpStageModel {
             .normalize(batch)
             .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 PP stage input: {reason}"));
         let front = u64::from(input.full.rows);
-        let late = u64::from(input.replay.as_ref().map_or(input.full.rows, |late| late.rows));
+        let late = u64::from(
+            input
+                .replay
+                .as_ref()
+                .map_or(input.full.rows, |late| late.rows),
+        );
         let hidden = self.hidden_row_bytes;
         let mut bytes = 0;
         if let Some(extra) = payload.front_extra_row_bytes {
@@ -1482,7 +1536,10 @@ impl DeepseekV41VllmPpStageModel {
                     .map(|&(q, _)| q.min(self.window))
                     .sum::<u32>()
             } else {
-                input.replay.as_ref().map_or(input.full.rows, |late| late.rows)
+                input
+                    .replay
+                    .as_ref()
+                    .map_or(input.full.rows, |late| late.rows)
             };
             let continuing = u64::from(continuing).min(front);
             bytes += match handoff {
@@ -1622,6 +1679,9 @@ pub fn build_with_engram_fetch(
     let hc = u64::from(hc_mult);
     let ctx = StageContext {
         host_gather,
+        host_step_ms: parallel
+            .deepinfer
+            .map_or(0.0, |engine| engine.host_step_us as f32 / 1000.0),
         name: &name,
         num_stages: stages.len() as u16,
         engram_layer_ids: &engram_layer_ids,
@@ -1902,7 +1962,9 @@ mod tests {
     #[test]
     fn boundaries_carry_what_the_next_stage_reads() {
         let model = model_cfg();
-        let hop = |partition: &[u32], stage: usize| configs(partition).stages[stage].send.clone().unwrap();
+        let hop = |partition: &[u32], stage: usize| {
+            configs(partition).stages[stage].send.clone().unwrap()
+        };
         // Between groups: hidden only.
         let p = hop(&[8, 32], 0);
         assert_eq!(p.front_extra_row_bytes, Some(0));
@@ -1925,8 +1987,8 @@ mod tests {
 
     #[test]
     fn a_fold_places_ranges_copies_and_the_v3_cut() {
-        let cfgs = build_configs(&model_cfg(), &fold_parallel(30, CutHandoff::V3), &uniform())
-            .unwrap();
+        let cfgs =
+            build_configs(&model_cfg(), &fold_parallel(30, CutHandoff::V3), &uniform()).unwrap();
         let (gpu0, gpu1) = (&cfgs.stages[0], &cfgs.stages[1]);
         assert_eq!(gpu0.layers, [(0, 10), (20, 30)]);
         assert_eq!(gpu1.layers, [(10, 20), (30, 40)]);
@@ -1958,8 +2020,8 @@ mod tests {
         );
         assert!(gpu0.deferred_only && gpu1.deferred_only);
         // The back cut is a parameter: 20-28 | 29-39.
-        let cfgs = build_configs(&model_cfg(), &fold_parallel(29, CutHandoff::V3), &uniform())
-            .unwrap();
+        let cfgs =
+            build_configs(&model_cfg(), &fold_parallel(29, CutHandoff::V3), &uniform()).unwrap();
         assert_eq!(cfgs.stages[1].layers, [(10, 20), (29, 40)]);
         // Front layers out of stage order are refused.
         let bad = DeepseekV41VllmPpParallel {
@@ -2063,6 +2125,7 @@ mod tests {
             engram_fetch: false,
             force_load_balance: false,
             prefill_chunk_tokens: None,
+            host_step_us: 0,
         };
         let fold = DeepseekV41VllmPpParallel {
             deepinfer: Some(engine),
@@ -2072,10 +2135,16 @@ mod tests {
         assert_eq!(cfgs.window, 140);
         for stage in &cfgs.stages {
             for body in stage.bodies.iter().chain(&stage.layer0) {
-                let mega = body.mega.as_ref().expect("every DeepInfer body runs the mega MoE");
+                let mega = body
+                    .mega
+                    .as_ref()
+                    .expect("every DeepInfer body runs the mega MoE");
                 assert_eq!((mega.ep_size, mega.num_physical_experts), (1, 384));
                 assert_eq!(body.attention.gemm_backends, vec!["deepgemm_mxfp8"]);
-                assert!(body.attention.deepinfer.is_some(), "DeepInfer attention kinds");
+                assert!(
+                    body.attention.deepinfer.is_some(),
+                    "DeepInfer attention kinds"
+                );
             }
         }
         assert!(cfgs.head.mhc_post_backends.is_some());
@@ -2085,7 +2154,13 @@ mod tests {
             .stages
             .iter()
             .flat_map(|stage| &stage.bodies)
-            .filter(|body| body.attention.deepinfer.as_ref().unwrap().candidate_metadata)
+            .filter(|body| {
+                body.attention
+                    .deepinfer
+                    .as_ref()
+                    .unwrap()
+                    .candidate_metadata
+            })
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(metadata, [vec![24], vec![32]]);
@@ -2098,7 +2173,12 @@ mod tests {
             .map(|body| body.layers.clone())
             .collect();
         assert_eq!(swa_index, [vec![0], vec![20]]);
-        assert_eq!(cfgs.stages[0].cut_body.map(|b| cfgs.stages[0].bodies[b].layers.clone()), Some(vec![20]));
+        assert_eq!(
+            cfgs.stages[0]
+                .cut_body
+                .map(|b| cfgs.stages[0].bodies[b].layers.clone()),
+            Some(vec![20])
+        );
         assert_eq!(cfgs.stages[1].cut_body, None);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
@@ -2106,6 +2186,21 @@ mod tests {
         assert_eq!(model.back_pass_window(), Some(140));
         let manifest = format!("{:?}", model.stages()[0].cost_log_manifest());
         assert!(manifest.contains("mega_moe"), "no mega_moe leaf on stage 0");
+        // DeepInfer's host time per step: one leaf on every stage.
+        let host = DeepseekV41VllmPpParallel {
+            deepinfer: Some(DeepInferEngine {
+                host_step_us: 6490,
+                ..engine
+            }),
+            ..fold_parallel(30, CutHandoff::V3)
+        };
+        let cfgs = build_configs(&model_cfg(), &host, &uniform()).unwrap();
+        let hosted = build("pp".into(), resolve_configs(&cfgs), &bridge).unwrap();
+        for stage in hosted.stages() {
+            assert_eq!(stage.host_step_ms, 6.49);
+            let manifest = format!("{:?}", stage.cost_log_manifest());
+            assert_eq!(manifest.matches(".host_step\"").count(), 1, "one host_step leaf per stage");
+        }
         // Redundant slots have no meaning when one GPU holds every expert.
         let redundant = DeepseekV41VllmPpParallel {
             deepinfer: Some(DeepInferEngine {

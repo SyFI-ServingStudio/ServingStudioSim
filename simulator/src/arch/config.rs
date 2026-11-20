@@ -792,6 +792,13 @@ pub enum IterArchSel {
         #[serde(default = "default_engram_cpu_threads")]
         #[param(default = 8, cache_key)]
         engram_cpu_threads: u32,
+        /// DeepInfer only: host time per engine step with the GPU idle, in
+        /// microseconds (scheduling, input metadata, post-process between two
+        /// prefill forwards). Measured, not tuned: set it from a capture and
+        /// cite the capture in the preset. 0 = not modeled.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        deepinfer_host_step_us: u32,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
