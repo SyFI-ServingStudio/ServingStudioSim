@@ -632,6 +632,9 @@ pub struct WorkerConfig {
     pub prefix_tiers: Vec<crate::worker::kv::TierSpec>,
     /// Tiers hold the stages' mean bytes instead of the most loaded stage's.
     pub prefix_tier_balanced_load: bool,
+    /// Tiers hold the model's unique per-token bytes over the stages
+    /// (balanced retention's form).
+    pub prefix_tier_unique_bytes: bool,
     /// The bound on a tier read's wait for its channel; `None`: unbounded.
     pub prefix_tier_read_wait: Option<crate::worker::admission::ReadWait>,
     /// A session context older than the run is read from the slowest tier.
@@ -703,6 +706,7 @@ impl Default for WorkerConfig {
             external_decode: false,
             prefix_tiers: Vec::new(),
             prefix_tier_balanced_load: false,
+            prefix_tier_unique_bytes: false,
             prefix_tier_read_wait: None,
             prefix_tier_warm_start: false,
             prefix_tier_loading_area: 0.0,

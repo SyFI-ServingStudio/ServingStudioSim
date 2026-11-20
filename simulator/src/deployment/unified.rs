@@ -1256,6 +1256,10 @@ fn apply_rank_tiers(
         "unified: prefix_tier_balanced_load is a pipeline what-if (pipeline_chunked_prefill)"
     );
     ensure!(
+        !config.prefix_tier_unique_bytes,
+        "unified: prefix_tier_unique_bytes is pipeline-only (pipeline_chunked_prefill)"
+    );
+    ensure!(
         config.prefix_tiers.is_empty()
             || matches!(config.kv_admission, KvAdmissionConfig::FullFootprint),
         "unified: host tiers need full-footprint KV admission"

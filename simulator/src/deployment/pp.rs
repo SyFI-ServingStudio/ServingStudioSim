@@ -21,6 +21,7 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
@@ -98,10 +99,14 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: TierBytes::of_pipeline(
-                        pipeline.stage_kv_cache_layouts(),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stage_kv_cache_layouts()
+                            .map(TierBytes::of_layout)
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let kv_shares = pipeline.pipeline_kv_shares();
@@ -181,10 +186,14 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: TierBytes::of_pipeline(
-                        pipeline.stage_kv_cache_layouts(),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stage_kv_cache_layouts()
+                            .map(TierBytes::of_layout)
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let kv_shares = pipeline.pipeline_kv_shares();
@@ -286,14 +295,15 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: TierBytes::of_stages(
-                        &pipeline
+                    tier_bytes: tier_bytes(
+                        pipeline
                             .stages()
                             .iter()
                             .map(|stage| TierBytes::of_layout(&stage.kv_cache_layout()))
-                            .collect::<Vec<_>>(),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let kv_shares = pipeline.pipeline_kv_shares();
@@ -341,6 +351,27 @@ impl Deployment for PpDeployment {
     }
 }
 
+/// What each GPU stores in and reads from a host tier, from every stage's
+/// bytes: the first stage with the most KV bytes per token, or with
+/// `prefix_tier_balanced_load` the stages' means, or with
+/// `prefix_tier_unique_bytes` the model's unique per-token bytes (`unique`,
+/// each source once) over the stages.
+fn tier_bytes(
+    stages: Vec<TierBytes>,
+    unique: &KvCacheLayout,
+    config: &WorkerConfig,
+) -> anyhow::Result<TierBytes> {
+    let mut bytes = TierBytes::of_stages(&stages, config.prefix_tier_balanced_load);
+    if config.prefix_tier_unique_bytes {
+        ensure!(
+            !config.prefix_tier_balanced_load,
+            "pp: prefix_tier_unique_bytes replaces prefix_tier_balanced_load; set one"
+        );
+        let depth = stages.len().max(1) as u64;
+        bytes.per_token = unique.per_token_bytes().div_ceil(depth);
+    }
+    Ok(bytes)
+}
 fn worker_config(
     cfg: &PpConfig,
     worker: &IterWorkerSel,
@@ -466,4 +497,31 @@ where
         flow.cluster().borrow_mut().attach_logger(dir);
     }
     Box::new(flow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::kv_layout::KvCachePart;
+
+    #[test]
+    fn unique_bytes_spread_the_models_cache_over_the_stages() {
+        // Two stages of 712 B/token each (their sources and the copies the
+        // other stage computes), 891 B/token unique.
+        let stage = || {
+            TierBytes::of_layout(&KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 712)))
+        };
+        let unique = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 891));
+        let config = |unique_bytes, balanced_load| WorkerConfig {
+            prefix_tier_unique_bytes: unique_bytes,
+            prefix_tier_balanced_load: balanced_load,
+            ..WorkerConfig::default()
+        };
+        let per_token = |config: &WorkerConfig| {
+            tier_bytes(vec![stage(), stage()], &unique, config).map(|bytes| bytes.per_token)
+        };
+        assert_eq!(per_token(&config(false, false)).unwrap(), 712);
+        assert_eq!(per_token(&config(true, false)).unwrap(), 446);
+        assert!(per_token(&config(true, true)).is_err());
+    }
 }

@@ -532,6 +532,15 @@ pub struct PrefixTierSpec {
     #[serde(default)]
     #[param(default = false)]
     prefix_tier_balanced_load: bool,
+    /// Tiers store the model's per-token KV with each source once (no stage
+    /// copies), spread evenly over the stages: the form balanced retention
+    /// keeps in HBM (`balanced_retained_kv`), so a context leaves for the
+    /// host as HBM holds it, and its read lands back in that form (the hit
+    /// then pulls its copies as any retained hit). Not vLLM. Pipeline only;
+    /// replaces `prefix_tier_balanced_load`.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_unique_bytes: bool,
     /// Start a read only while its tier's channel would begin it within this
     /// many ms; past that, `prefix_tier_read_wait_policy` decides. `0`: no
     /// bound. Needs a tier.
@@ -593,6 +602,7 @@ impl Default for PrefixTierSpec {
             ssd_tier_gb_per_s: default_ssd_tier_gb_per_s(),
             ssd_tier_writes: SsdTierWrites::default(),
             prefix_tier_balanced_load: false,
+            prefix_tier_unique_bytes: false,
             prefix_tier_max_read_wait_ms: 0.0,
             prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
             prefix_tier_warm_start: false,
@@ -682,6 +692,7 @@ impl PrefixTierSpec {
         );
         config.tier_state_compression_ratio = ratio;
         config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
+        config.prefix_tier_unique_bytes = self.prefix_tier_unique_bytes;
         config.prefix_tier_warm_start = self.prefix_tier_warm_start;
         Ok(())
     }
