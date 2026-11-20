@@ -840,6 +840,12 @@ where
     Ok(config.identity())
 }
 
+/// Leaf kinds an arch prices itself, writing the time into its leaf buffer
+/// (DeepInfer's host step, in-step gaps and Engram host-gather wait): no
+/// kernel, so no `KernelConfig` and no profile.db rows.
+pub(crate) const ARCH_PRICED_LEAF_KINDS: [&str; 3] =
+    ["host_step", "step_gaps", "engram_host_gather_wait"];
+
 /// [`KernelConfig::identity`] of a config of kernel `kind`, given as JSON (a
 /// manifest slot's `kernel_config`).
 pub(crate) fn config_identity(

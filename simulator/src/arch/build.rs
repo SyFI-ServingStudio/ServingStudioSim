@@ -3896,7 +3896,8 @@ fn build_selector<S: serde::de::DeserializeOwned>(
 }
 
 /// Per section and slot of `manifest`, the index in `records` of the config
-/// the slot's kernel reads: the record with its kind, GPU and identity.
+/// the slot's kernel reads: the record with its kind, GPU and identity; none
+/// for a leaf the arch prices itself (`ARCH_PRICED_LEAF_KINDS`).
 fn slot_configs(
     manifest: &crate::timing::CostManifestDoc,
     records: &[crate::timing::bridge::KernelConfigRecord],
@@ -3918,6 +3919,11 @@ fn slot_configs(
                 .slots
                 .iter()
                 .map(|slot| {
+                    if crate::timing::kernels::engine::ARCH_PRICED_LEAF_KINDS
+                        .contains(&slot.kind.as_str())
+                    {
+                        return Ok(None);
+                    }
                     let gpu = slot.kernel_config["gpu_name"].as_str().unwrap_or_default();
                     let identity = crate::timing::kernels::engine::config_identity(
                         &slot.kind,

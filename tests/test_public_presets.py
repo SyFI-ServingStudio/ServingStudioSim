@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from launcher.corpus import ROUTING_FILES
+from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.perf_api import DB_PATH
 from public_api import predict
 from public_api import preset as public_preset
@@ -126,13 +127,18 @@ def index(sim_bin) -> DeploymentIndex:
 @pytest.mark.needs_binary
 @pytest.mark.needs_db
 def test_every_leaf_names_a_published_config(index):
-    """Every leaf names a published config: the simulator matches each slot to
-    the record its kernel reads, so the Kernels page and the tree name one."""
+    """Every kernel leaf names a published config: the simulator matches each
+    slot to the record its kernel reads, so the Kernels page and the tree name
+    one. A leaf the arch prices itself (no profiled kind) names none."""
+    profiled = {spec.kernel_kind for spec in iter_kernel_profiler_specs()}
     for preset in index.presets.values():
         for member in preset.members:
             for section in member.sections:
                 for slot in section["slots"]:
-                    assert slot["config"] in index.configs, (preset.id, member.params, slot)
+                    if slot["config"] is None:
+                        assert slot["kernel"] not in profiled, (preset.id, member.params, slot)
+                    else:
+                        assert slot["config"] in index.configs, (preset.id, member.params, slot)
 
 
 @pytest.mark.presets
