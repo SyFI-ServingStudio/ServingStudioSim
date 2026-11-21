@@ -41,8 +41,9 @@ from launcher.alignment_campaign.packfile import write_campaign  # noqa: E402
 L = 131072  # --max-model-len
 CHUNK = 2048  # --max-num-batched-tokens per DP rank
 MAX_NUM_SEQS = 64  # the arch's MAX_NUM_SEQS (simulator/src/arch/deepseek_v41_vllm.rs)
-# This pack's own token_corpus pass (pack-relative, campaign.yaml resolves arch files from the pack dir; until published to the HF dataset); None before it ran.
-CORPUS = "../../../logs/20261120_0_dsv41_dp4_nonspec/01_dp4_diverse_100/profile_corpus/token_corpus/manifest.json"
+# This pack's own token_corpus pass (job 24586), published to the HF dataset.
+CORPUS = ("hf://datasets/UW-SyFI/servingstudio-workload@fb58b1490e01341e0c42f5eea41823435285afdf/"
+          "deepseek_v41_flash/vllm_dp4_ep4/diverse_100/capture/20261120/manifest.json")
 
 
 def capture_sizes(chunk: int) -> list[int]:

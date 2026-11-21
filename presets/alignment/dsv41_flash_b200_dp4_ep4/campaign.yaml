@@ -66,7 +66,7 @@ variants:
         1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872, 1888,
         1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032, 2048]
       routing: corpus
-      token_corpus_file: ../../../logs/20261120_0_dsv41_dp4_nonspec/01_dp4_diverse_100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@fb58b1490e01341e0c42f5eea41823435285afdf/deepseek_v41_flash/vllm_dp4_ep4/diverse_100/capture/20261120/manifest.json
     worker:
       type: chunked_prefill
       max_batch_tokens: 2048
