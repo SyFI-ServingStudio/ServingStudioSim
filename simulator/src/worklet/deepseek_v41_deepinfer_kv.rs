@@ -1,8 +1,9 @@
-//! DeepInfer's own launches around the DeepSeek-V4.1 prefill attention of one
-//! layer (DeepInfer a679bb8, `v4_modules/attn.py`, `compress.py`,
-//! `index_attn.py`), priced over the prefill rows. Part of
-//! [`super::deepseek_v41_attention_tp::DeepseekV41AttentionTpWorklet`] under
-//! `engine: deepinfer`; the decode rows keep the vLLM leaves.
+//! DeepInfer's own launches around the DeepSeek-V4.1 attention of one layer
+//! (DeepInfer a679bb8, `v4_modules/attn.py`, `compress.py`, `index_attn.py`).
+//! Part of [`super::deepseek_v41_attention_tp::DeepseekV41AttentionTpWorklet`]
+//! under `engine: deepinfer`. A DeepInfer step is either a prompt step or a
+//! decode step (`input_metadata.is_prompt`); the table below is the prompt
+//! step, priced over the prefill rows.
 //!
 //! | launch (nsys name) | call | rows / keys | leaf |
 //! |---|---|---|---|
@@ -25,10 +26,26 @@
 //! `write_kv_only` (the YOCO cut's `_store_yoco_full_kv` over every row) runs
 //! only the compressor and the main / index K stores; `kv_written` (the cut
 //! layer's compact body after that write) skips them.
+//!
+//! A decode step (capture: Slurm job 24554, `logs/20261120_0_deepinfer_decode_nsys`,
+//! 384 verify rows per rank) launches, per layer, over the decode rows:
+//!
+//! | launch (nsys name) | call | rows | leaf |
+//! |---|---|---|---|
+//! | `_fused_norm_rope_hadamard_cast_store_kvcache_kernel` | `_prepare_swa_kv` (decode): norm, RoPE, MXFP8 stored straight into the SWA ring | decode rows | `kv_swa_store` |
+//! | `_norm_kernel` | `q_a_norm` | decode rows | `q_a_norm` |
+//! | `_compress_and_update_state_decode_kernel` (+ `_1`) | ratio-2 KV source compressor | decode rows | `compress_decode` |
+//! | fused transform | main KV store, index Q, index K store (as the prompt step) | rows completing a compressed entry / decode rows | `main_store`, `index_q`, `index_k_store` |
+//! | `_get_candidate_compact_lens_kernel` | first consumer | decode rows | `compact_lens` |
+//! | `_restore_candidate_indices_inplace_kernel` | consumers, one launch | decode rows | `restore` |
+//! | `_convert_kv_index_kernel` | index sources: top-k slots to cache slots (`convert_kv_index`) | decode rows | `convert_kv_index` |
+//!
+//! No paged loads, SWA copy or index assembly run in decode: the decode
+//! attention reads the caches through the converted indices.
 
 use std::sync::Arc;
 
-use super::deepseek_v41_common::eval_or_zero;
+use super::deepseek_v41_common::{eval_or_zero, placeholder};
 use crate::op::attention::deepseek_v41_deepinfer_indexer::chunk_rows;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -52,6 +69,8 @@ pub struct DeepseekV41DeepInferKvConfig {
     pub gpu_name: String,
     pub kv_backends: Vec<&'static str>,
     pub memcpy_backends: Vec<&'static str>,
+    /// Placeholder backends of the launches with no kind.
+    pub elementwise_backends: Vec<&'static str>,
     pub q_lora_rank: u32,
     pub head_dim: u32,
     pub rope_dim: u32,
@@ -98,6 +117,12 @@ pub struct DeepseekV41DeepInferKvResolved {
     /// chunk of rows per launch.
     pub restore_chunk_rows: u32,
     pub kv_index_cat: Option<KvIndexCatKernelConfig>,
+    /// Decode: the SWA row stored straight into its ring.
+    pub kv_swa_store: FusedNormRopeCastKernelConfig,
+    /// Decode: `compress_and_update_state_decode` (two launches).
+    pub compress_decode: Option<ElementwiseKernelConfig>,
+    /// Decode: `convert_kv_index` (index sources).
+    pub convert_kv_index: Option<ElementwiseKernelConfig>,
     pub compress_ratio: u32,
 }
 
@@ -108,6 +133,10 @@ pub struct DeepseekV41DeepInferKvInput {
     pub write_kv_only: bool,
     /// The YOCO cut's `write_kv` already stored this layer's main / index KV.
     pub kv_written: bool,
+    /// Resident KV after each decode row (a decode step's rows).
+    pub decode_kv_lens: Vec<u32>,
+    /// Rows the decode launches run (the graph's padded rows).
+    pub decode_rows: u32,
 }
 
 pub struct DeepseekV41DeepInferKv {
@@ -126,6 +155,9 @@ pub struct DeepseekV41DeepInferKv {
     pub compact_lens: Option<Op<CandidateCompactLensKernel>>,
     pub restore: Option<Op<CandidateIndexRestoreKernel>>,
     pub kv_index_cat: Option<Op<KvIndexCatKernel>>,
+    pub kv_swa_store: Op<FusedNormRopeCastKernel>,
+    pub compress_decode: Option<Op<ElementwiseKernel>>,
+    pub convert_kv_index: Option<Op<ElementwiseKernel>>,
     resolved: DeepseekV41DeepInferKvResolved,
 }
 
@@ -271,6 +303,20 @@ impl DeepseekV41DeepInferKv {
                 topk: cfg.index_topk,
                 max_tokens_per_rank: rows,
             }),
+            // attn.py `_prepare_swa_kv` with `KVCacheOutArgs(swa_cache, ...)`:
+            // one MXFP8 row per decode row into the request's SWA ring.
+            kv_swa_store: fused(1, cfg.head_dim, true, "mxfp8", "cache", cfg.swa_ring_tokens),
+            // compress.py `forward_pre_norm` (decode): each row's fp32
+            // `[kv, score]` pair in, the request's compressor state updated
+            // and a completed entry out (two launches, no kind).
+            compress_decode: (cfg.kv_source && ratio > 1).then(|| {
+                placeholder(&cfg.elementwise_backends, &cfg.gpu_name, 2 * cfg.head_dim * 4, 2 * cfg.head_dim * 4)
+            }),
+            // index_attn.py `convert_kv_index`: each row's top-k logical
+            // indices and their block-table entries in, cache slots out.
+            convert_kv_index: cfg.index_source.then(|| {
+                placeholder(&cfg.elementwise_backends, &cfg.gpu_name, 2 * 4 * cfg.index_topk, 4 * cfg.index_topk)
+            }),
             compress_ratio: ratio,
         }
     }
@@ -334,15 +380,40 @@ impl DeepseekV41DeepInferKv {
                 "indexer.candidate_restore"
             ),
             kv_index_cat: maybe!(KvIndexCatKernel, r.kv_index_cat, "attention.kv_index_cat"),
+            kv_swa_store: op!(
+                FusedNormRopeCastKernel,
+                r.kv_swa_store,
+                "main.kv_swa_store_decode"
+            ),
+            compress_decode: maybe!(
+                ElementwiseKernel,
+                r.compress_decode,
+                "compressor.compress_state_decode"
+            ),
+            convert_kv_index: maybe!(
+                ElementwiseKernel,
+                r.convert_kv_index,
+                "indexer.convert_kv_index"
+            ),
             resolved,
         })
     }
 
     /// The launches before the indexer scoring (projections' consumers).
     pub fn compile_front(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
-        let mut children = vec![self.q_a_norm.compile(b), self.kv_swa.compile(b)];
+        let mut children = vec![
+            self.q_a_norm.compile(b),
+            self.kv_swa.compile(b),
+            self.kv_swa_store.compile(b),
+        ];
         for op in [&self.compress].into_iter().flatten() {
             children.push(op.compile(b));
+        }
+        if let Some(op) = &self.compress_decode {
+            children.push(CostNode::Scale {
+                n: 2,
+                child: Box::new(op.compile(b)),
+            });
         }
         for op in [&self.main_store, &self.index_q, &self.index_k_store]
             .into_iter()
@@ -374,12 +445,21 @@ impl DeepseekV41DeepInferKv {
         if let Some(op) = &self.kv_index_cat {
             children.push(op.compile(b));
         }
+        if let Some(op) = &self.convert_kv_index {
+            children.push(op.compile(b));
+        }
         children
     }
 
     pub fn eval_front(&self, input: &DeepseekV41DeepInferKvInput, ev: &mut Evaluator) {
         let pairs = &input.prefill_query_context_pairs;
-        let rows: u32 = pairs.iter().map(|&(q, _)| q).sum();
+        let prefill_rows: u32 = pairs.iter().map(|&(q, _)| q).sum();
+        let decode_rows = if input.decode_kv_lens.is_empty() {
+            0
+        } else {
+            input.decode_rows
+        };
+        let rows = prefill_rows + decode_rows;
         let zero = rows == 0;
         // `_store_yoco_full_kv` stores; the full attention path does not run.
         let attend = zero || input.write_kv_only;
@@ -387,11 +467,17 @@ impl DeepseekV41DeepInferKv {
         let ratio = self.resolved.compress_ratio.max(1);
         // prepare_tensor_input_v4.cpp: each request stores the compressed rows
         // its new tokens complete (at least one entry), and loads its whole
-        // compressed context.
+        // compressed context. A decode row completes an entry when its
+        // position closes a `ratio` group.
         let stored: u32 = pairs
             .iter()
             .map(|&(q, ctx)| (ctx / ratio - (ctx - q) / ratio).max(1))
-            .sum();
+            .sum::<u32>()
+            + input
+                .decode_kv_lens
+                .iter()
+                .filter(|&&kv| kv % ratio == 0)
+                .count() as u32;
         let loaded: u32 = pairs.iter().map(|&(_, ctx)| (ctx / ratio).max(1)).sum();
         let tokens = |num_tokens| FusedNormRopeCastKernelInput { num_tokens };
         eval_or_zero(
@@ -400,29 +486,43 @@ impl DeepseekV41DeepInferKv {
             attend,
             ev,
         );
-        eval_or_zero(&self.kv_swa, tokens(rows), attend, ev);
+        eval_or_zero(&self.kv_swa, tokens(prefill_rows), attend || prefill_rows == 0, ev);
+        eval_or_zero(
+            &self.kv_swa_store,
+            tokens(decode_rows),
+            input.write_kv_only || decode_rows == 0,
+            ev,
+        );
         if let Some(op) = &self.compress {
             eval_or_zero(
                 op,
-                CompressStatePrefillKernelInput { num_tokens: rows },
-                store,
+                CompressStatePrefillKernelInput { num_tokens: prefill_rows },
+                store || prefill_rows == 0,
+                ev,
+            );
+        }
+        if let Some(op) = &self.compress_decode {
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput { num_tokens: decode_rows },
+                decode_rows == 0,
                 ev,
             );
         }
         if let Some(op) = &self.main_store {
-            eval_or_zero(op, tokens(stored), store, ev);
+            eval_or_zero(op, tokens(stored), store || stored == 0, ev);
         }
         if let Some(op) = &self.index_q {
             eval_or_zero(op, tokens(rows), attend, ev);
         }
         if let Some(op) = &self.index_k_store {
-            eval_or_zero(op, tokens(stored), store, ev);
+            eval_or_zero(op, tokens(stored), store || stored == 0, ev);
         }
         for op in [&self.main_load, &self.index_k_load].into_iter().flatten() {
             eval_or_zero(
                 op,
                 PagedKvCacheLoadKernelInput { num_tokens: loaded },
-                attend,
+                attend || prefill_rows == 0,
                 ev,
             );
         }
@@ -432,24 +532,35 @@ impl DeepseekV41DeepInferKv {
         let pairs = &input.prefill_query_context_pairs;
         let rows: u32 = pairs.iter().map(|&(q, _)| q).sum();
         let skip = rows == 0 || input.write_kv_only;
+        let decode_rows = if input.decode_kv_lens.is_empty() || input.write_kv_only {
+            0
+        } else {
+            input.decode_rows
+        };
+        // The candidate launches run once over a decode step's rows.
+        let scored = if skip { decode_rows } else { rows + decode_rows };
         if let Some(op) = &self.compact_lens {
             eval_or_zero(
                 op,
-                CandidateCompactLensKernelInput { num_rows: rows },
-                skip,
+                CandidateCompactLensKernelInput { num_rows: scored },
+                scored == 0,
                 ev,
             );
         }
         if let Some(op) = &self.restore {
             let chunk = self.resolved.restore_chunk_rows;
-            let input = |num_rows| CandidateIndexRestoreKernelInput { num_rows };
+            let restore = |num_rows| CandidateIndexRestoreKernelInput { num_rows };
             let mut metrics = LeafMetrics::ZERO;
             if !skip {
                 for start in (0..rows).step_by(chunk as usize) {
-                    metrics.add_fanin(op.kernel.eval(&input(chunk.min(rows - start))));
+                    metrics.add_fanin(op.kernel.eval(&restore(chunk.min(rows - start))));
                 }
             }
-            ev.push(metrics, || input(rows.min(chunk)).into());
+            // `_topk_decode`: one restore over the decode rows.
+            if decode_rows > 0 {
+                metrics.add_fanin(op.kernel.eval(&restore(decode_rows)));
+            }
+            ev.push(metrics, || restore(scored.min(chunk)).into());
         }
         eval_or_zero(
             &self.kv_swa_copy,
@@ -479,6 +590,16 @@ impl DeepseekV41DeepInferKv {
         if let Some(op) = &self.kv_index_cat {
             eval_or_zero(op, KvIndexCatKernelInput { num_rows: rows }, skip, ev);
         }
+        if let Some(op) = &self.convert_kv_index {
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput {
+                    num_tokens: decode_rows,
+                },
+                decode_rows == 0,
+                ev,
+            );
+        }
     }
 }
 
@@ -493,6 +614,7 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             kv_backends: vec!["tilelang"],
             memcpy_backends: vec!["torch_memcpy_deepinfer"],
+            elementwise_backends: vec!["triton"],
             q_lora_rank: 1280,
             head_dim: 512,
             rope_dim: 64,

@@ -595,7 +595,9 @@ impl DeepseekV41AttentionTpWorklet {
             // program per decode row. Reads the row's top-k local indices and
             // their block-table entries (int32 each), writes the global slot
             // ids plus one length.
-            global_topk_remap: (ratio > 0)
+            // DeepInfer's counterpart is `convert_kv_index` on its index
+            // sources ([`DeepseekV41DeepInferKv`]).
+            global_topk_remap: (ratio > 0 && vllm)
                 .then(|| ew(cfg.index_topk * 8, cfg.index_topk * 4 + 4)),
             indexer: index_source.then(|| DeepseekV41IndexerOpConfig {
                 gpu_name: cfg.gpu_name.clone(),
@@ -649,6 +651,7 @@ impl DeepseekV41AttentionTpWorklet {
                     gpu_name: cfg.gpu_name.clone(),
                     kv_backends: di.kv_backends.clone(),
                     memcpy_backends: di.memcpy_backends.clone(),
+                    elementwise_backends: cfg.elementwise_backends.clone(),
                     q_lora_rank: cfg.q_lora_rank.get(),
                     head_dim,
                     rope_dim: cfg.rope_dim.get(),
@@ -964,25 +967,27 @@ impl DeepseekV41AttentionTpWorklet {
         let gates = stream_gates(input, &self.resolved.raw_cfg);
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let gemm = SingleGemmKernelInput { m: rows };
-        // Under DeepInfer the prefill rows take DeepInfer's own launches
-        // ([`DeepseekV41DeepInferKv`]); the vLLM leaves they replace keep the
-        // decode rows.
+        // Under DeepInfer every row takes DeepInfer's own launches
+        // ([`DeepseekV41DeepInferKv`]) in place of these vLLM leaves.
         let vllm_rows = match &self.deepinfer_kv {
-            Some(_) => rows.saturating_sub(
-                input
-                    .prefill_query_context_pairs
-                    .iter()
-                    .map(|&(q, _)| q)
-                    .sum::<u32>(),
-            ),
+            Some(_) => 0,
             None => rows,
         };
         let vllm_zero = vllm_rows == 0;
         let vllm_ew = ElementwiseKernelInput { num_tokens: vllm_rows };
+        let decode_rows = rows.saturating_sub(
+            input
+                .prefill_query_context_pairs
+                .iter()
+                .map(|&(q, _)| q)
+                .sum::<u32>(),
+        );
         let di_kv = DeepseekV41DeepInferKvInput {
             prefill_query_context_pairs: input.prefill_query_context_pairs.clone(),
             write_kv_only: input.write_kv_only,
             kv_written: input.kv_written,
+            decode_kv_lens: input.decode_kv_lens.clone(),
+            decode_rows,
         };
 
         for entry in [&self.entry_expand, &self.entry_hc_prenorm, &self.entry_pre_fuse]

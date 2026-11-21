@@ -155,8 +155,62 @@ pub fn deepseek_v41_dp_engine(
     }
 }
 
+/// The DeepInfer options of `deepseek_v41_vllm_dp_attn_ep_moe_dspark`,
+/// `None` under vLLM; DeepInfer-only fields set under vLLM are an error.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_dp_dspark_engine(
+    engine: DeepseekV41Engine,
+    num_redundant_experts: u32,
+    draft_num_redundant_experts: u32,
+    yoco_keep_tokens: u32,
+    engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+    force_load_balance: bool,
+    max_num_seqs: u32,
+    graph_interval: u32,
+    draft_graph_interval: u32,
+) -> anyhow::Result<
+    Option<(
+        super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine,
+        super::deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer,
+    )>,
+> {
+    if engine == DeepseekV41Engine::Vllm {
+        anyhow::ensure!(
+            draft_num_redundant_experts == 0,
+            "draft_num_redundant_experts is a DeepInfer option; set engine: deepinfer"
+        );
+    }
+    anyhow::ensure!(
+        graph_interval > 0 && draft_graph_interval > 0,
+        "DeepInfer graph intervals must be positive"
+    );
+    Ok(deepseek_v41_dp_engine(
+        engine,
+        num_redundant_experts,
+        yoco_keep_tokens,
+        engram_fetch,
+        force_load_balance,
+        0,
+        max_num_seqs,
+    )?
+    .map(|engine| {
+        (
+            engine,
+            super::deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer {
+                draft_num_redundant_experts,
+                graph_interval,
+                draft_graph_interval,
+            },
+        )
+    }))
+}
+
 const fn default_deepinfer_max_num_seqs() -> u32 {
     256
+}
+
+const fn default_deepinfer_graph_interval() -> u32 {
+    8
 }
 
 const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
@@ -885,8 +939,54 @@ pub enum IterArchSel {
         /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`; the
         /// FULL verify and draft graphs' request counts derive from it at the
         /// verify width. Omitted: vLLM's default list up to 2048. Empty: eager.
+        /// vLLM only; DeepInfer sizes its graphs from `max_num_seqs` and the
+        /// two graph intervals below.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+        /// Serving engine, as for `deepseek_v41_vllm_dp_attn_ep_moe`. Under
+        /// `deepinfer` the proposer is DeepInfer's DFlash (mtp/dflash.py).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: the target MoE's EPLB redundant slots.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        num_redundant_experts: u32,
+        /// DeepInfer only: the draft MoE's redundant slots
+        /// (`dflash_num_extra_experts`).
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        draft_num_redundant_experts: u32,
+        /// DeepInfer only: YoCo prefill truncation, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
+        /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// DeepInfer only: `max_num_seqs`; sizes the state slots and the
+        /// largest CUDA graphs (`max_num_seqs x (1 + draft_tokens)` target
+        /// rows, `max_num_seqs` draft requests).
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
+        /// DeepInfer only: `DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL` (default
+        /// 8; DeepInfer's benchmark sets 32): the target graphs' row sizes.
+        #[serde(default = "default_deepinfer_graph_interval")]
+        #[param(default = 8, cache_key)]
+        deepinfer_graph_interval: u32,
+        /// DeepInfer only: `DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL`
+        /// (default 8): the draft graphs' request sizes.
+        #[serde(default = "default_deepinfer_graph_interval")]
+        #[param(default = 8, cache_key)]
+        deepinfer_draft_graph_interval: u32,
+        /// DeepInfer only: forced load balance, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe` (target and draft MoE).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        force_load_balance: bool,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.

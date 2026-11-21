@@ -269,7 +269,7 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
 
 /// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
 /// `layers/linear.py` `apply_weight_fp8`).
-const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
+pub(crate) const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
 /// The grouped o_a projection: DeepGEMM `fp8_einsum` with an FP8 output pair
 /// (DeepInfer's V4 attention `wv`).
 const DEEPINFER_WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out"];
@@ -287,14 +287,14 @@ const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
 const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
 const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
-const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
+pub(crate) const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
 /// DeepInfer's TileLang KV launches around the prefill attention (paged loads
 /// and stores, fused norm/RoPE/cast, compressor, index assembly, `_norm_kernel`).
-const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
+pub(crate) const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
 /// The `kv_swa_cur.copy_` DtoD memcpy.
 const DEEPINFER_MEMCPY_BACKENDS: &[&str] = &["torch_memcpy_deepinfer"];
 /// DeepInfer's KV page (`ModelMetadata.resolved_tokens_per_block`).
-const DEEPINFER_BLOCK_SIZE: u32 = 128;
+pub(crate) const DEEPINFER_BLOCK_SIZE: u32 = 128;
 /// DeepInfer's HF loader (`hugging_face/config.py` defaults, a679bb8) sets
 /// `use_qnorm: False` and no field of the checkpoint's config overrides it, so
 /// `attn.py` builds the prefill attention with `enable_q_norm=False`
@@ -303,7 +303,7 @@ const DEEPINFER_Q_B_NORM: bool = false;
 /// `DEEPINFER_MAX_BACKTRACKING_TOKENS`' default, `max(v, nextn + 1)` with
 /// `nextn` 5 (`environ.py`): each request's SWA ring holds this many tokens
 /// past the window.
-const DEEPINFER_BACKTRACKING_TOKENS: u32 = 6;
+pub(crate) const DEEPINFER_BACKTRACKING_TOKENS: u32 = 6;
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -582,7 +582,7 @@ pub(crate) fn deepinfer_layer(
 /// DeepInfer's kernels on a body layer: DeepGEMM MXFP8 for every MXFP8
 /// projection the vLLM fork runs through FlashInfer, and DeepInfer's own
 /// mHC, prefill indexer and prefill attention kinds.
-fn deepinfer_backends(
+pub(crate) fn deepinfer_backends(
     tp1: &mut DeepseekV41LayerConfig,
     model: &DeepseekV41ModelCfg,
     kind: &LayerKind,
@@ -620,7 +620,7 @@ fn deepinfer_backends(
 
 /// DeepInfer's FFN from the vLLM FFN's geometry: the mega MoE over the
 /// logical experts plus the EPLB redundant slots.
-fn mega_ffn_config(
+pub(crate) fn mega_ffn_config(
     vllm: &DeepseekV41MoeFfnDpEpWorkletConfig,
     layers: &[u32],
     engine: &DeepInferEngine,

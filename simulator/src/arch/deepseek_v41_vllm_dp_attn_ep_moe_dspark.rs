@@ -31,23 +31,31 @@
 //! its own requests. A rank with nothing scheduled runs the one-request dummy.
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
+use crate::arch::deepseek_v41_deepinfer_dflash::{
+    graph_for, graph_sizes, DeepInferDflash, DeepInferDflashBackends, DeepInferDflashConfig,
+    DflashShape,
+};
 use crate::arch::deepseek_v41_dspark_plumbing::{
     PlumbingShape, StepPlumbing, StepPlumbingConfig,
 };
 use crate::arch::deepseek_v41_vllm::{
-    kv_cache_layout, prefill_pairs, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41ModelCfg,
-    DeepseekV41Step, DeepseekV41VllmParallel, LayerInput, MAX_NUM_SEQS,
+    kv_cache_layout, layer_input, prefill_pairs, BoundedReplay, DeepseekV41CudaGraphs,
+    DeepseekV41ModelCfg, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
+    FP32_GEMM_BACKENDS, MAX_NUM_SEQS,
 };
 use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{
-    self as dp_arch, dp_layer_config, labeled_max, normalize_dp_steps, resolve_layer,
-    DeepseekV41DpLayerResolved, DeepseekV41VllmDpConfigs, DeepseekV41VllmDpModel,
+    self as dp_arch, deepinfer_backends, dp_layer_config, labeled_max, mega_ffn_config,
+    normalize_dp_steps, resolve_layer, DeepInferEngine, DeepseekV41DpLayerResolved, DeepseekV41VllmDpConfigs, DeepseekV41VllmDpModel,
     DeepseekV41VllmDpParallel, DeepseekV41VllmDpResolved, DpLayerBody, DpLayerInput, DpStep,
+    DEEPINFER_BACKTRACKING_TOKENS, DEEPINFER_BLOCK_SIZE, DEEPINFER_GEMM_BACKENDS, DEEPINFER_KV_BACKENDS, DEEPINFER_TOPK_BACKENDS,
     DP_SIZE,
 };
 use crate::arch::deepseek_v41_vllm_dspark::{
-    atomic_elementwise, check_draft, context_kv_config, draft_layer_configs, logits_placeholders,
-    markov_config, widen_replay_scatter, DsparkCfg, LogitsPlaceholders, SampleStage,
+    atomic_elementwise, check_draft, context_kv_config, draft_kind, draft_layer_configs,
+    logits_placeholders, markov_config, widen_replay_scatter, DsparkCfg, LogitsPlaceholders,
+    SampleStage,
 };
+use crate::worklet::DeepseekV41AttentionEntry;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::spec::{DsparkMarkovStepConfig, DsparkMarkovStepInput, DsparkMarkovStepOp};
 use crate::op::Op;
@@ -82,6 +90,29 @@ pub struct DeepseekV41DpDsparkConfigs {
     /// `--cudagraph-capture-sizes` per rank (verify/draft FULL graphs).
     pub cudagraph_capture_sizes: Vec<u32>,
     pub plumbing: StepPlumbingConfig,
+    /// `Some` under `engine: deepinfer`: DeepInfer's DFlash replaces the
+    /// vLLM proposer's sample stage, context KV, Markov loop and plumbing.
+    pub deepinfer: Option<DflashDeepInferConfigs>,
+}
+
+/// DeepInfer's DFlash options of the DP DSpark arch.
+#[derive(Clone, Copy, Debug)]
+pub struct DflashDeepInfer {
+    /// `dflash_num_extra_experts`: the draft MoE's redundant slots.
+    pub draft_num_redundant_experts: u32,
+    /// `DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL`.
+    pub graph_interval: u32,
+    /// `DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL`.
+    pub draft_graph_interval: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DflashDeepInferConfigs {
+    pub dflash: DeepInferDflashConfig,
+    /// Main-graph row sizes (`max_num_seqs x verify width` at most).
+    pub target_graph_sizes: Vec<u32>,
+    /// DFlash-graph request sizes (`max_num_seqs` at most).
+    pub draft_graph_sizes: Vec<u32>,
 }
 
 pub struct DeepseekV41DpDsparkResolved {
@@ -98,6 +129,7 @@ pub struct DeepseekV41DpDsparkResolved {
     kv_cache_layout: KvCacheLayout,
     cudagraph_capture_sizes: Vec<u32>,
     plumbing: StepPlumbingConfig,
+    deepinfer: Option<DflashDeepInferConfigs>,
 }
 
 /// `target` is lane B's DP expansion; `draft_demand` covers the draft MoE.
@@ -108,8 +140,16 @@ pub fn build_configs(
     mut target: DeepseekV41VllmDpConfigs,
     draft_demand: &ExpertDemand,
     draft_tokens: u32,
+    dflash: Option<DflashDeepInfer>,
 ) -> std::result::Result<DeepseekV41DpDsparkConfigs, BuildError> {
     check_draft(dspark, draft_demand, draft_tokens)?;
+    let engine = parallel.deepinfer;
+    if engine.is_some() != dflash.is_some() {
+        return Err(BuildError::FitFailed {
+            kind: "deepseek_v41_vllm_dp_attn_ep_moe_dspark",
+            reason: "the DFlash options come with engine: deepinfer and only with it".into(),
+        });
+    }
     widen_replay_scatter(target.replay.as_mut(), model, dspark);
     // The rank-local recipe, as the DP target's: TP1, experts over the group.
     let local = DeepseekV41VllmParallel {
@@ -122,25 +162,94 @@ pub fn build_configs(
         max_num_batched_tokens: parallel.max_num_batched_tokens,
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
     };
-    let (first, rest) = draft_layer_configs(model, dspark, &local, draft_demand);
+    let (mut first, mut rest) = draft_layer_configs(model, dspark, &local, draft_demand);
+    let verify_width = draft_tokens + 1;
     // The draft exchange's all-gatherv per-rank cap, the target's rule: a
     // rank's rows are its scheduled tokens or the graph it pads to.
     let graphs = DeepseekV41CudaGraphs::new(
         &parallel.cudagraph_capture_sizes,
         MAX_NUM_SEQS,
-        &[draft_tokens + 1],
+        &[verify_width],
     );
-    let max_rank_tokens = parallel.max_num_batched_tokens.max(graphs.max_tokens());
+    let deepinfer = engine.zip(dflash).map(|(engine, dflash)| {
+        let target_graph_sizes =
+            graph_sizes(engine.max_num_seqs * verify_width, dflash.graph_interval);
+        let draft_graph_sizes = graph_sizes(engine.max_num_seqs, dflash.draft_graph_interval);
+        (engine, dflash, target_graph_sizes, draft_graph_sizes)
+    });
+    let max_rank_tokens = match &deepinfer {
+        Some((_, _, target_sizes, _)) => parallel
+            .max_num_batched_tokens
+            .max(*target_sizes.last().expect("graph sizes are never empty")),
+        None => parallel.max_num_batched_tokens.max(graphs.max_tokens()),
+    };
+    if deepinfer.is_some() {
+        // DFlash layers are DeepInfer ratio-0 layers (the draft's own
+        // attention, DeepGEMM linears, mega mHC) over the mega MoE.
+        deepinfer_backends(
+            &mut first,
+            model,
+            &draft_kind(DeepseekV41AttentionEntry::Layer0Pre),
+            max_rank_tokens,
+        );
+        deepinfer_backends(
+            &mut rest,
+            model,
+            &draft_kind(DeepseekV41AttentionEntry::FusedPostPre),
+            max_rank_tokens,
+        );
+    }
+    let mut draft_first = dp_layer_config(first, max_rank_tokens);
+    let mut draft_rest = dp_layer_config(rest, max_rank_tokens);
+    let mut deepinfer_configs = None;
+    if let Some((engine, dflash, target_graph_sizes, draft_graph_sizes)) = deepinfer {
+        let draft_engine = DeepInferEngine {
+            num_redundant_experts: dflash.draft_num_redundant_experts,
+            ..engine
+        };
+        for layer in [&mut draft_first, &mut draft_rest] {
+            // Every draft layer routes from the draft's one demand row.
+            let rows = vec![0; layer.layers.len()];
+            layer.mega = Some(mega_ffn_config(&layer.ffn, &rows, &draft_engine, max_rank_tokens)?);
+        }
+        deepinfer_configs = Some(DflashDeepInferConfigs {
+            dflash: DeepInferDflashConfig::new(
+                model,
+                dspark.num_draft_layers,
+                dspark.markov_rank,
+                draft_tokens,
+                &parallel.gpu_name,
+                parallel.max_model_len,
+                max_rank_tokens,
+                DeepInferDflashBackends {
+                    gemm: DEEPINFER_GEMM_BACKENDS,
+                    fp32_gemm: FP32_GEMM_BACKENDS,
+                    topk: DEEPINFER_TOPK_BACKENDS,
+                    kv: DEEPINFER_KV_BACKENDS,
+                    block_size: DEEPINFER_BLOCK_SIZE,
+                    swa_ring_tokens: model.sliding_window + DEEPINFER_BACKTRACKING_TOKENS,
+                },
+            ),
+            target_graph_sizes,
+            draft_graph_sizes,
+        });
+    }
     Ok(DeepseekV41DpDsparkConfigs {
         draft_tokens,
         num_draft_layers: dspark.num_draft_layers,
-        context_kv: context_kv_config(model, dspark, &first.attention),
-        draft_first: dp_layer_config(first, max_rank_tokens),
-        draft_rest: dp_layer_config(rest, max_rank_tokens),
+        context_kv: context_kv_config(model, dspark, &draft_first.attention),
+        draft_first,
+        draft_rest,
         head: target.head.clone(),
         markov: markov_config(model, dspark, &parallel.gpu_name),
         vocab_size: model.vocab_size,
-        kv_cache_layout: kv_cache_layout(model, 1, dspark.num_draft_layers),
+        // DeepInfer's own layout already holds every MTP layer's window.
+        kv_cache_layout: if deepinfer_configs.is_some() {
+            target.kv_cache_layout.clone()
+        } else {
+            kv_cache_layout(model, 1, dspark.num_draft_layers)
+        },
+        deepinfer: deepinfer_configs,
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
         // Each rank runs its own engine core at TP1.
         plumbing: StepPlumbingConfig::new(
@@ -175,6 +284,7 @@ pub fn resolve_configs(configs: DeepseekV41DpDsparkConfigs) -> DeepseekV41DpDspa
         kv_cache_layout: configs.kv_cache_layout,
         cudagraph_capture_sizes: configs.cudagraph_capture_sizes,
         plumbing: configs.plumbing,
+        deepinfer: configs.deepinfer,
         target: dp_arch::resolve_configs(&configs.target),
     }
 }
@@ -182,10 +292,20 @@ pub fn resolve_configs(configs: DeepseekV41DpDsparkConfigs) -> DeepseekV41DpDspa
 /// One rank's sample phase and the draft's rank-local launches. Each rank
 /// owns its own copy of every leaf (one slot set per rank under `Max_r`).
 struct RankEdges {
+    head: DeepseekV41HeadTpWorklet,
+    edges: Edges,
+}
+
+/// The engine-specific rank-local launches around the draft layers.
+enum Edges {
+    Vllm(VllmEdges),
+    DeepInfer(DeepInferDflash),
+}
+
+struct VllmEdges {
     sample: SampleStage,
     context_kv: DeepseekV41DsparkContextKvLocalWorklet,
     embedding: Op<ElementwiseKernel>,
-    head: DeepseekV41HeadTpWorklet,
     markov: DsparkMarkovStepOp,
     plumbing: StepPlumbing,
 }
@@ -203,6 +323,7 @@ struct RankDraft {
     requests: u32,
     layer: LayerInput,
     plumbing: PlumbingShape,
+    dflash: DflashShape,
 }
 
 /// DeepSeek-V4.1-Flash + DSpark, DP4 attention + EP4 experts.
@@ -217,6 +338,8 @@ pub struct DeepseekV41VllmDpDsparkModel {
     kv_cache_layout: KvCacheLayout,
     /// Graphs at the verify width (decode query length `draft_tokens + 1`).
     graphs: DeepseekV41CudaGraphs,
+    /// DeepInfer's main and DFlash graph sizes.
+    deepinfer_graphs: Option<(Vec<u32>, Vec<u32>)>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -229,33 +352,47 @@ pub fn build(
     let dspark = format!("{name}.dspark");
     let ranks = (0..DP_SIZE)
         .map(|_| -> std::result::Result<_, BuildError> {
+            let edges = match &resolved.deepinfer {
+                Some(di) => Edges::DeepInfer(DeepInferDflash::build(
+                    &format!("{dspark}.dflash"),
+                    &di.dflash,
+                    bridge,
+                )?),
+                None => Edges::Vllm(VllmEdges {
+                    sample: SampleStage::build(
+                        &format!("{name}.sample"),
+                        &resolved.logits,
+                        bridge,
+                    )?,
+                    context_kv: DeepseekV41DsparkContextKvLocalWorklet::build(
+                        format!("{dspark}.context_kv"),
+                        resolved.context_kv.clone(),
+                        bridge,
+                    )?,
+                    embedding: atomic_elementwise(
+                        format!("{dspark}.embedding"),
+                        resolved.embedding.clone(),
+                        bridge,
+                    )?,
+                    markov: DsparkMarkovStepOp::build(
+                        format!("{dspark}.markov"),
+                        resolved.markov.clone(),
+                        bridge,
+                    )?,
+                    plumbing: StepPlumbing::build(
+                        &format!("{name}.plumbing"),
+                        &resolved.plumbing,
+                        bridge,
+                    )?,
+                }),
+            };
             Ok(RankEdges {
-                sample: SampleStage::build(&format!("{name}.sample"), &resolved.logits, bridge)?,
-                context_kv: DeepseekV41DsparkContextKvLocalWorklet::build(
-                    format!("{dspark}.context_kv"),
-                    resolved.context_kv.clone(),
-                    bridge,
-                )?,
-                embedding: atomic_elementwise(
-                    format!("{dspark}.embedding"),
-                    resolved.embedding.clone(),
-                    bridge,
-                )?,
                 head: DeepseekV41HeadTpWorklet::build(
                     format!("{dspark}.head"),
                     resolved.head.clone(),
                     bridge,
                 )?,
-                markov: DsparkMarkovStepOp::build(
-                    format!("{dspark}.markov"),
-                    resolved.markov.clone(),
-                    bridge,
-                )?,
-                plumbing: StepPlumbing::build(
-                    &format!("{name}.plumbing"),
-                    &resolved.plumbing,
-                    bridge,
-                )?,
+                edges,
             })
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -269,6 +406,10 @@ pub fn build(
             MAX_NUM_SEQS,
             &[resolved.draft_tokens + 1],
         ),
+        deepinfer_graphs: resolved
+            .deepinfer
+            .as_ref()
+            .map(|di| (di.target_graph_sizes.clone(), di.draft_graph_sizes.clone())),
         draft_tokens: resolved.draft_tokens,
         num_draft_layers: resolved.num_draft_layers,
         kv_cache_layout: resolved.kv_cache_layout,
@@ -287,23 +428,33 @@ impl DeepseekV41VllmDpDsparkModel {
         let mut b = CostTreeBuilder::new();
         let mut sections = self.target.compile_sections(&mut b);
         let dspark = format!("{}.dspark", self.name);
+        let deepinfer = self.deepinfer_graphs.is_some();
         let pre = self
             .ranks
             .iter()
-            .map(|rank| {
-                CostNode::Sum(vec![
-                    rank.sample.compile(&mut b),
-                    rank.context_kv.compile(&mut b),
-                    rank.embedding.compile(&mut b),
-                ])
+            .map(|rank| match &rank.edges {
+                Edges::Vllm(e) => CostNode::Sum(vec![
+                    e.sample.compile(&mut b),
+                    e.context_kv.compile(&mut b),
+                    e.embedding.compile(&mut b),
+                ]),
+                Edges::DeepInfer(e) => e.compile(&mut b),
             })
             .collect();
         sections.push(labeled_max(
-            format!(
-                "{}.sample [Max over DP ranks: rejection sampler -> DSpark context KV -> \
-                 embedding]",
-                self.name
-            ),
+            if deepinfer {
+                format!(
+                    "{}.dflash [Max over DP ranks: DeepInfer step prep, DFlash main cache, \
+                     verify sampler, draft prep, Markov loop]",
+                    self.name
+                )
+            } else {
+                format!(
+                    "{}.sample [Max over DP ranks: rejection sampler -> DSpark context KV -> \
+                     embedding]",
+                    self.name
+                )
+            },
             pre,
         ));
         let mut draft = vec![self.draft_first.compile(None, &mut b)];
@@ -321,19 +472,24 @@ impl DeepseekV41VllmDpDsparkModel {
             .ranks
             .iter()
             .map(|rank| {
-                CostNode::Sum(vec![
-                    rank.head.compile(&mut b),
-                    CostNode::Scale {
+                let mut children = vec![rank.head.compile(&mut b)];
+                if let Edges::Vllm(e) = &rank.edges {
+                    children.push(CostNode::Scale {
                         n: self.draft_tokens,
-                        child: Box::new(rank.markov.compile(&mut b)),
-                    },
-                ])
+                        child: Box::new(e.markov.compile(&mut b)),
+                    });
+                }
+                CostNode::Sum(children)
             })
             .collect();
         draft.push(labeled_max(
             format!(
-                "{dspark}.head [Max over DP ranks: full-vocab head -> {} Markov steps]",
-                self.draft_tokens
+                "{dspark}.head [Max over DP ranks: full-vocab head{}]",
+                if deepinfer {
+                    String::new()
+                } else {
+                    format!(" -> {} Markov steps", self.draft_tokens)
+                }
             ),
             post,
         ));
@@ -344,19 +500,24 @@ impl DeepseekV41VllmDpDsparkModel {
             ),
             child: Box::new(CostNode::Sum(draft)),
         });
-        let plumbing = self
-            .ranks
-            .iter()
-            .map(|rank| rank.plumbing.compile(&mut b))
-            .collect();
-        sections.push(labeled_max(
-            format!(
-                "{}.plumbing [Max over DP ranks: step metadata, input prep, sampler and draft \
-                 bookkeeping]",
-                self.name
-            ),
-            plumbing,
-        ));
+        if !deepinfer {
+            let plumbing = self
+                .ranks
+                .iter()
+                .filter_map(|rank| match &rank.edges {
+                    Edges::Vllm(e) => Some(e.plumbing.compile(&mut b)),
+                    Edges::DeepInfer(_) => None,
+                })
+                .collect();
+            sections.push(labeled_max(
+                format!(
+                    "{}.plumbing [Max over DP ranks: step metadata, input prep, sampler and \
+                     draft bookkeeping]",
+                    self.name
+                ),
+                plumbing,
+            ));
+        }
         b.finish(CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41VllmDpDsparkModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} \
@@ -374,6 +535,7 @@ impl DeepseekV41VllmDpDsparkModel {
     ) -> std::result::Result<(DpStep, Vec<RankDraft>, DpLayerInput), String> {
         normalize_dp_dspark_input(
             &self.graphs,
+            self.deepinfer_graphs.as_ref(),
             input,
             self.draft_tokens,
             self.target.max_model_len(),
@@ -387,22 +549,25 @@ impl DeepseekV41VllmDpDsparkModel {
         });
         self.target.eval_step(&target, ev);
         for (edges, rank) in self.ranks.iter().zip(&ranks) {
-            edges
-                .sample
-                .eval(rank.logits_rows, rank.decode_requests, ev);
-            edges.context_kv.eval(
-                &DeepseekV41DsparkContextKvLocalWorkletInput {
-                    context_tokens: rank.context_tokens,
-                },
-                ev,
-            );
-            let rows = rank.layer.rows;
-            eval_or_zero(
-                &edges.embedding,
-                ElementwiseKernelInput { num_tokens: rows },
-                rows == 0,
-                ev,
-            );
+            match &edges.edges {
+                Edges::Vllm(e) => {
+                    e.sample.eval(rank.logits_rows, rank.decode_requests, ev);
+                    e.context_kv.eval(
+                        &DeepseekV41DsparkContextKvLocalWorkletInput {
+                            context_tokens: rank.context_tokens,
+                        },
+                        ev,
+                    );
+                    let rows = rank.layer.rows;
+                    eval_or_zero(
+                        &e.embedding,
+                        ElementwiseKernelInput { num_tokens: rows },
+                        rows == 0,
+                        ev,
+                    );
+                }
+                Edges::DeepInfer(e) => e.eval(&rank.dflash, ev),
+            }
         }
         self.draft_first.eval(&draft, None, false, ev);
         self.draft_rest.eval(&draft, None, false, ev);
@@ -416,15 +581,19 @@ impl DeepseekV41VllmDpDsparkModel {
                 },
                 ev,
             );
-            edges.markov.eval(
-                &DsparkMarkovStepInput {
-                    num_requests: rank.requests,
-                },
-                ev,
-            );
+            if let Edges::Vllm(e) = &edges.edges {
+                e.markov.eval(
+                    &DsparkMarkovStepInput {
+                        num_requests: rank.requests,
+                    },
+                    ev,
+                );
+            }
         }
         for (edges, rank) in self.ranks.iter().zip(&ranks) {
-            edges.plumbing.eval(&rank.plumbing, ev);
+            if let Edges::Vllm(e) = &edges.edges {
+                e.plumbing.eval(&rank.plumbing, ev);
+            }
         }
         assert_eq!(
             ev.filled(),
@@ -438,6 +607,7 @@ impl DeepseekV41VllmDpDsparkModel {
 /// step, each rank's sample/draft shapes, and the draft layers' DP batch.
 fn normalize_dp_dspark_input(
     graphs: &DeepseekV41CudaGraphs,
+    deepinfer_graphs: Option<&(Vec<u32>, Vec<u32>)>,
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
@@ -479,20 +649,34 @@ fn normalize_dp_dspark_input(
         logits_rows.push(prefill.len() as u32 + decode_tokens);
         steps.push(DeepseekV41Step { prefill, decode });
     }
-    let target = normalize_dp_steps(graphs, &steps, verify_width, logits_rows.clone(), replay);
+    let mut target = normalize_dp_steps(graphs, &steps, verify_width, logits_rows.clone(), replay);
+    if let Some((target_sizes, _)) = deepinfer_graphs {
+        deepinfer_target_graph(&mut target, &steps, verify_width, target_sizes);
+    }
 
     // Every scheduled request drafts a block; an idle rank runs the dummy's
-    // one request (a one-token context). Ranks agree on the draft graph.
+    // one request (a one-token context). vLLM ranks agree on the draft
+    // graph; each DeepInfer rank replays the DFlash graph of its own count.
     let live: Vec<u32> = steps.iter().map(|s| s.request_count().max(1)).collect();
     let busiest = live.iter().copied().max().unwrap_or(1);
     let graph = graphs.full_decode_requests(busiest, verify_width);
+    let draft_requests: Vec<(u32, bool)> = live
+        .iter()
+        .map(|&live| match deepinfer_graphs {
+            Some((_, draft_sizes)) => match graph_for(draft_sizes, live) {
+                Some(padded) => (padded, true),
+                None => (live, false),
+            },
+            None => (graph.unwrap_or(live), graph.is_some()),
+        })
+        .collect();
     let ranks: Vec<RankDraft> = steps
         .iter()
         .zip(&live)
         .zip(&logits_rows)
         .zip(&target.full.ranks)
-        .map(|(((step, &live), &logits), target_rank)| {
-            let requests = graph.unwrap_or(live);
+        .zip(&draft_requests)
+        .map(|((((step, &live), &logits), target_rank), &(requests, in_graph))| {
             let rows = requests * draft_tokens;
             let contexts: Vec<u32> = if step.request_count() == 0 {
                 vec![1]
@@ -527,7 +711,15 @@ fn normalize_dp_dspark_input(
                 draft_requests: requests,
                 draft_rows: rows,
             };
+            let dflash = DflashShape {
+                target_rows: target_rank.rows,
+                requests: step.request_count(),
+                logits_rows: logits,
+                draft_requests: requests,
+                draft_rows: rows,
+            };
             RankDraft {
+                dflash,
                 plumbing,
                 logits_rows: logits,
                 decode_requests: step.decode.len() as u32,
@@ -552,8 +744,8 @@ fn normalize_dp_dspark_input(
                         num_tokens: rows,
                         prefill_query_context_pairs: Vec::new(),
                         decode_kv_lens,
-                        aux_stream_live: graph.is_some(),
-                        full_graph: graph.is_some(),
+                        aux_stream_live: in_graph,
+                        full_graph: in_graph,
                         // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
                         mhc_overlap: false,
                         write_kv_only: false,
@@ -565,6 +757,56 @@ fn normalize_dp_dspark_input(
         .collect();
     let draft = DpLayerInput::new(ranks.iter().map(|rank| rank.layer.clone()).collect());
     Ok((target, ranks, draft))
+}
+
+/// DeepInfer's main graph (`CudaGraphRunner.select`): a decode-only rank
+/// replays the smallest captured row size that holds its rows, independently
+/// of the other ranks; past the largest graph, or in a prompt step, it runs
+/// eager. YoCo truncation is prompt-only, so a decode step has no replay batch.
+fn deepinfer_target_graph(
+    target: &mut DpStep,
+    steps: &[DeepseekV41Step],
+    verify_width: u32,
+    sizes: &[u32],
+) {
+    if steps.iter().any(|step| !step.prefill.is_empty()) {
+        return;
+    }
+    let dummy = vec![(verify_width, verify_width + 1)];
+    let ranks: Vec<(u32, Option<u32>, &[(u32, u32)], bool)> = steps
+        .iter()
+        .map(|step| {
+            let idle = step.decode.is_empty();
+            let decode: &[(u32, u32)] = if idle { &dummy } else { &step.decode };
+            let tokens: u32 = decode.iter().map(|&(q, _)| q).sum();
+            (tokens, graph_for(sizes, tokens), decode, idle)
+        })
+        .collect();
+    let all_graphed = ranks.iter().all(|&(_, rows, _, _)| rows.is_some());
+    target.mode = if all_graphed {
+        GraphMode::Full
+    } else {
+        GraphMode::Eager
+    };
+    target.full = DpLayerInput::new(
+        ranks
+            .iter()
+            .map(|&(tokens, rows, decode, idle)| {
+                let mode = if rows.is_some() {
+                    GraphMode::Full
+                } else {
+                    GraphMode::Eager
+                };
+                let mut layer = layer_input(mode, rows.unwrap_or(tokens), Vec::new(), decode);
+                if idle {
+                    layer.scheduled_rows = 0;
+                }
+                layer
+            })
+            .collect(),
+    );
+    target.replay = None;
+    target.deferred = false;
 }
 
 impl SpeculativeUnifiedModel for DeepseekV41VllmDpDsparkModel {
@@ -673,7 +915,7 @@ mod tests {
         let model = model_cfg();
         let dspark = DsparkCfg::from_json(Path::new(CONFIG)).unwrap();
         let target = dp_arch::build_configs(&model, &parallel(), &uniform(384, 40)).unwrap();
-        build_configs(&model, &dspark, &parallel(), target, &uniform(128, 1), 5).unwrap()
+        build_configs(&model, &dspark, &parallel(), target, &uniform(128, 1), 5, None).unwrap()
     }
 
     #[test]
@@ -750,6 +992,7 @@ mod tests {
         };
         let (target, ranks, draft) = normalize_dp_dspark_input(
             &DeepseekV41CudaGraphs::new(&parallel().cudagraph_capture_sizes, MAX_NUM_SEQS, &[6]),
+            None,
             &input,
             5,
             131_072,
