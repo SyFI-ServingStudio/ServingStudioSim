@@ -195,6 +195,21 @@ impl Deployment for UnifiedDeployment {
                 | IterWorkerSel::Speculative { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            back_batching: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    back_flush,
+                    back_flush_k,
+                    back_rows,
+                    back_cap,
+                    ..
+                } => crate::worker::config::back_batching_spec(
+                    *back_flush,
+                    *back_flush_k,
+                    *back_rows,
+                    *back_cap,
+                ),
+                _ => None,
+            },
             ..WorkerConfig::default()
         };
         g.worker
@@ -623,10 +638,18 @@ impl Deployment for UnifiedDeployment {
                 decoder_swa_bounded_replay,
                 max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                engine,
+                num_redundant_experts,
+                yoco_keep_tokens,
+                engram_fetch,
+                dp_size,
+                force_load_balance,
+                prefill_chunk_tokens,
+                deepinfer_max_num_seqs,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
-                ensure_chunked_prefill_worker("DeepSeek-V4.1 vLLM DP4/EP4", &g.worker)?;
+                ensure_chunked_prefill_worker("DeepSeek-V4.1 vLLM DP/EP", &g.worker)?;
                 let model = Arc::new(arch_build::deepseek_v41_vllm_dp_attn_ep_moe(
                     model_spec,
                     *routing,
@@ -637,6 +660,17 @@ impl Deployment for UnifiedDeployment {
                     *decoder_swa_bounded_replay,
                     *max_num_batched_tokens,
                     cudagraph_capture_sizes,
+                    crate::arch::config::deepseek_v41_dp_engine(
+                        *engine,
+                        *num_redundant_experts,
+                        *yoco_keep_tokens,
+                        *engram_fetch,
+                        *force_load_balance,
+                        *prefill_chunk_tokens,
+                        *deepinfer_max_num_seqs,
+                    )?,
+                    *engram_fetch,
+                    *dp_size,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -1010,6 +1044,18 @@ impl Deployment for UnifiedDeployment {
                 decoder_swa_bounded_replay,
                 max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                engine,
+                num_redundant_experts,
+                draft_num_redundant_experts,
+                yoco_keep_tokens,
+                engram_fetch,
+                deepinfer_max_num_seqs,
+                deepinfer_graph_interval,
+                deepinfer_draft_graph_interval,
+                force_load_balance,
+                sampler_top_p,
+                sampler_top_k,
+                sampler_top_logprobs,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -1024,6 +1070,23 @@ impl Deployment for UnifiedDeployment {
                     *decoder_swa_bounded_replay,
                     *max_num_batched_tokens,
                     cudagraph_capture_sizes,
+                    crate::arch::config::deepseek_v41_dp_dspark_engine(
+                        *engine,
+                        *num_redundant_experts,
+                        *draft_num_redundant_experts,
+                        *yoco_keep_tokens,
+                        *engram_fetch,
+                        *force_load_balance,
+                        *deepinfer_max_num_seqs,
+                        *deepinfer_graph_interval,
+                        *deepinfer_draft_graph_interval,
+                        crate::arch::deepseek_v41_deepinfer_dflash::DeepInferSampling {
+                            top_p: *sampler_top_p,
+                            top_k: *sampler_top_k,
+                            top_logprobs: *sampler_top_logprobs,
+                        },
+                    )?,
+                    *engram_fetch,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -1079,6 +1142,9 @@ impl Deployment for UnifiedDeployment {
             // unified worker's model.
             IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
                 bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
+            }
+            IterArchSel::DeepseekV41VllmPp { .. } => {
+                bail!("unified: deepseek_v41_vllm_pp runs only under deployment `pp`")
             }
             IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
             | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. } => {
@@ -1208,6 +1274,10 @@ fn apply_rank_tiers(
     ensure!(
         !config.prefix_tier_balanced_load,
         "unified: prefix_tier_balanced_load is a pipeline what-if (pipeline_chunked_prefill)"
+    );
+    ensure!(
+        !config.prefix_tier_unique_bytes,
+        "unified: prefix_tier_unique_bytes is pipeline-only (pipeline_chunked_prefill)"
     );
     ensure!(
         config.prefix_tiers.is_empty()
@@ -1445,6 +1515,10 @@ mod tests {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
+            back_flush: Default::default(),
+            back_flush_k: 16,
+            back_rows: Default::default(),
+            back_cap: Default::default(),
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
             pending_order: crate::worker::PendingOrderKind::Fifo,
@@ -1454,6 +1528,7 @@ mod tests {
             external_decode: false,
             state_retention: Default::default(),
             prefix_tiers: Default::default(),
+            square_cost: Default::default(),
         }
     }
 

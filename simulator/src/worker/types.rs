@@ -48,6 +48,9 @@ pub struct IterBatchPlan {
     /// Per partition, sorted: the only resident decodes that run when the
     /// partition participates. `None` means all of them.
     selected_decodes: Vec<Option<Vec<RequestId>>>,
+    /// The deferred back pass this step runs (back batching); copied into
+    /// [`crate::arch::contract::UnifiedArchInput::back_pass`].
+    pub back_pass: Option<Vec<Vec<(u32, u32)>>>,
 }
 
 impl IterBatchPlan {
@@ -576,6 +579,10 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// Balanced retention of a pipeline's retained prefixes and the measured
+    /// cost of the pull a hit makes (`None`: each stage keeps its copies).
+    /// Only the pipeline head recipe reads it.
+    pub balanced_retention: Option<crate::worker::kv::BalancedRetentionSpec>,
     /// How much prefill a pipeline microbatch, or a chunked-prefill DP rank's
     /// share of an iteration, takes. Only the two chunked recipes read it.
     pub microbatch_budget: crate::worker::admission::MicrobatchBudget,
@@ -586,6 +593,16 @@ pub struct WorkerConfig {
     /// cost-class order of those requests; `None`: no bound. Only the two
     /// chunked recipes read it.
     pub force_schedule: Option<crate::worker::admission::ForceSchedule>,
+    /// Back-pass batching (chunked-prefill and pipeline-head recipes on a
+    /// bounded-replay arch); `None` runs the ordinary forward.
+    pub back_batching: Option<crate::worker::shared::back_stash::BackBatchingSpec>,
+    /// Microbatches a pipeline head may keep in flight beyond its depth.
+    pub pipeline_extra_in_flight: u16,
+    /// Pipeline back batching: dispatch each back pass as its own unit
+    /// (virtual stages) instead of inside the front's stage steps.
+    pub pipeline_split_back: bool,
+    /// Ranked prefill order (`square_*` options); `None`: off.
+    pub prefill_rank: Option<crate::worker::admission::PrefillRank>,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -615,6 +632,9 @@ pub struct WorkerConfig {
     pub prefix_tiers: Vec<crate::worker::kv::TierSpec>,
     /// Tiers hold the stages' mean bytes instead of the most loaded stage's.
     pub prefix_tier_balanced_load: bool,
+    /// Tiers hold the model's unique per-token bytes over the stages
+    /// (balanced retention's form).
+    pub prefix_tier_unique_bytes: bool,
     /// The bound on a tier read's wait for its channel; `None`: unbounded.
     pub prefix_tier_read_wait: Option<crate::worker::admission::ReadWait>,
     /// A session context older than the run is read from the slowest tier.
@@ -667,9 +687,14 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            balanced_retention: None,
             microbatch_budget: crate::worker::admission::MicrobatchBudget::default(),
             started_order: crate::worker::admission::StartedOrder::StartOrder,
             force_schedule: None,
+            back_batching: None,
+            pipeline_extra_in_flight: 0,
+            pipeline_split_back: false,
+            prefill_rank: None,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             kv_overhead: crate::worker::kv::KvOverhead::Vllm,
             prefix_resume_points: None,
@@ -681,6 +706,7 @@ impl Default for WorkerConfig {
             external_decode: false,
             prefix_tiers: Vec::new(),
             prefix_tier_balanced_load: false,
+            prefix_tier_unique_bytes: false,
             prefix_tier_read_wait: None,
             prefix_tier_warm_start: false,
             prefix_tier_loading_area: 0.0,

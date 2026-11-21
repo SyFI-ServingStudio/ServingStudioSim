@@ -76,4 +76,11 @@ pub trait PipelineStageExecution {
         microbatch: u64,
         start: Time,
     ) -> Time;
+
+    /// Bytes this stage sends to the next for `input`, when the model gives
+    /// them ([`IterwiseUnifiedModel::pipeline_send_bytes`]); `None` keeps the
+    /// size the microbatch carries.
+    ///
+    /// [`IterwiseUnifiedModel::pipeline_send_bytes`]: crate::arch::contract::IterwiseUnifiedModel::pipeline_send_bytes
+    fn stage_send_bytes(&self, input: &crate::arch::contract::UnifiedArchInput) -> Option<u64>;
 }

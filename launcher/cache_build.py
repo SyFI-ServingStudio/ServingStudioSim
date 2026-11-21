@@ -6,7 +6,9 @@ kernel is missing, they (a) launch real CUDA kernels at once → wrong timing
 from contention, and (b) open profile.db for write at once → SQLite lock
 errors. So before any parallel launch we prebuild each unique `cache_key`
 **sequentially** with `build-cache-only` (INV-3). A single distinct key is a
-no-op of one prebuild.
+no-op of one prebuild. The read-only `dry-run` coverage probes that decide
+which keys need a build open profile.db with `mode=ro`, so they run in parallel;
+only the writes are serialized.
 
 **Which params form the key is Rust-authoritative.** The set of
 kernel-determining params is L1 knowledge (only Rust knows which params flow
@@ -189,8 +191,10 @@ async def prebuild_caches(
     registry: Registry,
     build_type: str = "debug",
     base_dir: Path | None = None,
+    parallelism: int = 1,
 ) -> bool:
-    """Run one `build-cache-only` per unique cache key, sequentially. Returns
+    """Run one `build-cache-only` per unique cache key, sequentially (the
+    read-only coverage probes before it run up to `parallelism` at once). Returns
     True iff every prebuild succeeded. The key leaves come from the Rust schema
     (`affects_cache`), so two runs differing only in non-kernel params (rate,
     server count, log_dir, ...) share a single prebuild.
@@ -206,10 +210,13 @@ async def prebuild_caches(
     env = _build_subprocess_env()
 
     # Probe under a shared lease first: a warm cache needs no exclusive lock, so
-    # a launcher never waits behind another launcher's running simulations.
-    pending = []
-    async with _LAUNCHER_LEASES.profile_database(write=False):
-        for config in _unique_by_cache_key(param_sets, registry):
+    # a launcher never waits behind another launcher's running simulations. The
+    # probes only read profile.db (`mode=ro`), so they run concurrently, bounded
+    # by `parallelism`; only the fill below is sequential (INV-3).
+    gate = asyncio.Semaphore(max(1, parallelism))
+
+    async def probe(config: dict) -> int | None:
+        async with gate:
             cfg_dir = _prebuild_log_dir(base_dir, config)
             config_path = cfg_dir / "run_config.yaml"
             build_cli_command(config, binary, config_path, subcommand="build-cache-only")
@@ -219,16 +226,20 @@ async def prebuild_caches(
             missing = await _probe_missing(
                 probe_argv, report, cfg_dir, env, journal, "cache_probe_shared"
             )
-            if missing is None:
-                return False
             if missing == 0:
                 journal.update(
                     "ensure_cache",
                     StageState.SUCCEEDED,
                     resources=["profile-db:shared"],
                 )
-            else:
-                pending.append(config)
+            return missing
+
+    unique = _unique_by_cache_key(param_sets, registry)
+    async with _LAUNCHER_LEASES.profile_database(write=False):
+        results = await asyncio.gather(*(probe(config) for config in unique))
+    if any(missing is None for missing in results):
+        return False
+    pending = [config for config, missing in zip(unique, results) if missing]
     if not pending:
         return True
 

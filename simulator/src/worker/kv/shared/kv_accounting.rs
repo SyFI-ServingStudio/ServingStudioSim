@@ -435,7 +435,7 @@ impl KvAccounting {
         &self.layout
     }
 
-    pub(super) fn options(&self) -> &KvAccountingOptions {
+    pub(crate) fn options(&self) -> &KvAccountingOptions {
         &self.options
     }
 

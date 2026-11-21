@@ -97,8 +97,126 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
-const fn default_decoder_swa_bounded_replay() -> bool {
+const fn default_deepseek_v41_dp_size() -> u32 {
+    4
+}
+
+fn default_decoder_swa_bounded_replay() -> bool {
     true
+}
+
+/// The `engine` choices of `deepseek_v41_vllm_dp_attn_ep_moe` (mirror of
+/// [`DeepseekV41Engine`]).
+const DEEPSEEK_V41_ENGINES: [&str; 2] = ["vllm", "deepinfer"];
+
+/// Which engine's kernels `deepseek_v41_vllm_dp_attn_ep_moe` composes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepseekV41Engine {
+    #[default]
+    Vllm,
+    Deepinfer,
+}
+
+/// The DeepInfer options of `deepseek_v41_vllm_dp_attn_ep_moe`, `None` under
+/// vLLM; DeepInfer-only fields set under vLLM are an error.
+pub fn deepseek_v41_dp_engine(
+    engine: DeepseekV41Engine,
+    num_redundant_experts: u32,
+    yoco_keep_tokens: u32,
+    engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+    force_load_balance: bool,
+    prefill_chunk_tokens: u32,
+    max_num_seqs: u32,
+) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
+    let engram_fetch = engram_fetch.fetches();
+    match engine {
+        DeepseekV41Engine::Vllm => {
+            anyhow::ensure!(
+                num_redundant_experts == 0
+                    && yoco_keep_tokens == 0
+                    && !force_load_balance
+                    && prefill_chunk_tokens == 0,
+                "num_redundant_experts, yoco_keep_tokens, force_load_balance and \
+                 prefill_chunk_tokens are DeepInfer options; set engine: deepinfer"
+            );
+            Ok(None)
+        }
+        DeepseekV41Engine::Deepinfer => Ok(Some(
+            super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine {
+                num_redundant_experts,
+                yoco_keep_tokens: (yoco_keep_tokens > 0).then_some(yoco_keep_tokens),
+                engram_fetch,
+                force_load_balance,
+                prefill_chunk_tokens: (prefill_chunk_tokens > 0).then_some(prefill_chunk_tokens),
+                max_num_seqs,
+            },
+        )),
+    }
+}
+
+/// The DeepInfer options of `deepseek_v41_vllm_dp_attn_ep_moe_dspark`,
+/// `None` under vLLM; DeepInfer-only fields set under vLLM are an error.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_dp_dspark_engine(
+    engine: DeepseekV41Engine,
+    num_redundant_experts: u32,
+    draft_num_redundant_experts: u32,
+    yoco_keep_tokens: u32,
+    engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+    force_load_balance: bool,
+    max_num_seqs: u32,
+    graph_interval: u32,
+    draft_graph_interval: u32,
+    sampling: super::deepseek_v41_deepinfer_dflash::DeepInferSampling,
+) -> anyhow::Result<
+    Option<(
+        super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine,
+        super::deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer,
+    )>,
+> {
+    if engine == DeepseekV41Engine::Vllm {
+        anyhow::ensure!(
+            draft_num_redundant_experts == 0,
+            "draft_num_redundant_experts is a DeepInfer option; set engine: deepinfer"
+        );
+        anyhow::ensure!(
+            sampling == Default::default(),
+            "sampler_* are DeepInfer options; set engine: deepinfer"
+        );
+    }
+    anyhow::ensure!(
+        graph_interval > 0 && draft_graph_interval > 0,
+        "DeepInfer graph intervals must be positive"
+    );
+    Ok(deepseek_v41_dp_engine(
+        engine,
+        num_redundant_experts,
+        yoco_keep_tokens,
+        engram_fetch,
+        force_load_balance,
+        0,
+        max_num_seqs,
+    )?
+    .map(|engine| {
+        (
+            engine,
+            super::deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer {
+                draft_num_redundant_experts,
+                graph_interval,
+                draft_graph_interval,
+                sampling,
+            },
+        )
+    }))
+}
+
+const fn default_deepinfer_max_num_seqs() -> u32 {
+    256
+}
+
+const fn default_deepinfer_graph_interval() -> u32 {
+    8
 }
 
 const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
@@ -559,6 +677,140 @@ pub enum IterArchSel {
         /// Empty: eager.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+        /// Serving engine whose kernels run the layers: `vllm` (the fork) or
+        /// `deepinfer` (DeepGEMM mega MoE, DeepGEMM MXFP8 linears, YoCo
+        /// prefill truncation; `DeepInferEngine`).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: EPLB redundant expert slots (`num_extra_experts`).
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        num_redundant_experts: u32,
+        /// DeepInfer only: YoCo prefill truncation keeps this many rows per
+        /// request past the cut layer (`DEEPINFER_YOCO_PREFILL_KEEP_TOKENS`);
+        /// 0 = off. `decoder_swa_bounded_replay` is vLLM's and is ignored.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
+        /// How Engram rows reach the GPU: `uva` (vLLM's host-UVA lookup; under
+        /// `engine: deepinfer` an approximation, see
+        /// `arch::deepseek_v41_engram_fetch`), `off` (the fetch priced out,
+        /// the Engram blocks' compute stays) or `none` (Engram fully off).
+        /// `true`/`false` read as uva/off.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
+        /// the per-sequence state slots DeepInfer reserves out of the KV budget
+        /// (`cache_engine.py`), so it moves the token capacity.
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
+        /// DP ranks per replica, which are also its EP group (2, 4 or 8; the
+        /// captured deployment is 4). A pool of `replicas` such groups places
+        /// sessions by prefix affinity like the PP replicas.
+        #[serde(default = "default_deepseek_v41_dp_size")]
+        #[param(default = 4, cache_key)]
+        dp_size: u32,
+        /// DeepInfer only: its benchmark's `DEEPINFER_FORCE_LOAD_BALANCE=1`
+        /// (`examples/benchmark.py`): every token takes top-k distinct slots
+        /// uniformly at random instead of the router's experts. For
+        /// reproducing DeepInfer's own benchmark numbers only.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        force_load_balance: bool,
+        /// DeepInfer only, `routing: corpus`: the tokens one request
+        /// contributes to a prefill batch (its prompt chunk). The mega MoE
+        /// draws a batch's routes as contiguous corpus segments of this
+        /// length, because one request's tokens route alike; 0 draws
+        /// independent tokens.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        prefill_chunk_tokens: u32,
+    },
+    /// DeepSeek-V4.1-Flash under plain pipeline parallelism on B200: each of
+    /// `pp_size` stages is one GPU running a contiguous layer range at TP1 /
+    /// EP1 (all heads and all 384 experts local, no collective). Any partition
+    /// is modeled; a cut inside a KV-sharing group keeps a copy of the
+    /// upstream KV source on the reading stage and forwards its new entries,
+    /// and bounded replay spans the stages after layer 20 (see
+    /// `arch/deepseek_v41_vllm_pp.rs`). Runs only under deployment `pp`.
+    DeepseekV41VllmPp {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size`
+        /// positive counts summing to 40. Empty: vLLM's `get_pp_indices`.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token,
+        /// so a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// vLLM's decoder SWA bounded replay, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens`, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`.
+        /// Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// Per stage, its layer ranges as `start-end` (end exclusive), stages
+        /// separated by `;` (a folded split: `0-10,20-30;10-20,30-40`).
+        /// Overrides `layer_partition`; a fold needs a worker back pass
+        /// (`back_flush`). Empty: `layer_partition`.
+        #[serde(default)]
+        #[param(string, cache_key)]
+        stage_layers: String,
+        /// How the replay cut layer's input reaches it: `v1` all rows' state,
+        /// `v2` continuing rows' state + collapsed hidden, `v3` continuing
+        /// rows' state + the cut source's KV entries (`write_kv` before the
+        /// hop).
+        #[serde(default)]
+        #[param(string, default = "v1", choices = ["v1", "v2", "v3"], cache_key)]
+        cut_handoff: crate::arch::deepseek_v41_vllm_pp::CutHandoff,
+        /// Serving engine whose kernels run each stage, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe` (`deepinfer`: DeepGEMM mega MoE
+        /// over the GPU's own 384 experts, DeepGEMM MXFP8 linears, YoCo).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: YoCo keep rows per request past the cut; 0 = off.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
+        /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// DeepInfer only: `max_num_seqs` (EngineArgs default 256). It sizes
+        /// the per-sequence state slots DeepInfer reserves out of the KV budget
+        /// (`cache_engine.py`), so it moves the token capacity.
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
@@ -693,8 +945,68 @@ pub enum IterArchSel {
         /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`; the
         /// FULL verify and draft graphs' request counts derive from it at the
         /// verify width. Omitted: vLLM's default list up to 2048. Empty: eager.
+        /// vLLM only; DeepInfer sizes its graphs from `max_num_seqs` and the
+        /// two graph intervals below.
         #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
         cudagraph_capture_sizes: Vec<u32>,
+        /// Serving engine, as for `deepseek_v41_vllm_dp_attn_ep_moe`. Under
+        /// `deepinfer` the proposer is DeepInfer's DFlash (mtp/dflash.py).
+        #[serde(default)]
+        #[param(string, default = "vllm", choices = DEEPSEEK_V41_ENGINES, cache_key)]
+        engine: DeepseekV41Engine,
+        /// DeepInfer only: the target MoE's EPLB redundant slots.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        num_redundant_experts: u32,
+        /// DeepInfer only: the draft MoE's redundant slots
+        /// (`dflash_num_extra_experts`).
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        draft_num_redundant_experts: u32,
+        /// DeepInfer only: YoCo prefill truncation, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        yoco_keep_tokens: u32,
+        /// How Engram rows reach the GPU, as for `deepseek_v41_vllm_dp_attn_ep_moe`.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = crate::arch::deepseek_v41_engram_fetch::ENGRAM_FETCH_CHOICES, cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
+        /// DeepInfer only: `max_num_seqs`; sizes the state slots and the
+        /// largest CUDA graphs (`max_num_seqs x (1 + draft_tokens)` target
+        /// rows, `max_num_seqs` draft requests).
+        #[serde(default = "default_deepinfer_max_num_seqs")]
+        #[param(default = 256, cache_key)]
+        deepinfer_max_num_seqs: u32,
+        /// DeepInfer only: `DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL` (default
+        /// 8; DeepInfer's benchmark sets 32): the target graphs' row sizes.
+        #[serde(default = "default_deepinfer_graph_interval")]
+        #[param(default = 8, cache_key)]
+        deepinfer_graph_interval: u32,
+        /// DeepInfer only: `DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL`
+        /// (default 8): the draft graphs' request sizes.
+        #[serde(default = "default_deepinfer_graph_interval")]
+        #[param(default = 8, cache_key)]
+        deepinfer_draft_graph_interval: u32,
+        /// DeepInfer only: forced load balance on the target MoE, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe`; the draft MoE always routes.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        force_load_balance: bool,
+        /// DeepInfer only: the requests sample with top-p (`top_p < 1`), which
+        /// adds a radix pass to the fused sampler.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        sampler_top_p: bool,
+        /// DeepInfer only: the requests sample with top-k (`top_k > 0`).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        sampler_top_k: bool,
+        /// DeepInfer only: the requests' `top_logprobs` (0 = none): a sorted
+        /// top-k of that width per verify row.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        sampler_top_logprobs: u32,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -1718,6 +2030,7 @@ impl IterArchSel {
             | Self::DeepseekV41VllmDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoeDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
+            | Self::DeepseekV41VllmPp { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1787,6 +2100,11 @@ impl IterArchSel {
                 ..
             }
             | Self::DeepseekV41VllmDpAttnEpMoe {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmPp {
                 model,
                 max_model_len,
                 ..

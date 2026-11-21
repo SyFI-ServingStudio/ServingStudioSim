@@ -2427,6 +2427,7 @@ mod tests {
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let batch = normalize_input(&input, 8192, &[]).unwrap();
         assert_eq!((batch.total_tokens, batch.request_count), (2048, 30));

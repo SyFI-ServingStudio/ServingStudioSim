@@ -1,0 +1,49 @@
+# DeepSeek-V4.1-Flash-1017 without speculative decoding on four B200s: DP4
+# attention (TP1 per rank) and EP4 experts over the same ranks. Two engines:
+# - vllm: the vLLM fork, as the DSpark sibling's server ran but without the
+#   proposer (deepseek_v41_vllm_dp_attn_ep_moe_dspark.yaml: --max-model-len
+#   131072, 2048 batched tokens per rank).
+# - deepinfer: the DeepInfer engine with 32 redundant expert slots, as
+#   DeepInfer's own B200 bench ran it (deepinfer-cpu-engram/exp/logs/
+#   bench_off_true_16384.22968.log: num_extra_experts=32, yoco_clip=140,
+#   max_num_batched_tokens 16384, max_model_len unset, so the checkpoint's
+#   1048576) and the scheduler study simulated it (wt-dsv41-sched/logs/
+#   20261118_73_final_matrix/*_dp4_*.yaml). Its host and in-step GPU idle is
+#   the sim preset's worker gpu_time_multiplier, not part of the arch.
+#   engram_fetch off: the fetch is priced out, the Engram blocks' compute
+#   stays. DeepInfer reads the tables over GPU-initiated RDMA; that this read
+#   hides behind the forward is an assumption, not measured (the RDMA path did
+#   not run on the B200 host: no data NIC link).
+# Routing: the 1017 checkpoint's own capture (vLLM TP4/EP4 + DSpark). Its routes
+# are accepted generated tokens only, no rejected draft routes (the capture's
+# provenance.json), so they are what a non-speculative run of the same weights
+# routes; routes are per token, so they replay at DP4/EP4. The non-DSpark
+# capture (DeepSeek-V4.1-Flash/deepseek_v41_vllm.yaml) is of the earlier
+# DeepSeek-V4.1-Flash checkpoint, other router weights.
+checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017
+gpu: NVIDIA B200
+arch:
+  type: deepseek_v41_vllm_dp_attn_ep_moe
+  fp8: true
+  dp_size: 4
+  engine: ${engine}
+  num_redundant_experts: ${num_redundant_experts}
+  yoco_keep_tokens: ${yoco_keep_tokens}
+  engram_fetch: ${engram_fetch}
+  max_model_len: ${max_model_len}
+  max_num_batched_tokens: ${max_num_batched_tokens}
+  routing: ${routing}
+  token_corpus_file: ${token_corpus_file}
+sweep:
+  engine: [vllm, deepinfer]
+derived:
+  num_redundant_experts: "32 if engine == 'deepinfer' else 0"
+  yoco_keep_tokens: "140 if engine == 'deepinfer' else 0"
+  engram_fetch: "'off' if engine == 'deepinfer' else 'uva'"
+  max_model_len: "1048576 if engine == 'deepinfer' else 131072"
+  max_num_batched_tokens: "16384 if engine == 'deepinfer' else 2048"
+compound:
+  workload:
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json

@@ -54,7 +54,7 @@ def deployment_key(cfg: Any) -> dict[str, Any]:
     for name in _NOT_TUNING:
         server.pop(name, None)
     devices = [token for token in cfg.cuda_visible_devices.split(",") if token.strip()]
-    return {
+    key = {
         "engine": cfg.engine,
         "model": str(Path(cfg.server.model_path).resolve()),
         "gpus": len(devices),
@@ -63,6 +63,16 @@ def deployment_key(cfg: Any) -> dict[str, Any]:
         if cfg.python_runtime is not None
         else {},
     }
+    # Flags a routing pass adds to the launch (EPLB's expert-load log, the routed-experts
+    # return) are part of the engine config vLLM hashes into its autotune cache file, so a
+    # warm-up of the timed passes' server leaves a token_corpus server's cache empty. Only a
+    # pass that adds some carries the field, which keeps every other key unchanged.
+    from .runner import pass_server_options
+
+    added = pass_server_options(cfg)
+    if added:
+        key["pass_server_args"] = [[flag, value] for flag, value in added]
+    return key
 
 
 def manifest_path(cache_dir: Path, cache_key: str, key: dict[str, Any]) -> Path:

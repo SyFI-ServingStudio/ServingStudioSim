@@ -13,6 +13,7 @@
 pub mod combine;
 pub mod dispatch;
 pub mod grouped_fp8_gemm;
+pub mod mega_moe_layers;
 pub mod sim;
 
 use crate::common::Fabric;
@@ -24,6 +25,7 @@ use crate::timing::routing::RoutingDistribution;
 
 pub use combine::MoeCombineOp;
 pub use dispatch::MoeDispatchOp;
+pub use mega_moe_layers::MegaMoeLayersOp;
 pub use grouped_fp8_gemm::{
     GroupedFp8GemmWithQuantConfig, GroupedFp8GemmWithQuantInput, GroupedFp8GemmWithQuantOp,
     GroupedGemmConfig, GroupedQuantConfig, QuantRows,

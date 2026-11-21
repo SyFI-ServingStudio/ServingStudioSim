@@ -1404,6 +1404,7 @@ mod tests {
                 total_kv_len,
             }],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         }
     }
 
@@ -1468,6 +1469,7 @@ mod tests {
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         };
         assert!(normalize_input(&x)
             .unwrap_err()
@@ -1482,6 +1484,7 @@ mod tests {
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         };
         assert!(normalize_input(&x)
             .unwrap_err()
@@ -1496,6 +1499,7 @@ mod tests {
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         };
         assert!(normalize_input(&x).is_err());
     }

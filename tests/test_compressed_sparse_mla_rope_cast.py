@@ -19,9 +19,6 @@ _BASE = dict(
     num_heads=64,
     head_dim=512,
     rope_dim=64,
-    max_model_len=65536,
-    max_num_batched_tokens=8192,
-    prefill_chunk_size=4,
     q_dtype="bf16",
     swa_cache_format="mxfp8",
     output_dtype="fp8_e4m3",
@@ -180,6 +177,8 @@ def test_invalid_shapes_fail_closed():
         _shape(num_heads=16)
     with pytest.raises(ValueError, match="query <= context"):
         _shape(query_context_pairs=((9, 8),))
+    with pytest.raises(runner.ProfilerNotImplemented, match="contexts up to"):
+        _shape(mode="prefill", query_context_pairs=((1, 1_048_577),))
 
 
 def test_swapab_accepts_only_the_steps_vllm_routes_to_it():
@@ -219,3 +218,24 @@ def test_record_bytes_match_the_simulators() -> None:
     for name in ("MXFP8_RECORD_BYTES", "NVFP4_RECORD_BYTES"):
         (value,) = re.findall(rf"const {name}: u32 = (\d+);", rust)
         assert getattr(kind, name) == int(value), name
+
+
+def test_flashmla_deepinfer_times_decode_only():
+    # Defect caught: a flashmla_deepinfer prefill row would stand in for vLLM's
+    # whole chunk segment; DeepInfer's prefill attention is its own kind.
+    args = dict(
+        mode="prefill",
+        query_context_pairs=((4, 64),),
+        compress_ratio=1,
+        window_size=128,
+        index_topk=512,
+        num_heads=64,
+        head_dim=512,
+        rope_dim=64,
+        q_dtype="bf16",
+        swa_cache_format="mxfp8",
+        compressed_cache_format="nvfp4",
+        output_dtype="fp8_e4m3",
+    )
+    with pytest.raises(runner.ProfilerNotImplemented, match="decode only"):
+        runner.profile_compressed_sparse_mla_rope_cast_flashmla_deepinfer(**args)

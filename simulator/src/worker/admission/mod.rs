@@ -16,6 +16,7 @@ mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod prefill_rank;
 mod read_wait;
 mod started_order;
 mod token_budget;
@@ -28,7 +29,7 @@ pub use decode_completion::{
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
-pub use microbatch_budget::{LoadBudget, MicrobatchBudget, PrefillSplit};
+pub use microbatch_budget::{LateBudget, LoadBudget, MicrobatchBudget, PrefillSplit};
 pub use pipelined_chunked_prefill_admission::PipelinedChunkedPrefillAdmission;
 pub use placement::LoadBalance;
 pub(crate) use placement::PartitionLoad;
@@ -38,6 +39,7 @@ pub use policy::{
     PendingOrder, PendingOrderKind, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub use prefill_rank::{PrefillRank, SquareCost};
 pub use read_wait::{ReadWait, ReadWaitPolicy};
 pub use started_order::StartedOrder;
 pub(crate) use token_budget::prefill_fits_budget;
@@ -100,6 +102,14 @@ pub trait MicrobatchAdmission<K: KvStore> {
     /// Called after execution lowered the microbatch: commit its prefill
     /// progress so the next microbatch can carry each request's following chunk.
     fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> Self::Ticket;
+    /// Virtual-stage back dispatch: move the back pass's completion out of
+    /// `ticket` into its own ticket, so the back pass runs as its own work
+    /// unit behind the front (the caller splits only a microbatch whose back
+    /// pass has rows). `None` when the microbatch carries decodes (a
+    /// decode's back layers need its own front, so it stays one unit).
+    fn split_back(&mut self, _ticket: &mut Self::Ticket) -> Option<Self::Ticket> {
+        None
+    }
     /// The microbatch left the last stage at `at`; push the requests it finished.
     fn complete_microbatch(
         &mut self,
@@ -117,6 +127,15 @@ pub trait MicrobatchAdmission<K: KvStore> {
     }
     /// When the next host-tier read lands.
     fn next_read_landing(&self, _kv_store: &K) -> Option<Time> {
+        None
+    }
+    /// The earliest time something admitted becomes schedulable on its own
+    /// (a balanced-retention pull landing); `None`: nothing waits on time.
+    fn next_landing(&self) -> Option<Time> {
+        None
+    }
+    /// The first such time after `now`: when an idle head must wake.
+    fn next_landing_after(&self, _now: Time) -> Option<Time> {
         None
     }
 }

@@ -2683,6 +2683,7 @@ mod tests {
                 ArchGroupInput::default(),
             ],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let normalized = normalize_input(&input, 2).unwrap();
         assert_eq!(normalized.total_tokens, 7);
@@ -2734,6 +2735,7 @@ mod tests {
         let empty = UnifiedArchInput {
             groups: vec![ArchGroupInput::default(); 2],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&empty, 2).is_ok());
         assert!(normalize_input(&empty, 1).is_err());
@@ -2741,16 +2743,19 @@ mod tests {
         let bad_prefill = UnifiedArchInput {
             groups: vec![group(1, vec![], vec![(0, 2)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&bad_prefill, 1).is_err());
         let bad_decode = UnifiedArchInput {
             groups: vec![group(0, vec![0], vec![])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&bad_decode, 1).is_err());
         let too_long = UnifiedArchInput {
             groups: vec![group(0, vec![TIMING_MAX_MODEL_LEN + 1], vec![])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&too_long, 1).is_err());
         let overflow = UnifiedArchInput {
@@ -2763,6 +2768,7 @@ mod tests {
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&overflow, 1).is_err());
     }

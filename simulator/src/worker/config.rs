@@ -19,8 +19,8 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use crate::common::Time;
 
 use super::admission::{
-    ForceSchedule, HitsFirst, LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit,
-    ReadWait, ReadWaitPolicy, StartedOrder,
+    ForceSchedule, HitsFirst, LateBudget, LoadBudget, MicrobatchBudget, PendingOrderKind,
+    PrefillSplit, ReadWait, ReadWaitPolicy, StartedOrder,
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
@@ -50,6 +50,88 @@ pub enum DpPlacement {
 }
 
 const DP_PLACEMENT_CHOICES: [&str; 2] = ["round-robin", "vllm-least-loaded"];
+
+/// Back-pass batching on a bounded-replay arch; see
+/// [`crate::worker::shared::back_stash`]. `off` is the ordinary forward.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackFlushKind {
+    #[default]
+    Off,
+    EveryStep,
+    Knee,
+    Fixed,
+}
+
+const BACK_FLUSH_CHOICES: [&str; 4] = ["off", "every-step", "knee", "fixed"];
+
+/// Which rows a prefill chunk leaves for the back pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackRowsKind {
+    #[default]
+    VllmChunk,
+    PromptTail,
+    ChunkTail,
+}
+
+const BACK_ROWS_CHOICES: [&str; 3] = ["vllm-chunk", "prompt-tail", "chunk-tail"];
+
+fn default_back_flush_k() -> u32 {
+    16
+}
+
+fn default_retained_copy_pieces_per_block() -> u32 {
+    1
+}
+
+/// The selector's back-batching fields as the worker's spec.
+/// Rows one back pass may carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackCapKind {
+    #[default]
+    None,
+    Knee,
+}
+
+const BACK_CAP_CHOICES: [&str; 2] = ["none", "knee"];
+
+/// How a pipeline runs a back pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackDispatchKind {
+    #[default]
+    Inline,
+    VirtualStages,
+}
+
+const BACK_DISPATCH_CHOICES: [&str; 2] = ["inline", "virtual-stages"];
+
+pub(crate) fn back_batching_spec(
+    flush: BackFlushKind,
+    k: u32,
+    rows: BackRowsKind,
+    cap: BackCapKind,
+) -> Option<crate::worker::shared::back_stash::BackBatchingSpec> {
+    use crate::worker::shared::back_stash::{BackBatchingSpec, BackCap, BackFlush, BackRows};
+    let flush = match flush {
+        BackFlushKind::Off => return None,
+        BackFlushKind::EveryStep => BackFlush::EveryStep,
+        BackFlushKind::Knee => BackFlush::Knee,
+        BackFlushKind::Fixed => BackFlush::Fixed(k),
+    };
+    let rows = match rows {
+        BackRowsKind::VllmChunk => BackRows::VllmChunk,
+        BackRowsKind::PromptTail => BackRows::PromptTail,
+        BackRowsKind::ChunkTail => BackRows::ChunkTail,
+    };
+    let cap = match cap {
+        BackCapKind::None => BackCap::None,
+        BackCapKind::Knee => BackCap::Knee,
+    };
+    Some(BackBatchingSpec { flush, rows, cap })
+}
 
 /// Where the chunked-prefill worker may end a non-final prefill chunk of an
 /// arch whose KV layout keeps a resumable recurrent state. A layout without
@@ -450,6 +532,15 @@ pub struct PrefixTierSpec {
     #[serde(default)]
     #[param(default = false)]
     prefix_tier_balanced_load: bool,
+    /// Tiers store the model's per-token KV with each source once (no stage
+    /// copies), spread evenly over the stages: the form balanced retention
+    /// keeps in HBM (`balanced_retained_kv`), so a context leaves for the
+    /// host as HBM holds it, and its read lands back in that form (the hit
+    /// then pulls its copies as any retained hit). Not vLLM. Pipeline only;
+    /// replaces `prefix_tier_balanced_load`.
+    #[serde(default)]
+    #[param(default = false)]
+    prefix_tier_unique_bytes: bool,
     /// Start a read only while its tier's channel would begin it within this
     /// many ms; past that, `prefix_tier_read_wait_policy` decides. `0`: no
     /// bound. Needs a tier.
@@ -511,6 +602,7 @@ impl Default for PrefixTierSpec {
             ssd_tier_gb_per_s: default_ssd_tier_gb_per_s(),
             ssd_tier_writes: SsdTierWrites::default(),
             prefix_tier_balanced_load: false,
+            prefix_tier_unique_bytes: false,
             prefix_tier_max_read_wait_ms: 0.0,
             prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
             prefix_tier_warm_start: false,
@@ -600,6 +692,7 @@ impl PrefixTierSpec {
         );
         config.tier_state_compression_ratio = ratio;
         config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
+        config.prefix_tier_unique_bytes = self.prefix_tier_unique_bytes;
         config.prefix_tier_warm_start = self.prefix_tier_warm_start;
         Ok(())
     }
@@ -688,6 +781,18 @@ pub struct MicrobatchBudgetSpec {
     #[serde(default)]
     #[param(default = 0)]
     load_budget_backlog_hi_tokens: u64,
+    /// Late-tier cap (`0`: off): the rules above work under this many tokens
+    /// while no queued request is late (SquareCost's late tier, so it needs
+    /// `square_lambda_per_s`), and under `max_batch_tokens` while one is. Per
+    /// attention DP rank unless `late_budget_any_rank`. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    late_budget_base_tokens: u32,
+    /// `chunked_prefill` with the late-tier cap: a late request on any
+    /// attention DP rank lifts every rank's cap. Not vLLM.
+    #[serde(default)]
+    #[param(default = false)]
+    late_budget_any_rank: bool,
 }
 
 impl MicrobatchBudgetSpec {
@@ -751,11 +856,37 @@ impl MicrobatchBudgetSpec {
                 backlog_hi_tokens: self.load_budget_backlog_hi_tokens,
             })
         };
+        let late = if self.late_budget_base_tokens == 0 {
+            ensure!(
+                !self.late_budget_any_rank,
+                "{owner}: late_budget_any_rank needs late_budget_base_tokens"
+            );
+            None
+        } else {
+            let floor = self.load_budget_low_tokens.max(self.min_microbatch_tokens);
+            ensure!(
+                floor <= self.late_budget_base_tokens
+                    && self.late_budget_base_tokens < max_batch_tokens,
+                "{owner}: late_budget_base_tokens ({}) must be in [{floor}, max_batch_tokens \
+                 ({max_batch_tokens})), at least load_budget_low_tokens and \
+                 min_microbatch_tokens",
+                self.late_budget_base_tokens
+            );
+            ensure!(
+                !(self.late_budget_any_rank && pipelined),
+                "{owner}: late_budget_any_rank spans attention DP ranks; a pipeline head has one"
+            );
+            Some(LateBudget {
+                base_tokens: self.late_budget_base_tokens,
+                any_rank: self.late_budget_any_rank,
+            })
+        };
         Ok(MicrobatchBudget {
             split,
             long_prefill_token_threshold: (self.long_prefill_token_threshold > 0)
                 .then_some(self.long_prefill_token_threshold),
             load,
+            late,
         })
     }
 }
@@ -821,6 +952,73 @@ impl ForceScheduleSpec {
             after: Time::from_ms(ms),
             hits_first,
         }))
+    }
+}
+
+/// Squared-lateness ranked prefill order (`prefill_rank.rs`). Flattened into
+/// both chunked selectors; `square_lambda_per_s > 0` turns it on and replaces
+/// `pending_order`, `srpt` and the force-schedule bound. Not vLLM.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, ParamStruct)]
+pub struct SquareCostSpec {
+    /// Penalty per squared second a request's TTFT runs past its bound
+    /// `max(square_d0_ms, square_k * isolated prefill time)` (`0`: off).
+    #[serde(default)]
+    #[param(default = 0.0)]
+    square_lambda_per_s: f64,
+    /// Floor of the bound (ms).
+    #[serde(default)]
+    #[param(default = 10000.0)]
+    square_d0_ms: Option<f64>,
+    /// Multiple of the isolated prefill time in the bound.
+    #[serde(default)]
+    #[param(default = 3.0)]
+    square_k: Option<f64>,
+    /// Prefill throughput of one rank (tokens/s) used for isolated and
+    /// remaining prefill times.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    square_tokens_per_s: f64,
+    /// Pad rule: a chunk that does not finish its request joins a step only
+    /// when its delay weight exceeds the step's finishing count.
+    #[serde(default)]
+    #[param(default = false)]
+    square_pad: bool,
+}
+
+impl SquareCostSpec {
+    /// The rank, `None` when off.
+    pub(crate) fn resolve(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::worker::admission::PrefillRank>> {
+        let lambda = self.square_lambda_per_s;
+        ensure!(
+            lambda.is_finite() && lambda >= 0.0,
+            "{owner}: square_lambda_per_s ({lambda}) must be a finite value >= 0"
+        );
+        if lambda == 0.0 {
+            return Ok(None);
+        }
+        let d0_ms = self.square_d0_ms.unwrap_or(10_000.0);
+        let k = self.square_k.unwrap_or(3.0);
+        let mu = self.square_tokens_per_s;
+        ensure!(
+            d0_ms.is_finite() && d0_ms >= 0.0 && k.is_finite() && k >= 0.0,
+            "{owner}: square_d0_ms ({d0_ms}) and square_k ({k}) must be finite values >= 0"
+        );
+        ensure!(
+            mu.is_finite() && mu > 0.0,
+            "{owner}: square_tokens_per_s ({mu}) must be > 0 when square_lambda_per_s is set"
+        );
+        Ok(Some(crate::worker::admission::PrefillRank::Square(
+            crate::worker::admission::SquareCost {
+                lambda_per_s: lambda,
+                d0_s: d0_ms / 1e3,
+                k,
+                tokens_per_s: mu,
+                pad: self.square_pad,
+            },
+        )))
     }
 }
 
@@ -990,6 +1188,28 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,
+        /// Back-pass batching (bounded-replay archs only): `off`, `every-step`,
+        /// `knee` (derived flush size), `fixed` (`back_flush_k` entries).
+        #[serde(default)]
+        #[param(string, default = "off", choices = BACK_FLUSH_CHOICES)]
+        back_flush: BackFlushKind,
+        /// Entries per back pass under `back_flush: fixed`.
+        #[serde(default = "default_back_flush_k")]
+        #[param(default = 16)]
+        back_flush_k: u32,
+        /// Rows a chunk leaves for the back pass (`window` = the arch's
+        /// replay window): `vllm-chunk` (every chunk's last `min(q, window)`),
+        /// `prompt-tail` (the prompt's last `window`, from its final chunk
+        /// only) or `chunk-tail` (each chunk its share of the prompt's last
+        /// `window`, at least one row: DeepInfer's YoCo compact truncation).
+        #[serde(default)]
+        #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
+        back_rows: BackRowsKind,
+        /// Rows one back pass may carry: `none` (all the flush releases) or
+        /// `knee` (at most `R* = a / b` per group; the rest waits).
+        #[serde(default)]
+        #[param(string, default = "none", choices = BACK_CAP_CHOICES)]
+        back_cap: BackCapKind,
         /// Archs whose KV layout keeps a resumable recurrent state only:
         /// `checkpoint` ends non-final prefill chunks on the layout's engine
         /// block (vLLM's Mamba `align` mode); `plain` chunks as
@@ -1033,6 +1253,9 @@ pub enum IterWorkerSel {
         /// sticky to their rank; see [`PrefixTierSpec`].
         #[serde(flatten)]
         prefix_tiers: PrefixTierSpec,
+        /// Per-rank squared-lateness order; see [`SquareCostSpec`].
+        #[serde(flatten)]
+        square_cost: SquareCostSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -1154,6 +1377,9 @@ pub enum IterWorkerSel {
         /// [`ForceScheduleSpec`].
         #[serde(flatten)]
         force_schedule: ForceScheduleSpec,
+        /// Squared-lateness order; see [`SquareCostSpec`].
+        #[serde(flatten)]
+        square_cost: SquareCostSpec,
         /// Decode runs elsewhere: a request completes at its first token, and
         /// its decode hands the context back, every output but the last
         /// extending the prompt's context in HBM and in the tiers (a round
@@ -1168,6 +1394,56 @@ pub enum IterWorkerSel {
         /// Host tiers behind the prefix cache; see [`PrefixTierSpec`].
         #[serde(flatten)]
         prefix_tiers: PrefixTierSpec,
+        /// Back-pass batching, as for `chunked_prefill`.
+        #[serde(default)]
+        #[param(string, default = "off", choices = BACK_FLUSH_CHOICES)]
+        back_flush: BackFlushKind,
+        #[serde(default = "default_back_flush_k")]
+        #[param(default = 16)]
+        back_flush_k: u32,
+        #[serde(default)]
+        #[param(string, default = "vllm-chunk", choices = BACK_ROWS_CHOICES)]
+        back_rows: BackRowsKind,
+        #[serde(default)]
+        #[param(string, default = "none", choices = BACK_CAP_CHOICES)]
+        back_cap: BackCapKind,
+        /// Microbatches the head may keep in flight beyond the pipeline depth
+        /// (vLLM async scheduling allows one more, `vllm/config/vllm.py`).
+        #[serde(default)]
+        #[param(default = 0)]
+        extra_in_flight_microbatches: u16,
+        /// How a back pass runs: `inline` (inside the stage steps of the
+        /// front microbatch that flushes it) or `virtual-stages` (its own
+        /// unit behind that front on every GPU; up to two units per stage in
+        /// flight).
+        #[serde(default)]
+        #[param(string, default = "inline", choices = BACK_DISPATCH_CHOICES)]
+        back_dispatch: BackDispatchKind,
+        /// Balanced retention (not vLLM): a retained context is stored once
+        /// over the stages, `1 / pp_size` of the model's per-token cache on
+        /// each, instead of every stage keeping each KV source its layers read
+        /// (copies of another stage's sources included). A hit pulls the
+        /// copies back from the peer stages with the copy engine before the
+        /// request's first chunk. Off: every stage keeps its copies.
+        #[serde(default)]
+        #[param(default = false)]
+        balanced_retained_kv: bool,
+        /// Balanced retention's pull, measured: submit and sync of one batch (us).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_latency_us: f64,
+        /// Copy-engine time per contiguous piece (us).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_us_per_piece: f64,
+        /// Contiguous peer-copy line rate (GB/s, 1e9 B/s); required when on.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        retained_copy_gb_per_s: f64,
+        /// Contiguous pieces a stage pulls per engine block.
+        #[serde(default = "default_retained_copy_pieces_per_block")]
+        #[param(default = 1)]
+        retained_copy_pieces_per_block: u32,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -1225,6 +1501,46 @@ impl IterWorkerSel {
         }
     }
 
+    /// A pipeline selector's balanced retention, validated; `None` when off
+    /// or for any other selector.
+    pub(crate) fn balanced_retention(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::worker::kv::BalancedRetentionSpec>> {
+        let Self::PipelineChunkedPrefill {
+            balanced_retained_kv: true,
+            retained_copy_latency_us,
+            retained_copy_us_per_piece,
+            retained_copy_gb_per_s,
+            retained_copy_pieces_per_block,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            retained_copy_gb_per_s.is_finite() && *retained_copy_gb_per_s > 0.0,
+            "{owner}: balanced_retained_kv needs a measured retained_copy_gb_per_s > 0"
+        );
+        ensure!(
+            retained_copy_latency_us.is_finite()
+                && *retained_copy_latency_us >= 0.0
+                && retained_copy_us_per_piece.is_finite()
+                && *retained_copy_us_per_piece >= 0.0
+                && *retained_copy_pieces_per_block > 0,
+            "{owner}: retained_copy_latency_us and retained_copy_us_per_piece must be >= 0, \
+             retained_copy_pieces_per_block > 0"
+        );
+        Ok(Some(crate::worker::kv::BalancedRetentionSpec {
+            copy_latency: crate::common::Time::from_ns(
+                (retained_copy_latency_us * 1e3).round() as u64
+            ),
+            copy_us_per_piece: *retained_copy_us_per_piece,
+            copy_bytes_per_us: retained_copy_gb_per_s * 1e3,
+            pieces_per_block: *retained_copy_pieces_per_block,
+        }))
+    }
+
     /// Validate a chunked selector's scheduling options and set them on
     /// `config`; every other selector keeps vLLM's scheduler.
     pub(crate) fn apply_chunked_scheduling(
@@ -1232,40 +1548,51 @@ impl IterWorkerSel {
         owner: &str,
         config: &mut WorkerConfig,
     ) -> Result<()> {
-        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, state_retention, pipelined) =
-            match self {
-                Self::ChunkedPrefill {
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    ..
-                } => (
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    false,
-                ),
-                Self::PipelineChunkedPrefill {
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    ..
-                } => (
-                    max_batch_tokens,
-                    srpt,
-                    microbatch_budget,
-                    force_schedule,
-                    state_retention,
-                    true,
-                ),
-                _ => return Ok(()),
-            };
+        let (
+            max_batch_tokens,
+            srpt,
+            microbatch_budget,
+            force_schedule,
+            state_retention,
+            square_cost,
+            pipelined,
+        ) = match self {
+            Self::ChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                false,
+            ),
+            Self::PipelineChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                state_retention,
+                square_cost,
+                true,
+            ),
+            _ => return Ok(()),
+        };
         config.microbatch_budget =
             microbatch_budget.resolve(owner, *max_batch_tokens, pipelined)?;
         config.started_order = if *srpt {
@@ -1276,6 +1603,23 @@ impl IterWorkerSel {
         config.force_schedule = force_schedule.resolve(owner, *srpt)?;
         config.state_retention = state_retention.resolve(owner)?;
         config.recurrent_state_anchors_in_place = state_retention.anchors_in_place(owner)?;
+        config.prefill_rank = square_cost.resolve(owner)?;
+        ensure!(
+            config.microbatch_budget.late.is_none()
+                || matches!(
+                    config.prefill_rank,
+                    Some(crate::worker::admission::PrefillRank::Square(_))
+                ),
+            "{owner}: late_budget_base_tokens follows SquareCost's late tier; it needs \
+             square_lambda_per_s > 0"
+        );
+        if config.prefill_rank.is_some() {
+            ensure!(
+                config.force_schedule.is_none(),
+                "{owner}: square_lambda_per_s replaces force_schedule_after_ms; set one"
+            );
+            config.started_order = StartedOrder::Ranked;
+        }
         Ok(())
     }
 
@@ -1512,6 +1856,47 @@ mod tests {
         assert!(
             chunked("force_schedule_after_ms: 2500\nforce_schedule_hits_first: true\n").is_err()
         );
+    }
+
+    fn budget_spec(yaml: &str) -> MicrobatchBudgetSpec {
+        serde_yaml::from_str(yaml).expect("parse budget spec")
+    }
+
+    #[test]
+    fn a_late_budget_resolves_off_by_default_and_validates_its_base() {
+        let off = budget_spec("{}").resolve("t", 32_768, true).unwrap();
+        assert_eq!(off.late, None);
+        let on = budget_spec("late_budget_base_tokens: 16384")
+            .resolve("t", 32_768, true)
+            .unwrap();
+        assert_eq!(
+            on.late,
+            Some(LateBudget {
+                base_tokens: 16_384,
+                any_rank: false
+            })
+        );
+        let any = budget_spec("{late_budget_base_tokens: 16384, late_budget_any_rank: true}");
+        assert!(
+            any.resolve("t", 32_768, false)
+                .unwrap()
+                .late
+                .unwrap()
+                .any_rank
+        );
+        // One partition per pipeline head: no rank to share with.
+        assert!(any.resolve("t", 32_768, true).is_err());
+        for bad in [
+            "late_budget_base_tokens: 32768",
+            "late_budget_any_rank: true",
+            "{late_budget_base_tokens: 2000, load_budget_low_tokens: 2374, \
+              load_budget_backlog_lo_tokens: 2374, load_budget_backlog_hi_tokens: 84500}",
+        ] {
+            assert!(
+                budget_spec(bad).resolve("t", 32_768, false).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

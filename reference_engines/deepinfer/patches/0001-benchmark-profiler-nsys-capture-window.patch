@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Sat, 14 Nov 2026 23:10:33 -0800
+Subject: [PATCH] benchmark: --profiler nsys capture window
+
+PROFILE=1 with --profiler nsys replaces the prefill torch.profiler window
+with a cudaProfilerStart/Stop range (nsys --capture-range=cudaProfilerApi)
+under NVTX di.capture.prefill, wraps each stable prefill step in NVTX
+di.prefill_step, and keeps the torch profiler (kineto warm-up included)
+out of the process so nsys owns CUPTI. The decode window runs uncaptured
+and no trace is exported. Default --profiler torch is upstream behavior.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ examples/benchmark.py | 52 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/examples/benchmark.py b/examples/benchmark.py
+index 331b1b06dea2b0db4211835c4b1889b49edf94ce..24fd00753729aa169ec43078b957666d2d92c575 100644
+--- a/examples/benchmark.py
++++ b/examples/benchmark.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import contextlib
+ import gc
+ import json
+ import os
+@@ -56,6 +57,14 @@ parser.add_argument("--enable_so", action="store_true")
+ parser.add_argument("--enable_eplb", action="store_true")
+ parser.add_argument("--profile_memory", action="store_true")
+ parser.add_argument("--tracing_path", default=Path("tracing"), type=Path, metavar="DIR")
++parser.add_argument(
++    "--profiler",
++    default="torch",
++    choices=["torch", "nsys"],
++    help="PROFILE=1 windows: torch.profiler traces (upstream), or nsys: the prefill window becomes a "
++    "cudaProfilerStart/Stop range with NVTX (nsys --capture-range=cudaProfilerApi), no torch profiler "
++    "anywhere (it would take CUPTI from nsys) and no trace export",
++)
+ parser.add_argument(
+     "--result_jsonl",
+     default=None,
+@@ -66,6 +75,26 @@ parser.add_argument(
+ 
+ args = parser.parse_args()
+ profiling_enabled = bool(int(os.environ.get("PROFILE", "1")))
++nsys_profiler = args.profiler == "nsys"
++
++
++@contextlib.contextmanager
++def nsys_window(tag: str | None):
++    """A capture range for nsys (`tag`), or nothing (None): the window's steps still run."""
++    import torch
++
++    if tag is not None:
++        torch.cuda.synchronize()
++        torch.cuda.cudart().cudaProfilerStart()
++        torch.cuda.nvtx.range_push(f"di.capture.{tag}")
++    try:
++        yield None
++    finally:
++        if tag is not None:
++            torch.cuda.synchronize()
++            torch.cuda.nvtx.range_pop()
++            torch.cuda.cudart().cudaProfilerStop()
++
+ 
+ # ================= 并行拓扑 =================
+ cp_size = args.cp
+@@ -175,7 +204,7 @@ def setup_llm(dp_rank: int) -> LLM:
+         dp_rank,
+         ep_size=ep_size,
+         cp_size=cp_size,
+-        profile_init=True,
++        profile_init=not nsys_profiler,
+         data_parallel_size=dp_size,
+         max_num_seqs=batch_num_requests,
+         max_num_batched_tokens=args.prefill_batch_size,
+@@ -418,7 +447,11 @@ def main(dp_size: int, dp_rank: int) -> None:
+         """Measure the per-request suffix after the cached prefix has warmed prefill."""
+         countdown_before = lb_flush_countdown()
+         before = remaining_prefill_tokens()
++        if nsys_profiler:
++            torch.cuda.nvtx.range_push("di.prefill_step")
+         llm.llm_engine.step()
++        if nsys_profiler:
++            torch.cuda.nvtx.range_pop()
+         processed = before - remaining_prefill_tokens()
+         if args.prompt_mode == "image":
+             deadline = time.perf_counter() + mm_ready_timeout_s
+@@ -480,12 +513,16 @@ def main(dp_size: int, dp_rank: int) -> None:
+             torch.profiler.ProfilerActivity.CUDA,
+         ]
+ 
+-        with torch.profiler.profile(activities=profile_activities) as prefill_prof:
++        with (
++            nsys_window("prefill")
++            if nsys_profiler
++            else torch.profiler.profile(activities=profile_activities)
++        ) as prefill_prof:
+             for _ in range(prefill_profile_steps):
+                 processed = run_stable_prefill_step(measure=False)
+                 assert processed == full_prefill_tokens, f"采集的 prefill step 应是满 chunk，实际处理 {processed} 个 token"
+             torch.cuda.synchronize()
+-        if dp_rank == 0:
++        if dp_rank == 0 and not nsys_profiler:
+             prefill_trace = dump_trace(prefill_prof)
+         while remaining_prefill_tokens() > 0:
+             run_stable_prefill_step(measure=False)
+@@ -511,11 +548,14 @@ def main(dp_size: int, dp_rank: int) -> None:
+ 
+     if profiling_enabled:
+         align_lb_stat_flush_phase(decode_profile_steps + 2, lambda: run_decode_step(measure=False))
+-        with torch.profiler.profile(activities=profile_activities) as decode_prof:
++        # Under nsys the decode window runs uncaptured (the capture range ended with prefill's).
++        with (
++            nsys_window(None) if nsys_profiler else torch.profiler.profile(activities=profile_activities)
++        ) as decode_prof:
+             # 多采两步：首步付 profiler 启动成本（npu上需要两步），_trace 导出时只取最后 decode_profile_steps 步
+             for _ in range(decode_profile_steps + 2):
+                 run_decode_step(measure=False)
+-        if dp_rank == 0:
++        if dp_rank == 0 and not nsys_profiler:
+             decode_trace = dump_trace(decode_prof)
+ 
+     if dp_rank == 0:
+@@ -568,7 +608,7 @@ def main(dp_size: int, dp_rank: int) -> None:
+             f"-yoco-{yoco_mode}{yoco_keep_tokens}"
+         )
+         trace_file = args.tracing_path / f"{trace_stem}.json"
+-        if dp_rank == 0:
++        if dp_rank == 0 and not nsys_profiler:
+             export_profile_trace(
+                 prefill_trace,
+                 decode_trace,

@@ -1,6 +1,6 @@
 """The serving engines alignment captures and L1 kernels run: an official base plus our patches.
 
-Each engine is a directory beside this file (`vllm/`, `sglang/`):
+Each engine is a directory beside this file (`vllm/`, `sglang/`, `deepinfer/`):
 
 - `BASE.yaml`: the upstream commit the patches apply to and the official image
   built from it, pinned by one digest per platform (`read_base`).
@@ -28,7 +28,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent
-ENGINES = ("vllm", "sglang")
+ENGINES = ("vllm", "sglang", "deepinfer")
 
 _SHA1 = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -62,6 +62,11 @@ class Base:
     platform_commits: dict[str, str]
     # Platform -> why it is pinned the way it is (free text, kept in the file).
     notes: dict[str, str] = field(default_factory=dict)
+    # Submodule path -> the commit `upstream_commit` pins it at, for an engine
+    # the image builds from source with its submodules (`deepinfer`). A record
+    # checked against the upstream tree (`materialize`, the Dockerfile), not a
+    # choice: the superproject commit already decides them.
+    submodules: dict[str, str] = field(default_factory=dict)
 
     def image_for(self, platform_name: str) -> str:
         """The pinned reference (`repository@sha256:...`) to build `FROM` on ``platform_name``."""
@@ -117,6 +122,7 @@ def source_dir(engine: str) -> Path:
 
 
 _TOP_KEYS = {"upstream_repo", "upstream_commit", "image", "platforms"}
+_OPTIONAL_KEYS = {"submodules"}
 _PLATFORM_KEYS = {"digest", "image", "upstream_commit", "note"}
 
 
@@ -135,6 +141,8 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
     least `digest: sha256:<64 hex>`. A platform published under another tag
     adds `image: repository:tag` and, when that image is of another upstream
     commit, `upstream_commit`. `note` is free text on why it is pinned so.
+    Optional: `submodules`, a mapping from a submodule path to the full commit
+    `upstream_commit` pins it at.
     """
 
     try:
@@ -143,7 +151,7 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
         raise BaseError(f"{origin}: not YAML: {exc}") from None
     if not isinstance(doc, dict):
         raise BaseError(f"{origin}: expected a mapping")
-    unknown = set(doc) - _TOP_KEYS
+    unknown = set(doc) - _TOP_KEYS - _OPTIONAL_KEYS
     if unknown:
         raise BaseError(f"{origin}: unknown key {sorted(unknown)[0]}")
     for key in _TOP_KEYS:
@@ -183,6 +191,12 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
             platform_commits[name] = str(entry["upstream_commit"])
         if "note" in entry:
             notes[name] = str(entry["note"]).strip()
+    submodules = doc.get("submodules", {})
+    if not isinstance(submodules, dict) or not all(
+        isinstance(path, str) and isinstance(commit, str) and _SHA1.fullmatch(commit)
+        for path, commit in submodules.items()
+    ):
+        raise BaseError(f"{origin}: submodules must map a path to a full 40-hex commit")
     return Base(
         upstream_repo=doc["upstream_repo"],
         upstream_commit=doc["upstream_commit"],
@@ -191,6 +205,7 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
         platform_images=platform_images,
         platform_commits=platform_commits,
         notes=notes,
+        submodules=dict(submodules),
     )
 
 
@@ -221,6 +236,8 @@ def format_base(base: Base, header: str) -> str:
         "image": base.image,
         "platforms": platforms,
     }
+    if base.submodules:
+        doc["submodules"] = dict(sorted(base.submodules.items()))
     comment = "".join(f"# {line}\n" if line else "#\n" for line in header.splitlines())
     return comment + yaml.safe_dump(doc, sort_keys=False, width=float("inf"))
 
@@ -229,7 +246,9 @@ def format_base(base: Base, header: str) -> str:
 # patches to the package as the official image installed it), and what a patch
 # may also touch because no image runs it. Anything else, a native source
 # above all, would build into an image that silently lacks it.
-_INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",)}
+# DeepInfer has no official image: its image builds the whole patched tree from
+# source (native extensions included), so every path is installed.
+_INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",), "deepinfer": ("",)}
 _NOT_RUN = re.compile(r"(^|/)(tests?|docs)/|\.md$")
 _RENAME_LINE = re.compile(r"(?:rename|copy) (?:from|to) (.+)")
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}

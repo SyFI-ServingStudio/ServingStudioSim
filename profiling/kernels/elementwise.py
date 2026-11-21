@@ -112,6 +112,8 @@ _SUMMARIES = {
     "(two planes of 256-byte rows transposed): the legacy direct_copy "
     "elementwise_kernel. Copies only.",
     "torch_cat": "Eager torch.cat of two bf16 halves: CatArrayBatchedCopy. Copies only.",
+    "torch_memcpy": "Eager contiguous bf16 copy_: one cudaMemcpyAsync device-to-device "
+    "(a copy-engine memcpy record, captured with CUPTI's memcpy activity). Copies only.",
 }
 
 # Each eager realization is also registered with a `_vllm` suffix: the same
@@ -126,14 +128,22 @@ _EAGER = (
     ),
     ("torch_cat", "profiling.runners.elementwise.torch", "profile_elementwise_cat"),
 )
+# The contiguous copy DeepInfer issues (``kv_swa_cur.copy_(kv_swa)`` in
+# v4_modules/attn.py) runs in DeepInfer's own environment.
+_DEEPINFER = (
+    ("torch_memcpy", "profiling.runners.elementwise.torch", "profile_elementwise_memcpy"),
+)
 for _backend, _runner_module, _function, _env in (
     ("triton", "profiling.runners.elementwise.triton", "profile_elementwise", None),
     *((b, m, f, None) for b, m, f in _EAGER),
     *((f"{b}_vllm", m, f, "vllm_env") for b, m, f in _EAGER),
+    *((f"{b}_deepinfer", m, f, "deepinfer_env") for b, m, f in _DEEPINFER),
 ):
-    _summary = _SUMMARIES[_backend.removesuffix("_vllm")]
-    if _env is not None:
+    _summary = _SUMMARIES[_backend.removesuffix("_vllm").removesuffix("_deepinfer")]
+    if _env == "vllm_env":
         _summary += " Run in vLLM's pinned environment."
+    elif _env is not None:
+        _summary += " Run in DeepInfer's environment."
     register(
         KernelProfilerSpec(
             kernel_kind=KIND,

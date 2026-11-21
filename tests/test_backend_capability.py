@@ -39,6 +39,7 @@ def test_gemm_backend_is_locked_to_dtype():
     assert supported_backends("single_gemm", DType.MXFP8_E4M3) == [
         "flashinfer_mxfp8",
         "flashinfer_mxfp8_prequantized",
+        "deepgemm_mxfp8",
     ]
     assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.FP8_E4M3)
     assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.BF16)

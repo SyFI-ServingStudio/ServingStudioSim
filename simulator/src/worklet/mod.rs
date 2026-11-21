@@ -19,12 +19,14 @@ pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
 pub mod deepseek_v41_attention_tp;
 pub mod deepseek_v41_common;
+pub mod deepseek_v41_deepinfer_kv;
 pub mod deepseek_v41_dspark_context_kv_local;
 pub mod deepseek_v41_engram_prefetch_local;
 pub mod deepseek_v41_engram_tp;
 pub mod deepseek_v41_head_tp;
 #[cfg(test)]
 mod deepseek_v41_iteration_tests;
+pub mod deepseek_v41_mega_moe_ffn_dp_ep;
 pub mod deepseek_v41_moe_ffn_dp_ep;
 pub mod deepseek_v41_moe_ffn_ep;
 pub mod deepseek_v41_prologue_tp;
@@ -140,6 +142,10 @@ pub use deepseek_v41_engram_tp::{
 pub use deepseek_v41_head_tp::{
     DeepseekV41HeadTpWorklet, DeepseekV41HeadTpWorkletConfig, DeepseekV41HeadTpWorkletInput,
     DeepseekV41HeadTpWorkletResolved,
+};
+pub use deepseek_v41_mega_moe_ffn_dp_ep::{
+    DeepseekV41MegaMoeFfnDpEpWorklet, DeepseekV41MegaMoeFfnDpEpWorkletConfig,
+    DeepseekV41MegaMoeFfnDpEpWorkletResolved,
 };
 pub use deepseek_v41_moe_ffn_dp_ep::{
     DeepseekV41MoeFfnDpEpWorklet, DeepseekV41MoeFfnDpEpWorkletConfig,

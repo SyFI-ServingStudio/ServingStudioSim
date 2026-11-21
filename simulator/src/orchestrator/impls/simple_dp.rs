@@ -2,7 +2,7 @@
 //! L6a (`SimpleDpPoolController`) + L6b (`SimpleDpFlow`) live in one file because
 //! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
-use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, Request, RequestId, SessionInput, SharedRequests, Time, WorkerId};
 use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEventCommon};
 
 use super::super::{Flow, OrchAction, WorkerFactory};
@@ -19,6 +19,23 @@ const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
 pub enum DpPlacementPolicy {
     LeastQueued,
     RoundRobin,
+}
+
+/// Session-affine placement, the pool-level form of the in-worker rule
+/// (`ChunkedPrefillAdmission::choose_partition` -> `retained_prefix_partition`):
+/// a session whose prefix KV is retained on some worker must go back to the
+/// worker retaining the most of it (ties to the lower index). `None` (a cold,
+/// standalone or fully evicted session) leaves the choice to the load policy.
+pub(crate) fn session_affine_worker(retained_tokens: impl IntoIterator<Item = u32>) -> Option<usize> {
+    let mut best = None;
+    let mut best_tokens = 0;
+    for (idx, tokens) in retained_tokens.into_iter().enumerate() {
+        if tokens > best_tokens {
+            best_tokens = tokens;
+            best = Some(idx);
+        }
+    }
+    best
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
@@ -168,6 +185,19 @@ where
     pub fn admit(&mut self, rid: RequestId) {
         self.admit_msg(W::Msg::from(rid));
     }
+
+    /// [`Self::admit`] with session affinity first: the worker retaining the
+    /// most of the session's prefix ([`session_affine_worker`]), else the load
+    /// policy. Workers that retain nothing across requests report 0 and keep
+    /// the plain load policy.
+    pub fn admit_session(&mut self, rid: RequestId, session: SessionInput) {
+        let retained = self.workers.iter().map(|w| w.retained_prefix_tokens(session));
+        let idx = session_affine_worker(retained).unwrap_or_else(|| self.choose_worker_idx());
+        self.workers[idx].enqueue(W::Msg::from(rid));
+        if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
+            self.worker_wakeup_times[idx] = Time::ZERO;
+        }
+    }
 }
 
 // ── L6b: deployment flow (the object L7 calls) ────────────────────────────────
@@ -219,9 +249,9 @@ where
     W::Msg: From<RequestId>,
 {
     fn on_arrival(&mut self, req: Request) {
-        let rid = req.core.id;
+        let (rid, session) = (req.core.id, req.definition.session);
         self.requests.borrow_mut().insert(req);
-        self.dp_pool.admit(rid);
+        self.dp_pool.admit_session(rid, session);
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {

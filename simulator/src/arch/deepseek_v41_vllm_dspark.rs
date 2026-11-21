@@ -229,6 +229,8 @@ pub(crate) fn draft_kind(entry: DeepseekV41AttentionEntry) -> LayerKind {
             candidate: DeepseekV41CandidateRole::None,
         },
         engram: false,
+        candidate_metadata: false,
+        paged_metadata: false,
     }
 }
 
@@ -859,7 +861,7 @@ fn normalize_dspark_input(
     // Every prefill chunk yields one logits row; every verify row one more.
     let logits_rows = prefill.len() as u32 + decode_tokens;
     let step = DeepseekV41Step { prefill, decode };
-    let target = normalize_step(graphs, &step, draft_tokens + 1, logits_rows, replay);
+    let target = normalize_step(graphs, &step, draft_tokens + 1, logits_rows, replay, None);
 
     // Every scheduled request drafts a block. The draft forward is one FULL
     // graph keyed by the request count (the verify width's capture sizes);
@@ -909,6 +911,7 @@ fn normalize_dspark_input(
             // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
             mhc_overlap: false,
             write_kv_only: false,
+            kv_written: false,
         },
     };
     Ok((target, step.decode.len() as u32, draft, plumbing))

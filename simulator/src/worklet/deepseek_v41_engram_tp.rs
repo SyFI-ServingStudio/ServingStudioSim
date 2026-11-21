@@ -16,6 +16,13 @@
 //!
 //! The lookups that produce the gathered rows run on side streams from the
 //! iteration start and are modelled by `DeepseekV41EngramPrefetchLocalWorklet`.
+//!
+//! With `mhc_unfused_backends` (DeepInfer `hc.py`), the hc post is
+//! TileKernels' `mhc_post_fwd` and the attention pre its five-launch shifted
+//! pre (`mhc_shifted_pre`), in place of the two placeholders. With
+//! `attn_norm_backends`, the RMSNorm + MXFP8 DeepInfer runs after the shifted
+//! pre (`hc.py` `layer_norm(..., return_bf16=True)`, one `_norm_kernel`) is its
+//! own leaf.
 
 use std::sync::Arc;
 
@@ -26,8 +33,10 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernelConfig, ElementwiseKernelInput, EngramGateKernel, EngramGateKernelConfig,
+    EngramGateKernelInput, MhcPostKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
+    MhcShiftedPreKernel, RmsNormMxfp8Kernel, RmsNormMxfp8KernelConfig, RmsNormMxfp8KernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -46,6 +55,58 @@ pub struct DeepseekV41EngramTpWorkletConfig {
     /// NCCL `all_reduce` curve used as the AllGather proxy.
     pub all_gather_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// `Some` when the engine gates the `wkv` output into the streams with
+    /// TileKernels' `engram_gate_fwd` (DeepInfer `v4_modules/engram.py`)
+    /// instead of vLLM's `_fused_engram_post_wkv`.
+    pub engram_gate_backends: Option<Vec<&'static str>>,
+    /// Largest per-rank token count (bounds the `engram_gate` token axis).
+    pub max_rank_tokens: u32,
+    /// `Some` when the engine runs the hc post and the shifted pre as
+    /// TileKernels' unfused mHC kernels (DeepInfer), not as placeholders.
+    pub mhc_unfused_backends: Option<Vec<&'static str>>,
+    /// `Some` when the engine runs the attention RMSNorm + MXFP8 after the
+    /// shifted pre as its own launch (DeepInfer `_norm_kernel`).
+    pub attn_norm_backends: Option<Vec<&'static str>>,
+    /// `false`: the Engram consumer is skipped (DeepInfer
+    /// `DEEPINFER_ENGRAM_SANITY_OFF=1`): `wkv` and the gate cost nothing. The
+    /// hc post, shifted pre and attention norm stay: that engine runs them
+    /// either way (its Engram-off capture has the same mHC/norm launches).
+    pub consumer: bool,
+}
+
+/// The launch that folds the `wkv` output into the hc streams.
+#[derive(Clone, Debug)]
+pub enum EngramPostWkvConfig {
+    /// vLLM `_fused_engram_post_wkv` (placeholder).
+    Fused(ElementwiseKernelConfig),
+    /// DeepInfer `engram_gate_fwd`.
+    Gate(EngramGateKernelConfig),
+}
+
+pub enum EngramPostWkv {
+    Fused(Op<ElementwiseKernel>),
+    Gate(Op<EngramGateKernel>),
+}
+
+impl EngramPostWkv {
+    fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
+        match self {
+            Self::Fused(op) => op.compile(b),
+            Self::Gate(op) => op.compile(b),
+        }
+    }
+
+    fn eval(&self, rows: u32, ev: &mut Evaluator) {
+        let zero = rows == 0;
+        match self {
+            Self::Fused(op) => {
+                eval_or_zero(op, ElementwiseKernelInput { num_tokens: rows }, zero, ev)
+            }
+            Self::Gate(op) => {
+                eval_or_zero(op, EngramGateKernelInput { num_tokens: rows }, zero, ev)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53,14 +114,20 @@ pub struct DeepseekV41EngramTpWorkletResolved {
     pub raw_cfg: DeepseekV41EngramTpWorkletConfig,
     /// Gathered bf16 bytes per token on every rank.
     pub gathered_bytes_per_token: u64,
-    pub mhc_post: ElementwiseKernelConfig,
+    /// vLLM's hc post placeholder; `None` with `mhc_unfused_backends`.
+    pub mhc_post: Option<ElementwiseKernelConfig>,
+    /// TileKernels' `mhc_post_fwd`.
+    pub tile_mhc_post: Option<MhcRmsNormKernelConfig>,
     pub all_gather: Option<AllReduceKernelConfig>,
     /// `None` at TP1: no all-gather, so no head-major copy.
     pub gather_copy: Option<ElementwiseKernelConfig>,
     pub wkv: SingleGemmKernelConfig,
-    pub post_wkv: ElementwiseKernelConfig,
-    pub hc_prenorm: ElementwiseKernelConfig,
-    pub pre_big_fuse: ElementwiseKernelConfig,
+    pub post_wkv: EngramPostWkvConfig,
+    pub hc_prenorm: Option<ElementwiseKernelConfig>,
+    pub pre_big_fuse: Option<ElementwiseKernelConfig>,
+    /// TileKernels' shifted pre in place of `hc_prenorm` + `pre_big_fuse`.
+    pub shifted_pre: Option<MhcRmsNormKernelConfig>,
+    pub attn_norm: Option<RmsNormMxfp8KernelConfig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,13 +137,16 @@ pub struct DeepseekV41EngramTpWorkletInput {
 
 pub struct DeepseekV41EngramTpWorklet {
     pub name: String,
-    pub mhc_post: Op<ElementwiseKernel>,
+    pub mhc_post: Option<Op<ElementwiseKernel>>,
+    pub tile_mhc_post: Option<Op<MhcPostKernel>>,
     pub all_gather: Option<Op<AllReduceKernel>>,
     pub gather_copy: Option<Op<ElementwiseKernel>>,
     pub wkv: Op<SingleGemmKernel>,
-    pub post_wkv: Op<ElementwiseKernel>,
-    pub hc_prenorm: Op<ElementwiseKernel>,
-    pub pre_big_fuse: Op<ElementwiseKernel>,
+    pub post_wkv: EngramPostWkv,
+    pub hc_prenorm: Option<Op<ElementwiseKernel>>,
+    pub pre_big_fuse: Option<Op<ElementwiseKernel>>,
+    pub shifted_pre: Option<Op<MhcShiftedPreKernel>>,
+    pub attn_norm: Option<Op<RmsNormMxfp8Kernel>>,
     resolved: DeepseekV41EngramTpWorkletResolved,
 }
 
@@ -91,21 +161,30 @@ impl DeepseekV41EngramTpWorklet {
             "Engram heads must divide tp_size"
         );
         let gpu = cfg.gpu_name.as_str();
-        let ew = |input: u32, output: u32| placeholder(&cfg.elementwise_backends, gpu, input, output);
+        let ew =
+            |input: u32, output: u32| placeholder(&cfg.elementwise_backends, gpu, input, output);
         let hidden_bytes = cfg.hidden_size.get() * 2;
         let hc_bytes = cfg.hc_mult * hidden_bytes;
         let mix_bytes = (2 + cfg.hc_mult) * cfg.hc_mult * 4;
         let engram_width = cfg.engram_num_heads * cfg.engram_head_dim;
         let gathered = u64::from(engram_width) * 2;
+        let placeholders = cfg.mhc_unfused_backends.is_none();
+        let tile = |backends: &Vec<&'static str>| MhcRmsNormKernelConfig {
+            backends: backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            hidden_size: cfg.hidden_size.clone(),
+            hc_mult: cfg.hc_mult,
+            hidden_dtype: DType::Bf16,
+        };
         DeepseekV41EngramTpWorkletResolved {
             gathered_bytes_per_token: gathered,
             // nvidia/model.py:472 `mhc_post`: hc streams + block output in,
             // updated hc streams out.
-            mhc_post: ew(hc_bytes + hidden_bytes, hc_bytes),
+            mhc_post: placeholders.then(|| ew(hc_bytes + hidden_bytes, hc_bytes)),
+            tile_mhc_post: cfg.mhc_unfused_backends.as_ref().map(tile),
             // common/engram.py:992 `tensor_model_parallel_all_gather`.
-            all_gather: (cfg.tp_size > 1).then(|| {
-                nccl_all_gather_proxy(&cfg.all_gather_backends, gpu, cfg.tp_size)
-            }),
+            all_gather: (cfg.tp_size > 1)
+                .then(|| nccl_all_gather_proxy(&cfg.all_gather_backends, gpu, cfg.tp_size)),
             // The all-gather's rank-major -> head-major contiguous copy
             // (`tensor_model_parallel_all_gather(out, dim=1)`, only at TP > 1).
             gather_copy: (cfg.tp_size > 1).then(|| ew(engram_width * 2, engram_width * 2)),
@@ -118,10 +197,31 @@ impl DeepseekV41EngramTpWorklet {
             },
             // common/engram.py:1027 `_fused_engram_post_wkv`: wkv output and
             // hc streams in, hc streams out.
-            post_wkv: ew(cfg.wkv_out_dim.get() * 2 + hc_bytes, hc_bytes),
+            post_wkv: match &cfg.engram_gate_backends {
+                None => {
+                    EngramPostWkvConfig::Fused(ew(cfg.wkv_out_dim.get() * 2 + hc_bytes, hc_bytes))
+                }
+                Some(backends) => EngramPostWkvConfig::Gate(EngramGateKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    hc_mult: cfg.hc_mult,
+                    hidden_size: cfg.hidden_size.clone(),
+                    dtype: DType::Bf16,
+                    max_tokens_per_rank: cfg.max_rank_tokens,
+                }),
+            },
             // nvidia/model.py:480 `mhc_pre_delayed_tilelang` (non-fused pre).
-            hc_prenorm: ew(hc_bytes, mix_bytes),
-            pre_big_fuse: ew(hc_bytes + mix_bytes, hidden_bytes),
+            hc_prenorm: placeholders.then(|| ew(hc_bytes, mix_bytes)),
+            pre_big_fuse: placeholders.then(|| ew(hc_bytes + mix_bytes, hidden_bytes)),
+            shifted_pre: cfg.mhc_unfused_backends.as_ref().map(tile),
+            attn_norm: cfg.attn_norm_backends.as_ref().map(|backends| RmsNormMxfp8KernelConfig {
+                backends: backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden: cfg.hidden_size.get(),
+                return_bf16: true,
+                dtype: DType::Bf16,
+                max_tokens_per_rank: cfg.max_rank_tokens,
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -140,9 +240,18 @@ impl DeepseekV41EngramTpWorklet {
                 )
             }};
         }
+        macro_rules! maybe {
+            ($kernel:ty, $cfg:expr, $suffix:literal) => {
+                match $cfg {
+                    Some(config) => Some(op!($kernel, config, $suffix)),
+                    None => None,
+                }
+            };
+        }
         let r = resolved.clone();
         Ok(Self {
-            mhc_post: op!(ElementwiseKernel, r.mhc_post, "mhc_post"),
+            mhc_post: maybe!(ElementwiseKernel, r.mhc_post, "mhc_post"),
+            tile_mhc_post: maybe!(MhcPostKernel, r.tile_mhc_post, "mhc_post"),
             all_gather: match r.all_gather {
                 Some(config) => Some(op!(AllReduceKernel, config, "all_gather")),
                 None => None,
@@ -152,16 +261,31 @@ impl DeepseekV41EngramTpWorklet {
                 None => None,
             },
             wkv: op!(SingleGemmKernel, r.wkv, "wkv"),
-            post_wkv: op!(ElementwiseKernel, r.post_wkv, "post_wkv"),
-            hc_prenorm: op!(ElementwiseKernel, r.hc_prenorm, "mhc_hc_prenorm"),
-            pre_big_fuse: op!(ElementwiseKernel, r.pre_big_fuse, "mhc_pre_big_fuse"),
+            post_wkv: match r.post_wkv {
+                EngramPostWkvConfig::Fused(config) => {
+                    EngramPostWkv::Fused(op!(ElementwiseKernel, config, "post_wkv"))
+                }
+                EngramPostWkvConfig::Gate(config) => {
+                    EngramPostWkv::Gate(op!(EngramGateKernel, config, "engram_gate"))
+                }
+            },
+            hc_prenorm: maybe!(ElementwiseKernel, r.hc_prenorm, "mhc_hc_prenorm"),
+            pre_big_fuse: maybe!(ElementwiseKernel, r.pre_big_fuse, "mhc_pre_big_fuse"),
+            shifted_pre: maybe!(MhcShiftedPreKernel, r.shifted_pre, "mhc_shifted_pre"),
+            attn_norm: maybe!(RmsNormMxfp8Kernel, r.attn_norm, "attn_norm"),
             name,
             resolved,
         })
     }
 
     pub fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
-        let mut children = vec![self.mhc_post.compile(b)];
+        let mut children = Vec::new();
+        if let Some(op) = &self.mhc_post {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            children.push(op.compile(b));
+        }
         if let Some(all_gather) = &self.all_gather {
             children.push(all_gather.compile(b));
         }
@@ -170,8 +294,15 @@ impl DeepseekV41EngramTpWorklet {
         }
         children.push(self.wkv.compile(b));
         children.push(self.post_wkv.compile(b));
-        children.push(self.hc_prenorm.compile(b));
-        children.push(self.pre_big_fuse.compile(b));
+        for op in [&self.hc_prenorm, &self.pre_big_fuse].into_iter().flatten() {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.shifted_pre {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.attn_norm {
+            children.push(op.compile(b));
+        }
         CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41EngramTpWorklet) [tp={}; heads={}x{}]",
@@ -188,7 +319,13 @@ impl DeepseekV41EngramTpWorklet {
         let rows = input.num_tokens;
         let zero = rows == 0;
         let ew = ElementwiseKernelInput { num_tokens: rows };
-        eval_or_zero(&self.mhc_post, ew.clone(), zero, ev);
+        let mhc = MhcRmsNormKernelInput { num_tokens: rows };
+        if let Some(op) = &self.mhc_post {
+            eval_or_zero(op, ew.clone(), zero, ev);
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            eval_or_zero(op, mhc.clone(), zero, ev);
+        }
         if let Some(all_gather) = &self.all_gather {
             eval_or_zero(
                 all_gather,
@@ -204,10 +341,27 @@ impl DeepseekV41EngramTpWorklet {
         if let Some(gather_copy) = &self.gather_copy {
             eval_or_zero(gather_copy, ew.clone(), zero, ev);
         }
-        eval_or_zero(&self.wkv, SingleGemmKernelInput { m: rows }, zero, ev);
-        eval_or_zero(&self.post_wkv, ew.clone(), zero, ev);
-        eval_or_zero(&self.hc_prenorm, ew.clone(), zero, ev);
-        eval_or_zero(&self.pre_big_fuse, ew, zero, ev);
+        let consumer_rows = if self.resolved.raw_cfg.consumer {
+            rows
+        } else {
+            0
+        };
+        eval_or_zero(
+            &self.wkv,
+            SingleGemmKernelInput { m: consumer_rows },
+            consumer_rows == 0,
+            ev,
+        );
+        self.post_wkv.eval(consumer_rows, ev);
+        for op in [&self.hc_prenorm, &self.pre_big_fuse].into_iter().flatten() {
+            eval_or_zero(op, ew.clone(), zero, ev);
+        }
+        if let Some(op) = &self.shifted_pre {
+            eval_or_zero(op, mhc, zero, ev);
+        }
+        if let Some(op) = &self.attn_norm {
+            eval_or_zero(op, RmsNormMxfp8KernelInput { num_tokens: rows }, zero, ev);
+        }
     }
 }
 
@@ -227,6 +381,11 @@ pub(crate) mod tests {
             gemm_backends: vec!["flashinfer_mxfp8"],
             all_gather_backends: vec!["nccl"],
             elementwise_backends: vec!["triton"],
+            engram_gate_backends: None,
+            consumer: true,
+            max_rank_tokens: 8192,
+            mhc_unfused_backends: None,
+            attn_norm_backends: None,
         }
     }
 
@@ -235,8 +394,11 @@ pub(crate) mod tests {
         let r = DeepseekV41EngramTpWorklet::resolve_config(&config());
         assert_eq!((r.wkv.k.get(), r.wkv.n.get()), (6144, 25600));
         assert_eq!(r.gathered_bytes_per_token, 12_288);
-        assert_eq!(r.mhc_post.input_bytes_per_token.get(), 51_200);
-        assert_eq!(r.post_wkv.output_bytes_per_token.get(), 40_960);
+        assert_eq!(r.mhc_post.as_ref().unwrap().input_bytes_per_token.get(), 51_200);
+        let EngramPostWkvConfig::Fused(post_wkv) = &r.post_wkv else {
+            panic!("vLLM runs the fused post-wkv")
+        };
+        assert_eq!(post_wkv.output_bytes_per_token.get(), 40_960);
         assert!(r.all_gather.is_some());
         let mut single = config();
         single.tp_size = 1;

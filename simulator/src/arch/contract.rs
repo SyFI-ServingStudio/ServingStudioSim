@@ -122,6 +122,14 @@ mod arch_group_input_tests {
 pub struct UnifiedArchInput {
     pub groups: Vec<ArchGroupInput>,
     pub tokens_per_source_rank: Vec<u32>,
+    /// Deferred back pass (`Some` only under a worker's back batching, see
+    /// `worker::shared::back_stash`): the layers from a bounded-replay arch's
+    /// cut on run this step only on these entries, `(prefix, rows)` per group,
+    /// each the rows a finished (or, under the per-chunk rule, any) prefill
+    /// chunk left in the stash. This step's own prefill rows stop after the
+    /// cut layer's `write_kv`. Each entry owns one lm-head row. `None` is the
+    /// ordinary forward, where the step's own rows run every layer.
+    pub back_pass: Option<Vec<Vec<(u32, u32)>>>,
 }
 
 /// Iter-wise query face for co-located workers: one call costs the whole
@@ -133,6 +141,13 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// from outside the simulator (timing-predict) check first.
     fn check_input(&self, _batch: &UnifiedArchInput) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Rows a deferred back pass keeps per request past the replay cut, when
+    /// the model's rule differs from its cache's sliding window (DeepInfer's
+    /// YoCo keeps 140 for a 128 window). `None`: the sliding window.
+    fn back_pass_window(&self) -> Option<u32> {
+        None
     }
 
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
@@ -192,6 +207,14 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// over every rank of one KV partition. L5 sizes capacity, admission, prefix
     /// entries and PD transfers from it; see [`crate::arch::kv_layout`].
     fn kv_cache_layout(&self) -> KvCacheLayout;
+
+    /// Bytes this model, run as one pipeline stage, sends to the next stage
+    /// for `batch`, when that is not the pipeline's per-token activation size
+    /// times the batch tokens (a stage that also forwards KV, or sends fewer
+    /// rows than it received). `None`, the default, keeps that product.
+    fn pipeline_send_bytes(&self, _batch: &UnifiedArchInput) -> Option<u64> {
+        None
+    }
 
     /// Whether the `cost_log` must keep each decode request's KV length.
     ///

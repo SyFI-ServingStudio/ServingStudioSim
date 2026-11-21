@@ -6,6 +6,10 @@ or V-up views, or the padded group-slot attention output a DeepGEMM MXFP8
 einsum reads) instead of presenting its constants as generic batched GEMM
 behavior. Any per-rank head count launches, except that the padded V-up layout
 holds at most 64 heads.
+
+``deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out`` is DeepInfer's grouped output
+projection: the same einsum on a contiguous attention output, writing e4m3 with
+UE8M0 scales per 32 (DeepGEMM's FP8-casting epilogue) instead of bf16.
 """
 
 from __future__ import annotations
@@ -91,6 +95,10 @@ DOC = KernelDoc(
         "with UE8M0 scales, stored in 8 padded group slots of which the call reads "
         "the first num_batches. Its GB/s counts one byte per input element plus one "
         "scale byte per 32, and two bytes per output element.",
+        "deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out reads a contiguous "
+        "[m, num_batches, k] activation and writes an e4m3 output with a UE8M0 "
+        "scale per 32 (DeepInfer's FP8-output einsum); its GB/s counts one byte "
+        "plus 1/32 scale byte per input and output element.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
 )
@@ -240,6 +248,40 @@ register(
                 "are stacked (n, k) linear weights, the output (num_batches, m, n)."
             ),
             url="https://pytorch.org/docs/stable/generated/torch.bmm.html",
+        ),
+    )
+)
+
+# DeepInfer's grouped output projection (wv / wo_a): the same DeepGEMM fp8_einsum
+# "bhr,hdr->bhd" with recipe (1, 1, 32), on a contiguous [m, h, k] MXFP8 attention
+# output, writing an FP8 (e4m3 + UE8M0 per 32) output tuple: DeepGEMM's
+# CastToFP8WithClamp epilogue, a different kernel instance from the bf16 one above.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out",
+        # DeepGEMM's fp8_einsum asserts arch_major == 10 for an FP8 output pair
+        # and runs per-32 scales only on its SM100 path (csrc/apis/einsum.hpp).
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.deepgemm_mxfp8_einsum_fp8_out",
+            function_name="profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out",
+        ),
+        table_name=KIND,
+        args_schema=BatchedGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                'DeepInfer\'s V4 attention wv projection: DeepGEMM fp8_einsum("bhr,hdr->bhd") '
+                "with a (1, 1, 32) MXFP8 recipe and an FP8 output tuple (e4m3 + UE8M0 "
+                "per 32) for the next linear. One sm100_fp8_fp4_gemm_1d1d launch."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
         ),
     )
 )

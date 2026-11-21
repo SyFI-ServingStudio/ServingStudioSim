@@ -1,0 +1,18 @@
+# DeepInfer reference engine: the upstream commit patches/ apply to, the CUDA image its
+# Dockerfile builds it on, and the vendor submodule commits that upstream commit pins.
+# Read by reference_engines (README.md); change it with `just ref bump-base deepinfer`.
+upstream_repo: https://github.com/deepseek-ai/DeepInfer.git
+upstream_commit: a679bb86ce36e883a98a97733492b686e5b9a08e
+image: docker.io/nvidia/cuda:13.3.1-devel-ubuntu24.04
+platforms:
+  linux/amd64:
+    note: 'DeepInfer publishes no image (its README builds from source with scripts/build.sh), so this pins the CUDA devel image the Dockerfile builds it on. CUDA 13.3: FlashMLA''s README quotes B200 numbers on 13.3; devel, because DeepEP and DeepGEMM JIT-compile their kernels at run time with nvcc.'
+    digest: sha256:03c372fd9c65fe7739279f8c65473b315dc61efaaffab03e1e65bc7be7aee61e
+  linux/arm64:
+    note: Pinned for completeness; no arm64 image has been built or run from it yet.
+    digest: sha256:afc92f9727f96346f2912934f11e5a43aa0581aca4a826bd5c8fd4ab6b152bcc
+submodules:
+  vendor/DeepEP: f6aa38fe06cd4a0489e7730365d4e0114970a2f3
+  vendor/DeepGEMM: 1fc9c66975ee322d628b3288534ca0e9ce12a64d
+  vendor/DeepSelect: bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18
+  vendor/FlashMLA: 2e5429fc5653bab6e081f09477126f731882a6a9

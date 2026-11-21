@@ -234,7 +234,9 @@ def test_update_invariants_adds_a_trace_but_will_not_rewrite_one(pack, tmp_path)
     assert path.read_text() == before
 
     # A case whose shapes moved is refused, and the record is left alone.
-    case = copy.cases[0]
+    case = next((c for c in copy.cases if not c.workload_trace.tracked), None)
+    if case is None:
+        pytest.skip(f"{pack.name} replays tracked traces only")
     spec = dataclasses.replace(case.workload_trace, repeats=case.workload_trace.repeats + 1)
     moved = dataclasses.replace(copy, cases=(dataclasses.replace(case, workload_trace=spec),))
     with pytest.raises(PackError, match="will not overwrite"):

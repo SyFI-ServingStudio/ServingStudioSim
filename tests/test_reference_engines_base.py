@@ -84,6 +84,27 @@ def test_malformed_documents_are_refused(text, message):
         parse_base(text)
 
 
+def test_submodule_pins_round_trip_and_must_be_full_commits():
+    doc = yaml.safe_load(_base())
+    doc["submodules"] = {"vendor/B": OTHER, "vendor/A": COMMIT}
+    base = parse_base(yaml.safe_dump(doc))
+    assert base.submodules == {"vendor/A": COMMIT, "vendor/B": OTHER}
+    assert parse_base(format_base(base, "header")) == base
+    assert parse_base(_base()).submodules == {}
+    doc["submodules"] = {"vendor/A": "abc"}
+    with pytest.raises(BaseError, match="submodules must map"):
+        parse_base(yaml.safe_dump(doc))
+
+
+def test_the_dockerfile_reads_the_submodule_pins_format_base_writes():
+    # reference_engines/deepinfer/Dockerfile reads them with sed, line by line.
+    base = read_base("deepinfer")
+    text = format_base(base, "header")
+    lines = text[text.index("submodules:\n") :].splitlines()[1:]
+    assert lines == [f"  {path}: {commit}" for path, commit in sorted(base.submodules.items())]
+    assert f"upstream_commit: {base.upstream_commit}" in text.splitlines()
+
+
 def test_a_platform_the_base_does_not_pin_is_refused():
     with pytest.raises(BaseError, match="no image for linux/arm64"):
         parse_base(_base()).image_for("linux/arm64")

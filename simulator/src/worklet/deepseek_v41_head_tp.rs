@@ -15,6 +15,9 @@
 //! No mHC-head or RMSNorm L1 rows exist on B200 at hidden 5120 (profile.db
 //! `rms_norm` has flashinfer B200 rows at 128/512/2048/6144 only), so both are
 //! byte placeholders.
+//!
+//! With `mhc_post_backends` (DeepInfer) the last FFN's hc post is TileKernels'
+//! `mhc_post_fwd` (kind `mhc_post`) in place of its placeholder.
 
 use std::sync::Arc;
 
@@ -25,8 +28,9 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernelConfig, ElementwiseKernelInput, MhcPostKernel, MhcRmsNormKernelConfig,
+    MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -40,16 +44,26 @@ pub struct DeepseekV41HeadTpWorkletConfig {
     pub lm_head_backends: Vec<&'static str>,
     pub all_gather_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// `Some`: the hc post is TileKernels' `mhc_post_fwd` (DeepInfer).
+    pub mhc_post_backends: Option<Vec<&'static str>>,
+    /// `Some`: the lm_head writes fp32 logits (DeepInfer
+    /// `deep_gemm.bf16_gemm_nt(hidden, weight, logits_fp32)`), in place of
+    /// the bf16 `lm_head_backends` GEMM.
+    pub lm_head_fp32_backends: Option<Vec<&'static str>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DeepseekV41HeadTpWorkletResolved {
     pub raw_cfg: DeepseekV41HeadTpWorkletConfig,
     pub vocab_per_rank: u32,
-    pub mhc_post: ElementwiseKernelConfig,
+    /// The placeholder; `None` with `mhc_post_backends`.
+    pub mhc_post: Option<ElementwiseKernelConfig>,
+    pub tile_mhc_post: Option<MhcRmsNormKernelConfig>,
     pub hc_collapse: ElementwiseKernelConfig,
     pub final_norm: ElementwiseKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
+    /// `Some` with `lm_head_fp32_backends`: replaces [`Self::lm_head`].
+    pub lm_head_fp32: Option<GemmFp32OutputKernelConfig>,
     pub logits_all_gather: Option<AllReduceKernelConfig>,
 }
 
@@ -67,12 +81,19 @@ pub struct DeepseekV41HeadTpWorkletInput {
 
 pub struct DeepseekV41HeadTpWorklet {
     pub name: String,
-    pub mhc_post: Op<ElementwiseKernel>,
+    pub mhc_post: Option<Op<ElementwiseKernel>>,
+    pub tile_mhc_post: Option<Op<MhcPostKernel>>,
     pub hc_collapse: Op<ElementwiseKernel>,
     pub final_norm: Op<ElementwiseKernel>,
-    pub lm_head: Op<SingleGemmKernel>,
+    pub lm_head: LmHead,
     pub logits_all_gather: Option<Op<AllReduceKernel>>,
     resolved: DeepseekV41HeadTpWorkletResolved,
+}
+
+/// The vocabulary projection: bf16 logits (vLLM) or fp32 logits (DeepInfer).
+pub enum LmHead {
+    Bf16(Op<SingleGemmKernel>),
+    Fp32(Op<GemmFp32OutputKernel>),
 }
 
 impl DeepseekV41HeadTpWorklet {
@@ -87,7 +108,17 @@ impl DeepseekV41HeadTpWorklet {
         DeepseekV41HeadTpWorkletResolved {
             vocab_per_rank,
             // nvidia/model.py:858 last FFN's `mhc_post`.
-            mhc_post: ew(hc_bytes + hidden_bytes, hc_bytes),
+            mhc_post: cfg
+                .mhc_post_backends
+                .is_none()
+                .then(|| ew(hc_bytes + hidden_bytes, hc_bytes)),
+            tile_mhc_post: cfg.mhc_post_backends.as_ref().map(|backends| MhcRmsNormKernelConfig {
+                backends: backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden_size.clone(),
+                hc_mult: cfg.hc_mult,
+                hidden_dtype: DType::Bf16,
+            }),
             // nvidia/model.py:890 `_hc_head_reduce_store`: hc streams and the
             // fp32 head mix in, one bf16 row out.
             hc_collapse: ew(hc_bytes + cfg.hc_mult * 4, hidden_bytes),
@@ -100,6 +131,15 @@ impl DeepseekV41HeadTpWorklet {
                 k: cfg.hidden_size.clone(),
                 dtype: DType::Bf16,
             },
+            lm_head_fp32: cfg.lm_head_fp32_backends.as_ref().map(|backends| {
+                GemmFp32OutputKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    n: vocab_per_rank.into(),
+                    k: cfg.hidden_size.clone(),
+                    input_dtype: DType::Bf16,
+                }
+            }),
             // layers/logits_processor.py:130 `tensor_model_parallel_all_gather`.
             logits_all_gather: (cfg.tp_size > 1).then(|| {
                 nccl_all_gather_proxy(&cfg.all_gather_backends, gpu, cfg.tp_size)
@@ -124,10 +164,20 @@ impl DeepseekV41HeadTpWorklet {
         }
         let r = resolved.clone();
         Ok(Self {
-            mhc_post: op!(ElementwiseKernel, r.mhc_post, "mhc_post"),
+            mhc_post: match r.mhc_post {
+                Some(config) => Some(op!(ElementwiseKernel, config, "mhc_post")),
+                None => None,
+            },
+            tile_mhc_post: match r.tile_mhc_post {
+                Some(config) => Some(op!(MhcPostKernel, config, "mhc_post")),
+                None => None,
+            },
             hc_collapse: op!(ElementwiseKernel, r.hc_collapse, "hc_head_collapse"),
             final_norm: op!(ElementwiseKernel, r.final_norm, "final_rms_norm"),
-            lm_head: op!(SingleGemmKernel, r.lm_head, "lm_head"),
+            lm_head: match r.lm_head_fp32 {
+                Some(config) => LmHead::Fp32(op!(GemmFp32OutputKernel, config, "lm_head")),
+                None => LmHead::Bf16(op!(SingleGemmKernel, r.lm_head, "lm_head")),
+            },
             logits_all_gather: match r.logits_all_gather {
                 Some(config) => Some(op!(AllReduceKernel, config, "logits_all_gather")),
                 None => None,
@@ -138,12 +188,21 @@ impl DeepseekV41HeadTpWorklet {
     }
 
     pub fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
-        let mut children = vec![
-            self.mhc_post.compile(b),
+        let mut children = Vec::new();
+        if let Some(op) = &self.mhc_post {
+            children.push(op.compile(b));
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            children.push(op.compile(b));
+        }
+        children.extend([
             self.hc_collapse.compile(b),
             self.final_norm.compile(b),
-            self.lm_head.compile(b),
-        ];
+            match &self.lm_head {
+                LmHead::Bf16(op) => op.compile(b),
+                LmHead::Fp32(op) => op.compile(b),
+            },
+        ]);
         if let Some(all_gather) = &self.logits_all_gather {
             children.push(all_gather.compile(b));
         }
@@ -167,17 +226,34 @@ impl DeepseekV41HeadTpWorklet {
         let logits = input.logits_rows;
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let post_rows = input.mhc_post_rows;
-        eval_or_zero(
-            &self.mhc_post,
-            ElementwiseKernelInput {
-                num_tokens: post_rows,
-            },
-            post_rows == 0,
-            ev,
-        );
+        if let Some(op) = &self.mhc_post {
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput {
+                    num_tokens: post_rows,
+                },
+                post_rows == 0,
+                ev,
+            );
+        }
+        if let Some(op) = &self.tile_mhc_post {
+            eval_or_zero(
+                op,
+                MhcRmsNormKernelInput {
+                    num_tokens: post_rows,
+                },
+                post_rows == 0,
+                ev,
+            );
+        }
         eval_or_zero(&self.hc_collapse, ew.clone(), rows == 0, ev);
         eval_or_zero(&self.final_norm, ew, rows == 0, ev);
-        eval_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, logits == 0, ev);
+        match &self.lm_head {
+            LmHead::Bf16(op) => eval_or_zero(op, SingleGemmKernelInput { m: logits }, logits == 0, ev),
+            LmHead::Fp32(op) => {
+                eval_or_zero(op, GemmFp32OutputKernelInput { m: logits }, logits == 0, ev)
+            }
+        }
         if let Some(all_gather) = &self.logits_all_gather {
             let gathered = u64::from(logits) * u64::from(self.resolved.raw_cfg.vocab_size) * 2;
             eval_or_zero(
@@ -206,6 +282,8 @@ pub(crate) mod tests {
             lm_head_backends: vec!["torch_linear"],
             all_gather_backends: vec!["nccl"],
             elementwise_backends: vec!["triton"],
+            mhc_post_backends: None,
+            lm_head_fp32_backends: None,
         }
     }
 

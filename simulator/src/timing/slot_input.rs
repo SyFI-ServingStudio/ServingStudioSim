@@ -48,12 +48,14 @@ use crate::timing::kernels::DsaFp32SplitStateUpdateKernelInput;
 use crate::timing::kernels::DsaPooledIndexCacheUpdateKernelInput;
 use crate::timing::kernels::DsaPooledLogitsPageTableKernelInput;
 use crate::timing::kernels::DsaPooledTopkPageTableKernelInput;
+use crate::timing::kernels::SparseMlaNormRopeCastPrefillKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::Fp32RowSplitLayerNormKernelInput;
 use crate::timing::kernels::HadamardFp8QuantKernelInput;
 use crate::timing::kernels::HadamardFp8QuantWeightScaleKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
+use crate::timing::kernels::MegaMoeKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
@@ -61,6 +63,22 @@ use crate::timing::kernels::SigmoidGatedRmsNormKernelInput;
 use crate::timing::kernels::{
     GroupedConvResidualRmsNormKernelInput, LayeredKvNormRopeCacheWriteKernelInput,
     QkNormRopeFp8KvWriteKernelInput,
+};
+use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput, MegaMhcKernelInput};
+use crate::timing::kernels::{
+    CandidateCompactLensKernelInput,
+    CandidateIndexRestoreKernelInput,
+    CompressStatePrefillKernelInput,
+    ExpandSwaIndexKernelInput,
+    FusedNormRopeCastKernelInput,
+    KvIndexCatKernelInput,
+    PagedKvCacheLoadKernelInput,
+    PagedKvCacheStoreKernelInput,
+    RmsNormMxfp8KernelInput,
+};
+use crate::timing::kernels::{
+    CandidateBlockMaxKernelInput, DeepSelectTopkKernelInput, MqaLogitsPrefillChunkKernelInput,
+    SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsPrefillKernelInput,
 };
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
@@ -73,6 +91,11 @@ use crate::timing::kernels::{
     KdaRecoverSSMVerifyKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
+use crate::timing::kernels::{
+    PagedMqaLogitsMetadataKernelInput, SparseMqaLogitsDecodeKernelInput,
+    SparseMqaLogitsDecodeMetadataKernelInput, DeepSelectLogitsTopkKernelInput,
+    FusedSampleKernelInput, GemmFp32AccumulateKernelInput,
+};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -183,6 +206,30 @@ log_inputs! {
     Fp32RowSplitLayerNorm => Fp32RowSplitLayerNormKernelInput,
     DsaFp32SplitStateUpdate => DsaFp32SplitStateUpdateKernelInput,
     Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
+    MegaMoe => MegaMoeKernelInput,
+    MegaGate => MegaGateKernelInput,
+    MegaMhc => MegaMhcKernelInput,
+    EngramGate => EngramGateKernelInput,
+    FusedNormRopeCast => FusedNormRopeCastKernelInput,
+    RmsNormMxfp8 => RmsNormMxfp8KernelInput,
+    PagedKvCacheLoad => PagedKvCacheLoadKernelInput,
+    PagedKvCacheStore => PagedKvCacheStoreKernelInput,
+    KvIndexCat => KvIndexCatKernelInput,
+    ExpandSwaIndex => ExpandSwaIndexKernelInput,
+    CompressStatePrefill => CompressStatePrefillKernelInput,
+    CandidateCompactLens => CandidateCompactLensKernelInput,
+    CandidateIndexRestore => CandidateIndexRestoreKernelInput,
+    MqaLogitsPrefillChunk => MqaLogitsPrefillChunkKernelInput,
+    SparseMqaLogitsPrefill => SparseMqaLogitsPrefillKernelInput,
+    SparseMqaLogitsMetadata => SparseMqaLogitsMetadataKernelInput,
+    SparseMqaLogitsDecode => SparseMqaLogitsDecodeKernelInput,
+    SparseMqaLogitsDecodeMetadata => SparseMqaLogitsDecodeMetadataKernelInput,
+    PagedMqaLogitsMetadata => PagedMqaLogitsMetadataKernelInput,
+    DeepSelectLogitsTopk => DeepSelectLogitsTopkKernelInput,
+    FusedSample => FusedSampleKernelInput,
+    GemmFp32Accumulate => GemmFp32AccumulateKernelInput,
+    CandidateBlockMax => CandidateBlockMaxKernelInput,
+    DeepSelectTopk => DeepSelectTopkKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,
     GdnCausalConvDecode => GdnCausalConvDecodeKernelInput,
@@ -221,6 +268,7 @@ log_inputs! {
     CompressedSparseMlaDecode => CompressedSparseMlaDecodeKernelInput,
     CompressedSparseMlaPrefill => CompressedSparseMlaPrefillKernelInput,
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
+    SparseMlaNormRopeCastPrefill => SparseMlaNormRopeCastPrefillKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
     EmbeddingRowGather => EmbeddingRowGatherKernelInput,

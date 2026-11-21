@@ -158,6 +158,40 @@ impl KvStore for KvCacheStore {
     }
 }
 
+
+impl KvCacheStore {
+    /// The partition holding the most retained tokens of `session_input`'s
+    /// prefix, and that count (ties go to the lower partition). Standalone and
+    /// pinned-prefix inputs create no affinity. Shared by in-worker partition
+    /// placement and the pool-level replica placement.
+    pub(crate) fn retained_prefix(&self, session_input: SessionInput) -> Option<(PartitionId, u32)> {
+        let (session_id, declared_prefix_tokens) = match session_input {
+            // A pinned prefix is resident on every partition, so it creates no
+            // placement affinity.
+            SessionInput::Standalone | SessionInput::PinnedPrefix { .. } => return None,
+            SessionInput::Session {
+                session_id,
+                declared_prefix_tokens,
+                ..
+            } => (session_id, declared_prefix_tokens),
+        };
+
+        let mut best_partition = None;
+        let mut best_resident_tokens = 0;
+        for (partition_index, prefix_cache) in self.prefix_caches.iter().enumerate() {
+            let resident_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
+            if resident_tokens > best_resident_tokens {
+                best_resident_tokens = resident_tokens;
+                best_partition = Some(
+                    PartitionId::try_from(partition_index)
+                        .expect("KvCacheStore partition count must fit PartitionId"),
+                );
+            }
+        }
+        best_partition.map(|partition| (partition, best_resident_tokens))
+    }
+}
+
 impl IterWorkerKv for KvCacheStore {
     fn drain_ready(&mut self) {
         KvCacheStore::drain_ready(self);
@@ -193,6 +227,11 @@ impl IterWorkerKv for KvCacheStore {
 
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         KvCacheStore::release_external(self, request, current_kv)
+    }
+
+    fn retained_prefix_tokens(&self, session_input: SessionInput) -> u32 {
+        self.retained_prefix(session_input)
+            .map_or(0, |(_, tokens)| tokens)
     }
 
     fn visit_prefill_admits(&self, partition: PartitionId, mut visitor: impl FnMut(RequestId)) {
@@ -595,30 +634,8 @@ impl TieredPrefixKv for KvCacheStore {
 
 impl PrefixKv for KvCacheStore {
     fn retained_prefix_partition(&self, session_input: SessionInput) -> Option<PartitionId> {
-        let (session_id, declared_prefix_tokens) = match session_input {
-            // A pinned prefix is resident on every partition, so it creates no
-            // placement affinity.
-            SessionInput::Standalone | SessionInput::PinnedPrefix { .. } => return None,
-            SessionInput::Session {
-                session_id,
-                declared_prefix_tokens,
-                ..
-            } => (session_id, declared_prefix_tokens),
-        };
-
-        let mut best_partition = None;
-        let mut best_resident_tokens = 0;
-        for (partition_index, prefix_cache) in self.prefix_caches.iter().enumerate() {
-            let resident_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
-            if resident_tokens > best_resident_tokens {
-                best_resident_tokens = resident_tokens;
-                best_partition = Some(
-                    PartitionId::try_from(partition_index)
-                        .expect("KvCacheStore partition count must fit PartitionId"),
-                );
-            }
-        }
-        best_partition
+        self.retained_prefix(session_input)
+            .map(|(partition, _)| partition)
     }
 
     fn preview_prefill_context(
@@ -1654,6 +1671,7 @@ mod tests {
         PrefixCacheBudget {
             max_retained_units,
             policy,
+            retained_scale: crate::worker::kv::shared::balanced_retention::RetainedScale::ONE,
         }
     }
 
