@@ -682,6 +682,82 @@ def build_flashmla_mega(
     return work, run, out
 
 
+# ---- flashmla_deepinfer ----------------------------------------------------
+
+
+def build_flashmla_deepinfer(torch: Any, shape: _Shape, device: Any) -> tuple[_Workload, Any, Any]:
+    """Build the workload and a closure making DeepInfer's decode attention call.
+
+    DeepInfer's ``decode_mla_mqa_sparse`` (``layers/attention_backend.py``) with
+    the kwargs of ``V4AttentionBase._fused_norm_rope_cast_kwargs``
+    (``models/v4_modules/attn.py``; ``use_qnorm`` is False for V4.1) calls
+    FlashMLA's ``fused_norm_rope_attn_rope_cast.decode`` once: the SWA cache and
+    its ``[T, window]`` slot list, plus on compressed layers the compressed cache
+    and its ``[T, index_topk]`` top-k slots as the extra operands. DeepInfer
+    passes no SWA ``topk_length`` and, every V4.1 compressed layer being sparse,
+    no extra ``topk_length``: the kernel walks every column, ``-1`` ones
+    included. Positions are int32, as ``InputMetadataV4.positions``.
+    """
+    try:
+        from flash_mla import fused_norm_rope_attn_rope_cast as mega
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            f"{KIND}:flashmla_deepinfer requires DeepInfer's FlashMLA (deepinfer_env)"
+        ) from exc
+    work = _build_workload(torch, shape, device, _torch_writer)
+    q_fused = _q_fused(work.q)
+    positions = work.positions.to(torch.int32)
+    extra_cache = None if work.extra_cache is None else work.extra_cache.unsqueeze(-2)
+    swa_cache = work.swa_cache.unsqueeze(-2)
+    out = types.SimpleNamespace(data=None, scale=None)
+
+    def run() -> None:
+        out.data, out.scale, _lse = mega.decode(
+            enable_q_norm=False,
+            rms_norm_eps=0.0,
+            token_positions=positions,
+            is_rope_neox_style=False,
+            rope_dim=_ROPE_DIM,
+            cos_sin_cache=work.cos_sin,
+            n_wv_group=shape.num_heads // 8,
+            num_per_channels=32,
+            use_tma_aligned_col_major_sf=True,
+            round_sf=True,
+            use_packed_ue8m0=True,
+            q=q_fused,
+            k_cache=swa_cache,
+            indices_in_kvcache=work.swa_slots,
+            sm_scale=_HEAD_DIM**-0.5,
+            d_v=_HEAD_DIM,
+            attn_sink=work.sink,
+            topk_length=None,
+            extra_k_cache=extra_cache,
+            extra_indices_in_kvcache=work.extra_slots,
+            extra_topk_length=None,
+        )
+
+    return work, run, out
+
+
+def profile_compressed_sparse_mla_rope_cast_flashmla_deepinfer(**kwargs: Any) -> ComputeMetrics:
+    """Time DeepInfer's decode attention launch (FlashMLA mega decode, no lengths)."""
+    shape = _validate_args(**kwargs)
+    if shape.mode != "decode":
+        raise ProfilerNotImplemented(
+            f"{KIND}:flashmla_deepinfer times decode only; DeepInfer's prefill attention is "
+            "sparse_mla_norm_rope_cast_prefill"
+        )
+
+    def build(torch: Any, device: Any) -> tuple[_Workload, Any]:
+        work, run, out = build_flashmla_deepinfer(torch, shape, device)
+        run()
+        torch.cuda.synchronize(device)
+        check_against_reference(torch, shape, work, out, "flashmla_deepinfer")
+        return work, run
+
+    return _profile(shape, "flashmla_deepinfer", build)
+
+
 def _check_swapab_route(shape: _Shape) -> None:
     """Fail unless ``_forward_decode_mega`` would route this shape to swap-AB."""
     from vllm.models.deepseek_v41.nvidia import flash_mla_mega_attn as mega
@@ -743,6 +819,7 @@ def profile_compressed_sparse_mla_rope_cast_swapab_cutedsl(**kwargs: Any) -> Com
 
 
 __all__ = [
+    "profile_compressed_sparse_mla_rope_cast_flashmla_deepinfer",
     "profile_compressed_sparse_mla_rope_cast_flashmla_mega",
     "profile_compressed_sparse_mla_rope_cast_swapab_cutedsl",
     "profile_compressed_sparse_mla_rope_cast_torch",

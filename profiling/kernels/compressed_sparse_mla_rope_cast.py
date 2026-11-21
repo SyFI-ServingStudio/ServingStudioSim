@@ -154,6 +154,8 @@ DOC = KernelDoc(
         "count (16 or 32) for swapab_cutedsl.",
         "swapab_cutedsl times decode only, on compressed layers (ratio 1 or 2), "
         "at most 16 query rows: the steps vLLM routes to it.",
+        "flashmla_deepinfer times decode only: DeepInfer's call of FlashMLA's own "
+        "build, which passes no top-k lengths, so the kernel walks every index column.",
         "A prefill row is one planner chunk: the deployment's chunk plan "
         "(max_model_len, max_num_batched_tokens, prefill chunk size) is applied by "
         "the simulator, which sums the chunks of a step.",
@@ -221,6 +223,38 @@ register(
                 "FlashMLA's fused_norm_rope_attn_rope_cast decode and prefill kernels, "
                 "through the vLLM mega-attention layer's segment methods, prefill "
                 "gathers included."
+            ),
+            url="https://github.com/deepseek-ai/FlashMLA",
+        ),
+    )
+)
+
+# DeepInfer's image ships FlashMLA's own build of the same kernel; its decode
+# call passes no top-k lengths (layers/attention_backend.py
+# decode_mla_mqa_sparse). Decode only: DeepInfer's prefill attention is the
+# sparse_mla_norm_rope_cast_prefill kind. Same semantics and args as
+# flashmla_mega, different timing: on one B200 at 64 x (6, 131800) decode rows
+# it took 55.7 us against flashmla_mega's 64.6 (ratio 1 and 2), and at short
+# contexts it walks all 640 index columns where vLLM's lengths stop early
+# (296 rows at ratio 1: 59.0 against 24.1 us).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashmla_deepinfer",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.compressed_sparse_mla_rope_cast",
+            function_name="profile_compressed_sparse_mla_rope_cast_flashmla_deepinfer",
+        ),
+        table_name=KIND,
+        args_schema=CompressedSparseMlaRopeCastArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=_MEGA_SUPPORT,
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashMLA fused_norm_rope_attn_rope_cast.decode from DeepInfer's image, "
+                "as DeepInfer's decode_mla_mqa_sparse calls it (no top-k lengths); decode only."
             ),
             url="https://github.com/deepseek-ai/FlashMLA",
         ),
