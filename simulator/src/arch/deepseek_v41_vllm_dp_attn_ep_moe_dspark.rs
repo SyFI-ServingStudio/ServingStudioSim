@@ -171,6 +171,14 @@ pub fn build_configs(
         MAX_NUM_SEQS,
         &[verify_width],
     );
+    if engine.is_some() {
+        // The target's decode rows are verify rows: `next_n` = the verify width.
+        for layer in std::iter::once(&mut target.layer0).chain(target.bodies.iter_mut()) {
+            if let Some(di) = &mut layer.attention.deepinfer {
+                di.decode_next_n = verify_width;
+            }
+        }
+    }
     let deepinfer = engine.zip(dflash).map(|(engine, dflash)| {
         let target_graph_sizes =
             graph_sizes(engine.max_num_seqs * verify_width, dflash.graph_interval);
@@ -203,8 +211,13 @@ pub fn build_configs(
     let mut draft_rest = dp_layer_config(rest, max_rank_tokens);
     let mut deepinfer_configs = None;
     if let Some((engine, dflash, target_graph_sizes, draft_graph_sizes)) = deepinfer {
+        // The draft never forces balance: `get_fused_dflash_get_input` writes
+        // `gate_force_random = False` for every draft row
+        // (`tilelang_ops/cuda/get_kv_index.py:121`), so it routes for real
+        // over EPLB's redundant slots.
         let draft_engine = DeepInferEngine {
             num_redundant_experts: dflash.draft_num_redundant_experts,
+            force_load_balance: false,
             ..engine
         };
         for layer in [&mut draft_first, &mut draft_rest] {

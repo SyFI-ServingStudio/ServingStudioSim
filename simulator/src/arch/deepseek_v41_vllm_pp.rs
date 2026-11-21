@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::deepseek_v41_vllm::{
-    self as tp_arch, fold_layers, index_plan, layer_config, normalize_step, resolve_layer,
+    self as tp_arch, fold_layers, index_plan, layer_config, mark_deepinfer_schedules, normalize_step, resolve_layer,
     stage_kv_cache_layout, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerBody,
     DeepseekV41LayerConfig, DeepseekV41LayerResolved, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
     DeepseekV41Step, DeepseekV41VllmParallel, LayerKind, NormalizedInput, PlanNode,
@@ -92,7 +92,6 @@ use crate::worklet::{
     DeepseekV41PrologueTpWorkletConfig,
 };
 
-use crate::op::attention::DeepseekV41CandidateRole;
 
 const ARCH_KIND: &str = "deepseek_v41_vllm_pp";
 
@@ -722,14 +721,8 @@ pub fn build_configs(
                 .map(|layer| (layer, model.layer_kind(layer)))
                 .collect();
             if parallel.deepinfer.is_some() {
-                // As in the DP arch: a forward's first candidate consumer
-                // builds the sparse schedule the later ones reuse. Each
-                // segment is its own forward on this GPU.
-                if let Some((_, kind)) = tail.iter_mut().find(|(_, kind)| {
-                    kind.attention.candidate == DeepseekV41CandidateRole::Consumer
-                }) {
-                    kind.candidate_metadata = true;
-                }
+                // As in the DP arch; each segment is its own forward on this GPU.
+                mark_deepinfer_schedules(&mut tail);
             }
             let nodes = index_plan(&fold_layers(&tail), &mut |kind, layers| {
                 bodies.push(stage_layer(kind, layers.to_vec()));

@@ -30,9 +30,28 @@
 //! ([`equivalent_context`]), and the top-k as uniform rows of the chunk's mean
 //! valid length ([`ChunkWork::row_len`]).
 //!
-//! Not priced here (no kind; the lane left them out):
-//! `_get_candidate_compact_lens_kernel` (once per step, first consumer) and
-//! `restore_candidate_indices_inplace` (after each consumer top-k).
+//! Decode rows (`_topk_decode`, `_compute_decode_p_sum`; capture
+//! `logs/20261120_0_deepinfer_decode_nsys`, per-call list in the lane's
+//! `idx_calls_graph.txt`) run once per step over all `batch x next_n` rows:
+//!
+//! - a dense index source and the candidate writer: the FP4 paged logits
+//!   ([`DsaPagedMqaLogitsDecodeKernel`], backend `deepgemm_fp4`), after the
+//!   paged schedule ([`PagedMqaLogitsMetadataKernel`]) that the first such
+//!   layer of each compress ratio builds and the rest reuse
+//!   (`_get_decode_metadata`, `paged_metadata`);
+//! - a candidate consumer: the paged sparse schedule
+//!   ([`SparseMqaLogitsDecodeMetadataKernel`], first consumer only) and the
+//!   candidate-restricted logits ([`SparseMqaLogitsDecodeKernel`]);
+//! - the candidate writer: `candidate_block_max` and the block top-k;
+//! - every layer: the row top-k.
+//!
+//! A decode request's keys are `floor(context / ratio)` of its rows' mean
+//! context; the kernels take the request count and that key window.
+//!
+//! Not priced here (the KV worklet's, [`crate::worklet::deepseek_v41_deepinfer_kv`]):
+//! `_get_candidate_compact_lens_kernel` (once per step, first consumer),
+//! `restore_candidate_indices_inplace` (after each consumer top-k) and
+//! `convert_kv_index`.
 
 use std::sync::Arc;
 
@@ -41,8 +60,14 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     CandidateBlockMaxKernel, CandidateBlockMaxKernelConfig, CandidateBlockMaxKernelInput,
     DeepSelectTopkKernel, DeepSelectTopkKernelConfig, DeepSelectTopkKernelInput,
-    MqaLogitsPrefillChunkKernel, MqaLogitsPrefillChunkKernelConfig,
-    MqaLogitsPrefillChunkKernelInput, SparseMqaLogitsMetadataKernel,
+    DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
+    DsaPagedMqaLogitsDecodeKernelInput, MqaLogitsPrefillChunkKernel,
+    MqaLogitsPrefillChunkKernelConfig, MqaLogitsPrefillChunkKernelInput,
+    PagedMqaLogitsMetadataKernel, PagedMqaLogitsMetadataKernelConfig,
+    PagedMqaLogitsMetadataKernelInput, SparseMqaLogitsDecodeKernel,
+    SparseMqaLogitsDecodeKernelConfig, SparseMqaLogitsDecodeKernelInput,
+    SparseMqaLogitsDecodeMetadataKernel, SparseMqaLogitsDecodeMetadataKernelConfig,
+    SparseMqaLogitsDecodeMetadataKernelInput, SparseMqaLogitsMetadataKernel,
     SparseMqaLogitsMetadataKernelConfig, SparseMqaLogitsMetadataKernelInput,
     SparseMqaLogitsPrefillKernel, SparseMqaLogitsPrefillKernelConfig,
     SparseMqaLogitsPrefillKernelInput,
@@ -80,6 +105,14 @@ pub struct DeepseekV41DeepInferIndexerOpConfig {
     pub logits_backends: Vec<&'static str>,
     pub candidate_block_max_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    /// The FP4 dense decode logits (`dsa_paged_mqa_logits_decode`).
+    pub decode_logits_backends: Vec<&'static str>,
+    /// This layer builds its ratio's dense decode schedule.
+    pub paged_metadata: bool,
+    /// Query rows per decode request: 1, or the verify width.
+    pub decode_next_n: u32,
+    /// DeepInfer's KV page in tokens; the index page holds `block_size / ratio` keys.
+    pub block_size: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +120,11 @@ pub struct DeepseekV41DeepInferIndexerOpInput {
     /// `(query_len, context_len)` per prefill request, context including the
     /// query.
     pub prefill_query_context_pairs: Vec<(u32, u32)>,
+    /// Resident KV before each live decode row.
+    pub decode_kv_lens: Vec<u32>,
+    /// Decode rows the launches cover: the graph's padded rows inside a FULL
+    /// graph, else the live rows.
+    pub decode_rows: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +141,11 @@ pub struct DeepseekV41DeepInferIndexerOpResolved {
     pub candidate_block_max: Option<CandidateBlockMaxKernelConfig>,
     pub candidate_topk: Option<DeepSelectTopkKernelConfig>,
     pub topk: DeepSelectTopkKernelConfig,
+    pub decode_next_n: u32,
+    pub decode_logits: Option<DsaPagedMqaLogitsDecodeKernelConfig>,
+    pub decode_metadata: Option<PagedMqaLogitsMetadataKernelConfig>,
+    pub decode_sparse_metadata: Option<SparseMqaLogitsDecodeMetadataKernelConfig>,
+    pub decode_sparse_logits: Option<SparseMqaLogitsDecodeKernelConfig>,
 }
 
 pub struct DeepseekV41DeepInferIndexerOp {
@@ -113,6 +156,13 @@ pub struct DeepseekV41DeepInferIndexerOp {
     pub candidate_block_max: Option<Arc<CandidateBlockMaxKernel>>,
     pub candidate_topk: Option<Arc<DeepSelectTopkKernel>>,
     pub topk: Arc<DeepSelectTopkKernel>,
+    pub decode_logits: Option<Arc<DsaPagedMqaLogitsDecodeKernel>>,
+    pub decode_metadata: Option<Arc<PagedMqaLogitsMetadataKernel>>,
+    pub decode_sparse_metadata: Option<Arc<SparseMqaLogitsDecodeMetadataKernel>>,
+    pub decode_sparse_logits: Option<Arc<SparseMqaLogitsDecodeKernel>>,
+    pub decode_candidate_block_max: Option<Arc<CandidateBlockMaxKernel>>,
+    pub decode_candidate_topk: Option<Arc<DeepSelectTopkKernel>>,
+    pub decode_topk: Arc<DeepSelectTopkKernel>,
     resolved: DeepseekV41DeepInferIndexerOpResolved,
 }
 
@@ -158,6 +208,9 @@ impl DeepseekV41DeepInferIndexerOp {
             0
         };
         let max_keys = cfg.max_model_len / ratio;
+        assert!(cfg.decode_next_n > 0, "decode rows per request must be positive");
+        assert_eq!(cfg.block_size % ratio, 0, "an index page holds whole keys");
+        let page = cfg.block_size / ratio;
         let gpu = cfg.gpu_name.clone();
         let logits_dtype = DType::Mxfp4E2m1;
         let topk = |top_k: u32, max_row_len: u32| DeepSelectTopkKernelConfig {
@@ -221,6 +274,59 @@ impl DeepseekV41DeepInferIndexerOp {
                 cfg.index_topk,
                 if consumer { candidate_tokens } else { max_keys },
             ),
+            decode_next_n: cfg.decode_next_n,
+            // `deep_gemm.fp8_fp4_paged_mqa_logits` over the page-planar FP4
+            // index cache (packed UE8M0 scales), bf16 weights and logits.
+            decode_logits: (!consumer).then(|| DsaPagedMqaLogitsDecodeKernelConfig {
+                backends: cfg.decode_logits_backends.clone(),
+                gpu_name: gpu.clone(),
+                next_n: cfg.decode_next_n,
+                max_model_len: max_keys.into(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                block_size: page,
+                q_dtype: logits_dtype,
+                cache_dtype: logits_dtype,
+                scale_dtype: logits_dtype,
+                weight_dtype: DType::Bf16,
+                output_dtype: DType::Bf16,
+                context_mode: "uniform".to_string(),
+                page_mapping: "unique_scattered".to_string(),
+                cache_format: "page_planar_fp4_ue8m0_scale".to_string(),
+                clean_logits: false,
+            }),
+            decode_metadata: (cfg.paged_metadata && !consumer).then(|| {
+                PagedMqaLogitsMetadataKernelConfig {
+                    backends: cfg.logits_backends.clone(),
+                    gpu_name: gpu.clone(),
+                    next_n: cfg.decode_next_n,
+                    block_size: page,
+                }
+            }),
+            decode_sparse_metadata: cfg.candidate_metadata.then(|| {
+                SparseMqaLogitsDecodeMetadataKernelConfig {
+                    backends: cfg.logits_backends.clone(),
+                    gpu_name: gpu.clone(),
+                    next_n: cfg.decode_next_n,
+                    block_size: page,
+                    candidate_blocks: cfg.candidate_topk_blocks,
+                    candidate_block_size: candidate_block,
+                    dtype: logits_dtype,
+                    max_context_len: max_keys,
+                }
+            }),
+            decode_sparse_logits: consumer.then(|| SparseMqaLogitsDecodeKernelConfig {
+                backends: cfg.logits_backends.clone(),
+                gpu_name: gpu.clone(),
+                next_n: cfg.decode_next_n,
+                block_size: page,
+                candidate_blocks: cfg.candidate_topk_blocks,
+                candidate_block_size: candidate_block,
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                dtype: logits_dtype,
+                max_context_len: max_keys,
+            }),
         }
     }
 
@@ -265,6 +371,41 @@ impl DeepseekV41DeepInferIndexerOp {
                 resolved.topk.clone(),
                 bridge,
             )?),
+            decode_logits: maybe!(
+                DsaPagedMqaLogitsDecodeKernel,
+                resolved.decode_logits,
+                "decode_logits"
+            ),
+            decode_metadata: maybe!(
+                PagedMqaLogitsMetadataKernel,
+                resolved.decode_metadata,
+                "decode_metadata"
+            ),
+            decode_sparse_metadata: maybe!(
+                SparseMqaLogitsDecodeMetadataKernel,
+                resolved.decode_sparse_metadata,
+                "decode_sparse_metadata"
+            ),
+            decode_sparse_logits: maybe!(
+                SparseMqaLogitsDecodeKernel,
+                resolved.decode_sparse_logits,
+                "decode_sparse_logits"
+            ),
+            decode_candidate_block_max: maybe!(
+                CandidateBlockMaxKernel,
+                resolved.candidate_block_max,
+                "decode_candidate_block_max"
+            ),
+            decode_candidate_topk: maybe!(
+                DeepSelectTopkKernel,
+                resolved.candidate_topk,
+                "decode_candidate_topk"
+            ),
+            decode_topk: Arc::new(DeepSelectTopkKernel::build(
+                slot("decode_topk"),
+                resolved.topk.clone(),
+                bridge,
+            )?),
             resolved,
             name,
         })
@@ -289,6 +430,25 @@ impl DeepseekV41DeepInferIndexerOp {
             leaves.push(leaf(b, name, "candidate_topk", &**k));
         }
         leaves.push(leaf(b, name, "topk", &*self.topk));
+        if let Some(k) = &self.decode_metadata {
+            leaves.push(leaf(b, name, "decode_metadata", &**k));
+        }
+        if let Some(k) = &self.decode_logits {
+            leaves.push(leaf(b, name, "decode_logits", &**k));
+        }
+        if let Some(k) = &self.decode_sparse_metadata {
+            leaves.push(leaf(b, name, "decode_sparse_metadata", &**k));
+        }
+        if let Some(k) = &self.decode_sparse_logits {
+            leaves.push(leaf(b, name, "decode_sparse_logits", &**k));
+        }
+        if let Some(k) = &self.decode_candidate_block_max {
+            leaves.push(leaf(b, name, "decode_candidate_block_max", &**k));
+        }
+        if let Some(k) = &self.decode_candidate_topk {
+            leaves.push(leaf(b, name, "decode_candidate_topk", &**k));
+        }
+        leaves.push(leaf(b, name, "decode_topk", &*self.decode_topk));
         CostNode::Sum(leaves)
     }
 
@@ -407,7 +567,125 @@ impl DeepseekV41DeepInferIndexerOp {
             |c| self.topk.eval(&topk(c)),
             |c| topk(c).into(),
         );
+        self.eval_decode(input, ev);
     }
+
+    /// The decode leaves, in [`Self::compile`] order; zero without decode rows.
+    fn eval_decode(&self, input: &DeepseekV41DeepInferIndexerOpInput, ev: &mut Evaluator) {
+        let r = &self.resolved;
+        let work = decode_work(input, r);
+        macro_rules! push {
+            ($kernel:expr, $input:expr) => {
+                if let Some(k) = $kernel {
+                    match &work {
+                        Some(w) => {
+                            let i = $input(w);
+                            ev.push(k.eval(&i), || i.clone().into());
+                        }
+                        None => ev.push(LeafMetrics::ZERO, || $input(&DecodeWork::EMPTY).into()),
+                    }
+                }
+            };
+        }
+        push!(&self.decode_metadata, |w: &DecodeWork| {
+            PagedMqaLogitsMetadataKernelInput {
+                batch_size: w.requests,
+            }
+        });
+        push!(&self.decode_logits, |w: &DecodeWork| {
+            DsaPagedMqaLogitsDecodeKernelInput {
+                batch_size: w.requests,
+                context_len: w.keys,
+            }
+        });
+        push!(&self.decode_sparse_metadata, |w: &DecodeWork| {
+            SparseMqaLogitsDecodeMetadataKernelInput {
+                batch_size: w.requests,
+                context_len: w.keys,
+            }
+        });
+        push!(&self.decode_sparse_logits, |w: &DecodeWork| {
+            SparseMqaLogitsDecodeKernelInput {
+                batch_size: w.requests,
+                context_len: w.keys,
+            }
+        });
+        push!(&self.decode_candidate_block_max, |w: &DecodeWork| {
+            CandidateBlockMaxKernelInput {
+                num_queries: w.rows,
+                context_len: w.context,
+            }
+        });
+        let block = r.candidate_block.max(1);
+        push!(&self.decode_candidate_topk, |w: &DecodeWork| {
+            DeepSelectTopkKernelInput {
+                num_rows: w.rows,
+                row_len: w.keys.div_ceil(block),
+            }
+        });
+        push!(Some(&self.decode_topk), |w: &DecodeWork| {
+            DeepSelectTopkKernelInput {
+                num_rows: w.rows,
+                row_len: w.row_len,
+            }
+        });
+    }
+}
+
+/// One step's decode coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeWork {
+    /// Rows the launches cover.
+    pub rows: u32,
+    /// `ceil(rows / next_n)`: the requests the logits kernels take.
+    pub requests: u32,
+    /// Mean context (tokens, own row included) over the live rows.
+    pub context: u32,
+    /// Index keys of that context: `max(1, floor(context / ratio))`.
+    pub keys: u32,
+    /// The top-k's row length: the keys, capped at a consumer's candidates.
+    pub row_len: u32,
+}
+
+impl DecodeWork {
+    const EMPTY: Self = Self {
+        rows: 0,
+        requests: 0,
+        context: 0,
+        keys: 0,
+        row_len: 0,
+    };
+}
+
+pub(crate) fn decode_work(
+    input: &DeepseekV41DeepInferIndexerOpInput,
+    r: &DeepseekV41DeepInferIndexerOpResolved,
+) -> Option<DecodeWork> {
+    let live = input.decode_kv_lens.len() as u64;
+    if live == 0 {
+        return None;
+    }
+    let rows = input.decode_rows.max(live as u32);
+    let context = input
+        .decode_kv_lens
+        .iter()
+        .map(|&kv| u64::from(kv) + 1)
+        .sum::<u64>()
+        .div_ceil(live);
+    let context = u32::try_from(context).expect("mean decode context fits u32");
+    let keys = (context / r.compress_ratio).max(1);
+    let row_len = if r.candidate_tokens == 0 {
+        keys
+    } else {
+        keys.min(r.candidate_tokens)
+    };
+    Some(DecodeWork {
+        rows,
+        requests: rows.div_ceil(r.decode_next_n),
+        context,
+        keys,
+        row_len,
+    })
 }
 
 fn leaf<K: Probe>(b: &mut CostTreeBuilder, name: &str, suffix: &str, kernel: &K) -> CostNode {

@@ -263,6 +263,12 @@ pub struct DeepseekV41AttentionDeepInfer {
     pub candidate_block_size: u32,
     /// This layer builds the step's sparse candidate schedule.
     pub candidate_metadata: bool,
+    /// This layer builds its compress ratio's dense decode schedule.
+    pub paged_metadata: bool,
+    /// The FP4 dense decode logits (`dsa_paged_mqa_logits_decode`).
+    pub index_decode_logits_backends: Vec<&'static str>,
+    /// Query rows per decode request: 1, or the verify width.
+    pub decode_next_n: u32,
     /// DeepInfer's TileLang KV kernels ([`DeepseekV41DeepInferKv`]).
     pub kv_backends: Vec<&'static str>,
     /// The `kv_swa_cur.copy_` memcpy (an `elementwise` backend).
@@ -599,7 +605,7 @@ impl DeepseekV41AttentionTpWorklet {
             // sources ([`DeepseekV41DeepInferKv`]).
             global_topk_remap: (ratio > 0 && vllm)
                 .then(|| ew(cfg.index_topk * 8, cfg.index_topk * 4 + 4)),
-            indexer: index_source.then(|| DeepseekV41IndexerOpConfig {
+            indexer: (index_source && vllm).then(|| DeepseekV41IndexerOpConfig {
                 gpu_name: cfg.gpu_name.clone(),
                 compress_ratio: ratio,
                 num_heads: cfg.index_num_heads.clone(),
@@ -627,6 +633,10 @@ impl DeepseekV41AttentionTpWorklet {
                     logits_backends: di.index_logits_backends.clone(),
                     candidate_block_max_backends: di.candidate_block_max_backends.clone(),
                     topk_backends: di.topk_backends.clone(),
+                    decode_logits_backends: di.index_decode_logits_backends.clone(),
+                    paged_metadata: di.paged_metadata,
+                    decode_next_n: di.decode_next_n,
+                    block_size: di.block_size,
                 }
             }),
             prefill_attn: deepinfer.map(|di| SparseMlaNormRopeCastPrefillKernelConfig {
@@ -1082,10 +1092,15 @@ impl DeepseekV41AttentionTpWorklet {
                 ev,
             );
         }
+        // The decode launches cover the decode segment's rows (`q.shape[0]`):
+        // the padded rows inside a FULL graph, else the live decode rows.
+        let decode_launch_rows = input.full_graph.then_some(rows);
         if let Some(indexer) = &self.deepinfer_indexer {
             indexer.eval(
                 &DeepseekV41DeepInferIndexerOpInput {
                     prefill_query_context_pairs: deepinfer_prefill.clone(),
+                    decode_rows: decode_launch_rows.unwrap_or(decode_kv_lens.len() as u32),
+                    decode_kv_lens: decode_kv_lens.clone(),
                 },
                 ev,
             );
@@ -1093,9 +1108,6 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(kv) = &self.deepinfer_kv {
             kv.eval_back(&di_kv, ev);
         }
-        // The remap launches over the decode segment's rows (`q.shape[0]`):
-        // the padded rows inside a FULL graph, else the live decode rows.
-        let decode_launch_rows = input.full_graph.then_some(rows);
         if let Some(op) = &self.global_topk_remap {
             let launched = decode_launch_rows.unwrap_or(decode_kv_lens.len() as u32);
             eval_or_zero(

@@ -54,13 +54,12 @@ use anyhow::Result;
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::deepseek_v41_vllm::{
-    self as tp_arch, fold_layers, index_plan, layer_config, layer_input, prefill_pairs,
+    self as tp_arch, fold_layers, index_plan, layer_config, layer_input, mark_deepinfer_schedules, prefill_pairs,
     replay_rows, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg,
     DeepseekV41ReplayConfig, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
     LayerKind, PlanNode,
 };
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
-use crate::op::attention::DeepseekV41CandidateRole;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -286,6 +285,8 @@ pub(crate) const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
 const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
 const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// DeepGEMM's FP4 paged decode logits (`fp8_fp4_paged_mqa_logits`).
+const DEEPINFER_INDEX_DECODE_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp4"];
 const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
 pub(crate) const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
 /// DeepInfer's TileLang KV launches around the prefill attention (paged loads
@@ -421,14 +422,7 @@ pub fn build_configs(
         .map(|layer| (layer, model.layer_kind(layer)))
         .collect();
     if parallel.deepinfer.is_some() {
-        // DeepInfer's first candidate consumer builds the step's sparse
-        // schedule; the later ones reuse it (`_get_sparse_prefill_metadata`).
-        if let Some((_, kind)) = tail
-            .iter_mut()
-            .find(|(_, kind)| kind.attention.candidate == DeepseekV41CandidateRole::Consumer)
-        {
-            kind.candidate_metadata = true;
-        }
+        mark_deepinfer_schedules(&mut tail);
     }
     let mut bodies = Vec::new();
     let plan = index_plan(&fold_layers(&tail), &mut |kind, layers| {
@@ -603,6 +597,10 @@ pub(crate) fn deepinfer_backends(
         candidate_topk_blocks: model.candidate_topk_blocks,
         candidate_block_size: model.candidate_block_size,
         candidate_metadata: kind.candidate_metadata,
+        paged_metadata: kind.paged_metadata,
+        index_decode_logits_backends: DEEPINFER_INDEX_DECODE_LOGITS_BACKENDS.to_vec(),
+        // The non-speculative step; the DSpark arch widens it to the verify width.
+        decode_next_n: 1,
         kv_backends: DEEPINFER_KV_BACKENDS.to_vec(),
         memcpy_backends: DEEPINFER_MEMCPY_BACKENDS.to_vec(),
         block_size: DEEPINFER_BLOCK_SIZE,
@@ -1910,7 +1908,7 @@ mod tests {
         let consumers: Vec<u32> = configs
             .bodies
             .iter()
-            .filter(|body| body.attention.layer.candidate == DeepseekV41CandidateRole::Consumer)
+            .filter(|body| body.attention.layer.candidate == crate::op::attention::DeepseekV41CandidateRole::Consumer)
             .flat_map(|body| body.layers.clone())
             .collect();
         assert_eq!(consumers, [24, 28, 32, 36]);
