@@ -50,7 +50,8 @@ pub struct DsaPagedMqaLogitsDecodeKernelInput {
 /// the grid stays rectangular.
 const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
 
-/// Each cached index token carries one fp32 scale beside its key bytes.
+/// Each cached index token carries 4 scale bytes beside its key bytes (one fp32
+/// scale, or four packed UE8M0 scales for FP4 keys).
 const SCALE_BYTES_PER_TOKEN: u32 = 4;
 
 pub struct DsaPagedMqaLogitsDecodeSpec;
@@ -85,7 +86,12 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
         // with batch x context. At a 1M context the far corner would ask for
         // tens of terabytes; bound it rather than hand the profiler a shape no
         // card can hold.
-        let cache_bytes_per_token = f64::from(config.head_dim.get() + SCALE_BYTES_PER_TOKEN);
+        // FP4 keys pack two elements per byte (DeepInfer's page-planar FP4 cache).
+        let key_bytes = match config.cache_dtype {
+            DType::Mxfp4E2m1 => config.head_dim.get() / 2,
+            _ => config.head_dim.get(),
+        };
+        let cache_bytes_per_token = f64::from(key_bytes + SCALE_BYTES_PER_TOKEN);
         grid.expand_2d(|batch_size, context_len| {
             context_len > max_model_len
                 || batch_size * context_len * cache_bytes_per_token > MAX_PROFILE_ALLOCATION_BYTES
@@ -455,5 +461,26 @@ mod tests {
 
         assert_eq!(cfg.compute_dtype(), Some(DType::Fp8E4m3));
         assert_eq!(cfg.kv_dtype(), Some(DType::Fp8E4m3));
+    }
+
+    /// DeepInfer's FP4 cache holds half the key bytes of the FP8 one, so the
+    /// allocation guard must admit cells the FP8 layout would refuse.
+    #[test]
+    fn fp4_cache_admits_cells_the_fp8_guard_refuses() {
+        let fp8 = config(FULL_MAX_MODEL_LEN);
+        let mut fp4 = fp8.clone();
+        fp4.backends = vec!["deepgemm_fp4"];
+        fp4.q_dtype = DType::Mxfp4E2m1;
+        fp4.cache_dtype = DType::Mxfp4E2m1;
+        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&fp8);
+        let fp8_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&fp8, &grid);
+        let fp4_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&fp4, &grid);
+        let cells = grid.expand_2d(|b, c| (b as u32, c as u32));
+        let at = |b: u32, c: u32| cells.iter().position(|&x| x == (b, c)).unwrap();
+        // 512 x 524288 keys: 33 GiB at 132 B/key (FP8), 17 GiB at 68 B/key (FP4).
+        let cell = at(512, 524288);
+        assert!(fp8_mask[cell]);
+        assert!(!fp4_mask[cell]);
+        assert_eq!(fp4.kv_dtype(), Some(DType::Mxfp4E2m1));
     }
 }

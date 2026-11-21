@@ -120,6 +120,7 @@ from profiling.kernels import (
     paged_attn_batch_prefill,  # noqa: F401
     paged_kv_cache_load,  # noqa: F401
     paged_kv_cache_store,  # noqa: F401
+    paged_mqa_logits_metadata,  # noqa: F401
     ple_gate,  # noqa: F401
     ple_ngram_ids,  # noqa: F401
     ple_short_conv,  # noqa: F401
@@ -145,6 +146,8 @@ from profiling.kernels import (
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
     sparse_mla_norm_rope_cast_prefill,  # noqa: F401
+    sparse_mqa_logits_decode,  # noqa: F401
+    sparse_mqa_logits_decode_metadata,  # noqa: F401
     sparse_mqa_logits_metadata,  # noqa: F401
     sparse_mqa_logits_prefill,  # noqa: F401
     static_fp8_quant,  # noqa: F401
