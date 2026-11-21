@@ -1,13 +1,17 @@
 # DeepSeek-V4.1-Flash-1017 without speculative decoding, one DP4/EP4 group on
 # four B200s. vLLM's DP coordinator places each request on the least-loaded
 # rank. Members:
-# - vllm: the vLLM fork, chunked prefill at 2048 tokens per DP rank.
-#   attn_gpu_memory_gb 75.215615: the KV pool per GPU the DSpark DP4 case
-#   measured (deepseek_v41_vllm_dp_attn_ep_moe_dspark_speculative.yaml, case
-#   20_dp4_diverse_100, --max-model-len 131072). That server also held the
-#   DSpark draft weights, so a non-speculative server has at least this much;
-#   no non-speculative DP4 server was measured. No non-speculative alignment
-#   pack: gpu_time_multiplier 1.0 (pure kernel sum).
+# - vllm: the vLLM fork, chunked prefill at 2048 tokens per DP rank. Both values
+#   come from the non-speculative DP4/EP4 alignment pack
+#   presets/alignment/dsv41_flash_b200_dp4_ep4 (case 01_dp4_diverse_100, 4x B200,
+#   --max-model-len 131072, --max-num-seqs 64, image vibesim-profiler-vllm:fe6a3d9a6af96e67).
+#   attn_gpu_memory_gb 79.220672: the KV pool per GPU that server sized,
+#   "Extended KV cache to 520936 blocks (73.78 GiB)" on every rank of its
+#   workload pass (calibration.json, from_capture). gpu_time_multiplier 1.0611:
+#   that capture's measured duty cycle as alignment Check 2 defines it
+#   (recommended_gpu_time_multiplier = sum of measured GPU cycles over the sum of
+#   the barrier critical path, analysis_kernel/reports/alignment_iteration_report.json);
+#   at 1.0 the same case's TPOT is -7.4% and TTFT -10.9% against the engine.
 # - deepinfer: DeepInfer as it runs, 16384 tokens per DP rank per step, FCFS,
 #   the back pass (layers 20-40 over the rows YoCo keeps, each prompt's last
 #   140) in every step, no deferral (back_flush every-step); back_rows
@@ -59,6 +63,6 @@ pools:
           back_rows: ${back_rows}
 compound:
   member:
-    vllm: {engine: vllm, max_batch_tokens: 2048, gpu_time_multiplier: 1.0, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 75.215615, back_flush: "off", back_rows: vllm-chunk}
+    vllm: {engine: vllm, max_batch_tokens: 2048, gpu_time_multiplier: 1.0611, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 79.220672, back_flush: "off", back_rows: vllm-chunk}
     deepinfer: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}
     deepinfer_best: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 83000.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}
