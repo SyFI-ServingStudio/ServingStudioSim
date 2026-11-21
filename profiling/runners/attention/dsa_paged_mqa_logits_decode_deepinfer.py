@@ -39,6 +39,9 @@ from profiling.runners.metrics import ComputeMetrics
 
 BACKEND = "deepgemm_fp4"
 TOL = 1e-3
+# Rows shorter than this are checked against the uncancelled magnitude (bf16 output).
+SHORT_ROW_KEYS = 64
+SHORT_ROW_TOL = 1e-2
 # The FP4 storage identity this backend measures (kind fields after the shape).
 CACHE_FORMAT = "page_planar_fp4_ue8m0_scale"
 _IDENTITY = {
@@ -137,9 +140,21 @@ def _check(torch: Any, ops: paged.PagedFp4Operands, logits: Any) -> None:
             row = request * ops.next_n + local
             want = common.reference_logits_row(torch, ops.q_ref[row], keys, ops.weights[row])
             got = logits[row, : ops.context_len].float()
-            diff = common.calc_diff(got, want)
-            if not diff <= TOL:
-                raise KernelLaunchFailed(f"{BACKEND} logits row {row}: diff {diff:.3e} > {TOL:.0e}")
+            if ops.context_len >= SHORT_ROW_KEYS:
+                diff = common.calc_diff(got, want)
+                bad = not diff <= TOL
+            else:
+                # A few logits are each a signed sum of heads that can cancel, so a
+                # relative measure over them is dominated by bf16 rounding; bound
+                # the error by the uncancelled head magnitude instead.
+                scale = (
+                    torch.relu(ops.q_ref[row].float() @ keys.float().t())
+                    * ops.weights[row].float().abs().unsqueeze(1)
+                ).sum(0)
+                diff = float(((got - want).abs() / scale.clamp_min(1e-30)).max())
+                bad = not diff <= SHORT_ROW_TOL
+            if bad:
+                raise KernelLaunchFailed(f"{BACKEND} logits row {row}: diff {diff:.3e}")
 
 
 def scheduled_keys(batch_size: int, context_len: int, block_size: int) -> int:
