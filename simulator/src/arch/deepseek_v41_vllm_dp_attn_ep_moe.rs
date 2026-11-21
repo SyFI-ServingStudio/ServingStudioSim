@@ -54,13 +54,12 @@ use anyhow::Result;
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::deepseek_v41_vllm::{
-    self as tp_arch, fold_layers, index_plan, layer_config, layer_input, prefill_pairs,
+    self as tp_arch, fold_layers, index_plan, layer_config, layer_input, mark_deepinfer_schedules, prefill_pairs,
     replay_rows, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg,
     DeepseekV41ReplayConfig, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
     LayerKind, PlanNode,
 };
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
-use crate::op::attention::DeepseekV41CandidateRole;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -269,7 +268,7 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
 
 /// DeepGEMM `fp8_fp4_gemm_nt` with MXFP8 activations and weights (DeepInfer
 /// `layers/linear.py` `apply_weight_fp8`).
-const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
+pub(crate) const DEEPINFER_GEMM_BACKENDS: &[&str] = &["deepgemm_mxfp8"];
 /// The grouped o_a projection: DeepGEMM `fp8_einsum` with an FP8 output pair
 /// (DeepInfer's V4 attention `wv`).
 const DEEPINFER_WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out"];
@@ -286,15 +285,22 @@ pub(crate) const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
 const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
 const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// `deep_gemm.bf16_gemm_nt` into fp32 logits: DeepGEMM hands the plain-store
+/// case to cuBLASLt (`smxx_cublaslt.hpp`).
+pub(crate) const DEEPINFER_LM_HEAD_BACKENDS: &[&str] = &["deepgemm_cublaslt"];
+/// DeepInfer's FlashMLA decode (`compressed_sparse_mla_rope_cast` mode decode).
+const DEEPINFER_DECODE_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
+/// DeepGEMM's FP4 paged decode logits (`fp8_fp4_paged_mqa_logits`).
+const DEEPINFER_INDEX_DECODE_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp4"];
 const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
-const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
+pub(crate) const DEEPINFER_TOPK_BACKENDS: &[&str] = &["deep_select"];
 /// DeepInfer's TileLang KV launches around the prefill attention (paged loads
 /// and stores, fused norm/RoPE/cast, compressor, index assembly, `_norm_kernel`).
-const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
+pub(crate) const DEEPINFER_KV_BACKENDS: &[&str] = &["tilelang"];
 /// The `kv_swa_cur.copy_` DtoD memcpy.
 const DEEPINFER_MEMCPY_BACKENDS: &[&str] = &["torch_memcpy_deepinfer"];
 /// DeepInfer's KV page (`ModelMetadata.resolved_tokens_per_block`).
-const DEEPINFER_BLOCK_SIZE: u32 = 128;
+pub(crate) const DEEPINFER_BLOCK_SIZE: u32 = 128;
 /// DeepInfer's HF loader (`hugging_face/config.py` defaults, a679bb8) sets
 /// `use_qnorm: False` and no field of the checkpoint's config overrides it, so
 /// `attn.py` builds the prefill attention with `enable_q_norm=False`
@@ -303,7 +309,7 @@ const DEEPINFER_Q_B_NORM: bool = false;
 /// `DEEPINFER_MAX_BACKTRACKING_TOKENS`' default, `max(v, nextn + 1)` with
 /// `nextn` 5 (`environ.py`): each request's SWA ring holds this many tokens
 /// past the window.
-const DEEPINFER_BACKTRACKING_TOKENS: u32 = 6;
+pub(crate) const DEEPINFER_BACKTRACKING_TOKENS: u32 = 6;
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
 #[derive(Clone)]
@@ -421,14 +427,7 @@ pub fn build_configs(
         .map(|layer| (layer, model.layer_kind(layer)))
         .collect();
     if parallel.deepinfer.is_some() {
-        // DeepInfer's first candidate consumer builds the step's sparse
-        // schedule; the later ones reuse it (`_get_sparse_prefill_metadata`).
-        if let Some((_, kind)) = tail
-            .iter_mut()
-            .find(|(_, kind)| kind.attention.candidate == DeepseekV41CandidateRole::Consumer)
-        {
-            kind.candidate_metadata = true;
-        }
+        mark_deepinfer_schedules(&mut tail);
     }
     let mut bodies = Vec::new();
     let plan = index_plan(&fold_layers(&tail), &mut |kind, layers| {
@@ -520,6 +519,9 @@ pub fn build_configs(
             mhc_post_backends: parallel
                 .deepinfer
                 .map(|_| DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
+            lm_head_fp32_backends: parallel
+                .deepinfer
+                .map(|_| DEEPINFER_LM_HEAD_BACKENDS.to_vec()),
         },
         kv_cache_layout: match &parallel.deepinfer {
             Some(engine) => deepinfer_kv_cache_layout(
@@ -582,7 +584,7 @@ pub(crate) fn deepinfer_layer(
 /// DeepInfer's kernels on a body layer: DeepGEMM MXFP8 for every MXFP8
 /// projection the vLLM fork runs through FlashInfer, and DeepInfer's own
 /// mHC, prefill indexer and prefill attention kinds.
-fn deepinfer_backends(
+pub(crate) fn deepinfer_backends(
     tp1: &mut DeepseekV41LayerConfig,
     model: &DeepseekV41ModelCfg,
     kind: &LayerKind,
@@ -591,6 +593,11 @@ fn deepinfer_backends(
     tp1.attention.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.prequantized_gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.wo_a_backends = DEEPINFER_WO_A_BACKENDS.to_vec();
+    // Decode attention: the image's own FlashMLA build of
+    // `fused_norm_rope_attn_rope_cast.decode`, called without top-k lengths
+    // and never through swap-AB (capture: one `fwd_kernel` per layer).
+    tp1.attention.mega_attn_backends = DEEPINFER_DECODE_ATTN_BACKENDS.to_vec();
+    tp1.attention.swapab_attn_backends = Vec::new();
     tp1.attention.deepinfer = Some(DeepseekV41AttentionDeepInfer {
         mega_mhc_backends: DEEPINFER_MEGA_MHC_BACKENDS.to_vec(),
         mhc_unfused_backends: DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec(),
@@ -603,6 +610,10 @@ fn deepinfer_backends(
         candidate_topk_blocks: model.candidate_topk_blocks,
         candidate_block_size: model.candidate_block_size,
         candidate_metadata: kind.candidate_metadata,
+        paged_metadata: kind.paged_metadata,
+        index_decode_logits_backends: DEEPINFER_INDEX_DECODE_LOGITS_BACKENDS.to_vec(),
+        // The non-speculative step; the DSpark arch widens it to the verify width.
+        decode_next_n: 1,
         kv_backends: DEEPINFER_KV_BACKENDS.to_vec(),
         memcpy_backends: DEEPINFER_MEMCPY_BACKENDS.to_vec(),
         block_size: DEEPINFER_BLOCK_SIZE,
@@ -620,7 +631,7 @@ fn deepinfer_backends(
 
 /// DeepInfer's FFN from the vLLM FFN's geometry: the mega MoE over the
 /// logical experts plus the EPLB redundant slots.
-fn mega_ffn_config(
+pub(crate) fn mega_ffn_config(
     vllm: &DeepseekV41MoeFfnDpEpWorkletConfig,
     layers: &[u32],
     engine: &DeepInferEngine,
@@ -1835,8 +1846,8 @@ mod tests {
             );
             assert_eq!(mega.num_logical_experts.get(), 384);
             assert_eq!(body.attention.gemm_backends, DEEPINFER_GEMM_BACKENDS);
-            // The kernels both engines share keep the fork's backends.
-            assert_eq!(body.attention.mega_attn_backends, configs_vllm_mega_attn());
+            assert_eq!(body.attention.mega_attn_backends, DEEPINFER_DECODE_ATTN_BACKENDS);
+            assert!(body.attention.swapab_attn_backends.is_empty());
         }
         // 384 + 30 slots do not split over 4 ranks.
         p.deepinfer = Some(DeepInferEngine {
@@ -1910,7 +1921,7 @@ mod tests {
         let consumers: Vec<u32> = configs
             .bodies
             .iter()
-            .filter(|body| body.attention.layer.candidate == DeepseekV41CandidateRole::Consumer)
+            .filter(|body| body.attention.layer.candidate == crate::op::attention::DeepseekV41CandidateRole::Consumer)
             .flat_map(|body| body.layers.clone())
             .collect();
         assert_eq!(consumers, [24, 28, 32, 36]);
@@ -1924,14 +1935,6 @@ mod tests {
             resolved.attention.mhc_overlap.is_none() && resolved.attention.entry_fused.is_none()
         );
         assert!(resolved.attention.entry_mega_mhc.is_some());
-    }
-
-    fn configs_vllm_mega_attn() -> Vec<&'static str> {
-        build_configs(&cfg(), &parallel(), &uniform_demand())
-            .unwrap()
-            .layer0
-            .attention
-            .mega_attn_backends
     }
 
     #[test]

@@ -25,6 +25,7 @@ from profiling.kernels import (
     compressed_sparse_mla_decode,  # noqa: F401
     compressed_sparse_mla_prefill,  # noqa: F401
     compressed_sparse_mla_rope_cast,  # noqa: F401
+    deep_select_logits_topk,  # noqa: F401
     deep_select_topk,  # noqa: F401
     dsa_compressed_mqa_logits_prefill,  # noqa: F401
     dsa_compressed_topk_prefill,  # noqa: F401
@@ -56,6 +57,7 @@ from profiling.kernels import (
     fp8_per_token_group_quant,  # noqa: F401
     fp32_row_split_layer_norm,  # noqa: F401
     fused_norm_rope_cast,  # noqa: F401
+    fused_sample,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
@@ -63,6 +65,7 @@ from profiling.kernels import (
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
     gdn_recurrent_decode_gated_norm,  # noqa: F401
+    gemm_fp32_accumulate,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_conv_residual_rms_norm,  # noqa: F401
     grouped_gemm,  # noqa: F401
@@ -120,6 +123,7 @@ from profiling.kernels import (
     paged_attn_batch_prefill,  # noqa: F401
     paged_kv_cache_load,  # noqa: F401
     paged_kv_cache_store,  # noqa: F401
+    paged_mqa_logits_metadata,  # noqa: F401
     ple_gate,  # noqa: F401
     ple_ngram_ids,  # noqa: F401
     ple_short_conv,  # noqa: F401
@@ -145,6 +149,8 @@ from profiling.kernels import (
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
     sparse_mla_norm_rope_cast_prefill,  # noqa: F401
+    sparse_mqa_logits_decode,  # noqa: F401
+    sparse_mqa_logits_decode_metadata,  # noqa: F401
     sparse_mqa_logits_metadata,  # noqa: F401
     sparse_mqa_logits_prefill,  # noqa: F401
     static_fp8_quant,  # noqa: F401

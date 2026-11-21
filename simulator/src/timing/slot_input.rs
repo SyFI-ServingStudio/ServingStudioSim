@@ -91,6 +91,11 @@ use crate::timing::kernels::{
     KdaRecoverSSMVerifyKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
+use crate::timing::kernels::{
+    PagedMqaLogitsMetadataKernelInput, SparseMqaLogitsDecodeKernelInput,
+    SparseMqaLogitsDecodeMetadataKernelInput, DeepSelectLogitsTopkKernelInput,
+    FusedSampleKernelInput, GemmFp32AccumulateKernelInput,
+};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -217,6 +222,12 @@ log_inputs! {
     MqaLogitsPrefillChunk => MqaLogitsPrefillChunkKernelInput,
     SparseMqaLogitsPrefill => SparseMqaLogitsPrefillKernelInput,
     SparseMqaLogitsMetadata => SparseMqaLogitsMetadataKernelInput,
+    SparseMqaLogitsDecode => SparseMqaLogitsDecodeKernelInput,
+    SparseMqaLogitsDecodeMetadata => SparseMqaLogitsDecodeMetadataKernelInput,
+    PagedMqaLogitsMetadata => PagedMqaLogitsMetadataKernelInput,
+    DeepSelectLogitsTopk => DeepSelectLogitsTopkKernelInput,
+    FusedSample => FusedSampleKernelInput,
+    GemmFp32Accumulate => GemmFp32AccumulateKernelInput,
     CandidateBlockMax => CandidateBlockMaxKernelInput,
     DeepSelectTopk => DeepSelectTopkKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,

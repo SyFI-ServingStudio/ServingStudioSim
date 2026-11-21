@@ -1276,6 +1276,11 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
     decoder_swa_bounded_replay: bool,
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
+    deepinfer: Option<(
+        deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine,
+        deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer,
+    )>,
+    engram_fetch: EngramFetch,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1293,7 +1298,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
-        deepinfer: None,
+        deepinfer: deepinfer.map(|(engine, _)| engine),
         dp_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE,
     };
     let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
@@ -1307,9 +1312,18 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         token_corpus_file,
         draft_tokens,
     )?;
-    let target =
+    let mut target =
         deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &target_demand)
             .context("expanding DeepSeek-V4.1-Flash DP4/EP4 target configs")?;
+    if !engram_fetch.fetches() {
+        target.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        let layers = std::iter::once(&mut target.layer0).chain(target.bodies.iter_mut());
+        for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+            engram.consumer = false;
+        }
+    }
     let configs = deepseek_v41_vllm_dp_attn_ep_moe_dspark::build_configs(
         &model_cfg,
         &dspark,
@@ -1317,6 +1331,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         target,
         &draft_demand,
         draft_tokens,
+        deepinfer.map(|(_, dflash)| dflash),
     )
     .context("expanding the DP DSpark proposer configs")?;
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe_dspark::resolve_configs(configs);
@@ -3371,6 +3386,18 @@ pub fn build_speculative_iter_model(
             decoder_swa_bounded_replay,
             max_num_batched_tokens,
             cudagraph_capture_sizes,
+            engine,
+            num_redundant_experts,
+            draft_num_redundant_experts,
+            yoco_keep_tokens,
+            engram_fetch,
+            deepinfer_max_num_seqs,
+            deepinfer_graph_interval,
+            deepinfer_draft_graph_interval,
+            force_load_balance,
+            sampler_top_p,
+            sampler_top_k,
+            sampler_top_logprobs,
         } => Ok((
             Box::new(deepseek_v41_vllm_dp_attn_ep_moe_dspark(
                 model,
@@ -3383,6 +3410,23 @@ pub fn build_speculative_iter_model(
                 *decoder_swa_bounded_replay,
                 *max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                super::config::deepseek_v41_dp_dspark_engine(
+                    *engine,
+                    *num_redundant_experts,
+                    *draft_num_redundant_experts,
+                    *yoco_keep_tokens,
+                    *engram_fetch,
+                    *force_load_balance,
+                    *deepinfer_max_num_seqs,
+                    *deepinfer_graph_interval,
+                    *deepinfer_draft_graph_interval,
+                    crate::arch::deepseek_v41_deepinfer_dflash::DeepInferSampling {
+                        top_p: *sampler_top_p,
+                        top_k: *sampler_top_k,
+                        top_logprobs: *sampler_top_logprobs,
+                    },
+                )?,
+                *engram_fetch,
                 gpu,
                 name,
                 bridge,

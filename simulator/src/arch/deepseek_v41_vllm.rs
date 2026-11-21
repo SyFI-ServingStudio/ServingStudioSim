@@ -419,6 +419,31 @@ impl DeepseekV41ModelCfg {
             },
             engram,
             candidate_metadata: false,
+            paged_metadata: false,
+        }
+    }
+}
+
+/// DeepInfer builds each indexer schedule once per forward and reuses it
+/// (`index_attn.py` `_get_sparse_prefill_metadata`, `_get_decode_metadata`):
+/// the first candidate consumer builds the sparse one, and the first dense
+/// scorer (non-consumer index source) of each compress ratio the paged decode one.
+pub fn mark_deepinfer_schedules(layers: &mut [(u32, LayerKind)]) {
+    if let Some((_, kind)) = layers
+        .iter_mut()
+        .find(|(_, kind)| kind.attention.candidate == DeepseekV41CandidateRole::Consumer)
+    {
+        kind.candidate_metadata = true;
+    }
+    let mut seen = Vec::new();
+    for (_, kind) in layers.iter_mut() {
+        let a = &kind.attention;
+        if a.index != DeepseekV41IndexRole::None
+            && a.candidate != DeepseekV41CandidateRole::Consumer
+            && !seen.contains(&a.compress_ratio)
+        {
+            seen.push(a.compress_ratio);
+            kind.paged_metadata = true;
         }
     }
 }
@@ -433,6 +458,9 @@ pub struct LayerKind {
     /// DeepInfer has one (its first candidate consumer builds it, the later
     /// consumers reuse it); always false under vLLM.
     pub candidate_metadata: bool,
+    /// The layer builds its compress ratio's dense decode schedule (DeepInfer
+    /// only, see [`mark_deepinfer_schedules`]).
+    pub paged_metadata: bool,
 }
 
 /// The layer fold: `Body` is one built body layer standing for `layers`;
@@ -893,6 +921,7 @@ pub fn build_configs(
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mhc_post_backends: None,
+            lm_head_fp32_backends: None,
         },
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
         replay,

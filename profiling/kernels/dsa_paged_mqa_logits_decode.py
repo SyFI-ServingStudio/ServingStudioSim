@@ -147,3 +147,36 @@ register(
         ),
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_fp4",
+        # DeepInfer's DeepGEMM: SM100 is the only arch with the FP4 (MX scale)
+        # paged path; attention.hpp asserts MX scales iff arch_major == 10.
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP4_E2M1}),
+            kv=frozenset({DType.MXFP4_E2M1}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_paged_mqa_logits_decode_deepinfer",
+            function_name="profile_dsa_paged_mqa_logits_decode_deepgemm_fp4",
+        ),
+        table_name=KIND,
+        args_schema=DsaPagedMqaLogitsDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepGEMM fp8_fp4_paged_mqa_logits with FP4 E2M1 Q and keys (UE8M0 "
+                "scales per 32), bf16 weights and logits, as DeepInfer's decode "
+                "indexer calls it: one row per verify token, indices naming each "
+                "row's request (cache_format page_planar_fp4_ue8m0_scale; "
+                "scale_dtype mxfp4_e2m1 = the format's own block scales)."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)

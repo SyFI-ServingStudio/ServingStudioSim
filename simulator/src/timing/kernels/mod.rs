@@ -15,6 +15,7 @@ pub mod compress_state_prefill;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
+pub mod deep_select_logits_topk;
 pub mod deep_select_topk;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
@@ -49,6 +50,7 @@ pub mod fp8_block_quant;
 pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
 pub mod fused_norm_rope_cast;
+pub mod fused_sample;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
@@ -56,6 +58,7 @@ pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
+pub mod gemm_fp32_accumulate;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod grouped_conv_residual_rms_norm;
@@ -113,6 +116,7 @@ pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
 pub mod paged_kv_cache_load;
 pub mod paged_kv_cache_store;
+pub mod paged_mqa_logits_metadata;
 pub mod ple_gate;
 pub mod ple_ngram_ids;
 pub mod ple_short_conv;
@@ -139,6 +143,8 @@ pub mod sparse_indexer_logits_prefill;
 pub mod sparse_indexer_prepare;
 pub mod sparse_mla_norm_rope_cast_prefill;
 pub mod sparse_indexer_topk;
+pub mod sparse_mqa_logits_decode;
+pub mod sparse_mqa_logits_decode_metadata;
 pub mod sparse_mqa_logits_metadata;
 pub mod sparse_mqa_logits_prefill;
 pub mod static_fp8_quant;
@@ -196,6 +202,10 @@ pub use compressed_sparse_mla_rope_cast::{
     CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastSpec, prefill_chunk_plan,
     swapab_layer,
     SWAPAB_MAX_TOKENS,
+};
+pub use deep_select_logits_topk::{
+    DeepSelectLogitsTopkKernel, DeepSelectLogitsTopkKernelConfig, DeepSelectLogitsTopkKernelInput,
+    DeepSelectLogitsTopkSpec,
 };
 pub use deep_select_topk::{
     DeepSelectTopkKernel, DeepSelectTopkKernelConfig, DeepSelectTopkKernelInput, DeepSelectTopkSpec,
@@ -313,6 +323,9 @@ pub use fused_norm_rope_cast::{
     FusedNormRopeCastKernel, FusedNormRopeCastKernelConfig, FusedNormRopeCastKernelInput,
     FusedNormRopeCastSpec,
 };
+pub use fused_sample::{
+    FusedSampleKernel, FusedSampleKernelConfig, FusedSampleKernelInput, FusedSampleSpec,
+};
 pub use gdn_causal_conv_decode::{
     GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput,
     GdnCausalConvDecodeSpec,
@@ -340,6 +353,10 @@ pub use gdn_recurrent_decode::{
 pub use gdn_recurrent_decode_gated_norm::{
     GdnRecurrentDecodeGatedNormKernel, GdnRecurrentDecodeGatedNormKernelConfig,
     GdnRecurrentDecodeGatedNormKernelInput, GdnRecurrentDecodeGatedNormSpec,
+};
+pub use gemm_fp32_accumulate::{
+    GemmFp32AccumulateKernel, GemmFp32AccumulateKernelConfig, GemmFp32AccumulateKernelInput,
+    GemmFp32AccumulateSpec,
 };
 pub use gemm_fp32_output::{
     GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, GemmFp32OutputSpec,
@@ -516,6 +533,10 @@ pub use paged_kv_cache_load::{
     PagedKvCacheLoadKernel, PagedKvCacheLoadKernelConfig, PagedKvCacheLoadKernelInput,
     PagedKvCacheLoadSpec,
 };
+pub use paged_mqa_logits_metadata::{
+    PagedMqaLogitsMetadataKernel, PagedMqaLogitsMetadataKernelConfig,
+    PagedMqaLogitsMetadataKernelInput, PagedMqaLogitsMetadataSpec,
+};
 pub use paged_kv_cache_store::{
     PagedKvCacheStoreKernel, PagedKvCacheStoreKernelConfig, PagedKvCacheStoreKernelInput,
     PagedKvCacheStoreSpec,
@@ -600,6 +621,14 @@ pub use sparse_indexer_prepare::{
     SparseIndexerPrepareSpec,
 };
 pub use sparse_indexer_topk::{SparseIndexerTopkKernel, SparseIndexerTopkSpec};
+pub use sparse_mqa_logits_decode::{
+    SparseMqaLogitsDecodeKernel, SparseMqaLogitsDecodeKernelConfig,
+    SparseMqaLogitsDecodeKernelInput, SparseMqaLogitsDecodeSpec,
+};
+pub use sparse_mqa_logits_decode_metadata::{
+    SparseMqaLogitsDecodeMetadataKernel, SparseMqaLogitsDecodeMetadataKernelConfig,
+    SparseMqaLogitsDecodeMetadataKernelInput, SparseMqaLogitsDecodeMetadataSpec,
+};
 pub use sparse_mqa_logits_metadata::{
     SparseMqaLogitsMetadataKernel, SparseMqaLogitsMetadataKernelConfig,
     SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsMetadataSpec,

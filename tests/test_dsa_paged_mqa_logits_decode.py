@@ -92,7 +92,7 @@ def test_registration_support_and_facades():
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_paged_mqa_logits_decode"
-    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND, "deepgemm_fp4"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaPagedMqaLogitsDecodeArgs
     assert spec.metric_family is MetricFamily.COMPUTE
