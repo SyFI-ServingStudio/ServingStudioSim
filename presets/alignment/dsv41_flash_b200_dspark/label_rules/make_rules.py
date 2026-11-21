@@ -1,6 +1,8 @@
 """Generate the dsv41_flash_b200_dspark label rules for one topology.
 
 Usage: make_rules.py <cost_manifest.json> > <topo>/rules.json
+Also generates the non-speculative dsv41_flash_b200_dp4_ep4 rules: a rule whose slot suffixes name no
+slot of the given manifest (the DSpark draft, verify and step-plumbing families) is left out.
 The cost manifest is any timing-predict worker manifest of that topology
 (timing_predict/raw/cost_manifest/worker_predict_0.json); its slots decide TP4
 (per-layer TP all-reduces) vs DP4 (EP dispatch all-gather / combine
@@ -31,7 +33,10 @@ def R(name, op, slots, typ, role, *, excl=TARGET_EXCL, phase="forward", sync=Fal
     r.update(m)
     if note:
         r["note"] = note
-    rules.append(r)
+    # A topology without a slot family (no DSpark draft or step plumbing in the non-speculative
+    # arch) gets no rule for it: labelling rejects a rule whose suffixes name no simulated slot.
+    if any(n.endswith("." + s) for n in SLOTNAMES for s in slots):
+        rules.append(r)
 
 
 def both(*suffixes):
@@ -168,6 +173,9 @@ for nxt in ("_fused_save_compress_norm_kernel", "_dsv4_topk_kernel", "QuantizeSw
 R("nvjet_sm100_", "proj.small", SMALL, "model", SMALL_ROLE, before="proj.small")
 R("splitKreduce_kernel", "proj.small", SMALL, "model", SMALL_ROLE, after="proj.small", before="proj.small")
 R("cute_dsl_ll_bf16_splitkLLBf16SplitK", "proj.small", SMALL, "model", SMALL_ROLE)
+# Its dot-product variant: the MoE router gate of a small-M step (non-speculative decode,
+# logs/20261120_0_dsv41_dp4_nonspec profile_nsys; the DSpark verify batches never reach it).
+R("cute_dsl_ll_bf16_dotprodLLBf16Dotprod", "proj.small", SMALL, "model", SMALL_ROLE)
 # MXFP8 path of an aux-stream input GEMM (compressor fused_wkv_wgate / indexer weights_proj,
 # DeepseekV4Attention._run_parallel_input_projections): quant + GEMM whose output is copied out
 R(GEMM, "proj.small", SMALL, "model", SMALL_ROLE, after_name=QS5120, before_name="bfloat16_copy_kernel_cuda",
@@ -281,7 +289,9 @@ for frag in ("vocab_parallel_embedding_kernel", "QuantizeSwizzled", "QuantizeLin
              "CatArrayBatchedCopy", "indexSelectSmallIndex"):
     R(frag, "dspark.draft", DRAFT_SLOTS,
       "model", DRAFT_ROLE, phase="draft", excl=None)
-if TP:
+if not DRAFT_SLOTS:
+    pass  # no DSpark draft: its collectives' suffixes would otherwise claim the target layers' slots
+elif TP:
     for frag in ("Allreduce", "ncclDevKernel_AllGather"):
         R(frag, "dspark.collectives", ["dspark.embedding_all_reduce", "tp_all_reduce", "dspark.head.logits_all_gather"],
           "collective", "DSpark draft all-reduces and logits all-gather", phase="draft", sync=True,
