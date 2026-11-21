@@ -1,7 +1,20 @@
-# vLLM DeepSeek-V4.1-Flash-1017 + DSpark (5 draft tokens) on four B200s, chunked
-# prefill at 2048 tokens per DP rank, as case 20_dp4_diverse_100 of the alignment pack
-# presets/alignment/dsv41_flash_b200_dspark ran it. attn_gpu_memory_gb is the KV
-# pool per GPU that case's workload pass measured (--max-model-len 131072).
+# DeepSeek-V4.1-Flash-1017 + DSpark (5 draft tokens) on four B200s, DP4/EP4.
+# Members:
+# - vllm: the vLLM fork, chunked prefill at 2048 tokens per DP rank, as case
+#   20_dp4_diverse_100 of the alignment pack presets/alignment/
+#   dsv41_flash_b200_dspark ran it. attn_gpu_memory_gb is the KV pool per GPU
+#   that case's workload pass measured (--max-model-len 131072).
+# - deepinfer: DeepInfer with DFlash as its own B200 decode bench ran it
+#   (arch preset member engine=deepinfer), 4096 tokens per DP rank per step.
+#   attn_gpu_memory_gb 73.70 GB (GB = 1e9 B): KV plus per-sequence state per
+#   GPU that DeepInfer itself sized in that run (kv_cache_size 67.32 +
+#   state_size 1.32 GiB, ServingStudio wt-dsv41-decode-deepinfer/logs/
+#   20261120_0_deepinfer_decode_nsys/logs/decode_graph_b4096.24554.log).
+#   gpu_time_multiplier 1.0211: alignment Check 2's duty cycle (sum of
+#   measured GPU cycles over the barrier critical path, mega MoE + NCCL
+#   barriers) of that run's nsys in CUDA-graph decode, 64 requests per rank at
+#   ~131k context (job 24554, 31 pooled steps x 4 ranks; multiplier.txt
+#   beside it). Measured on decode steps only; prefill steps take it too.
 deployment: unified
 pools:
   main:
@@ -9,14 +22,20 @@ pools:
       - replicas: ${replicas}
         arch:
           preset: deepseek_v41_vllm_dp_attn_ep_moe_dspark
+          engine: ${engine}
         worker:
           type: speculative
-          max_batch_tokens: 2048
+          max_batch_tokens: ${max_batch_tokens}
           batch_policy: mix
           draft_tokens: 5
           acceptance_seed: 73
+          gpu_time_multiplier: ${gpu_time_multiplier}
           # vLLM's DP coordinator places each request on the least-loaded engine.
           dp_placement: vllm-least-loaded
-          attn_gpu_memory_gb: 75.215615
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
 sweep:
   replicas: [1, 2]
+compound:
+  member:
+    vllm: {engine: vllm, max_batch_tokens: 2048, gpu_time_multiplier: 1.0, attn_gpu_memory_gb: 75.215615}
+    deepinfer: {engine: deepinfer, max_batch_tokens: 4096, gpu_time_multiplier: 1.0211, attn_gpu_memory_gb: 73.70}

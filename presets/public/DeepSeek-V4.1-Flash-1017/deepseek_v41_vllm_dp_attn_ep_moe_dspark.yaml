@@ -1,15 +1,51 @@
-# vLLM DeepSeek-V4.1-Flash-1017 with its DSpark proposer drafting 5 tokens, on
-# four B200s: DP4 attention (TP1 per rank) and EP4 experts over the same ranks. As the alignment pack
-# presets/alignment/dsv41_flash_b200_dspark ran it (--max-model-len 131072).
+# DeepSeek-V4.1-Flash-1017 with its DSpark (DFlash) proposer drafting 5 tokens,
+# on four B200s: DP4 attention (TP1 per rank) and EP4 experts over the same
+# ranks. Two engines:
+# - vllm: the vLLM fork, as the alignment pack presets/alignment/
+#   dsv41_flash_b200_dspark ran it (--max-model-len 131072).
+# - deepinfer: the DeepInfer engine as its own B200 decode bench ran it
+#   (ServingStudio wt-dsv41-decode-deepinfer/logs/20261120_0_deepinfer_decode_nsys,
+#   job 24554, logs/decode_graph_b4096.24554.log and results/results.jsonl):
+#   num_extra_experts 32 and dflash_num_extra_experts 32, yoco_clip 140,
+#   max_num_batched_tokens 4096, max_num_seqs 64, CUDA graphs at
+#   DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL 32 (DFlash graphs at the default 8),
+#   max_model_len unset (the checkpoint's 1048576), forced load balance on the
+#   target MoE (the bench's gate_force_random), Engram fully off
+#   (DEEPINFER_ENGRAM_SANITY_OFF: only the hash and token gather launch).
+#   Sampling as the bench requested: top_p 0.95, top_logprobs 5, no top_k.
+# Routing: the 1017 checkpoint's own capture (vLLM TP4/EP4 + DSpark).
 checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017
 gpu: NVIDIA B200
 arch:
   type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
   fp8: true
-  max_model_len: 131072
+  max_model_len: ${max_model_len}
   draft_tokens: 5
   routing: ${routing}
   token_corpus_file: ${token_corpus_file}
+  engine: ${engine}
+  num_redundant_experts: ${num_redundant_experts}
+  draft_num_redundant_experts: ${num_redundant_experts}
+  yoco_keep_tokens: ${yoco_keep_tokens}
+  engram_fetch: ${engram_fetch}
+  max_num_batched_tokens: ${max_num_batched_tokens}
+  deepinfer_max_num_seqs: ${deepinfer_max_num_seqs}
+  deepinfer_graph_interval: ${deepinfer_graph_interval}
+  force_load_balance: ${deepinfer}
+  sampler_top_p: ${deepinfer}
+  sampler_top_logprobs: ${sampler_top_logprobs}
+sweep:
+  engine: [vllm, deepinfer]
+derived:
+  deepinfer: "engine == 'deepinfer'"
+  num_redundant_experts: "32 if engine == 'deepinfer' else 0"
+  yoco_keep_tokens: "140 if engine == 'deepinfer' else 0"
+  engram_fetch: "'none' if engine == 'deepinfer' else 'uva'"
+  max_model_len: "1048576 if engine == 'deepinfer' else 131072"
+  max_num_batched_tokens: "4096 if engine == 'deepinfer' else 2048"
+  deepinfer_max_num_seqs: "64 if engine == 'deepinfer' else 256"
+  deepinfer_graph_interval: "32 if engine == 'deepinfer' else 8"
+  sampler_top_logprobs: "5 if engine == 'deepinfer' else 0"
 compound:
   workload:
     diverse_100:
