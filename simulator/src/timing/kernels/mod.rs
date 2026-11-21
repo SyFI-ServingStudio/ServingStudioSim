@@ -15,6 +15,7 @@ pub mod compress_state_prefill;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
+pub mod deep_select_logits_topk;
 pub mod deep_select_topk;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
@@ -49,6 +50,7 @@ pub mod fp8_block_quant;
 pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
 pub mod fused_norm_rope_cast;
+pub mod fused_sample;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
@@ -56,6 +58,7 @@ pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
+pub mod gemm_fp32_accumulate;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod grouped_conv_residual_rms_norm;
@@ -197,6 +200,10 @@ pub use compressed_sparse_mla_rope_cast::{
     swapab_layer,
     SWAPAB_MAX_TOKENS,
 };
+pub use deep_select_logits_topk::{
+    DeepSelectLogitsTopkKernel, DeepSelectLogitsTopkKernelConfig, DeepSelectLogitsTopkKernelInput,
+    DeepSelectLogitsTopkSpec,
+};
 pub use deep_select_topk::{
     DeepSelectTopkKernel, DeepSelectTopkKernelConfig, DeepSelectTopkKernelInput, DeepSelectTopkSpec,
 };
@@ -313,6 +320,9 @@ pub use fused_norm_rope_cast::{
     FusedNormRopeCastKernel, FusedNormRopeCastKernelConfig, FusedNormRopeCastKernelInput,
     FusedNormRopeCastSpec,
 };
+pub use fused_sample::{
+    FusedSampleKernel, FusedSampleKernelConfig, FusedSampleKernelInput, FusedSampleSpec,
+};
 pub use gdn_causal_conv_decode::{
     GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput,
     GdnCausalConvDecodeSpec,
@@ -340,6 +350,10 @@ pub use gdn_recurrent_decode::{
 pub use gdn_recurrent_decode_gated_norm::{
     GdnRecurrentDecodeGatedNormKernel, GdnRecurrentDecodeGatedNormKernelConfig,
     GdnRecurrentDecodeGatedNormKernelInput, GdnRecurrentDecodeGatedNormSpec,
+};
+pub use gemm_fp32_accumulate::{
+    GemmFp32AccumulateKernel, GemmFp32AccumulateKernelConfig, GemmFp32AccumulateKernelInput,
+    GemmFp32AccumulateSpec,
 };
 pub use gemm_fp32_output::{
     GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, GemmFp32OutputSpec,

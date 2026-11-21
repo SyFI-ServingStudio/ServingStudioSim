@@ -38,7 +38,9 @@ DOC = KernelDoc(
         "measured by sglang_router_auto. The alignment vLLM fork's "
         "_linear_with_fp32_out, which picks cute-DSL ll_bf16 or cuBLAS by m, is "
         "measured by vllm_ll_bf16_auto; vLLM's MoE GateLinear (ll_bf16 up to 16 "
-        "tokens, cuBLAS above) by vllm_gate_linear. m is the tokens; n "
+        "tokens, cuBLAS above) by vllm_gate_linear. DeepInfer's lm_head "
+        "(sampler_utils.get_logits, target and DFlash draft) calls DeepGEMM's "
+        "bf16_gemm_nt into an fp32 buffer, measured by deepgemm_cublaslt. m is the tokens; n "
         "and k are the output and input features."
     ),
     category="GEMM",
@@ -179,6 +181,35 @@ register(
                 "torch.mm with out_dtype=float32."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/router/gate_linear.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_cublaslt",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.gemm_fp32_output_deepgemm",
+            function_name="profile_gemm_fp32_output_deepgemm",
+        ),
+        table_name=KIND,
+        args_schema=GemmFp32OutputArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: the plain-store path goes to cuBLASLt on any
+        # architecture (gemm.hpp bf16_gemm_nt checks cuBLASLt before arch).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+        ),
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepGEMM bf16_gemm_nt(a, b, d) with an fp32 d, as DeepInfer's lm_head "
+                "calls it; DeepGEMM forwards a plain store to cuBLASLt (32F_FAST_TF32, "
+                "all-SM target, first heuristic algorithm)."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
         ),
     )
 )
