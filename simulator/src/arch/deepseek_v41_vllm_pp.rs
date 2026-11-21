@@ -881,6 +881,9 @@ pub fn build_configs(
             mhc_post_backends: parallel
                 .deepinfer
                 .map(|_| dp_arch::DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
+            lm_head_fp32_backends: parallel
+                .deepinfer
+                .map(|_| dp_arch::DEEPINFER_LM_HEAD_BACKENDS.to_vec()),
         },
         fork_accepts: fork_accepts_lists(model, &lists, rule.is_some()),
         stages,

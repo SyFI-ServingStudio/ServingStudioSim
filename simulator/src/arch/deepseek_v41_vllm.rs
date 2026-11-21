@@ -921,6 +921,7 @@ pub fn build_configs(
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mhc_post_backends: None,
+            lm_head_fp32_backends: None,
         },
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
         replay,

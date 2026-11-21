@@ -33,21 +33,24 @@
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::deepseek_v41_deepinfer_dflash::{
     graph_for, graph_sizes, DeepInferDflash, DeepInferDflashBackends, DeepInferDflashConfig,
-    DflashShape,
+    DeepInferSampling, DflashShape,
 };
+/// DeepInfer's TileLang `fused_sample`.
+const DEEPINFER_SAMPLE_BACKENDS: &[&str] = &["tilelang"];
 use crate::arch::deepseek_v41_dspark_plumbing::{
     PlumbingShape, StepPlumbing, StepPlumbingConfig,
 };
 use crate::arch::deepseek_v41_vllm::{
     kv_cache_layout, layer_input, prefill_pairs, BoundedReplay, DeepseekV41CudaGraphs,
     DeepseekV41ModelCfg, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
-    FP32_GEMM_BACKENDS, MAX_NUM_SEQS,
+    MAX_NUM_SEQS,
 };
 use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{
     self as dp_arch, deepinfer_backends, dp_layer_config, labeled_max, mega_ffn_config,
     normalize_dp_steps, resolve_layer, DeepInferEngine, DeepseekV41DpLayerResolved, DeepseekV41VllmDpConfigs, DeepseekV41VllmDpModel,
     DeepseekV41VllmDpParallel, DeepseekV41VllmDpResolved, DpLayerBody, DpLayerInput, DpStep,
-    DEEPINFER_BACKTRACKING_TOKENS, DEEPINFER_BLOCK_SIZE, DEEPINFER_GEMM_BACKENDS, DEEPINFER_KV_BACKENDS, DEEPINFER_TOPK_BACKENDS,
+    DEEPINFER_BACKTRACKING_TOKENS, DEEPINFER_BLOCK_SIZE, DEEPINFER_GEMM_BACKENDS, DEEPINFER_KV_BACKENDS,
+    DEEPINFER_LM_HEAD_BACKENDS, DEEPINFER_TOPK_BACKENDS,
     DP_SIZE,
 };
 use crate::arch::deepseek_v41_vllm_dspark::{
@@ -104,6 +107,7 @@ pub struct DflashDeepInfer {
     pub graph_interval: u32,
     /// `DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL`.
     pub draft_graph_interval: u32,
+    pub sampling: DeepInferSampling,
 }
 
 #[derive(Clone, Debug)]
@@ -234,10 +238,12 @@ pub fn build_configs(
                 &parallel.gpu_name,
                 parallel.max_model_len,
                 max_rank_tokens,
+                dflash.sampling,
                 DeepInferDflashBackends {
                     gemm: DEEPINFER_GEMM_BACKENDS,
-                    fp32_gemm: FP32_GEMM_BACKENDS,
+                    fp32_gemm: DEEPINFER_LM_HEAD_BACKENDS,
                     topk: DEEPINFER_TOPK_BACKENDS,
+                    sample: DEEPINFER_SAMPLE_BACKENDS,
                     kv: DEEPINFER_KV_BACKENDS,
                     block_size: DEEPINFER_BLOCK_SIZE,
                     swa_ring_tokens: model.sliding_window + DEEPINFER_BACKTRACKING_TOKENS,

@@ -30,6 +30,7 @@ use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
     ElementwiseKernelConfig, ElementwiseKernelInput, MhcPostKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -45,6 +46,10 @@ pub struct DeepseekV41HeadTpWorkletConfig {
     pub elementwise_backends: Vec<&'static str>,
     /// `Some`: the hc post is TileKernels' `mhc_post_fwd` (DeepInfer).
     pub mhc_post_backends: Option<Vec<&'static str>>,
+    /// `Some`: the lm_head writes fp32 logits (DeepInfer
+    /// `deep_gemm.bf16_gemm_nt(hidden, weight, logits_fp32)`), in place of
+    /// the bf16 `lm_head_backends` GEMM.
+    pub lm_head_fp32_backends: Option<Vec<&'static str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +62,8 @@ pub struct DeepseekV41HeadTpWorkletResolved {
     pub hc_collapse: ElementwiseKernelConfig,
     pub final_norm: ElementwiseKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
+    /// `Some` with `lm_head_fp32_backends`: replaces [`Self::lm_head`].
+    pub lm_head_fp32: Option<GemmFp32OutputKernelConfig>,
     pub logits_all_gather: Option<AllReduceKernelConfig>,
 }
 
@@ -78,9 +85,15 @@ pub struct DeepseekV41HeadTpWorklet {
     pub tile_mhc_post: Option<Op<MhcPostKernel>>,
     pub hc_collapse: Op<ElementwiseKernel>,
     pub final_norm: Op<ElementwiseKernel>,
-    pub lm_head: Op<SingleGemmKernel>,
+    pub lm_head: LmHead,
     pub logits_all_gather: Option<Op<AllReduceKernel>>,
     resolved: DeepseekV41HeadTpWorkletResolved,
+}
+
+/// The vocabulary projection: bf16 logits (vLLM) or fp32 logits (DeepInfer).
+pub enum LmHead {
+    Bf16(Op<SingleGemmKernel>),
+    Fp32(Op<GemmFp32OutputKernel>),
 }
 
 impl DeepseekV41HeadTpWorklet {
@@ -118,6 +131,15 @@ impl DeepseekV41HeadTpWorklet {
                 k: cfg.hidden_size.clone(),
                 dtype: DType::Bf16,
             },
+            lm_head_fp32: cfg.lm_head_fp32_backends.as_ref().map(|backends| {
+                GemmFp32OutputKernelConfig {
+                    backends: backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    n: vocab_per_rank.into(),
+                    k: cfg.hidden_size.clone(),
+                    input_dtype: DType::Bf16,
+                }
+            }),
             // layers/logits_processor.py:130 `tensor_model_parallel_all_gather`.
             logits_all_gather: (cfg.tp_size > 1).then(|| {
                 nccl_all_gather_proxy(&cfg.all_gather_backends, gpu, cfg.tp_size)
@@ -152,7 +174,10 @@ impl DeepseekV41HeadTpWorklet {
             },
             hc_collapse: op!(ElementwiseKernel, r.hc_collapse, "hc_head_collapse"),
             final_norm: op!(ElementwiseKernel, r.final_norm, "final_rms_norm"),
-            lm_head: op!(SingleGemmKernel, r.lm_head, "lm_head"),
+            lm_head: match r.lm_head_fp32 {
+                Some(config) => LmHead::Fp32(op!(GemmFp32OutputKernel, config, "lm_head")),
+                None => LmHead::Bf16(op!(SingleGemmKernel, r.lm_head, "lm_head")),
+            },
             logits_all_gather: match r.logits_all_gather {
                 Some(config) => Some(op!(AllReduceKernel, config, "logits_all_gather")),
                 None => None,
@@ -173,7 +198,10 @@ impl DeepseekV41HeadTpWorklet {
         children.extend([
             self.hc_collapse.compile(b),
             self.final_norm.compile(b),
-            self.lm_head.compile(b),
+            match &self.lm_head {
+                LmHead::Bf16(op) => op.compile(b),
+                LmHead::Fp32(op) => op.compile(b),
+            },
         ]);
         if let Some(all_gather) = &self.logits_all_gather {
             children.push(all_gather.compile(b));
@@ -220,7 +248,12 @@ impl DeepseekV41HeadTpWorklet {
         }
         eval_or_zero(&self.hc_collapse, ew.clone(), rows == 0, ev);
         eval_or_zero(&self.final_norm, ew, rows == 0, ev);
-        eval_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, logits == 0, ev);
+        match &self.lm_head {
+            LmHead::Bf16(op) => eval_or_zero(op, SingleGemmKernelInput { m: logits }, logits == 0, ev),
+            LmHead::Fp32(op) => {
+                eval_or_zero(op, GemmFp32OutputKernelInput { m: logits }, logits == 0, ev)
+            }
+        }
         if let Some(all_gather) = &self.logits_all_gather {
             let gathered = u64::from(logits) * u64::from(self.resolved.raw_cfg.vocab_size) * 2;
             eval_or_zero(
@@ -250,6 +283,7 @@ pub(crate) mod tests {
             all_gather_backends: vec!["nccl"],
             elementwise_backends: vec!["triton"],
             mhc_post_backends: None,
+            lm_head_fp32_backends: None,
         }
     }
 

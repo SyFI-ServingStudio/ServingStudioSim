@@ -1053,6 +1053,9 @@ impl Deployment for UnifiedDeployment {
                 deepinfer_graph_interval,
                 deepinfer_draft_graph_interval,
                 force_load_balance,
+                sampler_top_p,
+                sampler_top_k,
+                sampler_top_logprobs,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -1077,6 +1080,11 @@ impl Deployment for UnifiedDeployment {
                         *deepinfer_max_num_seqs,
                         *deepinfer_graph_interval,
                         *deepinfer_draft_graph_interval,
+                        crate::arch::deepseek_v41_deepinfer_dflash::DeepInferSampling {
+                            top_p: *sampler_top_p,
+                            top_k: *sampler_top_k,
+                            top_logprobs: *sampler_top_logprobs,
+                        },
                     )?,
                     *engram_fetch,
                     &gpu_name,

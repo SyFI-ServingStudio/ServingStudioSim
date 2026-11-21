@@ -168,6 +168,7 @@ pub fn deepseek_v41_dp_dspark_engine(
     max_num_seqs: u32,
     graph_interval: u32,
     draft_graph_interval: u32,
+    sampling: super::deepseek_v41_deepinfer_dflash::DeepInferSampling,
 ) -> anyhow::Result<
     Option<(
         super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine,
@@ -178,6 +179,10 @@ pub fn deepseek_v41_dp_dspark_engine(
         anyhow::ensure!(
             draft_num_redundant_experts == 0,
             "draft_num_redundant_experts is a DeepInfer option; set engine: deepinfer"
+        );
+        anyhow::ensure!(
+            sampling == Default::default(),
+            "sampler_* are DeepInfer options; set engine: deepinfer"
         );
     }
     anyhow::ensure!(
@@ -200,6 +205,7 @@ pub fn deepseek_v41_dp_dspark_engine(
                 draft_num_redundant_experts,
                 graph_interval,
                 draft_graph_interval,
+                sampling,
             },
         )
     }))
@@ -982,11 +988,25 @@ pub enum IterArchSel {
         #[serde(default = "default_deepinfer_graph_interval")]
         #[param(default = 8, cache_key)]
         deepinfer_draft_graph_interval: u32,
-        /// DeepInfer only: forced load balance, as for
-        /// `deepseek_v41_vllm_dp_attn_ep_moe` (target and draft MoE).
+        /// DeepInfer only: forced load balance on the target MoE, as for
+        /// `deepseek_v41_vllm_dp_attn_ep_moe`; the draft MoE always routes.
         #[serde(default)]
         #[param(default = false, cache_key)]
         force_load_balance: bool,
+        /// DeepInfer only: the requests sample with top-p (`top_p < 1`), which
+        /// adds a radix pass to the fused sampler.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        sampler_top_p: bool,
+        /// DeepInfer only: the requests sample with top-k (`top_k > 0`).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        sampler_top_k: bool,
+        /// DeepInfer only: the requests' `top_logprobs` (0 = none): a sorted
+        /// top-k of that width per verify row.
+        #[serde(default)]
+        #[param(default = 0, cache_key)]
+        sampler_top_logprobs: u32,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.

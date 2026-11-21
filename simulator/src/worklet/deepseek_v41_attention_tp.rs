@@ -702,6 +702,8 @@ impl DeepseekV41AttentionTpWorklet {
                 swa_cache_format: "mxfp8".to_string(),
                 compressed_cache_format: "nvfp4".to_string(),
                 output_dtype: DType::Fp8E4m3,
+                // DeepInfer attends prefill rows with `prefill_attn`.
+                prefill: vllm,
             },
             wo_a: BatchedGemmKernelConfig {
                 backends: cfg.wo_a_backends.clone(),

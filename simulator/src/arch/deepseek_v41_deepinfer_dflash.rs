@@ -12,15 +12,21 @@
 //! |---|---|---|
 //! | prep | before the main graph | block tables, decode metadata, ZOS input gathers, Engram hash (~31) |
 //! | main cache | inside the main graph | `_dflash_input_store` in the three target layers (11), then `update_main_cache`: `projection` GEMM, `projection_norm`, `main_kv_proj` GEMM, one SWA-cache store per draft layer (~60) |
-//! | verify | sampler, eager | DeepSelect top-k over the fp32 logits (135), fused sample (29), verification bookkeeping (~45); the lm_head is the target head's |
+//! | verify | sampler, eager | DeepSelect top-k over the fp32 logits (100), the requested top logprobs' top-k (35), fused sample (29), verification bookkeeping (~45); the lm_head is the target head's |
 //! | draft prep | DFlash graph | input copy, fused input index, draft-token embedding gather (~10) |
-//! | Markov | DFlash graph, per drafted position | `markov_w1` gather, `markov_w2` accumulated into the fp32 logits (`out_acc`), confidence head, top-k, fused sample, scatter (~80 per position); `store_mtp_info` once |
+//! | Markov | DFlash graph, per drafted position | `markov_w1` gather, `markov_w2` accumulated into the fp32 logits (`out_acc`, cuBLASLt beta 1), confidence head, top-k, fused sample, scatter (~80 per position); `store_mtp_info` once |
 //!
 //! The draft layers are DP layer bodies and the draft head is the target's
 //! head worklet (hc post, norm, fp32 lm_head), both priced by the arch.
 //! Launches with an L1 kind take it; the rest are elementwise placeholders
 //! sized from the checkpoint and the step (launch-bound, so the placeholder's
-//! small-size floor carries them).
+//! small-size floor carries them). Placeholder bytes follow the sampler lane's
+//! per-launch reading of the capture (`wt-dsv41-di-sampler` report).
+//!
+//! The sampler's cost depends on the requests' sampling parameters
+//! ([`DeepInferSampling`]): the fused sampler's radix passes on whether top-p /
+//! top-k filter, and a second top-k runs only when requests ask for top
+//! logprobs.
 
 use std::sync::Arc;
 
@@ -28,10 +34,11 @@ use crate::arch::deepseek_v41_vllm::{DeepseekV41ModelCfg, ELEMENTWISE_BACKENDS};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    DeepSelectTopkKernel, DeepSelectTopkKernelConfig, DeepSelectTopkKernelInput,
+    DeepSelectLogitsTopkKernel, DeepSelectLogitsTopkKernelConfig, DeepSelectLogitsTopkKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, FusedNormRopeCastKernel,
-    FusedNormRopeCastKernelConfig, FusedNormRopeCastKernelInput, GemmFp32OutputKernel,
-    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, RmsNormMxfp8Kernel,
+    FusedNormRopeCastKernelConfig, FusedNormRopeCastKernelInput, FusedSampleKernel,
+    FusedSampleKernelConfig, FusedSampleKernelInput, GemmFp32AccumulateKernel,
+    GemmFp32AccumulateKernelConfig, GemmFp32AccumulateKernelInput, RmsNormMxfp8Kernel,
     RmsNormMxfp8KernelConfig, RmsNormMxfp8KernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
@@ -89,10 +96,25 @@ pub struct DeepInferDflashConfig {
     pub swa_ring_tokens: u32,
     /// Most rows one rank runs (the tilelang kinds' row axis).
     pub max_tokens_per_rank: u32,
+    pub sampling: DeepInferSampling,
     pub gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    pub sample_backends: Vec<&'static str>,
     pub kv_backends: Vec<&'static str>,
+}
+
+/// The requests' sampling parameters, as far as they change the sampler's
+/// launches (every request alike).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeepInferSampling {
+    /// `top_p < 1`: the fused sampler's top-p radix pass runs.
+    pub top_p: bool,
+    /// `top_k > 0`: its top-k radix pass runs.
+    pub top_k: bool,
+    /// `top_logprobs`: a sorted top-k over the kept logprobs per verify row
+    /// (`_prepare_top_info`); 0 = none.
+    pub top_logprobs: u32,
 }
 
 /// What a placeholder's row count follows.
@@ -136,20 +158,18 @@ pub(crate) struct DeepInferDflash {
     name: String,
     draft_tokens: u32,
     num_draft_layers: u32,
-    vocab_size: u32,
-    verify_topk: Op<DeepSelectTopkKernel>,
+    verify_topk: Op<DeepSelectLogitsTopkKernel>,
+    verify_top_logprobs: Option<Op<DeepSelectLogitsTopkKernel>>,
+    verify_sample: Op<FusedSampleKernel>,
     projection: Op<SingleGemmKernel>,
     projection_norm: Op<RmsNormMxfp8Kernel>,
     main_kv_proj: Op<SingleGemmKernel>,
     main_kv_store: Op<FusedNormRopeCastKernel>,
-    markov_w2: Op<GemmFp32OutputKernel>,
-    markov_topk: Op<DeepSelectTopkKernel>,
+    markov_w2: Op<GemmFp32AccumulateKernel>,
+    markov_topk: Op<DeepSelectLogitsTopkKernel>,
+    markov_sample: Op<FusedSampleKernel>,
     phases: Vec<Phase>,
 }
-
-/// The verify phase runs DeepSelect twice over the verify rows (capture:
-/// two `topk_kernel` launches between the target lm_head and the fused sample).
-const VERIFY_TOPK_LAUNCHES: u32 = 2;
 
 impl DeepInferDflashConfig {
     pub(crate) fn new(
@@ -160,6 +180,7 @@ impl DeepInferDflashConfig {
         gpu_name: &str,
         max_model_len: u32,
         max_tokens_per_rank: u32,
+        sampling: DeepInferSampling,
         backends: DeepInferDflashBackends,
     ) -> Self {
         Self {
@@ -180,9 +201,11 @@ impl DeepInferDflashConfig {
             block_size: backends.block_size,
             swa_ring_tokens: backends.swa_ring_tokens,
             max_tokens_per_rank,
+            sampling,
             gemm_backends: backends.gemm.to_vec(),
             fp32_gemm_backends: backends.fp32_gemm.to_vec(),
             topk_backends: backends.topk.to_vec(),
+            sample_backends: backends.sample.to_vec(),
             kv_backends: backends.kv.to_vec(),
         }
     }
@@ -197,6 +220,7 @@ pub(crate) struct DeepInferDflashBackends {
     pub gemm: &'static [&'static str],
     pub fp32_gemm: &'static [&'static str],
     pub topk: &'static [&'static str],
+    pub sample: &'static [&'static str],
     pub kv: &'static [&'static str],
     pub block_size: u32,
     pub swa_ring_tokens: u32,
@@ -219,12 +243,25 @@ impl DeepInferDflash {
         }
         let gpu = c.gpu_name.clone();
         let hidden = c.hidden_size;
-        let topk = DeepSelectTopkKernelConfig {
-            backends: c.topk_backends.clone(),
+        let logits_topk = |num_columns: u32, top_k: u32, sorted: bool| {
+            DeepSelectLogitsTopkKernelConfig {
+                backends: c.topk_backends.clone(),
+                gpu_name: gpu.clone(),
+                num_columns: Dim::from(num_columns),
+                top_k,
+                sorted,
+                dtype: DType::Fp32,
+            }
+        };
+        // `process_sampling` over the force_topk-wide kept logits.
+        let sample = |reject_sampling: bool| FusedSampleKernelConfig {
+            backends: c.sample_backends.clone(),
             gpu_name: gpu.clone(),
-            top_k: c.force_topk,
+            num_columns: Dim::from(c.force_topk),
+            reject_sampling,
+            top_p_filter: c.sampling.top_p,
+            top_k_filter: c.sampling.top_k,
             dtype: DType::Fp32,
-            max_row_len: c.vocab_size,
         };
         let mxfp8 = |n: u32, k: u32| SingleGemmKernelConfig {
             backends: c.gemm_backends.clone(),
@@ -237,6 +274,7 @@ impl DeepInferDflash {
         let verify_rows = c.draft_tokens + 1;
         let table_width = c.max_model_len.div_ceil(c.block_size);
         let ngram_ids = c.engram_heads * c.engram_max_ngram;
+        let top_logprobs = c.sampling.top_logprobs;
         // (leaf, launches, rows, input bytes/row, output bytes/row)
         let prep = vec![
             // `_compute_seqlens_k_zos`: last step's accepted counts -> lengths.
@@ -255,21 +293,22 @@ impl DeepInferDflash {
             // `_dflash_input_store` in each target feature layer.
             ("dflash_input_store", c.num_draft_layers, Rows::TargetRows, hidden * BF16, hidden * BF16),
         ];
-        // Each verified row: its kept logits and indices in, its token and
-        // log-probabilities out (`_fused_sample_kernel_1`, then the request
-        // reduce `_fused_sample_kernel`).
-        let sample_in = c.force_topk * (FP32 + I32);
-        let sample_out = c.force_topk * FP32 + I64;
+        let kept = c.force_topk * (FP32 + I32);
         let verify = vec![
-            ("expand_sampling_params", 1, Rows::LogitsRows, 2 * FP32, 2 * FP32),
-            ("prepare_verification_metadata", 1, Rows::Requests, verify_rows * I32, verify_rows * I32),
-            ("fused_sample", 1, Rows::LogitsRows, sample_in, sample_out),
-            ("fused_sample_reduce", 1, Rows::LogitsRows, sample_out, I64),
-            ("map_lookup", 2, Rows::LogitsRows, c.force_topk * I32 + I64, I64),
-            ("remap_draft_topk", 1, Rows::LogitsRows, c.force_topk * I32, c.force_topk * I32),
-            ("scatter_gather", 1, Rows::LogitsRows, c.force_topk * FP32, c.force_topk * FP32),
-            ("get_accept_result", 1, Rows::Requests, verify_rows * 2 * I64, 2 * I32),
-            ("finalize_verification", 2, Rows::Requests, verify_rows * I64, verify_rows * I64),
+            // `_expand_sampling_params`: each row's request parameters.
+            ("expand_sampling_params", 1, Rows::LogitsRows, I64 + 3 * I64, 3 * I64),
+            ("prepare_verification_metadata", 1, Rows::Requests, I64, verify_rows * (2 * I32 + 1)),
+            // `_gather_kernel`: the verify rows' hidden states for the draft.
+            ("gather", 1, Rows::LogitsRows, hidden * BF16, hidden * BF16),
+            // `_map_lookup` by index, then by key over the kept indices.
+            ("map_lookup_index", 1, Rows::LogitsRows, I64, I32),
+            ("map_lookup_key", 1, Rows::LogitsRows, c.force_topk * I32 + I64, I32),
+            // `_remap_draft_topk`: the draft's kept ids and logprobs onto the target's.
+            ("remap_draft_topk", 1, Rows::LogitsRows, c.force_topk * (FP32 + 2 * I32), kept + I64),
+            // `_scatter_gather`: the top logprobs' ids.
+            ("scatter_gather", u32::from(top_logprobs > 0), Rows::LogitsRows, top_logprobs * I64, top_logprobs * I32),
+            ("get_accept_result", 1, Rows::LogitsRows, 2 * I64 + 2, 2 * I32 - 2),
+            ("finalize_verification", 2, Rows::LogitsRows, 3 * I64 + top_logprobs * I64, 6 * I64 + top_logprobs * I64),
         ];
         let draft_prep = vec![
             ("copy_decode_input", 1, Rows::DraftRequests, 2 * I32, 2 * I32),
@@ -279,14 +318,15 @@ impl DeepInferDflash {
         ];
         let rank = c.markov_rank;
         let markov = vec![
-            ("markov_w1_gather", c.draft_tokens, Rows::DraftRequests, I64, rank * BF16),
-            // `confidence_head_fused`: the position's hc hidden and Markov
+            // `_gather_kernel`: the sampled token's Markov embedding row.
+            ("markov_w1_gather", c.draft_tokens, Rows::DraftRequests, rank * BF16 + I32, rank * BF16),
+            // `confidence_head_fused`: the position's hidden and Markov
             // embedding in, one probability out.
             ("confidence_head", c.draft_tokens, Rows::DraftRequests, hidden * BF16 + rank * BF16, FP32),
-            ("fused_sample", c.draft_tokens, Rows::DraftRequests, sample_in, sample_out),
-            ("fused_sample_reduce", c.draft_tokens, Rows::DraftRequests, sample_out, I64),
-            ("token_scatter", c.draft_tokens, Rows::DraftRequests, c.force_topk * I32 + I64, I64),
-            ("store_mtp_info", 1, Rows::DraftRequests, c.draft_tokens * (I64 + FP32), c.draft_tokens * (I64 + FP32)),
+            // `_scatter_gather`: the sampled ids back to vocabulary ids.
+            ("token_scatter", c.draft_tokens, Rows::DraftRequests, I64, I32),
+            // `_store_mtp_info`: every draft row's kept ids and logprobs.
+            ("store_mtp_info", 1, Rows::DraftRows, I64, kept),
         ];
 
         let mut phases = Vec::new();
@@ -320,8 +360,22 @@ impl DeepInferDflash {
             name: name.to_string(),
             draft_tokens: c.draft_tokens,
             num_draft_layers: c.num_draft_layers,
-            vocab_size: c.vocab_size,
-            verify_topk: op!(DeepSelectTopkKernel, topk.clone(), "verify.topk"),
+            // `force_topk` over the target's fp32 vocabulary logits.
+            verify_topk: op!(
+                DeepSelectLogitsTopkKernel,
+                logits_topk(c.vocab_size, c.force_topk, false),
+                "verify.topk"
+            ),
+            verify_top_logprobs: (top_logprobs > 0)
+                .then(|| -> std::result::Result<_, BuildError> {
+                    Ok(op!(
+                        DeepSelectLogitsTopkKernel,
+                        logits_topk(c.force_topk, top_logprobs, true),
+                        "verify.top_logprobs"
+                    ))
+                })
+                .transpose()?,
+            verify_sample: op!(FusedSampleKernel, sample(true), "verify.fused_sample"),
             // dflash.py `update_main_cache`: the three feature layers'
             // hiddens projected to one hidden, normed to MXFP8, then every
             // draft layer's main-token key.
@@ -369,8 +423,8 @@ impl DeepInferDflash {
             // `markov_w2(w1, out_acc=logits)`: rank -> vocab, accumulated
             // into the position's fp32 logits.
             markov_w2: op!(
-                GemmFp32OutputKernel,
-                GemmFp32OutputKernelConfig {
+                GemmFp32AccumulateKernel,
+                GemmFp32AccumulateKernelConfig {
                     backends: c.fp32_gemm_backends.clone(),
                     gpu_name: gpu.clone(),
                     n: Dim::from(c.vocab_size),
@@ -379,7 +433,12 @@ impl DeepInferDflash {
                 },
                 "markov.markov_w2"
             ),
-            markov_topk: op!(DeepSelectTopkKernel, topk, "markov.topk"),
+            markov_topk: op!(
+                DeepSelectLogitsTopkKernel,
+                logits_topk(c.vocab_size, c.force_topk, false),
+                "markov.topk"
+            ),
+            markov_sample: op!(FusedSampleKernel, sample(false), "markov.fused_sample"),
             phases,
         })
     }
@@ -395,15 +454,20 @@ impl DeepInferDflash {
                 }
             }
         };
-        let mut children = vec![
-            scale(VERIFY_TOPK_LAUNCHES, self.verify_topk.compile(b)),
+        let mut children = vec![self.verify_topk.compile(b)];
+        if let Some(op) = &self.verify_top_logprobs {
+            children.push(op.compile(b));
+        }
+        children.extend([
+            self.verify_sample.compile(b),
             self.projection.compile(b),
             self.projection_norm.compile(b),
             self.main_kv_proj.compile(b),
             scale(self.num_draft_layers, self.main_kv_store.compile(b)),
             scale(self.draft_tokens, self.markov_w2.compile(b)),
             scale(self.draft_tokens, self.markov_topk.compile(b)),
-        ];
+            scale(self.draft_tokens, self.markov_sample.compile(b)),
+        ]);
         for phase in &self.phases {
             children.push(CostNode::Labeled {
                 label: phase.label.clone(),
@@ -427,11 +491,14 @@ impl DeepInferDflash {
     }
 
     pub(crate) fn eval(&self, shape: &DflashShape, ev: &mut Evaluator) {
-        let topk = |num_rows| DeepSelectTopkKernelInput {
-            num_rows,
-            row_len: self.vocab_size,
-        };
-        eval_or_zero(&self.verify_topk, topk(shape.logits_rows), shape.logits_rows == 0, ev);
+        let topk = |num_rows| DeepSelectLogitsTopkKernelInput { num_rows };
+        let sample = |num_rows| FusedSampleKernelInput { num_rows };
+        let logits = shape.logits_rows;
+        eval_or_zero(&self.verify_topk, topk(logits), logits == 0, ev);
+        if let Some(op) = &self.verify_top_logprobs {
+            eval_or_zero(op, topk(logits), logits == 0, ev);
+        }
+        eval_or_zero(&self.verify_sample, sample(logits), logits == 0, ev);
         let rows = shape.target_rows;
         let idle = rows == 0;
         eval_or_zero(&self.projection, SingleGemmKernelInput { m: rows }, idle, ev);
@@ -451,11 +518,12 @@ impl DeepInferDflash {
         let requests = shape.draft_requests;
         eval_or_zero(
             &self.markov_w2,
-            GemmFp32OutputKernelInput { m: requests },
+            GemmFp32AccumulateKernelInput { m: requests },
             requests == 0,
             ev,
         );
         eval_or_zero(&self.markov_topk, topk(requests), requests == 0, ev);
+        eval_or_zero(&self.markov_sample, sample(requests), requests == 0, ev);
         for phase in &self.phases {
             for leaf in &phase.leaves {
                 let n = match leaf.rows {

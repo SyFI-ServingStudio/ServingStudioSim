@@ -71,6 +71,9 @@ pub struct DeepseekV41MegaAttnOpConfig {
     /// `nvfp4` for the compressed cache; ignored (`none`) at ratio 0.
     pub compressed_cache_format: String,
     pub output_dtype: DType,
+    /// The prefill segment runs here (vLLM); `false` when the engine attends
+    /// prefill rows with its own kernel (DeepInfer), leaving decode only.
+    pub prefill: bool,
 }
 
 /// One rank's batch, split the way the fork splits it.
@@ -91,7 +94,7 @@ pub struct DeepseekV41MegaAttnOp {
     /// The prefill chunk planner's inputs: `(max_model_len,
     /// max_num_batched_tokens, prefill_chunk_size)`.
     planner: (u32, u32, u32),
-    pub prefill: Arc<CompressedSparseMlaRopeCastKernel>,
+    pub prefill: Option<Arc<CompressedSparseMlaRopeCastKernel>>,
     pub decode: Arc<CompressedSparseMlaRopeCastKernel>,
     /// `Some` on layers vLLM marks `_use_swapab`.
     pub decode_swapab: Option<Arc<CompressedSparseMlaRopeCastKernel>>,
@@ -122,11 +125,17 @@ impl DeepseekV41MegaAttnOp {
                 cfg.prefill_chunk_size,
             ),
             decode_swapab,
-            prefill: Arc::new(CompressedSparseMlaRopeCastKernel::build(
-                prefill_name,
-                kernel_config(&cfg, "prefill"),
-                bridge,
-            )?),
+            prefill: cfg
+                .prefill
+                .then(|| {
+                    CompressedSparseMlaRopeCastKernel::build(
+                        prefill_name,
+                        kernel_config(&cfg, "prefill"),
+                        bridge,
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?,
             decode: Arc::new(CompressedSparseMlaRopeCastKernel::build(
                 decode_name,
                 kernel_config(&cfg, "decode"),
@@ -137,18 +146,19 @@ impl DeepseekV41MegaAttnOp {
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let mut leaves = vec![
-            builder.leaf(
+        let mut leaves = Vec::new();
+        if let Some(prefill) = &self.prefill {
+            leaves.push(builder.leaf(
                 format!("{}.prefill", self.name),
-                self.prefill.kind(),
-                self.prefill.describe_config(),
-            ),
-            builder.leaf(
-                format!("{}.decode", self.name),
-                self.decode.kind(),
-                self.decode.describe_config(),
-            ),
-        ];
+                prefill.kind(),
+                prefill.describe_config(),
+            ));
+        }
+        leaves.push(builder.leaf(
+            format!("{}.decode", self.name),
+            self.decode.kind(),
+            self.decode.describe_config(),
+        ));
         if let Some(swapab) = &self.decode_swapab {
             leaves.push(builder.leaf(
                 format!("{}.decode_swapab", self.name),
@@ -161,7 +171,14 @@ impl DeepseekV41MegaAttnOp {
 
     pub fn eval(&self, input: &DeepseekV41MegaAttnOpInput, ev: &mut Evaluator) {
         let (prefill, decode) = split_input(input);
-        self.push_prefill(prefill, ev);
+        match &self.prefill {
+            Some(kernel) => push_prefill(kernel, self.planner, prefill, ev),
+            None => assert!(
+                prefill.query_context_pairs.is_empty(),
+                "{}: prefill rows on a decode-only mega attention",
+                self.name
+            ),
+        }
         let Some(swapab) = &self.decode_swapab else {
             push_segment(&self.decode, decode, ev);
             return;
@@ -179,12 +196,17 @@ impl DeepseekV41MegaAttnOp {
     }
 }
 
-impl DeepseekV41MegaAttnOp {
-    /// The prefill segment: one kernel eval per planned chunk, summed into the
-    /// one prefill leaf, which logs the whole segment.
-    fn push_prefill(&self, segment: CompressedSparseMlaRopeCastKernelInput, ev: &mut Evaluator) {
-        let config = &self.prefill.config;
-        let (max_model_len, max_num_batched_tokens, prefill_chunk_size) = self.planner;
+/// The prefill segment: one kernel eval per planned chunk, summed into the
+/// one prefill leaf, which logs the whole segment.
+fn push_prefill(
+    kernel: &CompressedSparseMlaRopeCastKernel,
+    planner: (u32, u32, u32),
+    segment: CompressedSparseMlaRopeCastKernelInput,
+    ev: &mut Evaluator,
+) {
+    {
+        let config = &kernel.config;
+        let (max_model_len, max_num_batched_tokens, prefill_chunk_size) = planner;
         let pairs = &segment.query_context_pairs;
         let mut metrics = LeafMetrics::ZERO;
         for chunk in prefill_chunk_plan(
@@ -195,7 +217,7 @@ impl DeepseekV41MegaAttnOp {
             max_num_batched_tokens,
             prefill_chunk_size,
         ) {
-            metrics.add_fanin(self.prefill.eval(&CompressedSparseMlaRopeCastKernelInput {
+            metrics.add_fanin(kernel.eval(&CompressedSparseMlaRopeCastKernelInput {
                 query_context_pairs: pairs[chunk].to_vec(),
             }));
         }
@@ -312,6 +334,7 @@ mod tests {
             swa_cache_format: "mxfp8".into(),
             compressed_cache_format: "nvfp4".into(),
             output_dtype: DType::Fp8E4m3,
+            prefill: true,
         }
     }
 

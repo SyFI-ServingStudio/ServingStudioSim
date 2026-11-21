@@ -285,6 +285,11 @@ pub(crate) const DEEPINFER_MHC_UNFUSED_BACKENDS: &[&str] = &["tile_kernels"];
 const DEEPINFER_PREFILL_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM `fp8_fp4_(sparse_)mqa_logits` and the sparse schedule.
 const DEEPINFER_INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_sm100"];
+/// `deep_gemm.bf16_gemm_nt` into fp32 logits: DeepGEMM hands the plain-store
+/// case to cuBLASLt (`smxx_cublaslt.hpp`).
+pub(crate) const DEEPINFER_LM_HEAD_BACKENDS: &[&str] = &["deepgemm_cublaslt"];
+/// DeepInfer's FlashMLA decode (`compressed_sparse_mla_rope_cast` mode decode).
+const DEEPINFER_DECODE_ATTN_BACKENDS: &[&str] = &["flashmla_deepinfer"];
 /// DeepGEMM's FP4 paged decode logits (`fp8_fp4_paged_mqa_logits`).
 const DEEPINFER_INDEX_DECODE_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp4"];
 const DEEPINFER_CANDIDATE_BLOCK_MAX_BACKENDS: &[&str] = &["tilelang"];
@@ -514,6 +519,9 @@ pub fn build_configs(
             mhc_post_backends: parallel
                 .deepinfer
                 .map(|_| DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec()),
+            lm_head_fp32_backends: parallel
+                .deepinfer
+                .map(|_| DEEPINFER_LM_HEAD_BACKENDS.to_vec()),
         },
         kv_cache_layout: match &parallel.deepinfer {
             Some(engine) => deepinfer_kv_cache_layout(
@@ -585,6 +593,11 @@ pub(crate) fn deepinfer_backends(
     tp1.attention.gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.prequantized_gemm_backends = DEEPINFER_GEMM_BACKENDS.to_vec();
     tp1.attention.wo_a_backends = DEEPINFER_WO_A_BACKENDS.to_vec();
+    // Decode attention: the image's own FlashMLA build of
+    // `fused_norm_rope_attn_rope_cast.decode`, called without top-k lengths
+    // and never through swap-AB (capture: one `fwd_kernel` per layer).
+    tp1.attention.mega_attn_backends = DEEPINFER_DECODE_ATTN_BACKENDS.to_vec();
+    tp1.attention.swapab_attn_backends = Vec::new();
     tp1.attention.deepinfer = Some(DeepseekV41AttentionDeepInfer {
         mega_mhc_backends: DEEPINFER_MEGA_MHC_BACKENDS.to_vec(),
         mhc_unfused_backends: DEEPINFER_MHC_UNFUSED_BACKENDS.to_vec(),
@@ -1833,8 +1846,8 @@ mod tests {
             );
             assert_eq!(mega.num_logical_experts.get(), 384);
             assert_eq!(body.attention.gemm_backends, DEEPINFER_GEMM_BACKENDS);
-            // The kernels both engines share keep the fork's backends.
-            assert_eq!(body.attention.mega_attn_backends, configs_vllm_mega_attn());
+            assert_eq!(body.attention.mega_attn_backends, DEEPINFER_DECODE_ATTN_BACKENDS);
+            assert!(body.attention.swapab_attn_backends.is_empty());
         }
         // 384 + 30 slots do not split over 4 ranks.
         p.deepinfer = Some(DeepInferEngine {
@@ -1922,14 +1935,6 @@ mod tests {
             resolved.attention.mhc_overlap.is_none() && resolved.attention.entry_fused.is_none()
         );
         assert!(resolved.attention.entry_mega_mhc.is_some());
-    }
-
-    fn configs_vllm_mega_attn() -> Vec<&'static str> {
-        build_configs(&cfg(), &parallel(), &uniform_demand())
-            .unwrap()
-            .layer0
-            .attention
-            .mega_attn_backends
     }
 
     #[test]
