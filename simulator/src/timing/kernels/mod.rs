@@ -113,6 +113,7 @@ pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
 pub mod paged_kv_cache_load;
 pub mod paged_kv_cache_store;
+pub mod paged_mqa_logits_metadata;
 pub mod ple_gate;
 pub mod ple_ngram_ids;
 pub mod ple_short_conv;
@@ -139,6 +140,8 @@ pub mod sparse_indexer_logits_prefill;
 pub mod sparse_indexer_prepare;
 pub mod sparse_mla_norm_rope_cast_prefill;
 pub mod sparse_indexer_topk;
+pub mod sparse_mqa_logits_decode;
+pub mod sparse_mqa_logits_decode_metadata;
 pub mod sparse_mqa_logits_metadata;
 pub mod sparse_mqa_logits_prefill;
 pub mod static_fp8_quant;
@@ -516,6 +519,10 @@ pub use paged_kv_cache_load::{
     PagedKvCacheLoadKernel, PagedKvCacheLoadKernelConfig, PagedKvCacheLoadKernelInput,
     PagedKvCacheLoadSpec,
 };
+pub use paged_mqa_logits_metadata::{
+    PagedMqaLogitsMetadataKernel, PagedMqaLogitsMetadataKernelConfig,
+    PagedMqaLogitsMetadataKernelInput, PagedMqaLogitsMetadataSpec,
+};
 pub use paged_kv_cache_store::{
     PagedKvCacheStoreKernel, PagedKvCacheStoreKernelConfig, PagedKvCacheStoreKernelInput,
     PagedKvCacheStoreSpec,
@@ -600,6 +607,14 @@ pub use sparse_indexer_prepare::{
     SparseIndexerPrepareSpec,
 };
 pub use sparse_indexer_topk::{SparseIndexerTopkKernel, SparseIndexerTopkSpec};
+pub use sparse_mqa_logits_decode::{
+    SparseMqaLogitsDecodeKernel, SparseMqaLogitsDecodeKernelConfig,
+    SparseMqaLogitsDecodeKernelInput, SparseMqaLogitsDecodeSpec,
+};
+pub use sparse_mqa_logits_decode_metadata::{
+    SparseMqaLogitsDecodeMetadataKernel, SparseMqaLogitsDecodeMetadataKernelConfig,
+    SparseMqaLogitsDecodeMetadataKernelInput, SparseMqaLogitsDecodeMetadataSpec,
+};
 pub use sparse_mqa_logits_metadata::{
     SparseMqaLogitsMetadataKernel, SparseMqaLogitsMetadataKernelConfig,
     SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsMetadataSpec,

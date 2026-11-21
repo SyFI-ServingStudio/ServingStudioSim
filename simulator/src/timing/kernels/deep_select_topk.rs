@@ -17,8 +17,12 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-const ROW_POINTS: [u32; 16] = [
-    1, 6, 7, 16, 32, 64, 128, 148, 149, 192, 256, 512, 1024, 2048, 4096, 8192,
+/// Past one wave the time steps per wave of CTAs, not per row (B200: rows
+/// 149-256 cost the same, 512 twice that), so the axis brackets the 256-thread
+/// kernel's two CTAs per SM (296 rows per wave) as well.
+const ROW_POINTS: [u32; 21] = [
+    1, 6, 7, 16, 32, 64, 128, 148, 149, 192, 256, 296, 297, 384, 512, 592, 593, 1024, 2048, 4096,
+    8192,
 ];
 
 const ROW_LEN_POINTS: [u32; 14] = [
@@ -125,6 +129,9 @@ mod tests {
         let grid = DeepSelectTopkSpec::sweep_grid(&config(131072));
         let rows = &grid.axes()[0];
         assert!(rows.contains(&148.0) && rows.contains(&149.0));
+        // Two 256-thread CTAs per SM: the second wave starts at 297 rows. Without
+        // the pair, 384 decode rows interpolate 256..512 and lose a quarter.
+        assert!(rows.contains(&296.0) && rows.contains(&297.0));
         assert_eq!(grid.axes()[1].last(), Some(&131072.0));
     }
 }
