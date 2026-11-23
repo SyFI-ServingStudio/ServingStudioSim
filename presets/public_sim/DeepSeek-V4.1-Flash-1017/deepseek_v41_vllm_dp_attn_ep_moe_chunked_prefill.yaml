@@ -1,0 +1,68 @@
+# DeepSeek-V4.1-Flash-1017 without speculative decoding, one DP4/EP4 group on
+# four B200s. vLLM's DP coordinator places each request on the least-loaded
+# rank. Members:
+# - vllm: the vLLM fork, chunked prefill at 2048 tokens per DP rank. Both values
+#   come from the non-speculative DP4/EP4 alignment pack
+#   presets/alignment/dsv41_flash_b200_dp4_ep4 (case 01_dp4_diverse_100, 4x B200,
+#   --max-model-len 131072, --max-num-seqs 64, image vibesim-profiler-vllm:fe6a3d9a6af96e67).
+#   attn_gpu_memory_gb 79.220672: the KV pool per GPU that server sized,
+#   "Extended KV cache to 520936 blocks (73.78 GiB)" on every rank of its
+#   workload pass (calibration.json, from_capture). gpu_time_multiplier 1.0611:
+#   that capture's measured duty cycle as alignment Check 2 defines it
+#   (recommended_gpu_time_multiplier = sum of measured GPU cycles over the sum of
+#   the barrier critical path, analysis_kernel/reports/alignment_iteration_report.json);
+#   at 1.0 the same case's TPOT is -7.4% and TTFT -10.9% against the engine.
+# - deepinfer: DeepInfer as it runs, 16384 tokens per DP rank per step, FCFS,
+#   the back pass (layers 20-40 over the rows YoCo keeps, each prompt's last
+#   140) in every step, no deferral (back_flush every-step); back_rows
+#   chunk-tail as DeepInfer truncates: per chunk, its rows inside the prompt's
+#   last 140 and at least one placeholder row (prepare_tensor_input_v4.cpp
+#   fill_yoco_truncation_metadata). attn_gpu_memory_gb 67.498 GB (GB = 1e9 B): KV plus per-sequence
+#   state per GPU that DeepInfer itself sized on DP4/EP4 B200 at MBT 16384
+#   (kv_cache_size 60.30 + state_size 2.56 GiB, deepinfer-cpu-engram/exp/logs/
+#   bench_off_true_16384.22968.log; wt-dsv41-pp-fold/logs/20261115_31_b200_memory/
+#   budget.json b200_dp4_mbt16384). The sim subtracts DeepInfer's fixed state
+#   slots from it. gpu_time_multiplier 1.0422: DeepInfer's measured duty cycle
+#   as alignment Check 2 defines it (sum of measured GPU cycles, first kernel
+#   to the next step's first kernel, over the sum of the barrier critical path,
+#   kernel busy + mega MoE barriers), from its own nsys of DP4/EP4 on B200 at
+#   MBT 16384, Engram off (job 22975, 32 steps per rank; ServingStudio
+#   wt-dsv41-merge/logs/20261120_deepinfer_multiplier/multiplier.py). It
+#   carries the host time between steps and the GPU idle inside one.
+# - deepinfer_best: the same plus the scheduler study's SquareCost order
+#   (tier_l10: shortest prefill first, SRPT, lambda 10/s, default D0 10 s and
+#   k 3; not in DeepInfer). square_tokens_per_s 83000 is one DP4 rank's
+#   saturated prefill rate at B200 memory, 82.9 ktok/s (wt-dsv41-sched/logs/
+#   20261115_42_async/table.tsv, dp4_mbt16384_k16_b200_async_sjf60). The
+#   study's final scheduler (wt-dsv41-sched/logs/20261118_73_final_matrix/
+#   matrix.json, dp4|unl|every|final vs fcfs: mean TTFT 0.28 vs 0.41 s at
+#   c4000) also lifts the step to 32768 tokens for late requests
+#   (late_budget_base_tokens 16384, any rank). DeepInfer's memory rule is
+#   measured at MBT 4096, 16384 and 65536 only, and its activation term is not
+#   linear in MBT, so there is no measured B200 budget at 32768: this member
+#   stays at 16384 tokens without the late tier.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: 1
+        arch:
+          preset: deepseek_v41_vllm_dp_attn_ep_moe
+          engine: ${engine}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          gpu_time_multiplier: ${gpu_time_multiplier}
+          dp_placement: vllm-least-loaded
+          pending_order: ${pending_order}
+          srpt: ${srpt}
+          square_lambda_per_s: ${square_lambda_per_s}
+          square_tokens_per_s: ${square_tokens_per_s}
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+          back_flush: ${back_flush}
+          back_rows: ${back_rows}
+compound:
+  member:
+    vllm: {engine: vllm, max_batch_tokens: 2048, gpu_time_multiplier: 1.0611, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 79.220672, back_flush: "off", back_rows: vllm-chunk}
+    deepinfer: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: fifo, srpt: false, square_lambda_per_s: 0.0, square_tokens_per_s: 0.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}
+    deepinfer_best: {engine: deepinfer, max_batch_tokens: 16384, gpu_time_multiplier: 1.0422, pending_order: shortest-prefill-first, srpt: true, square_lambda_per_s: 10.0, square_tokens_per_s: 83000.0, attn_gpu_memory_gb: 67.498, back_flush: every-step, back_rows: chunk-tail}

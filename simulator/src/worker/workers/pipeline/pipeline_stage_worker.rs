@@ -117,6 +117,9 @@ impl<E: PipelineStageExecution> PipelineStageWorker<E> {
             } = self.scheduled.pop_front().unwrap();
             microbatch.send_gid = self.communication_group_id;
             microbatch.ready_at = compute_end;
+            if let Some(bytes) = self.execution.stage_send_bytes(&microbatch.input) {
+                microbatch.activation_bytes = bytes;
+            }
             events.push(PipelineStageEvent::StageDone {
                 worker: self.context.id,
                 microbatch,
@@ -194,6 +197,7 @@ mod tests {
             input: Rc::new(UnifiedArchInput {
                 groups: vec![group],
                 tokens_per_source_rank: Vec::new(),
+                back_pass: None,
             }),
             activation_bytes: 0,
             send_gid,

@@ -594,6 +594,7 @@ fn iter_inputs(
             let input = UnifiedArchInput {
                 groups,
                 tokens_per_source_rank,
+                back_pass: None,
             };
             model
                 .check_input(&input)

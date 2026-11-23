@@ -72,6 +72,11 @@ _BASE_HEADER = {
         "SGLang reference engine: the upstream commit patches/ apply to and its official image.\n"
         "Read by reference_engines (README.md); change it with `just ref bump-base sglang`."
     ),
+    "deepinfer": (
+        "DeepInfer reference engine: the upstream commit patches/ apply to, the CUDA image its\n"
+        "Dockerfile builds it on, and the vendor submodule commits that upstream commit pins.\n"
+        "Read by reference_engines (README.md); change it with `just ref bump-base deepinfer`."
+    ),
 }
 
 
@@ -217,6 +222,18 @@ def _check_replaceable(dest: Path, *, force: bool, patches: list[Path]) -> None:
         )
 
 
+def _gitlinks(repo: Path, commit: str, paths: list[str]) -> dict[str, str]:
+    """The commit `commit`'s tree pins each submodule in `paths` at."""
+
+    found = {}
+    for path in paths:
+        fields = _git("ls-tree", commit, "--", path, cwd=repo).split()
+        if len(fields) < 3 or fields[0] != "160000":
+            raise RefError(f"{path} is not a submodule of {commit[:12]}")
+        found[path] = fields[2]
+    return found
+
+
 def materialize(engine: str, dest: Path, *, force: bool = False) -> str:
     base = read_base(engine)
     patches = patch_files(engine)
@@ -228,6 +245,11 @@ def materialize(engine: str, dest: Path, *, force: bool = False) -> str:
     _git("init", "--quiet", cwd=dest)
     _git("fetch", "--quiet", "--depth=1", str(cache), ref, cwd=dest)
     _git("checkout", "--quiet", "--detach", base.upstream_commit, cwd=dest)
+    pinned = _gitlinks(dest, base.upstream_commit, sorted(base.submodules))
+    if pinned != base.submodules:
+        raise RefError(
+            f"BASE.yaml's submodule commits differ from {base.upstream_commit[:12]}'s: {pinned}"
+        )
     if patches:
         result = subprocess.run(
             ["git", "am", "--quiet", "--committer-date-is-author-date", *map(str, patches)],
@@ -369,9 +391,21 @@ def bump_base(
         if name not in found:
             raise RefError(f"{other} is not published for {name} (only {', '.join(found)})")
         digests[name] = found[name]
+    submodules = {}
+    if old.submodules:
+        # The same submodules, at the commits the new upstream commit pins.
+        cache, ref = _object_cache(engine, Base(old.upstream_repo, commit, image, {}, {}, {}))
+        submodules = _gitlinks(cache, ref, sorted(old.submodules))
     # Notes explain the old pins; a bump keeps only the ones it is given.
     base = Base(
-        old.upstream_repo, commit, image, digests, platform_images, platform_commits, notes or {}
+        old.upstream_repo,
+        commit,
+        image,
+        digests,
+        platform_images,
+        platform_commits,
+        notes or {},
+        submodules,
     )
     # Validate before writing: a malformed BASE.yaml would stop every later command.
     text = format_base(base, _BASE_HEADER[engine])

@@ -8,7 +8,7 @@
 //! the concrete composition, while factories/controllers keep only that builder
 //! call. The trait therefore carries only per-tick driving methods.
 
-use crate::common::{Time, WorkerId};
+use crate::common::{SessionInput, Time, WorkerId};
 use crate::worker::types::WorkerStatus;
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, FfnWorkerEvent, FfnWorkerMsg};
 
@@ -41,6 +41,12 @@ pub trait IterWorker {
     fn enqueue(&mut self, msg: Self::Msg);
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time>;
     fn status(&self) -> WorkerStatus;
+    /// Retained (reusable) tokens of this session's prefix in the worker's KV;
+    /// pool placement sends a session back to the worker that holds the most.
+    /// Workers without a prefix-retaining KV report 0 (no affinity).
+    fn retained_prefix_tokens(&self, _session_input: SessionInput) -> u32 {
+        0
+    }
 }
 
 /// Extra L6-facing capability required by the AFD attention pool.

@@ -184,17 +184,21 @@ def workload_pass_name(pack: Pack, case: Case) -> str:
 def _artifact(directory: Path, result: dict[str, Any], key: str) -> Path:
     """A file `profile_result.json` recorded, found inside this pass directory.
 
-    The recorded path is absolute from wherever the profile ran; its position
-    under the recorded `log_dir` is what survives a moved campaign.
+    The runner records it relative to the pass directory (`alignment.artifact_paths.record`);
+    an older result recorded it absolute from wherever the profile ran, and its
+    position under the recorded `log_dir` is what survives a moved campaign.
     """
     recorded = result.get(key)
     if not isinstance(recorded, str) or not recorded:
         raise CalibrationError(f"{directory.name}/profile_result.json records no {key}")
     path = Path(recorded)
-    try:
-        relative = path.relative_to(str(result.get("log_dir", "")))
-    except ValueError:
-        relative = Path(path.name)
+    if path.is_absolute():
+        try:
+            relative = path.relative_to(str(result.get("log_dir", "")))
+        except ValueError:
+            relative = Path(path.name)
+    else:
+        relative = path
     candidate = directory / relative
     if not candidate.is_file():
         raise CalibrationError(f"{key} {relative} is not in {directory}")

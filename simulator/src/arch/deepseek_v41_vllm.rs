@@ -93,8 +93,8 @@ pub(crate) const TP_SIZE: u32 = 4;
 pub(crate) const EP_SIZE: u32 = 4;
 
 // Checkpoint identity (HF text_config); `from_json` rejects anything else.
-const BODY_LAYERS: u32 = 40;
-const MTP_LAYERS: u32 = 3;
+pub(crate) const BODY_LAYERS: u32 = 40;
+pub(crate) const MTP_LAYERS: u32 = 3;
 const HIDDEN: u32 = 5120;
 const NUM_EXPERTS: u32 = 384;
 const TOP_K: u32 = 6;
@@ -103,7 +103,7 @@ const VOCAB_SIZE: u32 = 129_280;
 const KV_SOURCE_LAYERS: [u32; 4] = [2, 8, 14, 20];
 const INDEX_SOURCE_LAYERS: [u32; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
 const CANDIDATE_SOURCE_LAYER: u32 = 20;
-const ENGRAM_LAYERS: [u32; 2] = [1, 14];
+pub(crate) const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 
 // Deployment identity (capture 2 `profile.yaml` / server log). Its
 // `--max-model-len 131072` is the selector's `max_model_len`, which the
@@ -128,7 +128,7 @@ const PREFILL_CHUNK_SIZE: u32 = 4;
 pub(crate) const MAX_NUM_SEQS: u32 = 64;
 /// Rows of TP rank 0's Engram table slice (`part_num_embeddings`, server log
 /// `engram.py:269`, layer 1): the lookup kind's exact table identity.
-const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
+pub(crate) const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
 /// `wkv` output width of the Engram block (captured MXFP8 GEMM 6144 -> 25600).
 const ENGRAM_WKV_OUT: u32 = 25_600;
 
@@ -185,6 +185,10 @@ pub struct DeepseekV41ModelCfg {
     pub kv_source_layer_ids: Vec<u32>,
     pub index_source_layer_ids: Vec<u32>,
     pub candidate_source_layer_id: u32,
+    /// Candidate blocks the source layer keeps per query row.
+    pub candidate_topk_blocks: u32,
+    /// Tokens per candidate block before compression.
+    pub candidate_block_size: u32,
     pub engram_layer_ids: Vec<u32>,
     /// Hash columns = `(engram_max_ngram_size - 1) * engram_n_heads` (24).
     pub engram_hash_heads: u32,
@@ -375,6 +379,8 @@ impl DeepseekV41ModelCfg {
             kv_source_layer_ids: raw.kv_source_layer_ids,
             index_source_layer_ids: raw.index_source_layer_ids,
             candidate_source_layer_id: raw.candidate_source_layer_id,
+            candidate_topk_blocks: raw.candidate_topk_blocks,
+            candidate_block_size: raw.candidate_block_size,
             engram_layer_ids: raw.engram_layer_ids,
             engram_hash_heads: (raw.engram_max_ngram_size - 1) * raw.engram_n_heads,
             engram_lookback_depth: raw.engram_max_ngram_size - 1,
@@ -412,6 +418,32 @@ impl DeepseekV41ModelCfg {
                 },
             },
             engram,
+            candidate_metadata: false,
+            paged_metadata: false,
+        }
+    }
+}
+
+/// DeepInfer builds each indexer schedule once per forward and reuses it
+/// (`index_attn.py` `_get_sparse_prefill_metadata`, `_get_decode_metadata`):
+/// the first candidate consumer builds the sparse one, and the first dense
+/// scorer (non-consumer index source) of each compress ratio the paged decode one.
+pub fn mark_deepinfer_schedules(layers: &mut [(u32, LayerKind)]) {
+    if let Some((_, kind)) = layers
+        .iter_mut()
+        .find(|(_, kind)| kind.attention.candidate == DeepseekV41CandidateRole::Consumer)
+    {
+        kind.candidate_metadata = true;
+    }
+    let mut seen = Vec::new();
+    for (_, kind) in layers.iter_mut() {
+        let a = &kind.attention;
+        if a.index != DeepseekV41IndexRole::None
+            && a.candidate != DeepseekV41CandidateRole::Consumer
+            && !seen.contains(&a.compress_ratio)
+        {
+            seen.push(a.compress_ratio);
+            kind.paged_metadata = true;
         }
     }
 }
@@ -422,6 +454,13 @@ pub struct LayerKind {
     pub attention: DeepseekV41AttentionLayer,
     /// An Engram block runs before this layer's attention.
     pub engram: bool,
+    /// The layer builds the step's sparse candidate-logits schedule. Only
+    /// DeepInfer has one (its first candidate consumer builds it, the later
+    /// consumers reuse it); always false under vLLM.
+    pub candidate_metadata: bool,
+    /// The layer builds its compress ratio's dense decode schedule (DeepInfer
+    /// only, see [`mark_deepinfer_schedules`]).
+    pub paged_metadata: bool,
 }
 
 /// The layer fold: `Body` is one built body layer standing for `layers`;
@@ -657,6 +696,9 @@ pub struct DeepseekV41LayerConfig {
     pub engram: Option<DeepseekV41EngramTpWorkletConfig>,
     pub attention: DeepseekV41AttentionTpWorkletConfig,
     pub ffn: DeepseekV41MoeFfnEpWorkletConfig,
+    /// `Some`: DeepGEMM's mega MoE (one GPU's whole EP group) replaces
+    /// [`Self::ffn`], which then only carries the geometry.
+    pub mega: Option<crate::worklet::DeepseekV41MegaMoeFfnDpEpWorkletConfig>,
 }
 
 /// Fold plan with each body replaced by its index into the body list.
@@ -729,7 +771,19 @@ pub struct DeepseekV41LayerResolved {
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorkletResolved>,
     attention: DeepseekV41AttentionTpWorkletResolved,
-    ffn: DeepseekV41MoeFfnEpWorkletResolved,
+    ffn: LayerFfnResolved,
+}
+
+/// The FFN a body runs: the vLLM fork's fused MoE worklet, or DeepGEMM's mega
+/// MoE over the GPU's EP group.
+enum LayerFfnResolved {
+    Vllm(DeepseekV41MoeFfnEpWorkletResolved),
+    Mega(crate::worklet::DeepseekV41MegaMoeFfnDpEpWorkletResolved),
+}
+
+enum LayerFfn {
+    Vllm(DeepseekV41MoeFfnEpWorklet),
+    Mega(crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet),
 }
 
 pub struct DeepseekV41VllmResolved {
@@ -866,6 +920,8 @@ pub fn build_configs(
             lm_head_backends: LM_HEAD_BACKENDS.to_vec(),
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            mhc_post_backends: None,
+            lm_head_fp32_backends: None,
         },
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
         replay,
@@ -1023,10 +1079,90 @@ pub(crate) fn kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> D
     }
 }
 
+/// One pipeline stage's cache: [`kv_cache_layout`]'s page rules applied to
+/// the stage's own layers `[start, end)` at TP1 (each PP rank allocates and
+/// packs only what it holds), plus a copy of each KV source in `copies`
+/// (`(source layer, keeps its index K)`): a source another stage computes
+/// whose compressed cache (and index K cache) this stage's layers read. A
+/// copy adds its compressed pages but no compressor ring (the compressor runs
+/// on the source's own stage). A stage holding no compressed cache (layers
+/// 0-1 alone hold only sliding windows) has no full-attention block: its SWA
+/// rows sit in 32-token pages with no stride padding.
+pub(crate) fn stage_kv_cache_layout(
+    model: &DeepseekV41ModelCfg,
+    layers: &[u32],
+    copies: &[(u32, bool)],
+) -> KvCacheLayout {
+    assert!(
+        !layers.is_empty()
+            && layers.windows(2).all(|w| w[0] < w[1])
+            && *layers.last().unwrap() < model.num_layers,
+        "stage layers {layers:?}"
+    );
+    // A synthetic layer list: the copied sources first, then the stage's
+    // layers in order, so the packing helpers index ratios by position.
+    let copied = copies.len() as u32;
+    let rebase = |ids: &[u32]| -> Vec<u32> {
+        ids.iter()
+            .filter_map(|id| layers.iter().position(|l| l == id))
+            .map(|position| position as u32 + copied)
+            .collect()
+    };
+    let mut stage = model.clone();
+    stage.compress_ratios = copies
+        .iter()
+        .map(|&(source, _)| model.compress_ratios[source as usize])
+        .chain(layers.iter().map(|&l| model.compress_ratios[l as usize]))
+        .collect();
+    stage.kv_source_layer_ids = (0..copied)
+        .chain(rebase(&model.kv_source_layer_ids))
+        .collect();
+    stage.index_source_layer_ids = copies
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, indexed))| indexed)
+        .map(|(position, _)| position as u32)
+        .chain(rebase(&model.index_source_layer_ids))
+        .collect();
+    let swa_layers = layers.len() as u64;
+    if !stage.kv_source_layer_ids.is_empty() {
+        let mut own = stage.clone();
+        own.kv_source_layer_ids.retain(|&id| id >= copied);
+        let (ring_layers, _) = compressor_ring(&own);
+        return kv_cache_layout_over(&stage, 1, swa_layers, ring_layers);
+    }
+    let swa_row = u64::from(MXFP8_RECORD_BYTES);
+    KvCacheLayout::new()
+        .with_part(
+            KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
+                .not_prefix_reusable()
+                .replicated(1),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(KV_BLOCK_SIZE),
+            fixed_device_bytes: swa_layers * kv_page_bytes(u64::from(SWA_BLOCK_SIZE), swa_row),
+        })
+}
+
 pub(crate) fn kv_cache_layout(
     model: &DeepseekV41ModelCfg,
     tp_size: u32,
     extra_swa_layers: u32,
+) -> KvCacheLayout {
+    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
+    let (ring_layers, _) = compressor_ring(model);
+    kv_cache_layout_over(model, tp_size, swa_layers, ring_layers)
+}
+
+/// [`kv_cache_layout`] with the sliding-window layer count and the
+/// compressor-ring layer count given explicitly (a pipeline stage's own
+/// layers; a stage holding a copy of another stage's KV source keeps its
+/// compressed pages but not its ring).
+fn kv_cache_layout_over(
+    model: &DeepseekV41ModelCfg,
+    tp_size: u32,
+    swa_layers: u64,
+    ring_layers: u64,
 ) -> KvCacheLayout {
     let page = kv_page_bytes;
     let swa_row = u64::from(MXFP8_RECORD_BYTES);
@@ -1036,7 +1172,8 @@ pub(crate) fn kv_cache_layout(
 
     let tp = tp_size;
     let mut layout = KvCacheLayout::new();
-    for (name, ratio, bytes, padded) in full_parts {
+    // A pipeline stage may hold no source of one ratio; that part is absent.
+    for (name, ratio, bytes, padded) in full_parts.into_iter().filter(|part| part.2 > 0) {
         layout = layout.with_part(
             KvCachePart::compressed(name, ratio, bytes)
                 .padded_to(padded)
@@ -1046,27 +1183,29 @@ pub(crate) fn kv_cache_layout(
     // A kind whose layers' pages fill whole groups pays a stride per group.
     let groups = |pages: u64| pages.div_ceil(block);
 
-    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
     let swa_block = u64::from(SWA_BLOCK_SIZE);
-    let swa_groups = u64::from(swa_kv_groups(model, extra_swa_layers));
-    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
-    layout
-        .with_part(
-            KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
-                .padded_to(swa_groups * stride / swa_block)
-                .not_prefix_reusable()
-                .replicated(tp),
-        )
-        .with_part(
+    // `swa_kv_groups` for this layer count.
+    let swa_groups = (swa_layers * page(swa_block, swa_row)).div_ceil(block);
+    let (_, ring_layer_bytes) = compressor_ring(model);
+    layout = layout.with_part(
+        KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
+            .padded_to(swa_groups * stride / swa_block)
+            .not_prefix_reusable()
+            .replicated(tp),
+    );
+    // A pipeline stage whose sources need no compressor ring has no ring part.
+    if ring_layers * ring_layer_bytes > 0 {
+        layout = layout.with_part(
             KvCachePart::per_request("compressor_ring", ring_layers * ring_layer_bytes)
                 .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * stride)
                 .not_prefix_reusable()
                 .replicated(tp),
-        )
-        .with_engine(EngineOverhead {
-            block_tokens: Some(KV_BLOCK_SIZE),
-            fixed_device_bytes: stride * u64::from(tp),
-        })
+        );
+    }
+    layout.with_engine(EngineOverhead {
+        block_tokens: Some(KV_BLOCK_SIZE),
+        fixed_device_bytes: stride * u64::from(tp),
+    })
 }
 
 fn lcm(a: u64, b: u64) -> u64 {
@@ -1101,6 +1240,11 @@ pub(crate) fn layer_config(
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            engram_gate_backends: None,
+            max_rank_tokens: parallel.max_num_batched_tokens,
+            mhc_unfused_backends: None,
+            attn_norm_backends: None,
+            consumer: true,
         }),
         attention: DeepseekV41AttentionTpWorkletConfig {
             layer: kind.attention,
@@ -1143,6 +1287,7 @@ pub(crate) fn layer_config(
             index_logits_prefill_backends: INDEX_LOGITS_BACKENDS.to_vec(),
             index_logits_decode_backends: INDEX_LOGITS_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            deepinfer: None,
         },
         ffn: DeepseekV41MoeFfnEpWorkletConfig {
             tp_size: parallel.tp_size,
@@ -1177,10 +1322,11 @@ pub(crate) fn layer_config(
             folded_rank_position: 0,
             skip_padding_rows: MOE_SKIP_PADDING,
         },
+        mega: None,
     }
 }
 
-fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41LayerResolved {
+pub(crate) fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41LayerResolved {
     DeepseekV41LayerResolved {
         layers: config.layers.clone(),
         engram: config
@@ -1188,7 +1334,12 @@ fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41LayerResolved {
             .as_ref()
             .map(DeepseekV41EngramTpWorklet::resolve_config),
         attention: DeepseekV41AttentionTpWorklet::resolve_config(&config.attention),
-        ffn: DeepseekV41MoeFfnEpWorklet::resolve_config(&config.ffn),
+        ffn: match &config.mega {
+            Some(mega) => LayerFfnResolved::Mega(
+                crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet::resolve_config(mega),
+            ),
+            None => LayerFfnResolved::Vllm(DeepseekV41MoeFfnEpWorklet::resolve_config(&config.ffn)),
+        },
     }
 }
 
@@ -1219,16 +1370,16 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
 }
 
 /// One built body layer: optional Engram block, attention, MoE FFN.
-struct DeepseekV41LayerBody {
+pub(crate) struct DeepseekV41LayerBody {
     name: String,
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorklet>,
     attention: DeepseekV41AttentionTpWorklet,
-    ffn: DeepseekV41MoeFfnEpWorklet,
+    ffn: LayerFfn,
 }
 
 impl DeepseekV41LayerBody {
-    fn build(
+    pub(crate) fn build(
         model_name: &str,
         resolved: DeepseekV41LayerResolved,
         bridge: &PerfApiBridge,
@@ -1248,26 +1399,60 @@ impl DeepseekV41LayerBody {
                 resolved.attention,
                 bridge,
             )?,
-            ffn: DeepseekV41MoeFfnEpWorklet::build(format!("{name}.ffn"), resolved.ffn, bridge)?,
+            ffn: match resolved.ffn {
+                LayerFfnResolved::Vllm(ffn) => LayerFfn::Vllm(DeepseekV41MoeFfnEpWorklet::build(
+                    format!("{name}.ffn"),
+                    ffn,
+                    bridge,
+                )?),
+                LayerFfnResolved::Mega(mega) => LayerFfn::Mega(
+                    crate::worklet::DeepseekV41MegaMoeFfnDpEpWorklet::build(
+                        format!("{name}.ffn"),
+                        mega,
+                        bridge,
+                    )?,
+                ),
+            },
             layers: resolved.layers,
             name,
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let mut children = Vec::new();
         if let Some(engram) = &self.engram {
             children.push(engram.compile(builder));
         }
         children.push(self.attention.compile(builder));
-        children.push(self.ffn.compile(builder));
+        match &self.ffn {
+            LayerFfn::Vllm(ffn) => children.push(ffn.compile(builder)),
+            // One GPU is the whole group: its local launches, then the kernel.
+            LayerFfn::Mega(mega) => {
+                children.extend(mega.compile_local(builder));
+                children.push(mega.compile_exchange(builder));
+            }
+        }
         CostNode::Labeled {
             label: format!("{} [layers {:?}]", self.name, self.layers),
             child: Box::new(CostNode::Sum(children)),
         }
     }
 
-    fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
+    /// A layer group that runs no rows this step (the late layers of a
+    /// deferred back pass with an empty stash, or a back-only step's front
+    /// layers) costs nothing; it is walked with a one-row placeholder to keep
+    /// the slot order.
+    pub(crate) fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
+        if input.rows == 0 {
+            let start = evaluator.filled();
+            self.eval_rows(&placeholder_layer_input(), evaluator);
+            evaluator.zero_from(start);
+            return;
+        }
+        self.eval_rows(input, evaluator);
+    }
+
+    fn eval_rows(&self, input: &LayerInput, evaluator: &mut Evaluator) {
         if let Some(engram) = &self.engram {
             engram.eval(
                 &DeepseekV41EngramTpWorkletInput {
@@ -1277,14 +1462,31 @@ impl DeepseekV41LayerBody {
             );
         }
         self.attention.eval(&input.attention, evaluator);
-        self.ffn.eval(
-            &DeepseekV41MoeFfnEpWorkletInput {
-                num_tokens: input.rows,
-                scheduled_tokens: input.scheduled_rows,
-                mhc_overlap: input.attention.mhc_overlap,
-            },
-            evaluator,
-        );
+        match &self.ffn {
+            LayerFfn::Vllm(ffn) => ffn.eval(
+                &DeepseekV41MoeFfnEpWorkletInput {
+                    num_tokens: input.rows,
+                    scheduled_tokens: input.scheduled_rows,
+                    mhc_overlap: input.attention.mhc_overlap,
+                },
+                evaluator,
+            ),
+            LayerFfn::Mega(mega) => {
+                let rank = crate::worklet::DeepseekV41MoeFfnDpRankInput {
+                    num_tokens: input.rows,
+                    scheduled_tokens: input.scheduled_rows,
+                    mhc_overlap: input.attention.mhc_overlap,
+                };
+                mega.eval_local(&rank, evaluator);
+                mega.eval_exchange(
+                    &crate::worklet::DeepseekV41MoeFfnDpEpWorkletInput {
+                        ranks: vec![rank],
+                        collective_tokens: vec![input.rows],
+                    },
+                    evaluator,
+                );
+            }
+        }
     }
 }
 
@@ -1463,6 +1665,7 @@ impl DeepseekV41VllmModel {
                                 full_graph: false,
                                 mhc_overlap: false,
                                 write_kv_only: true,
+                                kv_written: false,
                             }
                         };
                         replay.write_kv.eval(&write_kv, evaluator);
@@ -1501,7 +1704,7 @@ impl DeepseekV41VllmModel {
         );
         self.eval_plan(&self.plan, input, evaluator);
         if let Some(replay) = &self.replay {
-            let scattered = if input.replay.is_some() { rows } else { 0 };
+            let scattered = input.scatter_rows();
             eval_or_zero(
                 &replay.scatter,
                 ElementwiseKernelInput {
@@ -1513,7 +1716,7 @@ impl DeepseekV41VllmModel {
         }
         self.head.eval(
             &DeepseekV41HeadTpWorkletInput {
-                num_tokens: rows,
+                num_tokens: input.head_rows(),
                 mhc_post_rows: input.replay.as_ref().map_or(rows, |late| late.rows),
                 logits_rows: input.logits_rows,
             },
@@ -1525,12 +1728,14 @@ impl DeepseekV41VllmModel {
     pub(crate) fn normalize(&self, batch: &UnifiedArchInput) -> Result<NormalizedInput, String> {
         let step = DeepseekV41Step::from_unified(batch, self.max_model_len)?;
         let logits_rows = step.request_count();
+        let back = group_back_pairs(batch, self.max_model_len)?;
         Ok(normalize_step(
             &self.graphs,
             &step,
             1,
             logits_rows,
             self.replay_rule.as_ref(),
+            back.as_deref(),
         ))
     }
 
@@ -1864,6 +2069,62 @@ pub struct NormalizedInput {
     /// `Some` when the step runs the layers from the cut on the replay batch.
     pub replay: Option<LayerInput>,
     pub logits_rows: u32,
+    /// The replay batch is a deferred back pass
+    /// ([`UnifiedArchInput::back_pass`]): it carries stashed rows, not this
+    /// step's, so nothing scatters back and the head runs on its rows.
+    pub deferred: bool,
+}
+
+impl NormalizedInput {
+    /// Rows the head's hc collapse and final norm run: the batch after the
+    /// scatter, or the back pass's rows.
+    pub fn head_rows(&self) -> u32 {
+        match &self.replay {
+            Some(late) if self.deferred => late.rows,
+            _ => self.full.rows,
+        }
+    }
+
+    /// Rows the replay scatter writes back: the whole batch on an inline
+    /// replay step, none otherwise.
+    pub fn scatter_rows(&self) -> u32 {
+        match &self.replay {
+            Some(_) if !self.deferred => self.full.rows,
+            _ => 0,
+        }
+    }
+}
+
+/// A one-row prefill, the input a zero-row layer group is walked with.
+pub(crate) fn placeholder_layer_input() -> LayerInput {
+    layer_input(GraphMode::Eager, 1, vec![(1, 1)], &[])
+}
+
+/// A deferred back pass's `(prefix, rows)` entries as `(query, context)`
+/// pairs, validated as prefill chunks are.
+pub(crate) fn back_pairs(
+    entries: &[(u32, u32)],
+    max_model_len: u32,
+) -> Result<Vec<(u32, u32)>, String> {
+    prefill_pairs(entries, max_model_len).map_err(|reason| format!("back pass: {reason}"))
+}
+
+/// The deferred back pass of a one-group input, as `(query, context)` pairs.
+pub(crate) fn group_back_pairs(
+    input: &UnifiedArchInput,
+    max_model_len: u32,
+) -> Result<Option<Vec<(u32, u32)>>, String> {
+    match &input.back_pass {
+        None => Ok(None),
+        Some(groups) if groups.len() == input.groups.len() => {
+            back_pairs(&groups[0], max_model_len).map(Some)
+        }
+        Some(groups) => Err(format!(
+            "back pass has {} groups, the batch {}",
+            groups.len(),
+            input.groups.len()
+        )),
+    }
 }
 
 /// Decode requests as one-token attention rows: a request of `q` rows ending
@@ -1902,6 +2163,7 @@ pub(crate) fn layer_input(
             full_graph,
             mhc_overlap: mhc_overlap_live(full_graph, rows),
             write_kv_only: false,
+            kv_written: false,
         },
     }
 }
@@ -1909,13 +2171,24 @@ pub(crate) fn layer_input(
 /// Normalize a step: graph mode and padded rows, the replay batch
 /// ([`BoundedReplay`]), and the attention batches. `uniform_query_len` is 1
 /// without speculation and the verify width with it.
+///
+/// With a deferred back pass (`back`, `(query, context)` pairs) every step
+/// that prefills or carries stashed rows splits at the cut: the step's own
+/// rows (and decodes) run up to it, the cut layer's `write_kv` runs on them,
+/// and the later layers run on the stashed rows plus the decodes, padded as a
+/// replay batch. A step with neither is an ordinary decode step.
 pub(crate) fn normalize_step(
     graphs: &DeepseekV41CudaGraphs,
     step: &DeepseekV41Step,
     uniform_query_len: u32,
     logits_rows: u32,
     replay: Option<&BoundedReplay>,
+    back: Option<&[(u32, u32)]>,
 ) -> NormalizedInput {
+    if let Some(back) = back.filter(|back| !back.is_empty() || !step.prefill.is_empty()) {
+        let rule = replay.expect("a deferred back pass needs the bounded-replay cut");
+        return normalize_deferred(graphs, step, uniform_query_len, rule, back);
+    }
     let query_lens: Vec<u32> = step
         .prefill
         .iter()
@@ -1934,6 +2207,46 @@ pub(crate) fn normalize_step(
         full,
         replay,
         logits_rows,
+        deferred: false,
+    }
+}
+
+/// [`normalize_step`] with a deferred back pass: the front batch is the
+/// step's own rows (none on a back-only step), the late batch the stashed
+/// rows plus the decodes (none when the stash is held), and each back entry
+/// and decode row owns one logits row.
+fn normalize_deferred(
+    graphs: &DeepseekV41CudaGraphs,
+    step: &DeepseekV41Step,
+    uniform_query_len: u32,
+    rule: &BoundedReplay,
+    back: &[(u32, u32)],
+) -> NormalizedInput {
+    let query_lens: Vec<u32> = step
+        .prefill
+        .iter()
+        .chain(&step.decode)
+        .map(|&(q, _)| q)
+        .collect();
+    let (mode, rows) = if query_lens.is_empty() {
+        (GraphMode::Eager, 0)
+    } else {
+        graphs.step_graph(&query_lens, uniform_query_len)
+    };
+    let full = layer_input(mode, rows, step.prefill.clone(), &step.decode);
+    let kept = back.iter().map(|&(q, _)| q).sum::<u32>()
+        + step.decode.iter().map(|&(q, _)| q.min(rule.window)).sum::<u32>();
+    let late_rows = match kept {
+        0 => 0,
+        kept => graphs.replay_rows(kept, rule.window),
+    };
+    let late = layer_input(GraphMode::Piecewise, late_rows, back.to_vec(), &step.decode);
+    NormalizedInput {
+        mode,
+        full,
+        replay: Some(late),
+        logits_rows: back.len() as u32 + step.decode.iter().map(|&(q, _)| q).sum::<u32>(),
+        deferred: true,
     }
 }
 
@@ -2439,6 +2752,7 @@ mod tests {
             &UnifiedArchInput {
                 groups: vec![ArchGroupInput::default(), ArchGroupInput::default()],
                 tokens_per_source_rank: vec![],
+                back_pass: None,
             },
             None,
         )
@@ -2515,7 +2829,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 106), (6, 10)],
         };
-        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None);
+        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None, None);
         assert_eq!((input.mode, input.full.rows), (GraphMode::Full, 12));
         assert_eq!(
             input.full.attention.decode_kv_lens,
@@ -2527,7 +2841,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 50); 3],
         };
-        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None);
+        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None, None);
         assert_eq!(input.full.rows, 18);
         assert!(!input.full.attention.mhc_overlap);
         // PIECEWISE steps never take it.
@@ -2590,6 +2904,7 @@ mod tests {
         UnifiedArchInput {
             groups: vec![group(prefill, decode)],
             tokens_per_source_rank: vec![],
+            back_pass: None,
         }
     }
 
@@ -2604,6 +2919,7 @@ mod tests {
             1,
             step.request_count(),
             replay,
+            None,
         ))
     }
 

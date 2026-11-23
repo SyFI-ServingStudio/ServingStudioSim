@@ -86,6 +86,9 @@ pub struct TokenCorpus {
     /// same arch under another backend -- binds its own sampling parameters to
     /// bytes that are already read and already validated.
     ids: Arc<Vec<u16>>,
+    /// Draws take their windows from tokens `[0, sample_end)`; the rest is
+    /// held out (see [`Self::held_out`]).
+    sample_end: usize,
 }
 
 /// Summarised rather than derived: `ids` holds one entry per recorded
@@ -225,6 +228,7 @@ impl TokenCorpusConfig {
         Ok(TokenCorpus {
             config: self.clone(),
             ids: Arc::new(ids),
+            sample_end: self.num_tokens,
         })
     }
 }
@@ -245,6 +249,7 @@ impl TokenCorpus {
         Ok(Self {
             config: config.clone(),
             ids,
+            sample_end: config.num_tokens,
         })
     }
 
@@ -304,7 +309,12 @@ impl TokenCorpus {
 
     /// The start of the next `take`-token window, advancing `state`.
     fn window_start(&self, state: &mut u64, take: usize) -> usize {
-        let bound = (self.config.num_tokens - take + 1) as u64;
+        assert!(
+            take <= self.sample_end,
+            "a {take}-token window does not fit the {} sampled tokens",
+            self.sample_end
+        );
+        let bound = (self.sample_end - take + 1) as u64;
         // Unbiased bounded SplitMix64. Starts are drawn with replacement,
         // and a window may cross the seam between two concatenated
         // requests; both are properties of the recorded corpus, not of the
@@ -390,13 +400,78 @@ impl TokenCorpus {
         experts_per_rank: usize,
         draw: u32,
     ) -> Vec<Vec<u32>> {
+        self.candidates_ascending_by(token_counts, draw, |counts| {
+            fold_layerwise_expert_counts(counts, experts_per_rank)
+        })
+    }
+
+    /// Candidate `draw`'s per-layer histograms at each of `token_counts`
+    /// (ascending), each reduced by `fold`: [`Self::candidates_ascending`]
+    /// with the caller's fold, for a consumer that places experts first.
+    pub(super) fn candidates_ascending_by<T>(
+        &self,
+        token_counts: &[u32],
+        draw: u32,
+        fold: impl FnMut(&[Vec<u32>]) -> T,
+    ) -> Vec<T> {
         let seed = self
             .config
             .seed
             .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
-        self.sample_layer_counts_ascending(token_counts, seed, |counts| {
-            fold_layerwise_expert_counts(counts, experts_per_rank)
-        })
+        self.sample_layer_counts_ascending(token_counts, seed, fold)
+    }
+
+    /// The corpus split for a placement that rebalances from history: draws
+    /// keep the first half of the recorded tokens, and the second half is the
+    /// history, so a batch is never priced on a placement built from itself.
+    /// The corpus is stored request by request, so the halves are (up to the
+    /// one request that straddles the split) disjoint requests.
+    pub(super) fn held_out(&self) -> (Self, std::ops::Range<usize>) {
+        let split = self.config.num_tokens / 2;
+        (
+            Self {
+                config: self.config.clone(),
+                ids: Arc::clone(&self.ids),
+                sample_end: split,
+            },
+            split..self.config.num_tokens,
+        )
+    }
+
+    /// Per layer of the slice, the expert counts of consecutive `step_tokens`
+    /// windows of `range` (a trailing partial window dropped; the whole range
+    /// as one step when it is shorter than one window): the per-step history
+    /// an EPLB policy rebalances from.
+    pub(super) fn layer_step_loads(
+        &self,
+        range: std::ops::Range<usize>,
+        step_tokens: usize,
+    ) -> Vec<Vec<Vec<f64>>> {
+        let config = &self.config;
+        let len = range.len();
+        let (steps, width) = if step_tokens == 0 || step_tokens > len {
+            (1, len)
+        } else {
+            (len / step_tokens, step_tokens)
+        };
+        config
+            .layers()
+            .map(|layer| {
+                (0..steps)
+                    .map(|step| {
+                        let mut row = vec![0.0f64; config.num_experts];
+                        let start = range.start + step * width;
+                        for token in start..start + width {
+                            let offset = (token * config.num_layers + layer) * config.top_k;
+                            for &expert in &self.ids[offset..offset + config.top_k] {
+                                row[expert as usize] += 1.0;
+                            }
+                        }
+                        row
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }
 

@@ -243,6 +243,10 @@ where
     fn status(&self) -> WorkerStatus {
         IterBatchWorker::status(self)
     }
+
+    fn retained_prefix_tokens(&self, session_input: crate::common::SessionInput) -> u32 {
+        self.kv_store.retained_prefix_tokens(session_input)
+    }
 }
 
 #[cfg(test)]

@@ -144,6 +144,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_mxfp8",
         "flashinfer_mxfp8_prequantized",
         "flashinfer_cutedsl_bf16",
+        "deepgemm_mxfp8",
     }
 
 
@@ -1505,8 +1506,8 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
 
     captured: dict[str, object] = {}
 
-    def fake_subprocess_run(cmd, *, env, capture_output, text, check):
-        del capture_output, text, check
+    def fake_subprocess_run(cmd, *, env, capture_output, text, check, timeout):
+        del capture_output, text, check, timeout
         captured["cmd"] = cmd
         captured["env"] = env
         output_path = Path(cmd[cmd.index("--worker-output") + 1])
@@ -1586,6 +1587,7 @@ def test_run_profile_batch_rejects_invalid_gpu_count():
 def test_documented_profile_env_registry_complete():
     expected_envs = {
         "causal_conv1d_env",
+        "deepinfer_env",
         "default_env",
         "flashinfer_pip_env",
         "flashinfer_kda_env",

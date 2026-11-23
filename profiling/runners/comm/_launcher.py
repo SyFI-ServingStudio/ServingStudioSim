@@ -50,29 +50,24 @@ class TorchMpLauncher(MultiGpuLauncher):
         except ImportError as exc:
             raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
 
-        ctx = mp.get_context("spawn")
-        result_queue = ctx.SimpleQueue()
-        try:
-            mp.spawn(
-                _torch_mp_entry,
-                args=(
-                    self.num_gpus,
-                    self.backend,
-                    self.master_addr,
-                    self.master_port,
-                    per_rank_fn,
-                    kwargs,
-                    result_queue,
-                ),
-                nprocs=self.num_gpus,
-                join=True,
-            )
-        except Exception as exc:
-            raise KernelLaunchFailed(str(exc)) from exc
-
-        if result_queue.empty():
+        received, error = _spawn_and_collect(
+            mp,
+            _torch_mp_entry,
+            (
+                self.num_gpus,
+                self.backend,
+                self.master_addr,
+                self.master_port,
+                per_rank_fn,
+                kwargs,
+            ),
+            self.num_gpus,
+        )
+        if error is not None:
+            raise KernelLaunchFailed(str(error)) from error
+        if not received:
             return None
-        ok, payload = result_queue.get()
+        ok, payload = received[0]
         if not ok:
             raise KernelLaunchFailed(str(payload))
         return payload
@@ -106,28 +101,17 @@ class NvshmemLauncher(MultiGpuLauncher):
         except ImportError as exc:
             raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
 
-        ctx = mp.get_context("spawn")
-        result_queue = ctx.SimpleQueue()
-        try:
-            mp.spawn(
-                _nvshmem_mp_entry,
-                args=(
-                    self.num_gpus,
-                    self.master_addr,
-                    self.master_port,
-                    per_rank_fn,
-                    kwargs,
-                    result_queue,
-                ),
-                nprocs=self.num_gpus,
-                join=True,
-            )
-        except Exception as exc:
-            raise KernelLaunchFailed(str(exc)) from exc
-
-        if result_queue.empty():
+        received, error = _spawn_and_collect(
+            mp,
+            _nvshmem_mp_entry,
+            (self.num_gpus, self.master_addr, self.master_port, per_rank_fn, kwargs),
+            self.num_gpus,
+        )
+        if error is not None:
+            raise KernelLaunchFailed(str(error)) from error
+        if not received:
             return None
-        ok, payload = result_queue.get()
+        ok, payload = received[0]
         if not ok:
             raise KernelLaunchFailed(str(payload))
         return payload
@@ -198,35 +182,61 @@ def _spawn_vllm_ranks(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
 
+    received, error = _spawn_and_collect(
+        mp,
+        entry,
+        (launcher.num_gpus, launcher.master_addr, launcher.master_port, per_rank_fn, kwargs),
+        launcher.num_gpus,
+    )
+    for ok, error_kind, payload in received:
+        if not ok:
+            _raise_remote_error(error_kind, payload)
+    if error is not None:
+        raise KernelLaunchFailed(str(error)) from error
+    if not received:
+        raise KernelLaunchFailed(f"{group} returned no result")
+    return received[0][2]
+
+
+#: How often the parent drains the result queue while its ranks run.
+_RESULT_POLL_S = 0.1
+
+
+def _spawn_and_collect(
+    mp: Any,
+    entry: Callable[..., None],
+    args: tuple[Any, ...],
+    nprocs: int,
+) -> tuple[list[Any], BaseException | None]:
+    """Spawn ``entry(rank, *args, result_queue)`` on ``nprocs`` ranks.
+
+    Returns every item the ranks put on the queue, in arrival order, and the
+    error ``join`` raised (``None`` when every rank exited cleanly).
+
+    The queue is drained while the ranks run, never only after they are
+    joined: it is an OS pipe, so a rank whose pickled result is larger than
+    the pipe buffer (64 KiB on Linux) blocks in ``put`` until somebody reads,
+    and a parent that joins first then waits forever on a rank that waits on
+    it. A 2720-spec mega MoE chunk (about 130 KB of results) hung that way
+    (``wt-dsv41-deepinfer/logs/20261115_15_hang_rootcause``).
+    """
     context = mp.get_context("spawn")
     result_queue = context.SimpleQueue()
-    try:
-        mp.spawn(
-            entry,
-            args=(
-                launcher.num_gpus,
-                launcher.master_addr,
-                launcher.master_port,
-                per_rank_fn,
-                kwargs,
-                result_queue,
-            ),
-            nprocs=launcher.num_gpus,
-            join=True,
-        )
-    except Exception as exc:
-        if not result_queue.empty():
-            ok, error_kind, payload = result_queue.get()
-            if not ok:
-                _raise_remote_error(error_kind, payload)
-        raise KernelLaunchFailed(str(exc)) from exc
+    received: list[Any] = []
 
-    if result_queue.empty():
-        raise KernelLaunchFailed(f"{group} returned no result")
-    ok, error_kind, payload = result_queue.get()
-    if not ok:
-        _raise_remote_error(error_kind, payload)
-    return payload
+    def drain() -> None:
+        while not result_queue.empty():
+            received.append(result_queue.get())
+
+    try:
+        processes = mp.spawn(entry, args=(*args, result_queue), nprocs=nprocs, join=False)
+        while not processes.join(timeout=_RESULT_POLL_S):
+            drain()
+    except Exception as exc:
+        drain()
+        return received, exc
+    drain()
+    return received, None
 
 
 def _vllm_tp_group_entry(

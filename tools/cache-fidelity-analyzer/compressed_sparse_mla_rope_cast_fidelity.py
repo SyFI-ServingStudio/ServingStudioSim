@@ -9,7 +9,8 @@ this file only places physical probes and compares.
 The probes target the DeepSeek-V4.1 default `max_model_len` (1048576): prefill
 chunks at contexts between the gather-area planes (200K..900K), a two-request
 chunk, chunks at 1M, and decode at 1M context (decode keys saturate, so these
-check that the cache is flat in context).
+check that the cache is flat in context). The kind's rows carry no
+`max_model_len`; it only bounds the probe contexts here.
 
 Two stages, run from the repo root under uv on a B200 node:
 
@@ -56,9 +57,6 @@ _DIMS = {
     "num_heads": 64,
     "head_dim": 512,
     "rope_dim": 64,
-    "max_model_len": MAX_MODEL_LEN,
-    "max_num_batched_tokens": 2048,
-    "prefill_chunk_size": 4,
     "q_dtype": "bf16",
     "swa_cache_format": "mxfp8",
     "output_dtype": "fp8_e4m3",
@@ -69,9 +67,7 @@ SWAPAB = "swapab_cutedsl"
 SWAPAB_HEADS = 16
 
 
-def config(
-    mode: str, ratio: int, backend: str = BACKEND, max_model_len: int = MAX_MODEL_LEN
-) -> dict:
+def config(mode: str, ratio: int, backend: str = BACKEND) -> dict:
     swapab = backend == SWAPAB
     return {
         "backends": [backend],
@@ -81,7 +77,6 @@ def config(
         "compressed_cache_format": "none" if ratio == 0 else "nvfp4",
         **_DIMS,
         "num_heads": SWAPAB_HEADS if swapab else _DIMS["num_heads"],
-        "max_model_len": max_model_len,
     }
 
 
@@ -132,7 +127,7 @@ def stage_probes(out: Path, backend: str) -> None:
     probes, specs = [], []
     if backend == SWAPAB:
         for ratio, mml in swapab_configs():
-            cfg = config("decode", ratio, SWAPAB, mml)
+            cfg = config("decode", ratio, SWAPAB)
             dims = {k: v for k, v in cfg.items() if k not in cf._NON_DIM_KEYS}
             for pairs, region in swapab_probes(ratio, mml):
                 probes.append(
@@ -191,7 +186,7 @@ def stage_report(out: Path, truth_path: Path, sim_bin: str, backend: str) -> Non
             if p["mode"] == mode and p["ratio"] == ratio and p.get("mml", MAX_MODEL_LEN) == mml
         ]
         points = [{"query_context_pairs": probes[i]["pairs"]} for i in idx]
-        results = cf.eval_kind(sim_bin, KIND, config(mode, ratio, backend, mml), points)
+        results = cf.eval_kind(sim_bin, KIND, config(mode, ratio, backend), points)
         for i, r in zip(idx, results):
             t = truth[i]
             tms = t.get("metrics", {}).get("time_ms") if t.get("status") == "ok" else None

@@ -492,6 +492,7 @@ class CuptiKernelProfiler:
         *,
         device: int | str | Any = "cuda",
         clear_l2_bytes: int | None = None,
+        include_memcpy: bool = False,
     ) -> None:
         torch_mod = _require_torch()
         if not torch_mod.cuda.is_available():
@@ -502,6 +503,8 @@ class CuptiKernelProfiler:
             raise ValueError(f"Expected a CUDA device, got {self.device}")
 
         self._profiler = _get_extension().CuptiKernelActivityProfiler()
+        # Also record copy-engine memcpys (named ``memcpy_DtoD`` etc.) as launches.
+        self.include_memcpy = include_memcpy
         self.clear_l2_bytes = (
             default_l2_flush_bytes(self.device) if clear_l2_bytes is None else clear_l2_bytes
         )
@@ -546,7 +549,7 @@ class CuptiKernelProfiler:
         if clear_l2_before_run:
             self.clear_l2_cache()
 
-        self._profiler.start()
+        self._profiler.start(include_memcpy=self.include_memcpy)
         self._run_launch_burst(
             fn,
             launches_per_run=launches_per_run,
@@ -962,8 +965,11 @@ def profile_kernel(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
+    include_memcpy: bool = False,
 ) -> KernelProfileSummary:
-    profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
+    profiler = CuptiKernelProfiler(
+        device=device, clear_l2_bytes=clear_l2_bytes, include_memcpy=include_memcpy
+    )
     return profiler.profile(
         fn,
         num_warmup=num_warmup,
@@ -992,8 +998,11 @@ def profile_kernel_until_converged(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
+    include_memcpy: bool = False,
 ) -> KernelProfileSummary:
-    profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
+    profiler = CuptiKernelProfiler(
+        device=device, clear_l2_bytes=clear_l2_bytes, include_memcpy=include_memcpy
+    )
     return profiler.profile_until_converged(
         fn,
         num_warmup=num_warmup,
@@ -1025,8 +1034,11 @@ def profile_kernel_for_duration(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
+    include_memcpy: bool = False,
 ) -> KernelProfileSummary:
-    profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
+    profiler = CuptiKernelProfiler(
+        device=device, clear_l2_bytes=clear_l2_bytes, include_memcpy=include_memcpy
+    )
     return profiler.profile_for_duration(
         fn,
         num_warmup=num_warmup,

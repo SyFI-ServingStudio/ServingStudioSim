@@ -264,6 +264,7 @@ class Timer:
         kernel_name: str | None = None,
         clear_l2: bool = True,
         interval_union: bool = False,
+        include_memcpy: bool = False,
     ) -> float:
         """Return average kernel-only runtime in milliseconds using CUPTI.
 
@@ -284,6 +285,8 @@ class Timer:
         ``min_rep`` is a launch-count floor and ``max_rep`` caps the formal
         launch count when the active-time estimate asks for more repetitions.
         Pass ``rep`` for the fixed-count median-of-three path instead.
+        ``include_memcpy=True`` also counts copy-engine memcpy records (named
+        ``memcpy_DtoD`` etc.), for a callable whose work is a ``cudaMemcpyAsync``.
 
         When a ``MeasureContext`` is active (only ever set by ``python -m profiling
         measure``), this call is diverted to a sustained trend+telemetry capture
@@ -308,6 +311,8 @@ class Timer:
             )
         cupti = _load_cupti_module()
         duration_kwargs = {"interval_union": True} if interval_union else {}
+        if include_memcpy:
+            duration_kwargs["include_memcpy"] = True
 
         if rep is not None:
             if rep <= 0:

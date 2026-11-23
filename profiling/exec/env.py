@@ -198,6 +198,15 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
         isolated_site_packages=True,
     ),
+    # The DeepInfer reference engine (reference_engines/deepinfer): its own venv with the
+    # DeepGEMM/DeepEP/FlashMLA/DeepSelect builds DeepInfer vendors. It exists only in its
+    # image (DeepInfer publishes none and nothing installs it on a host), so this host
+    # entry names the image's interpreter and runs only under the in-image runtime.
+    "deepinfer_env": ProfileEnv(
+        "deepinfer_env",
+        Path("/opt/deepinfer-venv/bin/python"),
+        isolated_site_packages=True,
+    ),
 }
 
 

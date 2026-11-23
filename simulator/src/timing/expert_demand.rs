@@ -18,7 +18,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use super::routing::{sample_and_fold_layerwise_topk_expert_counts, RoutingDistribution};
+use super::expert_placement::{LayerSlots, SlotPlacement};
+use super::routing::{
+    fold_layerwise_expert_counts, sample_and_fold_layerwise_topk_expert_counts,
+    sample_layerwise_topk_expert_counts, RoutingDistribution,
+};
 use super::token_corpus::{select_candidate, TokenCorpus, TokenCorpusConfig};
 
 /// The seed every demand source folds at, so a profiled shape is reproducible.
@@ -118,6 +122,20 @@ impl ExpertDemand {
         // MTP slice) binds the same file, and `prepare` reads it again later.
         load_cached(&config).context("reading the token corpus payload")?;
         Ok(Self::Corpus(config))
+    }
+
+    /// The same source drawn in contiguous runs of `group_size` tokens (a
+    /// corpus binding's segment length); a marginal has no token order and
+    /// is returned unchanged.
+    pub fn with_group_size(&self, group_size: u32) -> Self {
+        match self {
+            Self::Popularity { .. } => self.clone(),
+            Self::Corpus(config) => {
+                let mut config = config.clone();
+                config.group_size = group_size;
+                Self::Corpus(config)
+            }
+        }
     }
 
     /// Expert count this source produces histograms over, so a consumer can
@@ -348,6 +366,207 @@ impl ExpertDemand {
             .collect())
     }
 }
+
+/// Placed whole-group histograms already drawn this process, per demand
+/// source, `top_k`, placement and EP width, then per global token count.
+type SlotKey = (ExpertDemand, u32, SlotPlacement, usize);
+type SlotCache = Mutex<HashMap<SlotKey, HashMap<u32, Arc<Vec<u32>>>>>;
+static SLOTTED: OnceLock<SlotCache> = OnceLock::new();
+
+impl ExpertDemand {
+    /// The per-slot row counts of the whole EP group at each global token
+    /// count, for a kernel that runs every rank at once (DeepGEMM mega MoE).
+    ///
+    /// Each layer's draw is placed on that layer's slots ([`SlotPlacement`],
+    /// laid out from the layer's long-run load: the per-layer marginal, or the
+    /// whole corpus), then the layers fold as in [`Self::per_expert_batches`]
+    /// with one rank's slots as the shard: slots sorted within a rank, ranks
+    /// heaviest first. The result is `placement.num_slots(E)` long; rank `r`
+    /// is the `r`-th run of `num_slots / ep_size`.
+    pub fn per_slot_batches(
+        &self,
+        top_k: u32,
+        global_token_counts: &[u32],
+        placement: SlotPlacement,
+        ep_size: usize,
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        let num_slots = placement.num_slots(self.num_experts());
+        anyhow::ensure!(
+            ep_size > 0 && num_slots % ep_size == 0,
+            "{num_slots} slots must split over {ep_size} ranks"
+        );
+        if global_token_counts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots_per_rank = num_slots / ep_size;
+        let key = (self.clone(), top_k, placement, ep_size);
+        let cache = SLOTTED.get_or_init(Default::default);
+        let mut missing: Vec<u32> = {
+            let cache = cache.lock().expect("slot demand cache");
+            let known = cache.get(&key);
+            global_token_counts
+                .iter()
+                .copied()
+                .filter(|n| known.is_none_or(|known| !known.contains_key(n)))
+                .collect()
+        };
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            let drawn = self.draw_slotted(top_k, &missing, placement, ep_size, slots_per_rank)?;
+            let mut cache = cache.lock().expect("slot demand cache");
+            let known = cache.entry(key.clone()).or_default();
+            for (n, folded) in missing.into_iter().zip(drawn) {
+                known.insert(n, Arc::new(folded));
+            }
+        }
+        let cache = cache.lock().expect("slot demand cache");
+        let known = &cache[&key];
+        Ok(global_token_counts
+            .iter()
+            .map(|n| known[n].as_ref().clone())
+            .collect())
+    }
+
+    fn draw_slotted(
+        &self,
+        top_k: u32,
+        token_counts: &[u32],
+        placement: SlotPlacement,
+        ep_size: usize,
+        slots_per_rank: usize,
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        let place_and_fold = |layouts: &[LayerSlots], layers: &[Vec<u32>]| {
+            let placed: Vec<Vec<u32>> = layouts
+                .iter()
+                .zip(layers)
+                .map(|(layout, counts)| layout.place(counts))
+                .collect();
+            fold_layerwise_expert_counts(&placed, slots_per_rank)
+        };
+        if let SlotPlacement::ForcedBalance { .. } = placement {
+            let num_slots = placement.num_slots(self.num_experts());
+            let uniform = vec![RoutingDistribution::uniform(num_slots as u32).ppm().to_vec()];
+            return Ok(parallel_by_cost(
+                &token_counts.iter().map(|&n| u64::from(n)).collect::<Vec<_>>(),
+                |index| {
+                    let layers = sample_layerwise_topk_expert_counts(
+                        &uniform,
+                        top_k,
+                        token_counts[index],
+                        FOLD_SEED,
+                    );
+                    fold_layerwise_expert_counts(&layers, slots_per_rank)
+                },
+            ));
+        }
+        Ok(match self.prepare()? {
+            PreparedDemand::Popularity(layerwise_global_ppm) => {
+                // A marginal is its own long-run history: one step per layer.
+                let layouts: Vec<LayerSlots> = layerwise_global_ppm
+                    .iter()
+                    .map(|ppm| {
+                        let load: Vec<f64> = ppm.iter().map(|&p| f64::from(p)).collect();
+                        placement.layout(&[load], ep_size)
+                    })
+                    .collect();
+                parallel_by_cost(
+                    &token_counts
+                        .iter()
+                        .map(|&n| u64::from(n))
+                        .collect::<Vec<_>>(),
+                    |index| {
+                        let layers = sample_layerwise_topk_expert_counts(
+                            layerwise_global_ppm,
+                            top_k,
+                            token_counts[index],
+                            FOLD_SEED,
+                        );
+                        place_and_fold(&layouts, &layers)
+                    },
+                )
+            }
+            PreparedDemand::Corpus(corpus) => {
+                // Draws come from one half of the corpus and the placement's
+                // history from the other: steps the size of the priced batch,
+                // as many as DeepInfer's expert-count window keeps.
+                let (sampled, history) = corpus.held_out();
+                let layouts: Vec<Vec<LayerSlots>> = parallel_by_cost(
+                    &vec![1; token_counts.len()],
+                    |index| {
+                        let step = token_counts[index] as usize;
+                        let window = history.start
+                            ..history
+                                .end
+                                .min(history.start + step.saturating_mul(EPLB_WINDOW_STEPS));
+                        corpus
+                            .layer_step_loads(window, step)
+                            .iter()
+                            .map(|steps| placement.layout(steps, ep_size))
+                            .collect()
+                    },
+                );
+                let draws = sampled.sampling_candidates() as usize;
+                let mut per_draw = parallel_by_cost(&vec![1; draws], |draw| {
+                    let mut index = 0;
+                    sampled
+                        .candidates_ascending_by(token_counts, draw as u32, |layers| {
+                            let folded = place_and_fold(&layouts[index], layers);
+                            index += 1;
+                            folded
+                        })
+                        .into_iter()
+                });
+                token_counts
+                    .iter()
+                    .map(|_| {
+                        select_candidate(
+                            per_draw
+                                .iter_mut()
+                                .map(|draw| draw.next().expect("one candidate per count"))
+                                .collect(),
+                            slots_per_rank,
+                        )
+                    })
+                    .collect()
+            }
+        })
+    }
+
+    /// This demand at one layer of its routed-layer axis: a corpus binding
+    /// narrowed to that layer, or that layer's marginal (a single-row marginal
+    /// stands for every layer).
+    pub fn layer(&self, layer: usize) -> anyhow::Result<Self> {
+        Ok(match self {
+            Self::Popularity {
+                layerwise_global_ppm,
+            } => {
+                let row = if layerwise_global_ppm.len() == 1 { 0 } else { layer };
+                let ppm = layerwise_global_ppm
+                    .get(row)
+                    .with_context(|| format!("no marginal for layer {layer}"))?;
+                Self::Popularity {
+                    layerwise_global_ppm: vec![ppm.clone()],
+                }
+            }
+            Self::Corpus(config) => {
+                let start = config.layer_start + layer;
+                anyhow::ensure!(
+                    start < config.layer_end,
+                    "layer {layer} is outside the corpus binding's layers"
+                );
+                let mut config = config.clone();
+                config.layer_start = start;
+                config.layer_end = start + 1;
+                Self::Corpus(config)
+            }
+        })
+    }
+}
+
+/// DeepInfer's EPLB history window in steps (`DEEPINFER_EXPERT_COUNT_WINDOW_SIZE`
+/// default, `environ.py`).
+const EPLB_WINDOW_STEPS: usize = 100;
 
 /// Upper bound on sampling threads. Enough to hide a corpus sweep behind the
 /// rest of the build without taking a shared host's cores from concurrent runs.

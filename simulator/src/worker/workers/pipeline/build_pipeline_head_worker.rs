@@ -4,15 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::kv_layout::KvCacheLayout;
+use crate::arch::kv_layout::{KvCacheLayout, PipelineKvShares};
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::kv::{BalancedRetention, RetainedScale};
+use crate::worker::shared::back_stash::{back_window, BackProbe, BackStash};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    kv_cache_store_with_retained_scale, prefill_chunk_end_quantum, prepare_iter_build_essentials,
     resolve_kv_accounting, with_host_tiers,
 };
 
@@ -35,12 +37,49 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     stage_model: Arc<M>,
     layout: PipelineLayout,
     kv_cache_layout: &KvCacheLayout,
+    kv_shares: &PipelineKvShares,
     requests: SharedRequests,
     config: WorkerConfig,
     cost_log_dir: Option<PathBuf>,
     pool: PoolId,
     gpu_name: &str,
     cluster: SharedGpuCluster,
+) -> PipelineHead<M> {
+    build_pipeline_head_worker_with_back(
+        id,
+        pool_tag,
+        stage_model,
+        layout,
+        kv_cache_layout,
+        kv_shares,
+        requests,
+        config,
+        cost_log_dir,
+        pool,
+        gpu_name,
+        cluster,
+        None,
+    )
+}
+
+/// [`build_pipeline_head_worker`] with the whole pipeline's back-pass probe,
+/// used when `config.back_batching` is set (see
+/// [`crate::worker::shared::back_stash`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_pipeline_head_worker_with_back<M: IterwiseUnifiedModel>(
+    id: WorkerId,
+    pool_tag: &'static str,
+    stage_model: Arc<M>,
+    layout: PipelineLayout,
+    kv_cache_layout: &KvCacheLayout,
+    kv_shares: &PipelineKvShares,
+    requests: SharedRequests,
+    config: WorkerConfig,
+    cost_log_dir: Option<PathBuf>,
+    pool: PoolId,
+    gpu_name: &str,
+    cluster: SharedGpuCluster,
+    back_probe: Option<BackProbe>,
 ) -> PipelineHead<M> {
     let max_batch_tokens = config
         .max_batch_tokens
@@ -80,13 +119,21 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         cluster
             .borrow_mut()
             .register_comm_group(essentials.allocation_base, 1, pool_tag, id.0);
-    let kv_store = kv_cache_store(
+    let balanced = config.balanced_retention.map(|spec| {
+        let balanced =
+            BalancedRetention::resolve(kv_cache_layout, kv_shares, kv_accounting.options(), spec)
+                .unwrap_or_else(|error| panic!("balanced retention: {error:#}"));
+        tracing::info!(worker = id.0, ?balanced, "pipeline head balanced retention");
+        balanced
+    });
+    let kv_store = kv_cache_store_with_retained_scale(
         kv_accounting,
         1,
         1,
         &config,
         essentials.sampler,
         prefix_cache_logger,
+        balanced.map_or(RetainedScale::ONE, |balanced| balanced.scale()),
     );
     let kv_store = with_host_tiers(
         kv_store,
@@ -106,6 +153,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         None => admission,
     }
     .with_microbatch_budget(config.microbatch_budget, layout.depth)
+    .with_budget_tally(id.0)
     .with_started_order(config.started_order);
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
@@ -113,19 +161,44 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if let Some(schedule) = config.force_schedule {
         admission = admission.with_force_schedule(schedule);
     }
+    if let Some(rank) = config.prefill_rank {
+        admission = admission.with_prefill_rank(rank);
+    }
     if let Some(read_wait) = config.prefix_tier_read_wait {
         admission = admission.with_read_wait(read_wait);
     }
     if config.external_decode {
         admission = admission.with_external_decode();
     }
+    if let Some(spec) = config.back_batching {
+        let probe = back_probe.expect("back batching on a pipeline needs the pipeline's probe");
+        admission = admission.with_back_stash(BackStash::new(
+            spec,
+            stage_model
+                .back_pass_window()
+                .unwrap_or_else(|| back_window(kv_cache_layout)),
+            1,
+            probe,
+        ));
+    }
+    if let Some(balanced) = balanced {
+        admission = admission.with_balanced_retention(balanced, id.0);
+    }
 
-    PipelineHeadWorker::from_components(
+    let head = PipelineHeadWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         UnifiedIterExecution::new(stage_model, essentials.cost),
-        layout,
+        // The head's in-flight window; `depth` itself stays the stage count.
+        PipelineLayout {
+            depth: layout.depth + config.pipeline_extra_in_flight,
+            ..layout
+        },
         send_gid,
-    )
+    );
+    match config.back_batching.is_some() && config.pipeline_split_back {
+        true => head.with_split_back(),
+        false => head,
+    }
 }

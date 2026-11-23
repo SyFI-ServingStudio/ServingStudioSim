@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use crate::arch::deepseek_v41_engram_fetch::EngramFetch;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -25,33 +26,34 @@ use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark,
-    deepseek_v41_vllm_dspark, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
-    glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
-    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
-    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
-    mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
-    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel,
-    DeepseekV41VllmDsparkModel, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
-    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
-    Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
-    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
-    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
-    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
-    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
+    deepseek_v41_vllm_dspark, deepseek_v41_vllm_pp, deepseek_v4_vllm,
+    glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dp_attn_dsa_moe,
+    glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe, glm53_flash_vllm_fp8_dp_attn_ep_moe,
+    glm53_flash_vllm_fp8_kda_dsa_moe, glm53_flash_vllm_fp8_pp_kda_dsa_moe,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, inkling_vllm_nvfp4_rel_attn_moe, llama3_dense,
+    llama3_dense_tp, llama3_dp_attn_tp_ffn, mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense,
+    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    qwen4_exp_vllm_nvfp4_gdn_qsa_moe, AttnLayerwiseModel, DeepseekV41ModelCfg,
+    DeepseekV41VllmDpDsparkModel, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
+    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
+    FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
+    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
+    Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
+    Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1140,6 +1142,9 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     decoder_swa_bounded_replay: bool,
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
+    deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
+    engram_fetch: EngramFetch,
+    dp_size: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1155,23 +1160,105 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        deepinfer,
+        dp_size,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
         seed: routing_seed,
         num_experts: model_cfg.num_experts,
         experts_per_token: model_cfg.top_k,
-        ep_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16,
+        ep_size: dp_size as u16,
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: model_cfg.num_layers,
     };
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
-    let configs = deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
-        .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    let mut configs =
+        deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding DeepSeek-V4.1-Flash DP/EP architecture configs")?;
+    if !engram_fetch.fetches() {
+        configs.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        let layers = std::iter::once(&mut configs.layer0).chain(configs.bodies.iter_mut());
+        for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+            engram.consumer = false;
+        }
+    }
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
     deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash under plain pipeline parallelism (B200, one
+/// TP1/EP1 GPU per stage). Routed demand is one binding over all 40 routed
+/// layers at EP1, verify width 1.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_pp(
+    model_spec: &ModelSpec,
+    pp_size: u16,
+    layer_partition: &[u32],
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    stage_layers: &str,
+    cut_handoff: deepseek_v41_vllm_pp::CutHandoff,
+    deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
+    engram_fetch: EngramFetch,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<deepseek_v41_vllm_pp::DeepseekV41VllmPpModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = deepseek_v41_vllm_pp::DeepseekV41VllmPpParallel {
+        pp_size,
+        layer_partition: layer_partition.to_vec(),
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        stage_layers: deepseek_v41_vllm_pp::parse_stage_layers(stage_layers)?,
+        cut_handoff,
+        deepinfer,
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let mut configs = deepseek_v41_vllm_pp::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash PP architecture configs")?;
+    if !engram_fetch.fetches() {
+        configs.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        for stage in &mut configs.stages {
+            let layers = stage.layer0.iter_mut().chain(stage.bodies.iter_mut());
+            for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+                engram.consumer = false;
+            }
+        }
+    }
+    let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
+    deepseek_v41_vllm_pp::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash PP model (often a missing profile.db row)")
 }
 
 /// Build DeepSeek-V4.1-Flash + DSpark under DP4 attention + EP4 experts: the
@@ -1189,6 +1276,11 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
     decoder_swa_bounded_replay: bool,
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
+    deepinfer: Option<(
+        deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine,
+        deepseek_v41_vllm_dp_attn_ep_moe_dspark::DflashDeepInfer,
+    )>,
+    engram_fetch: EngramFetch,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1206,6 +1298,8 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         decoder_swa_bounded_replay,
         max_num_batched_tokens,
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        deepinfer: deepinfer.map(|(engine, _)| engine),
+        dp_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE,
     };
     let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
     let (target_demand, draft_demand) = dspark_demands(
@@ -1218,9 +1312,18 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         token_corpus_file,
         draft_tokens,
     )?;
-    let target =
+    let mut target =
         deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &target_demand)
             .context("expanding DeepSeek-V4.1-Flash DP4/EP4 target configs")?;
+    if !engram_fetch.fetches() {
+        target.engram_prefetch = None;
+    }
+    if engram_fetch == EngramFetch::None {
+        let layers = std::iter::once(&mut target.layer0).chain(target.bodies.iter_mut());
+        for engram in layers.filter_map(|layer| layer.engram.as_mut()) {
+            engram.consumer = false;
+        }
+    }
     let configs = deepseek_v41_vllm_dp_attn_ep_moe_dspark::build_configs(
         &model_cfg,
         &dspark,
@@ -1228,6 +1331,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
         target,
         &draft_demand,
         draft_tokens,
+        deepinfer.map(|(_, dflash)| dflash),
     )
     .context("expanding the DP DSpark proposer configs")?;
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe_dspark::resolve_configs(configs);
@@ -2781,6 +2885,52 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::DeepseekV41VllmPp {
+            model,
+            pp_size,
+            layer_partition,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+            stage_layers,
+            cut_handoff,
+            engine,
+            yoco_keep_tokens,
+            engram_fetch,
+            deepinfer_max_num_seqs,
+        } => Box::new(deepseek_v41_vllm_pp(
+            model,
+            *pp_size,
+            layer_partition,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            *decoder_swa_bounded_replay,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
+            stage_layers,
+            *cut_handoff,
+            super::config::deepseek_v41_dp_engine(
+                *engine,
+                0,
+                *yoco_keep_tokens,
+                *engram_fetch,
+                false,
+                0,
+                *deepinfer_max_num_seqs,
+            )?,
+            *engram_fetch,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::DeepseekV41VllmDpAttnEpMoe {
             model,
             routing,
@@ -2791,6 +2941,14 @@ pub fn build_iter_model(
             decoder_swa_bounded_replay,
             max_num_batched_tokens,
             cudagraph_capture_sizes,
+            engine,
+            num_redundant_experts,
+            yoco_keep_tokens,
+            engram_fetch,
+            dp_size,
+            force_load_balance,
+            prefill_chunk_tokens,
+            deepinfer_max_num_seqs,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2801,6 +2959,17 @@ pub fn build_iter_model(
             *decoder_swa_bounded_replay,
             *max_num_batched_tokens,
             cudagraph_capture_sizes,
+            super::config::deepseek_v41_dp_engine(
+                *engine,
+                *num_redundant_experts,
+                *yoco_keep_tokens,
+                *engram_fetch,
+                *force_load_balance,
+                *prefill_chunk_tokens,
+                *deepinfer_max_num_seqs,
+            )?,
+            *engram_fetch,
+            *dp_size,
             gpu,
             name,
             bridge,
@@ -3217,6 +3386,18 @@ pub fn build_speculative_iter_model(
             decoder_swa_bounded_replay,
             max_num_batched_tokens,
             cudagraph_capture_sizes,
+            engine,
+            num_redundant_experts,
+            draft_num_redundant_experts,
+            yoco_keep_tokens,
+            engram_fetch,
+            deepinfer_max_num_seqs,
+            deepinfer_graph_interval,
+            deepinfer_draft_graph_interval,
+            force_load_balance,
+            sampler_top_p,
+            sampler_top_k,
+            sampler_top_logprobs,
         } => Ok((
             Box::new(deepseek_v41_vllm_dp_attn_ep_moe_dspark(
                 model,
@@ -3229,6 +3410,23 @@ pub fn build_speculative_iter_model(
                 *decoder_swa_bounded_replay,
                 *max_num_batched_tokens,
                 cudagraph_capture_sizes,
+                super::config::deepseek_v41_dp_dspark_engine(
+                    *engine,
+                    *num_redundant_experts,
+                    *draft_num_redundant_experts,
+                    *yoco_keep_tokens,
+                    *engram_fetch,
+                    *force_load_balance,
+                    *deepinfer_max_num_seqs,
+                    *deepinfer_graph_interval,
+                    *deepinfer_draft_graph_interval,
+                    crate::arch::deepseek_v41_deepinfer_dflash::DeepInferSampling {
+                        top_p: *sampler_top_p,
+                        top_k: *sampler_top_k,
+                        top_logprobs: *sampler_top_logprobs,
+                    },
+                )?,
+                *engram_fetch,
                 gpu,
                 name,
                 bridge,

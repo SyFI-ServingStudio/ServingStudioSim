@@ -88,6 +88,10 @@ keeping them. The host setups follow.
 site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's
 own build.
 
+`deepinfer_env` has no host setup: DeepInfer publishes no image and nothing installs it on
+a host, so it runs only in its reference-engine image (`just ref build-image deepinfer`),
+under the default container runtime or `VIBESIM_PROFILE_RUNTIME=in-image`.
+
 `flashinfer_kda_env` on the host is a venv at `~/profile_envs/flashinfer_kda` (or a
 symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
 Blackwell KDA prefill kernels are only on its main branch, and they need Torch
@@ -271,6 +275,19 @@ historical results and record the selected database with the experiment.
    shape-dependent ones.
    Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
    spec, and writes JSON results back.
+   Each worker gets `floor + specs × per_spec` seconds of wall clock
+   (`VIBESIM_PROFILE_CHUNK_TIMEOUT_FLOOR_S`, default 900, covers container start,
+   rank init and JIT; `VIBESIM_PROFILE_SPEC_TIMEOUT_S`, default 5). The per-spec
+   bound is 10× the slowest measured: mega MoE fills of 40 chunks × 68 specs
+   (Slurm 22917) and 17 chunks × 431–494 specs (22920) took at most 0.50 s of
+   chunk wall clock per spec, start-up included (about 20 s per chunk). A
+   500-spec chunk thus gets 57 min, inside a 2 h job. Raise either variable for
+   a kernel whose specs are slower. Past it the worker is killed (a container by its name),
+   every spec of the chunk fails with an error naming the chunk's first and last
+   spec and the elapsed time, and the batch goes on with the other chunks.
+   Multi-GPU runners hand rank 0's result back over a pipe; the launcher reads it
+   while the ranks run (`runners/comm/_launcher.py` `_spawn_and_collect`), so a
+   result of any size cannot block the join.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
    rows through `Table.insert`. Failed specs retain their worker error in one

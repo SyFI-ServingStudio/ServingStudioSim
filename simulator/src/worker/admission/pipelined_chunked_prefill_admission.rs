@@ -53,11 +53,21 @@
 //! chunk on a state-checkpoint boundary (vLLM's `_mamba_block_aligned_split`,
 //! which does not change under PP), via the same rule as unified chunked
 //! prefill. One attention partition only.
+//!
+//! Under balanced retention (`with_balanced_retention`, not vLLM) a retained
+//! context lies once over the stages, and a hit first pulls each stage's
+//! copies back with the copy engine (`worker::kv::BalancedRetention`). The
+//! request is admitted as any other, its KV reserved and its prefix taken from
+//! the cache, but its first chunk waits in `copying` until the pull lands.
+//! Pulls run one after another on the pipeline's copy queue and overlap the
+//! stages' compute; a landed request joins the started prompts.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+
+use crate::worker::shared::back_stash::{BackEntry, BackStash};
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::{ChunkedPrefillKv, TieredPrefixKv};
+use crate::worker::kv::{BalancedRetention, ChunkedPrefillKv, TieredPrefixKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
@@ -65,10 +75,11 @@ use crate::worker::types::IterBatchPlan;
 use super::chunked_prefill_admission::ChunkEndAlignment;
 use super::external_decode::ExternalDecode;
 use super::fresh_reads::{AtHead, FreshReads, FreshSource};
-use super::microbatch_budget::MicrobatchBudget;
+use super::microbatch_budget::{BudgetTally, MicrobatchBudget};
 use super::policy::{ForceSchedule, Queued};
 use super::read_wait::ReadWait;
-use super::started_order::{FillPrefillBudget, FreshGate, StartedOrder};
+use super::prefill_rank::{PrefillRank, Rank};
+use super::started_order::{Admitted, FillPrefillBudget, FreshGate, StartedOrder};
 use super::{
     AdmissionCandidate, Deadline, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy,
 };
@@ -85,6 +96,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     budget: MicrobatchBudget,
     /// Microbatches the pipeline holds, which an even split divides the round by.
     depth: u16,
+    /// Per-minute share of full-cap budgets, kept when the budget varies.
+    tally: Option<BudgetTally>,
     /// Order of started prompts against queued ones.
     started_order: StartedOrder,
     /// Where chunks may end, when the engine can only checkpoint recurrent
@@ -106,6 +119,96 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     reads: FreshReads,
     /// The decode runs elsewhere: a request completes at its first token.
     external_decode: Option<ExternalDecode>,
+    /// Back-pass batching (see [`crate::worker::shared::back_stash`]): a
+    /// microbatch's tails enter the stash when it exits, and a later
+    /// microbatch's back pass carries them; the request's first token is
+    /// emitted when that microbatch exits.
+    back: Option<PipelineBack>,
+    /// Balanced retention: hits whose copy-engine pull has not landed.
+    copies: Option<PrefixCopies>,
+}
+
+/// Hits waiting on their pull, and the pipeline's copy queue.
+struct PrefixCopies {
+    balanced: BalancedRetention,
+    /// When the copy queue is free again.
+    free_at: Time,
+    /// Admitted hits in landing order (the queue is FIFO), with when they land.
+    copying: VecDeque<(Time, AdmissionCandidate)>,
+    tally: CopyTally,
+}
+
+/// Per-minute log of the pulls ("prefix copy tally"): count, bytes, and how
+/// long each request waited from admission to the landing.
+#[derive(Default)]
+struct CopyTally {
+    worker: u16,
+    minute: u64,
+    copies: u64,
+    bytes: u64,
+    wait_us_sum: u64,
+    wait_us_max: u64,
+    /// Waits by upper edge [`COPY_WAIT_EDGES_US`], the last bucket open.
+    buckets: [u64; COPY_WAIT_EDGES_US.len() + 1],
+}
+
+const COPY_WAIT_EDGES_US: [u64; 12] = [
+    50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 1_000_000,
+];
+
+impl CopyTally {
+    fn record(&mut self, now: Time, bytes: u64, wait: Time) {
+        let minute = (now.as_ms() / 60_000.0) as u64;
+        if minute != self.minute {
+            self.flush();
+            self.minute = minute;
+        }
+        let wait_us = wait.as_ns() / 1_000;
+        self.copies += 1;
+        self.bytes += bytes;
+        self.wait_us_sum += wait_us;
+        self.wait_us_max = self.wait_us_max.max(wait_us);
+        let bucket = COPY_WAIT_EDGES_US
+            .iter()
+            .position(|&edge| wait_us <= edge)
+            .unwrap_or(COPY_WAIT_EDGES_US.len());
+        self.buckets[bucket] += 1;
+    }
+
+    fn flush(&mut self) {
+        if self.copies > 0 {
+            tracing::info!(
+                worker = self.worker,
+                minute = self.minute,
+                copies = self.copies,
+                bytes = self.bytes,
+                wait_us_sum = self.wait_us_sum,
+                wait_us_max = self.wait_us_max,
+                buckets = ?self.buckets,
+                "prefix copy tally"
+            );
+        }
+        // Field by field: assigning a fresh tally would drop (and flush) this one.
+        self.copies = 0;
+        self.bytes = 0;
+        self.wait_us_sum = 0;
+        self.wait_us_max = 0;
+        self.buckets = [0; COPY_WAIT_EDGES_US.len() + 1];
+    }
+}
+
+impl Drop for CopyTally {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+struct PipelineBack {
+    stash: BackStash,
+    /// Microbatches formed so far.
+    step: u64,
+    /// The requests the microbatch being formed flushes.
+    flushing: Vec<RequestId>,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -122,6 +225,12 @@ pub struct PrefillChunk {
 pub struct MicrobatchTicket {
     chunks: Vec<PrefillChunk>,
     decodes: Vec<RequestId>,
+    /// Back batching: the entries this microbatch's chunks leave, stashed
+    /// when it exits.
+    back_entries: Vec<BackEntry>,
+    /// Back batching: the requests whose tails this microbatch's back pass
+    /// carries, completed when it exits.
+    back_requests: Vec<RequestId>,
 }
 
 impl MicrobatchTicket {
@@ -147,6 +256,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             max_batch_tokens,
             budget: MicrobatchBudget::default(),
             depth: 1,
+            tally: None,
             started_order: StartedOrder::default(),
             chunk_end_alignment: None,
             started_prefills: Vec::new(),
@@ -156,6 +266,42 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             in_flight_prefill_tokens: 0,
             reads: FreshReads::new(1),
             external_decode: None,
+            back: None,
+            copies: None,
+        }
+    }
+
+    /// Store retained contexts once over the stages and pull each hit's
+    /// copies back before its first chunk (`balanced`). Not vLLM.
+    pub(crate) fn with_balanced_retention(
+        mut self,
+        balanced: BalancedRetention,
+        worker: u16,
+    ) -> Self {
+        self.copies = Some(PrefixCopies {
+            balanced,
+            free_at: Time::ZERO,
+            copying: VecDeque::new(),
+            tally: CopyTally {
+                worker,
+                ..CopyTally::default()
+            },
+        });
+        self
+    }
+
+    /// Move the hits whose pull has landed by `now` to the started prompts.
+    fn land_copies(&mut self, now: Time) {
+        let Some(copies) = self.copies.as_mut() else {
+            return;
+        };
+        while copies
+            .copying
+            .front()
+            .is_some_and(|&(ready, _)| ready <= now)
+        {
+            let (_, candidate) = copies.copying.pop_front().unwrap();
+            self.started_prefills.push(candidate);
         }
     }
 
@@ -186,6 +332,13 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
+    /// Log the per-minute share of full-cap budgets as worker `worker`'s,
+    /// when the budget varies.
+    pub(crate) fn with_budget_tally(mut self, worker: u16) -> Self {
+        self.tally = self.budget.varies().then(|| BudgetTally::new(worker));
+        self
+    }
+
     /// Order started prompts against queued ones by `order`.
     pub(crate) fn with_started_order(mut self, order: StartedOrder) -> Self {
         self.started_order = order;
@@ -197,6 +350,23 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     /// Not vLLM.
     pub(crate) fn with_force_schedule(mut self, schedule: ForceSchedule) -> Self {
         self.policy = self.policy.with_force_schedule(schedule);
+        self
+    }
+
+    /// Batch the back pass of a bounded-replay arch through `stash`.
+    pub(crate) fn with_back_stash(mut self, stash: BackStash) -> Self {
+        self.back = Some(PipelineBack {
+            stash,
+            step: 0,
+            flushing: Vec::new(),
+        });
+        self
+    }
+
+    /// Order started and queued prompts by `rank`. Not vLLM.
+    pub(crate) fn with_prefill_rank(mut self, rank: PrefillRank) -> Self {
+        self.policy = self.policy.with_rank(rank);
+        self.started_order = StartedOrder::Ranked;
         self
     }
 
@@ -228,7 +398,20 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 )
             })
             .sum();
-        started + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens
+        let copying: u64 = self.copies.as_ref().map_or(0, |copies| {
+            copies
+                .copying
+                .iter()
+                .map(|(_, candidate)| {
+                    u64::from(
+                        kv_store
+                            .resolved_prefill_context(candidate.request_id)
+                            .remaining_prefill_tokens(),
+                    )
+                })
+                .sum()
+        });
+        started + copying + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens
     }
 }
 
@@ -247,6 +430,20 @@ where
         self.policy.splits_by_class()
     }
 
+    fn rank_of(
+        &self,
+        _partition: u16,
+        request: RequestId,
+        remaining: u32,
+        now: Time,
+    ) -> Option<Rank> {
+        self.policy.rank_of(request, remaining, now)
+    }
+
+    fn pads(&self, _partition: u16) -> bool {
+        self.policy.pads()
+    }
+
     fn started_prefills_mut(&mut self, _partition: u16) -> &mut Vec<AdmissionCandidate> {
         &mut self.started_prefills
     }
@@ -260,7 +457,8 @@ where
         budget: u32,
         now: Time,
         gate: FreshGate,
-    ) -> u32 {
+    ) -> Admitted {
+        let mut finished = 0;
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
         let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
@@ -294,9 +492,15 @@ where
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
+            // A landed read goes first, whatever the rank.
+            let head_rank = match source {
+                FreshSource::Landed => None,
+                FreshSource::Queued(_) => policy.head_rank(),
+            };
             if !gate.admits(
                 source == FreshSource::Queued(Queued::Pending),
                 resolved_prefill.remaining_prefill_tokens(),
+                head_rank,
             ) {
                 break;
             }
@@ -306,7 +510,14 @@ where
                 self.chunk_end_alignment,
                 self.max_batch_tokens,
             );
-            if chunk_tokens == 0 {
+            if chunk_tokens == 0
+                || gate.pads_out(
+                    finished,
+                    chunk_tokens,
+                    resolved_prefill.remaining_prefill_tokens(),
+                    head_rank,
+                )
+            {
                 break;
             }
             let footprint = kv_store.footprint(
@@ -333,14 +544,34 @@ where
                 record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
                 context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
             }
+            // A retained hit's copies come back first; it takes no budget.
+            let pull = self.copies.as_ref().and_then(|copies| {
+                resolved_prefill.session_id().and_then(|_| {
+                    copies
+                        .balanced
+                        .copy(resolved_prefill.resident_prefix_tokens())
+                })
+            });
+            if let (Some(pull), Some(copies)) = (pull, self.copies.as_mut()) {
+                let ready = copies.free_at.max(now) + pull.duration;
+                copies.free_at = ready;
+                copies.copying.push_back((ready, candidate));
+                copies.tally.record(now, pull.bytes, ready - now);
+                continue;
+            }
             kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
             remaining_budget -= chunk_tokens;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
                 self.started_prefills.push(candidate);
+            } else {
+                finished += 1;
             }
         }
         FreshReads::return_passed_over(policy, policy_context, passed_over);
-        budget - remaining_budget
+        Admitted {
+            taken: budget - remaining_budget,
+            finished,
+        }
     }
 
     fn schedule_started_chunk(
@@ -432,6 +663,7 @@ where
                 && FreshReads::held_context_at_risk(PARTITION, &self.policy, kv_store, horizon);
             self.policy.set_hits_first(at_risk);
         }
+        self.land_copies(now);
         let mut remaining_budget = self.max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
@@ -457,13 +689,22 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
-        if self.budget.follows_backlog() {
-            remaining_budget = self.budget.prefill_budget(
-                remaining_budget,
-                self.prefill_round_tokens(kv_store),
+        if self.budget.varies() {
+            let round = if self.budget.reads_round() {
+                self.prefill_round_tokens(kv_store)
+            } else {
+                0
+            };
+            let rule = self.budget.rule_budget(
+                round,
                 self.depth,
+                self.policy.has_late(),
                 self.max_batch_tokens,
             );
+            if let Some(tally) = self.tally.as_mut() {
+                tally.record(now, rule >= self.max_batch_tokens);
+            }
+            remaining_budget = remaining_budget.min(rule);
         }
         self.fill_prefill(
             self.started_order,
@@ -474,7 +715,28 @@ where
             remaining_budget,
             now,
         );
-        kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
+        let has_front = kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty();
+        // A front that cannot run this formation (every waiting prompt blocked,
+        // e.g. on KV the stash's own requests hold) counts as not pending: the
+        // stash flushes rather than wait for a formation that never comes.
+        let front_pending = has_front
+            && (!self.started_prefills.is_empty()
+                || self.reads.len() > self.reads.reading()
+                || self.policy.len() > 0);
+        let Some(back) = self.back.as_mut() else {
+            return has_front;
+        };
+        // Only exited microbatches' tails are in the stash.
+        let flushes = back.stash.should_flush(&[], front_pending, back.step + 1);
+        back.flushing.clear();
+        if flushes {
+            let batch = back.stash.take(&[]);
+            back.flushing = batch.requests;
+            batch_plan.back_pass = Some(batch.groups);
+        } else {
+            batch_plan.back_pass = Some(back.stash.empty_pass());
+        }
+        has_front || flushes
     }
 
     fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> MicrobatchTicket {
@@ -482,6 +744,30 @@ where
             decodes: std::mem::take(&mut self.scheduled_decodes),
             ..MicrobatchTicket::default()
         };
+        if let Some(back) = self.back.as_mut() {
+            back.step += 1;
+            ticket.back_requests = std::mem::take(&mut back.flushing);
+            let (stash, step) = (&back.stash, back.step);
+            kv_store.visit_prefill_admits(PARTITION, |request| {
+                let resolved = kv_store.resolved_prefill_context(request);
+                let (prefix, chunk) = resolved.active_chunk();
+                let finishes = chunk == resolved.remaining_prefill_tokens();
+                if let Some((prefix, rows)) = stash.chunk_entry(
+                    prefix,
+                    chunk,
+                    resolved.resident_prefix_tokens(),
+                    prefix + resolved.remaining_prefill_tokens(),
+                ) {
+                    ticket.back_entries.push(BackEntry {
+                        group: 0,
+                        prefix,
+                        rows,
+                        request: finishes.then_some(request),
+                        step,
+                    });
+                }
+            });
+        }
         self.in_flight_decodes
             .extend(ticket.decodes.iter().copied());
         kv_store.visit_prefill_admits(PARTITION, |request| {
@@ -508,6 +794,16 @@ where
         ticket
     }
 
+    fn split_back(&mut self, ticket: &mut MicrobatchTicket) -> Option<MicrobatchTicket> {
+        if self.back.is_none() || !ticket.decodes.is_empty() {
+            return None;
+        }
+        Some(MicrobatchTicket {
+            back_requests: std::mem::take(&mut ticket.back_requests),
+            ..MicrobatchTicket::default()
+        })
+    }
+
     fn complete_microbatch(
         &mut self,
         kv_store: &mut K,
@@ -517,7 +813,13 @@ where
         at: Time,
     ) {
         self.in_flight_prefill_tokens -= ticket.tokens();
-        let MicrobatchTicket { chunks, decodes } = ticket;
+        let MicrobatchTicket {
+            chunks,
+            decodes,
+            back_entries,
+            back_requests,
+        } = ticket;
+        let deferred = self.back.is_some();
         let mut finished_decodes = Vec::new();
         {
             let mut store = context.requests.borrow_mut();
@@ -556,7 +858,7 @@ where
                     .prefill_tokens_processed
                     .checked_add(chunk.chunk_tokens)
                     .expect("prefill progress overflows u32");
-                if !chunk.finishes_prefill {
+                if !chunk.finishes_prefill || deferred {
                     continue;
                 }
                 record.record_first_token(at, context.log_tokens());
@@ -583,6 +885,35 @@ where
                 completed.push(chunk.request);
             }
         }
+        if let Some(back) = self.back.as_mut() {
+            for entry in back_entries {
+                back.stash.push(entry);
+            }
+        }
+        // The requests whose back pass this microbatch carried.
+        for request in back_requests {
+            let remaining_output_tokens = {
+                let mut store = context.requests.borrow_mut();
+                let record = &mut store[request];
+                record.record_first_token(at, context.log_tokens());
+                let stage = if record.is_complete() {
+                    UnifiedStage::Done
+                } else {
+                    UnifiedStage::Decode
+                };
+                context.stamp_stage(record, at, stage as u16);
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted)
+            };
+            kv_store.finish_chunked_prefill(request, PARTITION, remaining_output_tokens);
+            if remaining_output_tokens == 0 {
+                kv_store.release_retaining_prefix(request, PARTITION, at);
+                completed.push(request);
+            }
+        }
         kv_store.sample_submit(PARTITION, at);
         if let Some(external_decode) = &mut self.external_decode {
             external_decode.hand_back(kv_store, PARTITION, at);
@@ -599,5 +930,17 @@ where
 
     fn next_read_landing(&self, kv_store: &K) -> Option<Time> {
         kv_store.next_tier_landing()
+    }
+
+    fn next_landing(&self) -> Option<Time> {
+        self.copies
+            .as_ref()
+            .and_then(|copies| copies.copying.front().map(|&(ready, _)| ready))
+    }
+
+    fn next_landing_after(&self, now: Time) -> Option<Time> {
+        let copying = &self.copies.as_ref()?.copying;
+        let first = copying.partition_point(|&(ready, _)| ready <= now);
+        copying.get(first).map(|&(ready, _)| ready)
     }
 }

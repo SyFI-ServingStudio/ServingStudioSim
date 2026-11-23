@@ -3,8 +3,11 @@
 //! and owns the pipeline's KV; later stages pull activations over NVLink and
 //! compute their layers.
 //!
-//! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe` and the hybrid
-//! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
+//! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe`, the hybrid
+//! `glm53_flash_vllm_fp8_pp_kda_dsa_moe` and `deepseek_v41_vllm_pp`, each with
+//! `pipeline_chunked_prefill`. A stage model may size what it sends to the
+//! next stage itself (`pipeline_send_bytes`); otherwise a microbatch carries
+//! its tokens times the layout's activation bytes per token.
 //! The arch builds every stage's model once; the stage models are shared across
 //! replicas. The head sizes the pipeline's KV from the arch's
 //! `pipeline_kv_cache_layout`: the most constrained stage's cache. Its host
@@ -18,6 +21,7 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
@@ -28,9 +32,9 @@ use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::kv::TierBytes;
 use crate::worker::{
-    build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
-    CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    build_pipeline_head_worker, build_pipeline_head_worker_with_back, build_pipeline_stage_worker,
+    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent,
+    PipelineHeadMsg, PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -95,12 +99,17 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: TierBytes::of_pipeline(
-                        pipeline.stage_kv_cache_layouts(),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stage_kv_cache_layouts()
+                            .map(TierBytes::of_layout)
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -125,6 +134,7 @@ impl Deployment for PpDeployment {
                             Arc::clone(&head_model),
                             layout,
                             &kv_cache_layout,
+                            &kv_shares,
                             std::rc::Rc::clone(&head_store),
                             head_config.clone(),
                             head_log_dir.clone(),
@@ -176,12 +186,17 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
-                    tier_bytes: TierBytes::of_pipeline(
-                        pipeline.stage_kv_cache_layouts(),
-                        worker_config.prefix_tier_balanced_load,
-                    ),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stage_kv_cache_layouts()
+                            .map(TierBytes::of_layout)
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
                 };
                 let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -206,6 +221,7 @@ impl Deployment for PpDeployment {
                             Arc::clone(&head_model),
                             layout,
                             &kv_cache_layout,
+                            &kv_shares,
                             std::rc::Rc::clone(&head_store),
                             head_config.clone(),
                             head_log_dir.clone(),
@@ -216,11 +232,136 @@ impl Deployment for PpDeployment {
                     },
                 ))
             }
+            IterArchSel::DeepseekV41VllmPp {
+                pp_size,
+                layer_partition,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                decoder_swa_bounded_replay,
+                max_num_batched_tokens,
+                cudagraph_capture_sizes,
+                stage_layers,
+                cut_handoff,
+                engine,
+                yoco_keep_tokens,
+                engram_fetch,
+                deepinfer_max_num_seqs,
+                ..
+            } => {
+                let pipeline = arch_build::deepseek_v41_vllm_pp(
+                    model_spec,
+                    *pp_size,
+                    layer_partition,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    *decoder_swa_bounded_replay,
+                    *max_num_batched_tokens,
+                    cudagraph_capture_sizes,
+                    stage_layers,
+                    *cut_handoff,
+                    crate::arch::config::deepseek_v41_dp_engine(
+                        *engine,
+                        0,
+                        *yoco_keep_tokens,
+                        *engram_fetch,
+                        false,
+                        0,
+                        *deepinfer_max_num_seqs,
+                    )?,
+                    *engram_fetch,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?;
+                let pipeline = Arc::new(pipeline);
+                // Each stage sizes what it sends (`pipeline_send_bytes`); the
+                // per-token size is the hidden-state fallback.
+                let layout = PipelineLayout {
+                    depth: pipeline.pp_size(),
+                    activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                    tier_bytes: tier_bytes(
+                        pipeline
+                            .stages()
+                            .iter()
+                            .map(|stage| TierBytes::of_layout(&stage.kv_cache_layout()))
+                            .collect(),
+                        &pipeline.pipeline_kv_shares().unique,
+                        &worker_config,
+                    )?,
+                };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let kv_shares = pipeline.pipeline_kv_shares();
+                let back_probe = worker_config.back_batching.map(|_| {
+                    crate::worker::shared::back_stash::model_probe(Arc::clone(&pipeline), 1)
+                });
+                let head_model = Arc::clone(&pipeline.stages()[0]);
+                let head_store = std::rc::Rc::clone(&store);
+                let head_log_dir = log_dir.clone();
+                let head_gpu = gpu_name.clone();
+                let head_config = worker_config.clone();
+                Ok(assemble_pp_flow(
+                    pipeline.stages(),
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name.clone(),
+                    PpStagePoolConfig {
+                        replicas: g.replicas,
+                        depth: layout.depth,
+                        placement,
+                    },
+                    build_activation_cost(&gpu_name, bridge)?,
+                    move |id, cluster| {
+                        build_pipeline_head_worker_with_back(
+                            id,
+                            STAGE_POOL_TAG,
+                            Arc::clone(&head_model),
+                            layout,
+                            &kv_cache_layout,
+                            &kv_shares,
+                            std::rc::Rc::clone(&head_store),
+                            head_config.clone(),
+                            head_log_dir.clone(),
+                            PP_STAGE_POOL,
+                            &head_gpu,
+                            std::rc::Rc::clone(cluster),
+                            back_probe.clone(),
+                        )
+                    },
+                ))
+            }
             other => bail!("pp: arch {other:?} has no pipeline-parallel stage model"),
         }
     }
 }
 
+/// What each GPU stores in and reads from a host tier, from every stage's
+/// bytes: the first stage with the most KV bytes per token, or with
+/// `prefix_tier_balanced_load` the stages' means, or with
+/// `prefix_tier_unique_bytes` the model's unique per-token bytes (`unique`,
+/// each source once) over the stages.
+fn tier_bytes(
+    stages: Vec<TierBytes>,
+    unique: &KvCacheLayout,
+    config: &WorkerConfig,
+) -> anyhow::Result<TierBytes> {
+    let mut bytes = TierBytes::of_stages(&stages, config.prefix_tier_balanced_load);
+    if config.prefix_tier_unique_bytes {
+        ensure!(
+            !config.prefix_tier_balanced_load,
+            "pp: prefix_tier_unique_bytes replaces prefix_tier_balanced_load; set one"
+        );
+        let depth = stages.len().max(1) as u64;
+        bytes.per_token = unique.per_token_bytes().div_ceil(depth);
+    }
+    Ok(bytes)
+}
 fn worker_config(
     cfg: &PpConfig,
     worker: &IterWorkerSel,
@@ -235,6 +376,12 @@ fn worker_config(
         pending_order,
         external_decode,
         prefix_tiers,
+        back_flush,
+        back_flush_k,
+        back_rows,
+        back_cap,
+        extra_in_flight_microbatches,
+        back_dispatch,
         ..
     } = worker
     else {
@@ -259,6 +406,15 @@ fn worker_config(
         pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
+        back_batching: crate::worker::config::back_batching_spec(
+            *back_flush,
+            *back_flush_k,
+            *back_rows,
+            *back_cap,
+        ),
+        pipeline_extra_in_flight: *extra_in_flight_microbatches,
+        pipeline_split_back: *back_dispatch
+            == crate::worker::config::BackDispatchKind::VirtualStages,
         prefill_chunk_alignment: *prefill_chunk_alignment,
         external_decode: *external_decode,
         max_model_len,
@@ -267,6 +423,7 @@ fn worker_config(
     worker.kv_accounting().apply("pp", &mut config)?;
     worker.apply_chunked_scheduling("pp", &mut config)?;
     prefix_tiers.apply("pp", &mut config)?;
+    config.balanced_retention = worker.balanced_retention("pp")?;
     Ok(config)
 }
 
@@ -304,7 +461,8 @@ where
     H: IterWorker<Msg = PipelineHeadMsg, Event = PipelineHeadEvent> + 'static,
 {
     assert_eq!(stages.len(), usize::from(pool_config.depth));
-    Box::new(PpFlow::new(
+    let net_log_dir = log_dir.clone();
+    let flow = PpFlow::new(
         std::rc::Rc::clone(&store),
         &pool_config,
         cost,
@@ -322,5 +480,38 @@ where
                 std::rc::Rc::clone(cluster),
             )
         },
-    ))
+    );
+    // Stage-to-stage activation transfers go to `raw/gpu_cluster.parquet`, as
+    // PD's KV transfers do, once the workers have registered their groups.
+    if let Some(dir) = net_log_dir.as_deref() {
+        flow.cluster().borrow_mut().attach_logger(dir);
+    }
+    Box::new(flow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::kv_layout::KvCachePart;
+
+    #[test]
+    fn unique_bytes_spread_the_models_cache_over_the_stages() {
+        // Two stages of 712 B/token each (their sources and the copies the
+        // other stage computes), 891 B/token unique.
+        let stage = || {
+            TierBytes::of_layout(&KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 712)))
+        };
+        let unique = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 891));
+        let config = |unique_bytes, balanced_load| WorkerConfig {
+            prefix_tier_unique_bytes: unique_bytes,
+            prefix_tier_balanced_load: balanced_load,
+            ..WorkerConfig::default()
+        };
+        let per_token = |config: &WorkerConfig| {
+            tier_bytes(vec![stage(), stage()], &unique, config).map(|bytes| bytes.per_token)
+        };
+        assert_eq!(per_token(&config(false, false)).unwrap(), 712);
+        assert_eq!(per_token(&config(true, false)).unwrap(), 446);
+        assert!(per_token(&config(true, true)).is_err());
+    }
 }

@@ -55,13 +55,13 @@ const DEEPGEMM_MEGA: &str = "deepgemm_mega";
 /// Last token count of each `mega_mhc` K-split specialization (40/27/20), the
 /// first token count of the next one, and one probe step (8) on either side,
 /// plus 256 inside the 27-split range. The time jumps between T and T+1.
-const DEEPGEMM_MEGA_SPLIT_POINTS: [u32; 13] = [
+pub(crate) const DEEPGEMM_MEGA_SPLIT_POINTS: [u32; 13] = [
     184, 192, 193, 200, 256, 312, 320, 321, 328, 440, 448, 449, 456,
 ];
 
 /// Last token count of each 16-split wave up to T=4096 and the first of the
 /// next wave; the time jumps between the two.
-const DEEPGEMM_MEGA_WAVE_POINTS: [u32; 14] = [
+pub(crate) const DEEPGEMM_MEGA_WAVE_POINTS: [u32; 14] = [
     576, 577, 1152, 1153, 1728, 1729, 2368, 2369, 2944, 2945, 3520, 3521, 4096, 4097,
 ];
 

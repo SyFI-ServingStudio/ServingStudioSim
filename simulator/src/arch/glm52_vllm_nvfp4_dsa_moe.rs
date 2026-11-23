@@ -3528,6 +3528,7 @@ mod tests {
         let input = UnifiedArchInput {
             groups: vec![group(5, vec![64, 91], vec![(3, 2), (0, 3)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let normalized = normalize_input(&input, 4, 8_192).unwrap();
         assert_eq!(normalized.total_tokens, 7);
@@ -3931,18 +3932,21 @@ mod tests {
         let too_many_groups = UnifiedArchInput {
             groups: vec![ArchGroupInput::default(); 2],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&too_many_groups, 4, 8_192).is_err());
 
         let bad_prefill = UnifiedArchInput {
             groups: vec![group(1, vec![], vec![(0, 2)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&bad_prefill, 4, 8_192).is_err());
 
         let too_long = UnifiedArchInput {
             groups: vec![group(0, vec![8_193], vec![])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&too_long, 4, 8_192).is_err());
     }
@@ -3953,12 +3957,14 @@ mod tests {
         let fits = UnifiedArchInput {
             groups: vec![group(65_000, vec![100_000; 535], vec![(0, 65_000)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         assert!(normalize_input(&fits, 4, 202_752).is_ok());
 
         let over = UnifiedArchInput {
             groups: vec![group(65_000, vec![100_000; 536], vec![(0, 65_000)])],
             tokens_per_source_rank: Vec::new(),
+            back_pass: None,
         };
         let reason = normalize_input(&over, 4, 202_752).unwrap_err();
         assert!(reason.contains("65536 token rows"), "{reason}");

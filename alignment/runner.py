@@ -306,17 +306,27 @@ _EXPERT_LOAD_SERVER_ARGS = (
 )
 
 
+def pass_server_options(cfg: ProfileConfig) -> list[tuple[str, str | None]]:
+    """The (flag, value) options this pass's kind adds to the server, beyond the config.
+
+    They change what the engine compiles and tunes (vLLM hashes its whole config into
+    its FlashInfer autotune cache file), so the warm-caches key holds them too
+    (`alignment/warm_caches.py:deployment_key`).
+    """
+    if cfg.profile_kind not in ROUTING_PROFILE_KINDS:
+        return []
+    options = list(_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()))
+    if cfg.captures_expert_load:
+        options += _EXPERT_LOAD_SERVER_ARGS
+    return options
+
+
 def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
     """Add backend- and pass-required server flags exactly once to the launch argv."""
     for argument in cfg.workload.backend.required_server_args:
         if argument not in server_argv:
             server_argv.append(argument)
-    if cfg.profile_kind not in ROUTING_PROFILE_KINDS:
-        return
-    options = list(_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()))
-    if cfg.captures_expert_load:
-        options += _EXPERT_LOAD_SERVER_ARGS
-    for flag, value in options:
+    for flag, value in pass_server_options(cfg):
         # argparse accepts both `--flag value` and `--flag=value`.
         present = [
             i for i, arg in enumerate(server_argv) if arg == flag or arg.startswith(f"{flag}=")

@@ -1,5 +1,6 @@
 //! `op/attention` — compound attention ops. See doc/detailed_design/L2.md.
 
+pub mod deepseek_v41_deepinfer_indexer;
 pub mod deepseek_v41_indexer;
 pub mod deepseek_v41_mega_attn;
 pub mod dsa_indexer;
@@ -9,6 +10,10 @@ pub mod glm53_kpool_sparse_mla;
 pub mod sparse_gqa;
 pub mod sparse_gqa_indexer;
 
+pub use deepseek_v41_deepinfer_indexer::{
+    DeepseekV41DeepInferIndexerOp, DeepseekV41DeepInferIndexerOpConfig,
+    DeepseekV41DeepInferIndexerOpInput, DeepseekV41DeepInferIndexerOpResolved,
+};
 pub use deepseek_v41_indexer::{
     byte_rate_placeholder_shape, DeepseekV41CandidateRole, DeepseekV41IndexerOp,
     DeepseekV41IndexerOpConfig, DeepseekV41IndexerOpInput, DeepseekV41IndexerOpResolved,

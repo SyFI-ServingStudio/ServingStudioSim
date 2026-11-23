@@ -11,11 +11,18 @@ buffer. ``mode`` picks the segment:
 
 - ``decode`` is ``_forward_decode_mega``, one
   ``fused_norm_rope_attn_rope_cast_decode`` launch over the paged caches;
-- ``prefill`` is ``_forward_prefill_mega``. For each chunk of up to
-  ``prefill_chunk_size`` requests, it launches the compressed-cache gather
-  (``_dequantize_and_gather_k_nvfp4`` when ratio > 0), the MXFP8 SWA gather
-  (CuTe DSL), ``combine_topk_swa_indices`` and one
-  ``fused_norm_rope_attn_rope_cast_fwd``. All of these launches are in the slot.
+- ``prefill`` is one chunk of ``_forward_prefill_mega``'s chunk loop: the
+  compressed-cache gather (``_dequantize_and_gather_k_nvfp4`` when ratio > 0),
+  the MXFP8 SWA gather (CuTe DSL), ``combine_topk_swa_indices`` and one
+  ``fused_norm_rope_attn_rope_cast_fwd`` over the given requests. All of these
+  launches are in the row. The loop's chunk plan
+  (``DeepseekSparseSWAMetadata.get_prefill_chunk_plan``) is the only place
+  vLLM's ``max_model_len``, ``max_num_batched_tokens`` and
+  ``PREFILL_CHUNK_SIZE`` reach this segment: they size a workspace budget that
+  groups requests into chunks. A chunk's launches depend only on its own
+  requests (the gather buffer is ``chunk requests x chunk width`` either way),
+  so the row key holds no planner input; the simulator replays the planner with
+  the deployment's values and sums the chunks.
 
 The kernel math has Q RoPE (GPT-J pairs, last 64 of 512 dims) and 1-KV-head
 sparse MLA with an attention sink. It attends over the 128-token sliding
@@ -38,8 +45,7 @@ heads take the swap-AB kernel instead (``_swapab_decode_supported``,
 puts the KV slots on the MMA's M side and runs only the live heads, so its
 rows carry the live count (16 or 32). ``query_context_pairs`` holds ``(query_len, context_len)`` per
 request, with context including the query. In decode mode every query token
-is one flattened row. ``max_model_len``, ``max_num_batched_tokens`` and
-``prefill_chunk_size`` drive the prefill chunk planner, and decode ignores them.
+is one flattened row; in prefill mode the pairs are the requests of one chunk.
 """
 
 from __future__ import annotations
@@ -91,15 +97,6 @@ class CompressedSparseMlaRopeCastArgs(KernelArgs):
     )
     head_dim: int = arg(unit="elements", doc="Elements in each query head and latent key.")
     rope_dim: int = arg(unit="elements", doc="Trailing head elements rotated by RoPE.")
-    max_model_len: int = arg(
-        unit="tokens", doc="Longest context the prefill chunk planner provisions for."
-    )
-    max_num_batched_tokens: int = arg(
-        unit="tokens", doc="Most tokens in one scheduler step, sizing the prefill gather buffers."
-    )
-    prefill_chunk_size: int = arg(
-        unit="requests", doc="Most prefill requests gathered and attended in one chunk."
-    )
     q_dtype: DType = arg(doc="Element type of the query input.")
     swa_cache_format: str = arg(doc="Record format of the sliding-window KV cache.")
     compressed_cache_format: str = arg(
@@ -122,9 +119,9 @@ DOC = KernelDoc(
         "the inverse RoPE and an FP8 E4M3 cast with one UE8M0 scale per 32 "
         "elements, written in the layout the output projection reads. Per layer "
         "the decode and prefill tokens are two calls on disjoint output rows. "
-        "Decode is one launch over the paged caches. Prefill runs, per chunk of "
-        "up to prefill_chunk_size requests, the compressed and window cache "
-        "gathers, the index merge and one attention launch, all counted here."
+        "Decode is one launch over the paged caches. Prefill is one chunk of the "
+        "prefill loop: the compressed and window cache gathers, the index merge "
+        "and one attention launch over the chunk's requests, all counted here."
     ),
     category="Attention",
     subcategory="Compressed sparse MLA",
@@ -149,7 +146,7 @@ DOC = KernelDoc(
     ),
     caveats=(
         "The runner takes head_dim 512, rope_dim 64, window_size 128, index_topk "
-        "512, prefill_chunk_size 4, num_heads 64 or 128, compress_ratio 0, 1 or 2, "
+        "512, num_heads 64 or 128, compress_ratio 0, 1 or 2, contexts up to 1048576, "
         f"bf16 queries, an MXFP8 window cache ({MXFP8_RECORD_BYTES} B per token) and an "
         f"NVFP4 ({NVFP4_RECORD_BYTES} B) or MXFP8 compressed cache.",
         "num_heads is the head count the kernel runs: the padded count (64 or "
@@ -157,6 +154,11 @@ DOC = KernelDoc(
         "count (16 or 32) for swapab_cutedsl.",
         "swapab_cutedsl times decode only, on compressed layers (ratio 1 or 2), "
         "at most 16 query rows: the steps vLLM routes to it.",
+        "flashmla_deepinfer times decode only: DeepInfer's call of FlashMLA's own "
+        "build, which passes no top-k lengths, so the kernel walks every index column.",
+        "A prefill row is one planner chunk: the deployment's chunk plan "
+        "(max_model_len, max_num_batched_tokens, prefill chunk size) is applied by "
+        "the simulator, which sums the chunks of a step.",
         "Decode takes at most 2048 query rows and 256 requests. The global top-k "
         "remap that precedes decode is outside the call; the runner passes "
         "precomputed cache slots.",
@@ -221,6 +223,38 @@ register(
                 "FlashMLA's fused_norm_rope_attn_rope_cast decode and prefill kernels, "
                 "through the vLLM mega-attention layer's segment methods, prefill "
                 "gathers included."
+            ),
+            url="https://github.com/deepseek-ai/FlashMLA",
+        ),
+    )
+)
+
+# DeepInfer's image ships FlashMLA's own build of the same kernel; its decode
+# call passes no top-k lengths (layers/attention_backend.py
+# decode_mla_mqa_sparse). Decode only: DeepInfer's prefill attention is the
+# sparse_mla_norm_rope_cast_prefill kind. Same semantics and args as
+# flashmla_mega, different timing: on one B200 at 64 x (6, 131800) decode rows
+# it took 55.7 us against flashmla_mega's 64.6 (ratio 1 and 2), and at short
+# contexts it walks all 640 index columns where vLLM's lengths stop early
+# (296 rows at ratio 1: 59.0 against 24.1 us).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashmla_deepinfer",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.compressed_sparse_mla_rope_cast",
+            function_name="profile_compressed_sparse_mla_rope_cast_flashmla_deepinfer",
+        ),
+        table_name=KIND,
+        args_schema=CompressedSparseMlaRopeCastArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=_MEGA_SUPPORT,
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashMLA fused_norm_rope_attn_rope_cast.decode from DeepInfer's image, "
+                "as DeepInfer's decode_mla_mqa_sparse calls it (no top-k lengths); decode only."
             ),
             url="https://github.com/deepseek-ai/FlashMLA",
         ),

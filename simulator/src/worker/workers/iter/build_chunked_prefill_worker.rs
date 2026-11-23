@@ -25,6 +25,7 @@ use crate::worker::admission::{
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::TierBytes;
+use crate::worker::shared::back_stash::{back_window, model_probe, BackStash};
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
@@ -107,11 +108,15 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         None => admission,
     }
     .with_microbatch_budget(config.microbatch_budget)
+    .with_budget_tally(id.0)
     .with_started_order(config.started_order);
     let mut admission = match config.force_schedule {
         Some(schedule) => admission.with_force_schedule(schedule),
         None => admission,
     };
+    if let Some(rank) = config.prefill_rank {
+        admission = admission.with_prefill_rank(rank);
+    }
     if !config.prefix_tiers.is_empty() || config.external_decode {
         admission = admission.with_sticky_sessions();
     }
@@ -121,6 +126,17 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     if config.external_decode {
         admission = admission.with_external_decode();
     }
+    let admission = match config.back_batching {
+        Some(spec) => admission.with_back_stash(BackStash::new(
+            spec,
+            model
+                .back_pass_window()
+                .unwrap_or_else(|| back_window(&model.kv_cache_layout())),
+            num_partitions,
+            model_probe(Arc::clone(&model), num_partitions),
+        )),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

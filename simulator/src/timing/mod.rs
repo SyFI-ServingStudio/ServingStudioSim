@@ -5,6 +5,7 @@ pub mod cache;
 pub mod cost_tree;
 pub mod dims;
 pub mod expert_demand;
+pub mod expert_placement;
 pub mod kernels;
 pub mod result;
 pub mod routing;

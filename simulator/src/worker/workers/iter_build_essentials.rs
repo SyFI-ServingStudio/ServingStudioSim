@@ -21,8 +21,8 @@ use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::{KvPoolFacts, SharedGpuCluster};
 use crate::worker::kv::{
-    KvAccounting, KvAccountingOptions, KvCacheStore, SharedKvAccounting, SharedTiersReports,
-    TierBytes, TierStateOptions,
+    KvAccounting, KvAccountingOptions, KvCacheStore, RetainedScale, SharedKvAccounting,
+    SharedTiersReports, TierBytes, TierStateOptions,
 };
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
@@ -82,9 +82,32 @@ pub(crate) fn kv_cache_store(
     sampler: Option<KvSampler>,
     prefix_cache_logger: Option<PrefixCacheLogger>,
 ) -> KvCacheStore {
+    kv_cache_store_with_retained_scale(
+        accounting,
+        num_partitions,
+        num_attn_shards,
+        config,
+        sampler,
+        prefix_cache_logger,
+        RetainedScale::ONE,
+    )
+}
+
+/// [`kv_cache_store`] whose retained entries cost `retained_scale` of what
+/// `accounting` charges them (balanced pipeline retention).
+pub(crate) fn kv_cache_store_with_retained_scale(
+    accounting: SharedKvAccounting,
+    num_partitions: usize,
+    num_attn_shards: u16,
+    config: &WorkerConfig,
+    sampler: Option<KvSampler>,
+    prefix_cache_logger: Option<PrefixCacheLogger>,
+    retained_scale: RetainedScale,
+) -> KvCacheStore {
     let prefix_cache = config
         .prefix_cache
-        .resolve_units(&accounting, num_attn_shards);
+        .resolve_units(&accounting, num_attn_shards)
+        .with_retained_scale(retained_scale);
     KvCacheStore::new(
         num_partitions,
         accounting,

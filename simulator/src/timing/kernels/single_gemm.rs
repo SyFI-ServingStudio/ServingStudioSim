@@ -89,7 +89,16 @@ impl KernelSpec for SingleGemmSpec {
     const KIND: KernelKind = "single_gemm";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        if config.dtype == DType::Mxfp8E4m3 {
+        // FlashInfer's MXFP8 GEMM is tuned per hybrid bucket. DeepGEMM's
+        // (`deepgemm_mxfp8`) picks its tile per exact m with no tuner and runs
+        // prefill steps far past the bucket axis' 8192 top, so it keeps the
+        // generic axis below, as does a mixed backend list.
+        if config.dtype == DType::Mxfp8E4m3
+            && config
+                .backends
+                .iter()
+                .all(|b| b.starts_with("flashinfer_mxfp8"))
+        {
             return SweepGrid::new(vec![hybrid_bucket_m_axis()]);
         }
         // A mixed backend list keeps the generic axis below.
@@ -322,6 +331,31 @@ mod tests {
             SingleGemmSpec::sweep_grid(&fp8(vec!["flashinfer_fp8_tensor", "deepgemm"])).axes(),
             generic.axes()
         );
+    }
+
+    /// DeepInfer's DeepGEMM MXFP8 linear has no tuning buckets and runs
+    /// prefill steps of up to 65536 rows per rank; capping it at the FlashInfer
+    /// bucket axis' 8192 would extrapolate every long prefill.
+    #[test]
+    fn deepgemm_mxfp8_axis_spans_prefill_rows_and_ignores_flashinfer_buckets() {
+        let cfg = |backends: Vec<&'static str>| SingleGemmKernelConfig {
+            backends,
+            ..mxfp8_cfg()
+        };
+        let generic = SingleGemmSpec::sweep_grid(&SingleGemmKernelConfig {
+            dtype: DType::Bf16,
+            ..cfg(vec!["torch"])
+        });
+        let deepgemm = SingleGemmSpec::sweep_grid(&cfg(vec!["deepgemm_mxfp8"]));
+        assert_eq!(deepgemm.axes(), generic.axes());
+        assert_eq!(deepgemm.axes()[0].last(), Some(&65536.0));
+        let mixed = SingleGemmSpec::sweep_grid(&cfg(vec!["flashinfer_mxfp8", "deepgemm_mxfp8"]));
+        assert_eq!(mixed.axes(), generic.axes());
+        let flashinfer = SingleGemmSpec::sweep_grid(&cfg(vec![
+            "flashinfer_mxfp8",
+            "flashinfer_mxfp8_prequantized",
+        ]));
+        assert_eq!(flashinfer.axes()[0].last(), Some(&8192.0));
     }
 
     #[test]

@@ -14,6 +14,8 @@ mod kv_cache_store;
 mod shared;
 
 pub use kv_cache_store::KvCacheStore;
+pub(crate) use shared::balanced_retention::RetainedScale;
+pub use shared::balanced_retention::{BalancedRetention, BalancedRetentionSpec};
 pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
 pub use shared::kv_accounting::{KvOverhead, PartCharge, PartPadding, PrefixResumePoints};
 pub use shared::kv_cache_report::KvCacheReport;
@@ -336,6 +338,9 @@ pub trait IterWorkerKv: KvStore {
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
+    /// Retained tokens of `session_input`'s prefix on this store's best
+    /// partition (0 when none): what pool-level session-affine placement reads.
+    fn retained_prefix_tokens(&self, session_input: SessionInput) -> u32;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.
     fn visit_prefill_admits(&self, partition: PartitionId, visitor: impl FnMut(RequestId));

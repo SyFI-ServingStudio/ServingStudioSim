@@ -124,8 +124,10 @@ def _copy_elements(input_size_bytes: int, output_size_bytes: int, realization: s
     return output_size_bytes // 2
 
 
-def _time_copy(run_once, output_size_bytes: int) -> ComputeMetrics:
-    time_ms = Timer.cupti(run_once, warmup=5, kernel_name=None)
+def _time_copy(
+    run_once, output_size_bytes: int, *, include_memcpy: bool = False
+) -> ComputeMetrics:
+    time_ms = Timer.cupti(run_once, warmup=5, kernel_name=None, include_memcpy=include_memcpy)
     energy_j = Energy.perf(run_once, warmup=5, per_iter_time_ms=time_ms)
     bytes_accessed = 2 * output_size_bytes
     bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
@@ -224,5 +226,37 @@ def profile_elementwise_cat(
         if not torch.equal(destination[:first_elements], first):
             raise AssertionError("cat wrote the wrong values")
         return _time_copy(run_once, int(output_size_bytes))
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_elementwise_memcpy(
+    input_size_bytes: int,
+    output_size_bytes: int,
+) -> ComputeMetrics:
+    """Contiguous same-dtype ``copy_`` between two device tensors.
+
+    PyTorch issues it as one ``cudaMemcpyAsync`` device-to-device, not a
+    kernel (DeepInfer's ``kv_swa_cur.copy_(kv_swa)`` shows as a DtoD memcpy in
+    nsys), so CUPTI times the memcpy activity record.
+    """
+    elements = _copy_elements(input_size_bytes, output_size_bytes, "memcpy")
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for the memcpy runner") from exc
+    try:
+        source = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+        source.normal_()
+        destination = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+
+        def run_once():
+            destination.copy_(source)
+
+        run_once()
+        torch.cuda.synchronize()
+        if not torch.equal(destination, source):
+            raise AssertionError("copy_ wrote the wrong values")
+        return _time_copy(run_once, int(output_size_bytes), include_memcpy=True)
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
