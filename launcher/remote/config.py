@@ -46,8 +46,15 @@ class Slurm:
     # GPUs per job (`--gres=gpu:N`). A GPU command asks for at least what its
     # specs need; 0 leaves a CPU job without any.
     gpus: int = 0
+    # Nodes per job (`--nodes`); `gpus` is then per node. A capture whose server
+    # spans nodes (`server.nnodes`) asks for that many.
+    nodes: int = 1
     # Extra `#SBATCH` arguments, verbatim (e.g. "--qos=foo").
     extra: tuple[str, ...] = ()
+    # A held allocation (`launcher/remote/allocation_runner.sh`) to queue jobs
+    # into instead of submitting each: its Slurm job id. The other fields then
+    # describe what it holds.
+    allocation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,9 +68,12 @@ class GpuWait:
 #: `docker`: each GPU job is one container of the profiler image; the remote
 #: needs only docker (and, for simulation or timing-predict there, uv and cargo).
 #: `in-image`: the remote is itself a profiler image (a pod), which runs GPU work only.
+#: `pyxis`: a Slurm cluster with pyxis/enroot and no docker: each GPU job is one
+#: `srun --container-image` of the profiler image's squashfs (built there with
+#: `profiling/container/enroot_build.py`, kept under `images`), one task per node.
 #: Either way the job runs on the image's own interpreters: nothing GPU-side is
 #: installed or built on the remote.
-PROFILE_RUNTIMES = ("docker", "in-image")
+PROFILE_RUNTIMES = ("docker", "in-image", "pyxis")
 #: `gpus: auto` on a direct remote: each job takes idle GPUs when it starts.
 AUTO_GPUS = "auto"
 
@@ -95,6 +105,13 @@ class Remote:
     # free memory for `quiet_s` seconds (a host whose users also run outside
     # the scheduler). None: start at once.
     gpu_wait: GpuWait | None = None
+    # `pyxis` only: the directory of profiler-image squashfs files, one per tag
+    # (`vibesim-profiler-vllm+<inputs>.sqsh`).
+    images: PurePosixPath | None = None
+    # `pyxis` only: the compute nodes' platform (`linux/arm64`), when it is not
+    # this machine's. Image tags hash the platform's pinned base, so the
+    # launcher resolves them for it. None: this machine's.
+    platform: str | None = None
     # The remote may lose its disk (a container pod): copy results back whole.
     ephemeral: bool = False
     # Directory of remote.yaml; `.remote/known_hosts` beside it pins host keys.
@@ -179,6 +196,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
             "mounts",
             "gpus",
             "gpu_wait",
+            "images",
+            "platform",
         },
         "",
     )
@@ -214,8 +233,23 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
     if AUTO_GPUS in gpus and gpus != [AUTO_GPUS]:
         raise RemoteConfigError(f"gpus: {AUTO_GPUS} cannot be combined with GPU names")
     gpu_wait = _parse_gpu_wait(raw.get("gpu_wait"))
-    if (mounts or gpus or gpu_wait) and profile_runtime != "docker":
-        raise RemoteConfigError("mounts, gpus and gpu_wait apply only to profile_runtime: docker")
+    if (gpus or gpu_wait) and profile_runtime != "docker":
+        raise RemoteConfigError("gpus and gpu_wait apply only to profile_runtime: docker")
+    if mounts and profile_runtime not in ("docker", "pyxis"):
+        raise RemoteConfigError("mounts apply only to profile_runtime: docker or pyxis")
+    images = raw.get("images")
+    if (images is None) != (profile_runtime != "pyxis"):
+        raise RemoteConfigError("images (a squashfs directory) is required by, and only by, pyxis")
+    if profile_runtime == "pyxis" and slurm is None:
+        raise RemoteConfigError("profile_runtime: pyxis needs launch: {slurm: ...}")
+    platform = raw.get("platform")
+    if platform is not None:
+        if profile_runtime != "pyxis":
+            raise RemoteConfigError("platform applies only to profile_runtime: pyxis")
+        if platform not in ("linux/amd64", "linux/arm64"):
+            raise RemoteConfigError(
+                f"platform must be linux/amd64 or linux/arm64, got {platform!r}"
+            )
     ephemeral = raw.get("ephemeral", False)
     if not isinstance(ephemeral, bool):
         raise RemoteConfigError(f"ephemeral must be true or false, got {ephemeral!r}")
@@ -232,6 +266,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
         mounts=tuple(_absolute(mount, "mounts[]") for mount in mounts),
         gpus=tuple(str(gpu) for gpu in gpus),
         gpu_wait=gpu_wait,
+        images=None if images is None else _absolute(images, "images"),
+        platform=platform,
         ephemeral=ephemeral,
         config_dir=config_dir,
     )
@@ -266,7 +302,17 @@ def _parse_launch(raw: Any) -> Slurm | None:
     body = raw["slurm"]
     _reject_unknown(
         body,
-        {"time", "partition", "cpus_per_task", "mem", "account", "gpus", "extra"},
+        {
+            "time",
+            "partition",
+            "cpus_per_task",
+            "mem",
+            "account",
+            "gpus",
+            "nodes",
+            "extra",
+            "allocation",
+        },
         "launch.slurm.",
     )
     time = body.get("time")
@@ -281,12 +327,22 @@ def _parse_launch(raw: Any) -> Slurm | None:
     gpus = body.get("gpus", 0)
     if not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 0:
         raise RemoteConfigError(f"launch.slurm.gpus must be a non-negative integer, got {gpus!r}")
+    nodes = body.get("nodes", 1)
+    if not isinstance(nodes, int) or isinstance(nodes, bool) or nodes < 1:
+        raise RemoteConfigError(f"launch.slurm.nodes must be a positive integer, got {nodes!r}")
     for key in ("partition", "mem", "account"):
         if body.get(key) is not None and not isinstance(body[key], str):
             raise RemoteConfigError(f"launch.slurm.{key} must be a string")
     extra = body.get("extra", [])
     if not isinstance(extra, list) or not all(isinstance(e, str) for e in extra):
         raise RemoteConfigError("launch.slurm.extra must be a list of sbatch arguments")
+    allocation = body.get("allocation")
+    if allocation is not None:
+        allocation = str(allocation)
+        if not allocation.isdigit():
+            raise RemoteConfigError(
+                f"launch.slurm.allocation must be a Slurm job id, got {allocation!r}"
+            )
     return Slurm(
         time=time,
         partition=body.get("partition"),
@@ -294,7 +350,9 @@ def _parse_launch(raw: Any) -> Slurm | None:
         mem=body.get("mem"),
         account=body.get("account"),
         gpus=gpus,
+        nodes=nodes,
         extra=tuple(extra),
+        allocation=allocation,
     )
 
 

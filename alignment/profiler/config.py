@@ -91,6 +91,11 @@ class ServerConfig:
     # takes the vLLM driver's default (`DEFAULT_API_SERVER_COUNT`); SGLang has
     # no such knob and rejects a value.
     api_server_count: int | None = None
+    # Nodes the server spans (`alignment/profiler/multinode.py`): node 0 runs
+    # the API servers and DP ranks 0..L-1, node k runs headless ranks
+    # k*L..(k+1)*L-1, L = dp_size / nnodes. `cuda_visible_devices` then names
+    # one node's devices, the same on every node.
+    nnodes: int = 1
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -354,6 +359,12 @@ class ProfileConfig:
         return server_gpu_count(
             self.engine, self.server.tp_size, self.server.dp_size, self.server.extra_args
         )
+
+    @property
+    def local_gpu_count(self) -> int:
+        """GPUs the server runs on in one node (all of them on one node)."""
+
+        return self.gpu_count // max(1, self.server.nnodes)
 
     @property
     def captures_expert_load(self) -> bool:

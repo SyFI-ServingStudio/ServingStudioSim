@@ -62,10 +62,11 @@ def test_remote_set_overrides_one_field_for_this_call(remote_yaml):
         ("workdir=relative/dir", "workdir must be an absolute path"),
         ("files=nfs", "files must be rsync or shared"),
         ("launch.slurm.time=", "launch.slurm.time is required"),
-        ("launch.slurm.nodes=1", "unknown field.*launch.slurm.nodes"),
+        ("launch.slurm.ntasks=1", "unknown field.*launch.slurm.ntasks"),
         ("lanch=direct", "unknown field.*lanch"),
         ("access=ssh", "access must be `local`"),
         ("profile_runtime=podman", "profile_runtime must be"),
+        ("platform=linux/arm64", "platform applies only to profile_runtime: pyxis"),
         # A path through a plain value is a usage error, not a traceback.
         ("files.mode=rsync", "files is 'shared', not a mapping"),
     ],
@@ -73,6 +74,28 @@ def test_remote_set_overrides_one_field_for_this_call(remote_yaml):
 def test_a_malformed_remote_names_the_field(remote_yaml, override, message):
     with pytest.raises(RemoteConfigError, match=message):
         load_remote("cluster", (override,), path=remote_yaml)
+
+
+def test_a_pyxis_remote_names_its_nodes_platform_for_image_tags(remote_yaml, monkeypatch):
+    import reference_engines
+    from launcher.remote.run import Session
+
+    pyxis = (
+        "profile_runtime=pyxis",
+        "images=/shared/images",
+        "platform=linux/arm64",
+    )
+    cluster = load_remote("cluster", pyxis, path=remote_yaml)
+    assert cluster.platform == "linux/arm64"
+    with pytest.raises(RemoteConfigError, match="platform must be"):
+        load_remote("cluster", (*pyxis[:2], "platform=arm64"), path=remote_yaml)
+
+    # Blank, and restored to unset at teardown after Session overwrites it.
+    monkeypatch.setenv(reference_engines.PLATFORM_ENV, "")
+    monkeypatch.setattr(reference_engines.platform, "machine", lambda: "x86_64")
+    assert reference_engines.host_platform() == "linux/amd64"
+    Session(cluster)
+    assert reference_engines.host_platform() == "linux/arm64"
 
 
 def test_a_broken_remote_yaml_is_a_config_error(tmp_path):

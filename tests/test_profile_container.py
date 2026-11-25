@@ -336,6 +336,7 @@ def test_imex_channel_is_declared_by_the_fabric_memory_backends_only() -> None:
         ("moe_ep_reduce_scatter", "mnnvl_pull"),
         ("row_all_gather", "mnnvl_lamport"),
         ("row_all_gather", "mnnvl_pull"),
+        ("sparse_mla_shard_q", "vllm_symm_mem"),
     }
 
 
