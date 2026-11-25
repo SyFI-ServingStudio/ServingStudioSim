@@ -151,8 +151,10 @@ register(
 )
 
 
-# An MLA layout with qk_nope 256 and no RoPE part, v_head 256, kv_lora 512 and an
-# unpadded attention output. Same torch.bmm call as the two backends above.
+# MLA layouts with an unpadded attention output: qk_nope 256 with no RoPE part,
+# v_head 256 (the first pair), and qk_nope 128 + RoPE 64, v_head 128 (the second
+# pair, Kimi-K3.1); kv_lora 512 for both. Same torch.bmm call as the two
+# backends above.
 _MLA_URL = "https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention/mla_attention.py"
 for _backend, _function, _summary in (
     (
@@ -166,6 +168,18 @@ for _backend, _function, _summary in (
         "profile_mla_v_up_unpadded",
         "torch.bmm for value expansion from an attention output with no head "
         "padding, on vLLM's packed W_UV view.",
+    ),
+    (
+        "torch_mla_q_absorb_nope128_rope64",
+        "profile_mla_q_absorb_nope128_rope64",
+        "torch.bmm for query absorption of the 128-wide nope part of a 192-wide "
+        "head (Kimi-K3.1 MLA), on vLLM's packed W_UK view.",
+    ),
+    (
+        "torch_mla_v_up_v128_unpadded",
+        "profile_mla_v_up_v128_unpadded",
+        "torch.bmm for value expansion to 128-wide heads from an attention output "
+        "with no head padding (Kimi-K3.1 MLA), on vLLM's packed W_UV view.",
     ),
 ):
     register(

@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from profiling.runners import vllm_tactic_policy
+from profiling.runners.moe import gated_activation
+
 
 def _moe_shape(args: dict[str, Any]) -> str:
     return (
@@ -40,7 +43,14 @@ def nvfp4_fused_moe(args: dict[str, Any], stack: str, precomputed_routing: bool)
     label = f"nvfp4_fused_moe.{stack}" + (
         ".routed" if precomputed_routing else f".{args['routing_method']}"
     )
-    return label + _moe_shape(args)
+    # vLLM-rule tactics (vllm_tactic_policy) keep their own file per batch
+    # budget, apart from the legacy per-shape autotune's.
+    suffix = vllm_tactic_policy.label_suffix() if stack == "vllm" else ""
+    # FlashInfer's file key has no activation either, and SiTU runs other
+    # GEMM1 cubins (siTuGlu): its tactics get their own file. The default
+    # SwiGLU adds nothing, so existing files keep their names.
+    activation = gated_activation.parse(args.get("gated_activation")).label_suffix()
+    return label + _moe_shape(args) + activation + suffix
 
 
 def nvfp4_fused_moe_vllm(**args: Any) -> str:

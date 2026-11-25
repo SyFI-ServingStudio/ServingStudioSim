@@ -82,8 +82,10 @@ DOC = KernelDoc(
         "indexer's distribution, whose real rows it times within -5..+1% on B200 "
         "(normals read +10..+21%, the increasing template +50..+59%).",
         "Above 64 rows the op switches to a sampled top-k when the host max_seq_len "
-        "reaches 98304 (K=512); serving passes the token max_seq_len, this runner the "
-        "row length. On B200 the difference measured within 2% at 37,500 and 75,000.",
+        "reaches 98304 (K=512); serving passes the token max_seq_len, vllm_cuda the "
+        "row length. On B200 the difference measured within 2% at 37,500 and 75,000. "
+        "Under a full CUDA graph the bound is the capture-time max_model_len; "
+        "vllm_cuda_graph passes that.",
         "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
@@ -231,6 +233,36 @@ register(
                 "row's valid prefix; the fork's opt-in decode top-k on SM100."
             ),
             url="https://github.com/vllm-project/DeepSelect",
+        ),
+    )
+)
+
+
+# A decode step replayed from a full CUDA graph calls persistent_topk with the
+# capture-time host bound max_seq_len = max_model_len, which from 98304 up
+# selects sampled_topk_kernel for every row count above the cooperative ceiling.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda_graph",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode",
+            function_name="profile_dsa_persistent_topk_decode_vllm_cuda_graph",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's persistent_topk as a full CUDA graph replays it: the same "
+                "op as vllm_cuda, launched with the capture-time host bound "
+                "max_seq_len = max_model_len instead of the row length."
+            ),
         ),
     )
 )

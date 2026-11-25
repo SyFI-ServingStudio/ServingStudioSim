@@ -58,6 +58,8 @@ def test_kind_table_backend_and_runner_ref_contract():
         _V_UP_BACKEND,
         "torch_mla_q_absorb_no_rope",
         "torch_mla_v_up_unpadded",
+        "torch_mla_q_absorb_nope128_rope64",
+        "torch_mla_v_up_v128_unpadded",
         _WO_A_BACKEND,
         "torch_bmm_packed_lhs",
         "deepgemm_mxfp8_einsum_grouped_o_proj_fp8_out",
@@ -355,7 +357,12 @@ def test_no_rope_unpadded_layout_has_no_rope_split_and_no_head_padding():
     from profiling.runners.gemm import batched_gemm as runner
 
     q = runner._build_layout_q_absorb_operands(
-        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+        torch,
+        runner._NO_ROPE_UNPADDED_LAYOUT,
+        num_batches=16,
+        m=3,
+        torch_dtype=torch.float32,
+        device="cpu",
     )
     assert tuple(q.lhs.shape) == (16, 3, 256)
     assert q.lhs.stride() == (256, 16 * 256, 1)
@@ -363,10 +370,17 @@ def test_no_rope_unpadded_layout_has_no_rope_split_and_no_head_padding():
     assert tuple(q.out.shape) == (16, 3, 512)
     assert q.out.stride() == (512, 16 * 512, 1)
     v = runner._build_layout_v_up_operands(
-        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+        torch,
+        runner._NO_ROPE_UNPADDED_LAYOUT,
+        num_batches=16,
+        m=3,
+        torch_dtype=torch.float32,
+        device="cpu",
     )
     assert tuple(v.attention_base.shape) == (3, 16, 512)
     assert tuple(v.rhs.shape) == (16, 512, 256)
     assert tuple(v.out.shape) == (16, 3, 256)
     with pytest.raises(ValueError, match=r"\(256, 512\)"):
-        runner._validate_layout_args("torch_mla_q_absorb_no_rope", (256, 512), 16, 3, 512, 192, "bf16")
+        runner._validate_layout_args(
+            "torch_mla_q_absorb_no_rope", (256, 512), 16, 3, 512, 192, "bf16"
+        )

@@ -510,6 +510,74 @@ def _logical_scheduled_bytes(
     )
 
 
+def _prepare_varlen_mx_call(
+    deep_gemm: Any,
+    entry_point: Any,
+    operands: _DsaPagedMqaLogitsDecodeOperands,
+    *,
+    block_size: int,
+    num_sms: int,
+    max_model_len: int,
+) -> tuple[Any, Any, Any] | None:
+    """The SM100 varlen form of forks whose entry point takes `indices`.
+
+    Those forks require MX-scaled inputs and the varlen layout on SM100, as
+    vLLM's indexer calls them: every (request, draft) row is its own request
+    of one query (q [B * next_n, 1, H, D], one context length and block-table
+    row per row, `indices` naming the owning request), unit UE8M0 query scales
+    with the query scale folded into the fp32 weights, and each cached key's
+    power-of-two scale stored as four equal UE8M0 bytes. The cache is rewritten
+    to that format in place; the returned kernel carries `check_operands`,
+    whose fp32 scales decode the rewritten bytes for the Torch check.
+    """
+    import inspect
+
+    from dataclasses import replace
+
+    import torch
+
+    if "indices" not in inspect.signature(entry_point).parameters:
+        return None
+    use_mx = getattr(deep_gemm, "mqa_logits_use_mx_scales", None)
+    if not (callable(use_mx) and use_mx()):
+        return None
+    from profiling.runners.attention.dsa_mqa_logits_prefill import ue8m0_x4
+
+    batch_size, next_n, num_heads, head_dim = operands.q.shape
+    rows = batch_size * next_n
+    q = operands.q.reshape(rows, 1, num_heads, head_dim)
+    q_scale, weights = deep_gemm.mqa_logits_mx_inputs(q, None, operands.weights, torch.float32)
+    # DeepGEMM asserts 2-D context lengths: (rows, 1) in the varlen form.
+    context_lens = operands.context_lens.reshape(rows, 1).contiguous()
+    block_table = operands.block_table.repeat_interleave(next_n, dim=0).contiguous()
+    indices = torch.arange(
+        batch_size, dtype=torch.int32, device=q.device
+    ).repeat_interleave(next_n)
+    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens, block_size=block_size, num_sms=num_sms, indices=indices
+    )
+    scale_words = operands.scale_view.view(torch.int32)
+    exponents = (scale_words >> 23) & 0xFF
+    decoded = torch.exp2((exponents - 127).to(torch.float32))
+    scale_words.copy_(ue8m0_x4(torch, decoded))
+
+    def kernel() -> Any:
+        return entry_point(
+            (q, q_scale),
+            operands.cache,
+            weights,
+            context_lens,
+            block_table,
+            schedule_metadata,
+            max_model_len,
+            logits_dtype=torch.float32,
+            indices=indices,
+        )
+
+    kernel.check_operands = replace(operands, scale_view=decoded)  # type: ignore[attr-defined]
+    return context_lens, schedule_metadata, kernel
+
+
 def _prepare_deepgemm_call(
     deep_gemm: Any,
     operands: _DsaPagedMqaLogitsDecodeOperands,
@@ -520,6 +588,12 @@ def _prepare_deepgemm_call(
 ) -> tuple[Any, Any, Any]:
     """Adapt pinned contexts and build metadata before returning the timed call."""
     entry_point = _paged_mqa_logits_entry_point(deep_gemm)
+    varlen = _prepare_varlen_mx_call(
+        deep_gemm, entry_point, operands, block_size=block_size, num_sms=num_sms,
+        max_model_len=max_model_len,
+    )
+    if varlen is not None:
+        return varlen
     # The unified entry point takes `q = (values, scales_or_None)`; the FP8 path
     # passes None because the per-token scale is folded into `weights`.
     unified = getattr(entry_point, "__name__", "") == "fp8_fp4_paged_mqa_logits"
@@ -778,7 +852,11 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
 
         # Compile, initialize, and check the exact shape before formal CUPTI timing.
         _check_first_request(
-            torch, operands, kernel(), context_len=context_len, max_model_len=max_model_len
+            torch,
+            getattr(kernel, "check_operands", operands),
+            kernel(),
+            context_len=context_len,
+            max_model_len=max_model_len,
         )
         torch.cuda.synchronize()
         time_ms = Timer.cupti(

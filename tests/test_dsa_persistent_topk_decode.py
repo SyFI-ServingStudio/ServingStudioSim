@@ -91,6 +91,7 @@ def test_registration_support_policy_and_facades() -> None:
         _FORK_BACKEND,
         _COOPERATIVE_BACKEND,
         "deep_select",
+        "vllm_cuda_graph",
     ]
     deep_select = find_kernel_profiler_spec(KIND, "deep_select")
     assert deep_select.supports.allows(DType.FP32, gpu="NVIDIA B200")
@@ -1164,3 +1165,53 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
         runner.profile_dsa_persistent_topk_decode_vllm_cuda(
             **(_BASE_SPEC | {"batch_size": 1, "context_len": 3, "next_n": 1})
         )
+
+
+@pytest.mark.parametrize(
+    ("function_name", "expected_max_seq_len"),
+    [
+        ("profile_dsa_persistent_topk_decode_vllm_cuda", 7),
+        ("profile_dsa_persistent_topk_decode_vllm_cuda_graph", 4096),
+    ],
+)
+def test_graph_backend_passes_capture_time_max_seq_len(
+    monkeypatch, function_name, expected_max_seq_len
+) -> None:
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    spec = find_kernel_profiler_spec(KIND, "vllm_cuda_graph")
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.runner_ref.module_name == "profiling.runners.attention.dsa_persistent_topk_decode"
+    assert spec.runner_ref.function_name == "profile_dsa_persistent_topk_decode_vllm_cuda_graph"
+
+    operands = runner.build_native_operands(
+        torch,
+        batch_size=1,
+        context_len=7,
+        next_n=1,
+        max_model_len=8,
+        top_k=4,
+        logits_row_stride=8,
+        device="cpu",
+    )
+    seen = []
+    monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
+    monkeypatch.setattr(runner, "_load_native_op", lambda _torch: lambda *a: seen.append(a[5]))
+    monkeypatch.setattr(runner, "build_native_operands", lambda *args, **kwargs: operands)
+    monkeypatch.setattr(runner, "validate_native_semantics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(runner.Timer, "cupti", lambda kernel, **kwargs: (kernel(), 0.25)[1])
+    monkeypatch.setattr(runner.Energy, "perf", lambda kernel, **kwargs: 0.0)
+    getattr(runner, function_name)(
+        **(
+            _BASE_SPEC
+            | {
+                "batch_size": 1,
+                "context_len": 7,
+                "next_n": 1,
+                "max_model_len": 4096,
+                "logits_row_stride": 4096,
+            }
+        )
+    )
+    assert seen and set(seen) == {expected_max_seq_len}

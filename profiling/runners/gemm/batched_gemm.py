@@ -55,6 +55,16 @@ _NO_ROPE_UNPADDED_LAYOUT = _MlaLayout(
     padded_heads=None,
 )
 
+# Kimi-K3.1 MLA: qk_nope 128 plus a 64-wide RoPE part (q head 192), v_head 128,
+# kv_lora 512, on the same unpadded FlashInfer sparse-MLA attention output.
+_ROPE64_UNPADDED_LAYOUT = _MlaLayout(
+    q_head_width=192,
+    qk_nope_head_dim=128,
+    v_head_dim=128,
+    kv_lora_rank=512,
+    padded_heads=None,
+)
+
 
 @dataclass(frozen=True)
 class _QAbsorbOperands:
@@ -492,6 +502,38 @@ def profile_mla_v_up_unpadded(
     """Profile MLA V-up into an unpadded head axis ([N,B,512] x [N,512,256])."""
     backend = "torch_mla_v_up_unpadded"
     layout = _NO_ROPE_UNPADDED_LAYOUT
+    args = _validate_layout_args(
+        backend, (layout.kv_lora_rank, layout.v_head_dim), num_batches, m, n, k, dtype
+    )
+    return _profile_layout_bmm(backend, _build_layout_v_up_operands, layout, *args)
+
+
+def profile_mla_q_absorb_nope128_rope64(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile MLA Q absorption of the nope part of a 192-wide head ([N,B,128] x [N,128,512])."""
+    backend = "torch_mla_q_absorb_nope128_rope64"
+    layout = _ROPE64_UNPADDED_LAYOUT
+    args = _validate_layout_args(
+        backend, (layout.qk_nope_head_dim, layout.kv_lora_rank), num_batches, m, n, k, dtype
+    )
+    return _profile_layout_bmm(backend, _build_layout_q_absorb_operands, layout, *args)
+
+
+def profile_mla_v_up_v128_unpadded(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile MLA V-up into an unpadded head axis ([N,B,512] x [N,512,128])."""
+    backend = "torch_mla_v_up_v128_unpadded"
+    layout = _ROPE64_UNPADDED_LAYOUT
     args = _validate_layout_args(
         backend, (layout.kv_lora_rank, layout.v_head_dim), num_batches, m, n, k, dtype
     )

@@ -135,6 +135,7 @@ _DEEPINFER = (
 )
 for _backend, _runner_module, _function, _env in (
     ("triton", "profiling.runners.elementwise.triton", "profile_elementwise", None),
+    ("triton_vllm", "profiling.runners.elementwise.triton", "profile_elementwise", "vllm_env"),
     *((b, m, f, None) for b, m, f in _EAGER),
     *((f"{b}_vllm", m, f, "vllm_env") for b, m, f in _EAGER),
     *((f"{b}_deepinfer", m, f, "deepinfer_env") for b, m, f in _DEEPINFER),

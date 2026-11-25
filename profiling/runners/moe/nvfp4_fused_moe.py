@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from dataclasses import dataclass
 from typing import Any
 
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners import tactic_labels
-from profiling.runners.autotune_cache import autotune_cached
+from profiling.runners import tactic_labels, vllm_tactic_policy
+from profiling.runners.autotune_cache import autotune_cached, vllm_served_tactic
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
+from profiling.runners.moe import gated_activation as gated_activation_mod
 from profiling.runners.moe.routing_methods import (
     UNBIASED_ROUTING_METHODS,
     forced_routing_logits,
@@ -298,6 +301,53 @@ def _precomputed_routing_kwargs(torch: Any, ids: Any, args: dict[str, Any]) -> d
     }
 
 
+def _vllm_served_decision(
+    torch: Any, args: dict[str, Any], precomputed_routing: bool
+) -> vllm_tactic_policy.VllmTactic:
+    """The tactic vLLM serves for this call (``vllm_tactic_policy``): the batch
+    budget and DP size come from the environment, the budget defaulting to
+    vLLM's own default for this GPU."""
+
+    budget = vllm_tactic_policy.configured_batch_tokens()
+    if budget is None:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        budget = vllm_tactic_policy.vllm_default_batch_tokens(props.total_memory, props.name)
+    chunk = (
+        vllm_tactic_policy.trtllm_routed_chunk_size(args["top_k"], args["num_experts"])
+        if precomputed_routing
+        else None
+    )
+    return vllm_tactic_policy.vllm_tactic(
+        args["num_tokens"],
+        batch_tokens=budget,
+        dp_size=vllm_tactic_policy.configured_dp_size(),
+        routed_chunk=chunk,
+    )
+
+
+def _check_bucket_mirror(decision: vllm_tactic_policy.VllmTactic) -> None:
+    """The policy mirrors FlashInfer's bucket functions; fail loudly if this
+    FlashInfer's differ rather than reproduce the wrong rule."""
+
+    try:
+        from flashinfer.fused_moe.utils import (
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket,
+        )
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "the vLLM tactic policy needs FlashInfer's hybrid MoE buckets; set "
+            f"{vllm_tactic_policy.POLICY_ENV}={vllm_tactic_policy.POLICY_RUNNER_AUTOTUNE}"
+        ) from exc
+    fi_buckets = tuple(get_hybrid_num_tokens_buckets(decision.batch_tokens))
+    fi_bucket = map_to_hybrid_bucket(decision.num_tokens, decision.tune_max)
+    if fi_buckets != decision.tuning_buckets or fi_bucket != decision.bucket:
+        raise KernelLaunchFailed(
+            f"vllm_tactic_policy disagrees with FlashInfer: buckets {fi_buckets} vs "
+            f"{decision.tuning_buckets}, bucket {fi_bucket} vs {decision.bucket}"
+        )
+
+
 def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) -> str:
     """Name of the persisted tactic file for this call's runner configuration
     (``profiling.runners.tactic_labels.nvfp4_fused_moe``)."""
@@ -354,6 +404,10 @@ def _validate_args(*, stack: str = "vllm", **kwargs: Any) -> dict[str, Any]:
     if stack == "sglang" and args["routing_method"] not in SGLANG_ROUTING_METHODS:
         raise ValueError(f"unsupported routing method for SGLang: {args['routing_method']}")
     validate_routing_groups(args["routing_method"], args["n_group"], args["topk_group"])
+    activation = gated_activation_mod.parse(args.get("gated_activation"))
+    if stack == "sglang" and not activation.is_default:
+        raise ValueError("the SGLang NVFP4 MoE path is profiled with SwiGLU only")
+    args["gated_activation"] = None if activation.is_default else activation.canonical()
     # vLLM pads checkpoint weights to these alignments before the shuffle
     # (flashinfer_fp4_moe.py: align_trtllm_fp4_moe_hidden_dim_for_fi to 256,
     # align_fp4_moe_weights_for_fi to 64 for the gated gate/up), so the kernel
@@ -449,6 +503,7 @@ def _profile_nvfp4_fused_moe_sm100(
     routed_scaling_numerator: int,
     routed_scaling_denominator: int,
     per_expert_batches: tuple[int, ...],
+    gated_activation: str | None = None,
 ) -> ComputeMetrics:
     spec = dict(locals())
     spec.pop("stack")
@@ -518,6 +573,12 @@ def _profile_nvfp4_fused_moe_sm100(
                 "routing_method_type": ROUTING_METHODS[args["routing_method"]],
             }
             fused_moe_fn = flashinfer.fused_moe.trtllm_fp4_block_scale_moe
+        # GEMM1's gated activation and its constants, as vLLM's
+        # TrtLlmNvFp4ExpertsBase passes them (gated_activation.py). The default
+        # is the SwiGLU call every earlier row measured.
+        activation_kwargs = gated_activation_mod.gemm1_kwargs(
+            torch, gated_activation_mod.parse(args["gated_activation"]), args["num_local_experts"]
+        )
 
         def run_once() -> None:
             _call_trtllm_fp4_moe(
@@ -531,9 +592,7 @@ def _profile_nvfp4_fused_moe_sm100(
                     "gemm1_weights": experts.w1,
                     "gemm1_weights_scale": experts.s1,
                     "gemm1_bias": None,
-                    "gemm1_alpha": None,
-                    "gemm1_beta": None,
-                    "gemm1_clamp_limit": None,
+                    **activation_kwargs,
                     "gemm2_weights": experts.w2,
                     "gemm2_weights_scale": experts.s2,
                     "gemm2_bias": None,
@@ -546,23 +605,37 @@ def _profile_nvfp4_fused_moe_sm100(
                     "local_expert_offset": 0,
                     "local_num_experts": args["num_local_experts"],
                     "do_finalize": do_finalize,
-                    "activation_type": 3,
                     "output": output,
                     **stack_kwargs,
                 },
             )
 
-        # vLLM tunes this exact call. SGLang tunes a dummy precomputed-top-k
-        # signature, so timing an extra autotune here would select a tactic its
-        # production invocation does not use.
-        if stack != "sglang":
-            with autotune_cached(autotune, tuning_label(args, stack, precomputed_routing)):
-                run_once()
-        else:
+        # Tactic choice. SGLang tunes a dummy precomputed-top-k signature, so
+        # an autotune here would select a tactic its production invocation
+        # does not use. vLLM serves what its start-up warm-up tuned for the
+        # hybrid buckets up to the batch budget, and tactic -1 for any bucket
+        # beyond (vllm_tactic_policy); the legacy policy autotunes this shape
+        # in-process instead.
+        label = tuning_label(args, stack, precomputed_routing)
+        if stack == "sglang":
+            scope: Any = contextlib.nullcontext()
             run_once()
-        torch.cuda.synchronize()
-        time_ms = Timer.cupti(run_once, warmup=3, interval_union=True)
-        energy_j = Energy.perf(run_once, per_iter_time_ms=time_ms)
+        elif vllm_tactic_policy.tactic_policy() == vllm_tactic_policy.POLICY_VLLM:
+            decision = _vllm_served_decision(torch, args, precomputed_routing)
+            _check_bucket_mirror(decision)
+            print(f"[vllm-tactic] {label}: {decision.describe()}", file=sys.stderr)
+            scope = vllm_served_tactic(
+                autotune, label, decision, vllm_tactic_policy.NVFP4_MOE_CUSTOM_OP, run_once
+            )
+        else:
+            with autotune_cached(autotune, label):
+                run_once()
+            scope = contextlib.nullcontext()
+        with scope:
+            run_once()
+            torch.cuda.synchronize()
+            time_ms = Timer.cupti(run_once, warmup=3, interval_union=True)
+            energy_j = Energy.perf(run_once, per_iter_time_ms=time_ms)
     except ProfilerNotImplemented:
         raise
     except Exception as exc:

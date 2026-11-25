@@ -210,7 +210,8 @@ def test_conv_compaction_keeps_the_history_ending_at_the_accepted_token() -> Non
 
 def test_verify_operands_follow_the_kimi_k3_layout() -> None:
     # Defect: timing contiguous q/k/v copies the production call never makes,
-    # a contiguous beta, or records outside the layer's cache page.
+    # a contiguous beta, records inside the layer's cache page (the fork keeps
+    # them in request-row KDARecoverSSMRecords), or the old cache-record kwargs.
     shape = runner.validate_verify_args(**{**_VERIFY, "num_heads": 2})
     operands = runner.build_verify_operands(torch, shape, device=torch.device("cpu"))
     seen: dict = {}
@@ -238,9 +239,15 @@ def test_verify_operands_follow_the_kimi_k3_layout() -> None:
     assert page.kg.shape == (5, 2, 8, 256) and page.kg.dtype is torch.bfloat16
     assert page.conv.shape == (5, 10, width)
     page_bytes = page.raw.numel() // 5
-    for view in (page.conv, page.checkpoint, page.correction, page.kg):
+    for view in (page.conv, page.checkpoint):
         assert view.untyped_storage().data_ptr() == page.raw.untyped_storage().data_ptr()
         assert view.stride(0) * view.element_size() == page_bytes
+    for view in (page.correction, page.kg):
+        assert view.untyped_storage().data_ptr() != page.raw.untyped_storage().data_ptr()
+    assert "correction_cache" not in seen and "kg_cache" not in seen
+    records = seen["records"]
+    assert records.correction.shape == (4, 2, 8, 128) and records.correction.dtype is torch.float32
+    assert records.key_gate.shape == (4, 2, 8, 256) and records.key_gate.dtype is torch.bfloat16
 
 
 def test_commit_context_gets_every_layer_and_no_align_metadata() -> None:
@@ -263,12 +270,9 @@ def test_commit_context_gets_every_layer_and_no_align_metadata() -> None:
     runner.invoke_commit(operands)
     assert len(created["layers"]) == 2 and created["spec"] == 8 and created["max_reqs"] == 4
     layer = created["layers"][0]
-    assert [t.shape for t in layer.kv_cache] == [
-        (5, 10, 768),
-        (5, 2, 128, 128),
-        (5, 2, 8, 128),
-        (5, 2, 8, 256),
-    ]
+    assert [t.shape for t in layer.kv_cache] == [(5, 10, 768), (5, 2, 128, 128)]
+    assert layer.recoverssm_records.correction.shape == (4, 2, 8, 128)
+    assert layer.recoverssm_records.key_gate.shape == (4, 2, 8, 256)
     assert layer.gate_lower_bound == -5.0 and layer.local_num_heads == 2
     (accepted, slots, qsl), kwargs = calls[0]
     assert accepted.tolist() == [3, 3, 3, 3]

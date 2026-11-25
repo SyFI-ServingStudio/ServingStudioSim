@@ -768,6 +768,68 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     ``max_seq_len = context_len``; production passes the batch's token maximum,
     which only gates the <=32-row cooperative radix setup (``> 32768``).
     """
+    return _profile_vllm_cuda(
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+        graph_max_seq_len=False,
+    )
+
+
+def profile_dsa_persistent_topk_decode_vllm_cuda_graph(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the persistent callable as a captured CUDA graph replays it.
+
+    A decode step under a full CUDA graph runs the call recorded at capture,
+    whose host ``max_seq_len`` is the capture-time bound, ``max_model_len``
+    (vLLM ``v1/worker/gpu/model_states/mamba_hybrid.py`` ``for_capture``), not
+    the batch's longest row. ``persistent_topk`` picks its path from that host
+    value, and from 98304 up it runs ``sampled_topk_kernel`` whatever the rows
+    hold. This backend passes ``max_seq_len = max_model_len``; the rows are the
+    same as ``vllm_cuda``'s.
+    """
+    return _profile_vllm_cuda(
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+        graph_max_seq_len=True,
+    )
+
+
+def _profile_vllm_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+    *,
+    graph_max_seq_len: bool,
+) -> ComputeMetrics:
     (
         batch_size,
         context_len,
@@ -789,6 +851,9 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         index_dtype,
         context_mode,
     )
+    # The host bound the call is launched with: the row length eagerly, the
+    # capture-time max_model_len under a CUDA graph.
+    max_seq_len = max_model_len if graph_max_seq_len else context_len
     try:
         import torch
     except ImportError as exc:
@@ -818,7 +883,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             op,
             operands,
             top_k=top_k,
-            max_seq_len=context_len,
+            max_seq_len=max_seq_len,
             overflow_allowed=overflow_allowed,
         )
 
@@ -827,7 +892,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
                 op,
                 operands,
                 top_k=top_k,
-                max_seq_len=context_len,
+                max_seq_len=max_seq_len,
             )
 
         # Correctness above is the exact-shape first launch. Synchronize before

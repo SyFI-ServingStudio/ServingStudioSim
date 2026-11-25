@@ -95,10 +95,12 @@ def _validate_args(
             f"({min(_SUPPORTED_KERNEL_SIZES)}..{max(_SUPPORTED_KERNEL_SIZES)}), "
             f"got {validated.kernel_size}"
         )
-    if validated.dtype is not DType.BF16 or validated.state_dtype is not DType.BF16:
+    # The conv state follows --mamba-cache-dtype: bf16 by default, fp32 when a
+    # deployment sets --mamba-cache-dtype float32 (Kimi-K3.1's recipe).
+    if validated.dtype is not DType.BF16 or validated.state_dtype not in (DType.BF16, DType.FP32):
         raise ValueError(
             "vllm_triton gdn_causal_conv_decode requires dtype=bf16 and "
-            "state_dtype=bf16, got "
+            "state_dtype=bf16 or fp32, got "
             f"{validated.dtype.value} and {validated.state_dtype.value}"
         )
     return validated

@@ -25,7 +25,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, EP_RANKS_BY_LOAD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import (
+    CUPTI_METHOD,
+    EP_RANKS_BY_LOAD,
+    BackendDoc,
+    KernelDoc,
+    arg,
+    optional_arg,
+)
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -95,6 +102,18 @@ class Nvfp4FusedMoeArgs(KernelArgs):
     )
     per_expert_batches: tuple[int, ...] = arg(
         unit="tokens", doc="Selected token count for each global expert, in expert order."
+    )
+    gated_activation: str | None = optional_arg(
+        absent="swiglu",
+        doc=(
+            "GEMM1's gated activation. Absent means swiglu (FlashInfer"
+            " ActivationType.Swiglu, no alpha, beta or clamp), what every row measured"
+            " before the field existed. 'situ:beta=<b>,linear_beta=<lb>' is Kimi's"
+            " SiTU-GLU (ActivationType.Situ) with the model's activation_situ_beta and"
+            " activation_situ_linear_beta, passed per expert as gemm1_alpha and"
+            " gemm1_beta the way vLLM's TRT-LLM NVFP4 experts pass them; it runs the"
+            " siTuGlu GEMM1 cubins. Only the vLLM NVFP4 backends take it."
+        ),
     )
 
 
@@ -180,6 +199,9 @@ DOC = KernelDoc(
         "The vLLM NVFP4 backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
+        "gated_activation selects SwiGLU (absent) or SiTU-GLU for the vLLM NVFP4 "
+        "backends; SiTU rows pass the SiTU constants but keep the SwiGLU rows' "
+        "scale scalars, which change values, not kernels or timing.",
         "The NVFP4 backends pass no SwiGLU clamp (gemm1_clamp_limit is None); vLLM "
         "passes the model's swiglu_limit when it has one. FP8 block-scale "
         "deepseek_v3 rows were measured with SwiGLU clamp 10, renormalize_naive rows "

@@ -116,3 +116,31 @@ register(
         ),
     )
 )
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_pynccl",
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.moe_ep_collectives_vllm_pynccl",
+            function_name="profile_row_all_gather_batch",
+        ),
+        table_name=KIND,
+        args_schema=RowAllGatherArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "vLLM's TP all-gather of bf16 rows through PyNcclCommunicator: one NCCL "
+                "AllGather (all_gatherv when the shards differ), the sequence-parallel "
+                "gather before attention."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/pynccl.py",
+        ),
+    )
+)

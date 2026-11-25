@@ -30,6 +30,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners.comm._multinode import local_rank_count
 
 KIND: str = "all_reduce"
 
@@ -115,7 +116,16 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
         args_schema=AllReduceArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        # NCCL spreads a group larger than a node over the job's nodes.
+        gpu_count_fn=(
+            (
+                lambda spec: local_rank_count(
+                    int(spec["num_gpus"]), str(spec.get("fabric", "nvlink"))
+                )
+            )
+            if backend == "nccl"
+            else (lambda spec: int(spec["num_gpus"]))
+        ),
         list_native=True,
         doc=_BACKEND_DOCS[backend],
     )
