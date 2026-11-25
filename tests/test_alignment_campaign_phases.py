@@ -133,18 +133,24 @@ def _phase1_pack(
 
 
 def _write_workload_pass(
-    case_dir: Path, *, log: str = SERVER_LOG, engine: str = "vllm", relative: bool = False
+    case_dir: Path,
+    *,
+    log: str = SERVER_LOG,
+    engine: str = "vllm",
+    relative: bool = False,
+    spec_metrics: dict = SPEC_METRICS,
 ) -> None:
     """A workload pass as `alignment profile` leaves it, recorded from elsewhere.
 
     `relative` records the artifacts as the runner does now (`artifact_paths.record`):
     relative to the pass directory; otherwise as an older result, absolute.
+    `spec_metrics` replaces the draft counters, for a pack drafting another depth.
     """
     directory = case_dir / "profile_workload"
     (directory / engine).mkdir(parents=True, exist_ok=True)
     recorded = "/elsewhere/campaign/90_diverse_100/profile_workload"
     prefix = "" if relative else f"{recorded}/"
-    (directory / "spec_decode_metrics.json").write_text(json.dumps(SPEC_METRICS))
+    (directory / "spec_decode_metrics.json").write_text(json.dumps(spec_metrics))
     (directory / engine / "p1_server.log").write_text(log)
     (directory / engine / "p1_metrics.jsonl").write_text(
         "".join(json.dumps(line) + "\n" for line in METRICS_LINES)

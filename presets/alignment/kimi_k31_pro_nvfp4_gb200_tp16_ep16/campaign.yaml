@@ -1,0 +1,137 @@
+schema_version: 1
+pack: kimi_k31_pro_nvfp4_gb200_tp16_ep16
+description: Kimi-K3.1-Pro NVFP4 (routed experts NVFP4, KDA and shared experts MXFP8, MLA BF16) on
+  four GB200 NVL72 trays, one TP16 replica (attention, KDA and dense layers tensor-parallel over
+  MNNVL) with the routed experts EP16, vLLM main c5db9bd, DSpark proposer with 7 drafted tokens
+  (verify width 8). One server spans the four trays (server.nnodes 4, a head and three headless
+  peers joined by node rank). Prefill and mixed steps run in piecewise CUDA graphs, decode in full
+  graphs. Alignment phase 1 only, the tracked diverse_100 trace at its recorded arrival times.
+recorded_on:
+  host: gb200_nvl72
+  gpu: NVIDIA GB200
+  checkpoint_snapshots:
+    kimi_k31_pro_nvfp4: models--nvidia--Kimi-K3.1-Pro-NVFP4/snapshots/3af0462972c9cc07e5ba6e0867b44f961ce95e9b
+    kimi_k31_pro_dspark: models--Inferact--Kimi-K3.1-Pro-DSpark/snapshots/46ea9cb020652016de0d6e60ee6e4510fd6ec986
+  nsys_version: 2025.5.2
+  device_roles:
+    primary: 0,1,2,3
+variants:
+  tp16_ep16_c4096_s32:
+    deployment: unified
+    gpu: NVIDIA GB200
+    replicas: 1
+    checkpoint: kimi_k31_pro_nvfp4
+    # The proposer ships as its own checkpoint; rendering writes its host path
+    # into `--speculative-config`.
+    draft_checkpoint: kimi_k31_pro_dspark
+    # The checkpoint ships only tiktoken.model; the load generator reads
+    # tokenizer.json, converted from it (token-identical on the corpus).
+    tokenizer: kimi_k31_pro_tokenizer
+    engine: vllm
+    backend: openai
+    run_name_prefix: kimi_k31_gb200_tp16
+    python_runtime:
+      packages:
+      - name: nvtx
+        version: 0.2.15
+        index_url: https://pypi.org/simple
+      environment:
+        HF_HUB_OFFLINE: '1'
+        OMP_NUM_THREADS: '8'
+        # Each rank reads its share of 1.5 TB of safetensors (about 10 min from
+        # node-local NVMe); vLLM's default 600 s is shorter.
+        VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+        VLLM_RPC_TIMEOUT: '600000'
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # The GB300 DEP16 preset's collectives: NCCL over the NVL72 fabric.
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_MNNVL_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        NCCL_NET_PLUGIN: none
+    server:
+      tp_size: 16
+      dp_size: 1
+      nnodes: 4
+      expert_parallel_size: 16
+      expert_count_reduction_group_size: 16
+      # TP16 shards the 68 GiB of non-expert weights that DP16 copies onto
+      # every rank, so a rank holds about 94 GiB of weights out of 184 GiB:
+      # room for 4096-token chunks and piecewise CUDA graphs up to that size.
+      # Model runner V2 sizes the two graph families separately: piecewise
+      # prefill graphs by token count (below), FULL decode graphs by request
+      # count (default grid up to max-num-seqs, at 8 tokens per request).
+      # Smoke (2026-11-19): 4.78 GiB of graphs, 3.83M KV tokens; a 32K prompt
+      # prefills in 1.5 s, and a concurrent decode stream stays at 4.4 ms/token.
+      chunk_size: 4096
+      enable_server_load_tracking: true
+      api_server_count: 1
+      served_model_name: kimi-k31-pro
+      # Kimi's KimiLinearForCausalLM declares MixtureOfExperts but sets none of
+      # its EPLB fields (num_moe_layers is unset), so EPLB never registers the
+      # model and the routing pass has no balancedness stream to record; the
+      # engine's own way to say so is --no-enable-eplb (routes alone).
+      extra_args: [--no-enable-eplb, --enable-expert-parallel, --trust-remote-code, --language-model-only, --kv-cache-dtype,
+        fp8, --mamba-cache-dtype, float32, --mamba-ssm-cache-dtype, float32, --use-replayssm, --max-num-seqs,
+        '32', --attention-config, '{"indexer_kv_dtype":"mxfp4"}', --seed, '0', --generation-config, vllm,
+        --compilation-config, '{"cudagraph_mode":"FULL_AND_PIECEWISE","prefill_cudagraph_capture_token_sizes":[256,512,1024,2048,4096]}',
+        --speculative-config, '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block"}']
+    arch:
+      type: kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark
+      model_config: model/config/kimi_k31_pro_nvfp4.json
+      draft_tokens: 7
+      tp_size: 16
+      dp_size: 1
+      # The capture's own routes (profile_corpus pass), published to the
+      # workload dataset.
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@6ad8e60bf522a04db0fde4efffd8de2b33c87a1a/kimi_k31_pro_nvfp4/vllm_dspark_k7/diverse_100/capture/20261120/manifest.json
+      # FULL decode graphs by request count (vLLM's default grid 1-6, 8..16
+      # by 2, 20..32 by 4, at 8 rows each) and the piecewise prefill token
+      # sizes, as one token grid: the capture log's `cudagraph_capture_sizes`.
+      cudagraph_capture_sizes: [8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512, 1024, 2048, 4096]
+    worker:
+      type: speculative
+      max_batch_tokens: 4096
+      batch_policy: mix
+      draft_tokens: 7
+      acceptance_seed: 73
+      dp_placement: vllm-least-loaded
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+    - kind: nsys
+      name: profile_nsys
+      trace: workload
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 7
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: tp16_diverse_100
+  variant: tp16_ep16_c4096_s32
+  phase: 1
+  purpose: 'alignment Phase 1: the tracked diverse_100 trace at its recorded arrival times.'
+  coverage: [diverse_100]
+  max_model_len: 131072
+  max_concurrency: 256
+  chunk_size: 4096
+  speculative_acceptance: &from_capture
+    status: from_capture
+  speculative_acceptance_by_output_position: *from_capture
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.94
+  capture_seconds: 60.0
+  device_role: primary
+  workload_trace:
+    path: trace/diverse_100.csv
+  attn_gpu_memory_gb: *from_capture
