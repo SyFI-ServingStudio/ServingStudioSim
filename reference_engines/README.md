@@ -13,15 +13,13 @@ kept as an official base plus our patches. One directory per engine:
 
 | Engine | Upstream base | Official image |
 | --- | --- | --- |
-| `vllm` | main `5629b26` (2026-11-07) | `public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26…` (vLLM's post-merge CI image); arm64: `…:b4dffa50…-arm64` |
+| `vllm` | main `c5db9bd` (2026-11-19) | `public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c5db9bd…` (vLLM's post-merge CI image); arm64: `…:c5db9bd…-arm64` |
 | `sglang` | main `9d547e19` (2026-11-08) | `lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19` |
 | `deepinfer` | main `a679bb8` | none; built from source on `nvidia/cuda:13.3.1-devel-ubuntu24.04` |
 
-vLLM's CI publishes no arm64 image of `5629b26`; the arm64 base is
-`b4dffa50`, 3 commits earlier, which differs from it only in `recipes/` and
-`tests/`, so the same patches apply (BASE.yaml: `platforms.linux/arm64` has its
-own `image`, `upstream_commit` and a `note` saying why). SGLang's tag is a
-multi-platform index; BASE.yaml pins both platforms' manifests. The arm64 images are build-verified only.
+vLLM's CI publishes an arm64 image of `c5db9bd` under the `-arm64` tag
+(BASE.yaml: `platforms.linux/arm64` has its own `image`). SGLang's tag is a
+multi-platform index; BASE.yaml pins both platforms' manifests. The vLLM arm64 image is run on GB200; the SGLang arm64 image is build-verified only.
 
 DeepInfer publishes no image (its README builds from source with
 `scripts/build.sh`), so its BASE.yaml pins the CUDA devel image its Dockerfile
@@ -166,7 +164,7 @@ least to most:
    that installs it at interpreter start;
 5. the req-frontend `session_runner`, built in a stage on the same base;
 6. the patches, applied to the engine as the official image installed it:
-   vLLM's wheel in `/usr/local/lib/python3.12/dist-packages` (only `vllm/`
+   vLLM's wheel in the system Python's dist-packages (`/usr/local/lib/python3.14/dist-packages` since c5db9bd) (only `vllm/`
    paths), SGLang's editable checkout at `/sgl-workspace/sglang`. A patch that
    does not apply means the image is not BASE.yaml's commit, and the build fails;
 7. this checkout's `profiling/`, `launcher/`, `gpu/` and the guard for the build's self-check
