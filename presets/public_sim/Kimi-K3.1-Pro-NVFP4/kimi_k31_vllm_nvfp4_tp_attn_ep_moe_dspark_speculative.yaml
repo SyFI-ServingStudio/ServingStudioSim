@@ -1,0 +1,24 @@
+# vLLM Kimi-K3.1-Pro NVFP4 + DSpark (7 draft tokens), chunked prefill at 4096
+# tokens, on gb200_nvl72_tp16 as case 01_tp16_diverse_100 of
+# presets/alignment/kimi_k31_pro_nvfp4_gb200_tp16_ep16 ran it.
+# attn_gpu_memory_gb is the KV pool per GPU that the case's workload pass
+# measured (--max-model-len 131072).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark
+          max_model_len: 131072
+        worker:
+          type: speculative
+          max_batch_tokens: 4096
+          batch_policy: mix
+          draft_tokens: 7
+          acceptance_seed: 73
+          # vLLM's DP coordinator places each request on the least-loaded engine.
+          dp_placement: vllm-least-loaded
+          attn_gpu_memory_gb: 60.805999
+sweep:
+  replicas: [1]

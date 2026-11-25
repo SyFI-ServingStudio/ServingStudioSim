@@ -91,3 +91,9 @@ XiaomiMiMo/MiMo-V2.6-Flash-RL:
   name: MiMo V2.6 Flash RL
   family: MiMo
   config: mimo_v2_6_flash_rl
+# The ModelOpt NVFP4 export of Kimi-K3.1-Pro: routed experts in NVFP4; KDA and
+# the shared experts MXFP8; MLA attention BF16.
+nvidia/Kimi-K3.1-Pro-NVFP4:
+  name: Kimi K3.1 Pro NVFP4
+  family: Kimi
+  config: kimi_k31_pro_nvfp4

@@ -75,3 +75,5 @@ qwen35_vllm_nvfp4_gdn_dense:
   name: "vLLM, one GPU"
 qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative:
   name: "vLLM, one GPU, MTP speculative decoding"
+kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark:
+  name: "vLLM, TP attention, EP MoE, DSpark speculative decoding"
