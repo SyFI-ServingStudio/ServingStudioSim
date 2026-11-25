@@ -107,10 +107,30 @@ const TOTAL_TOKEN_POINTS: [u32; 11] = [1, 4, 16, 64, 256, 1024, 4096, 8192, 1638
 /// The (total tokens, ragged largest rank tokens) grid shared by the naive
 /// DP/EP MoE collectives. The total axis stops at `max_total_tokens`.
 pub(crate) fn collective_grid(max_total_tokens: u32) -> SweepGrid {
-    let totals = TOTAL_TOKEN_POINTS
+    collective_grid_with_totals(max_total_tokens, &[])
+}
+
+/// [`collective_grid`] with extra total-token points chosen by the arch (the
+/// totals its steps actually exchange), merged into the shared axis in order.
+/// The extra totals are measured on the equal-split line only: see
+/// [`extra_total_off_the_zero_line`].
+pub(crate) fn collective_grid_with_totals(max_total_tokens: u32, extra_totals: &[u32]) -> SweepGrid {
+    let mut totals: Vec<u32> = TOTAL_TOKEN_POINTS
         .into_iter()
-        .filter(|&tokens| tokens <= max_total_tokens);
+        .chain(extra_totals.iter().copied())
+        .filter(|&tokens| tokens <= max_total_tokens)
+        .collect();
+    totals.sort_unstable();
+    totals.dedup();
     SweepGrid::new(vec![Axis::values(totals), Axis::values(RANK_TOKEN_POINTS)])
+}
+
+/// Whether a grid cell is a ragged cell at an arch-added total. Those totals
+/// are added for equal-split steps, so only their zero-line cell is profiled;
+/// the ragged cells stay unmeasured (infeasible) and ragged lookups keep
+/// reading the shared totals' rows.
+pub(crate) fn extra_total_off_the_zero_line(total_tokens: u32, ragged_max_rank_tokens: u32) -> bool {
+    ragged_max_rank_tokens != 0 && !TOTAL_TOKEN_POINTS.contains(&total_tokens)
 }
 
 /// The per-rank counts profiled at one grid cell, or `None` when the cell
@@ -152,7 +172,8 @@ fn validate_config(config: &MoeEpAllGatherKernelConfig) {
     assert!(config.num_gpus >= 2, "EP all-gather needs >= 2 ranks");
     assert!(matches!(config.hidden_dtype, DType::Bf16 | DType::Fp8E4m3));
     assert_eq!(config.router_dtype, DType::Fp32);
-    assert_eq!(config.fabric, "nvlink");
+    // One node over NVLink, or the job's nodes over InfiniBand (vllm_pynccl).
+        assert!(matches!(config.fabric.as_str(), "nvlink" | "infiniband"));
 }
 
 register_kernel!(MoeEpAllGatherKernel, MoeEpAllGatherSpec);
@@ -227,6 +248,23 @@ mod tests {
         }
         assert!((time_us(vec![2, 1, 1, 1, 1, 1, 1, 1]) - 200.0).abs() < 1e-3);
         assert!((time_us(vec![88, 87, 87, 87, 87, 87, 87, 87]) - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn extra_totals_merge_into_the_axis_and_stay_on_the_zero_line() {
+        let shared = collective_grid(8192);
+        assert_eq!(collective_grid_with_totals(8192, &[]).axes(), shared.axes());
+        let extended = collective_grid_with_totals(8192, &[48, 32, 64, 16384]);
+        // Merged in order, duplicates of shared points and totals past the
+        // bound dropped; the ragged axis is unchanged.
+        assert_eq!(
+            extended.axes()[0],
+            vec![1.0, 4.0, 16.0, 32.0, 48.0, 64.0, 256.0, 1024.0, 4096.0, 8192.0]
+        );
+        assert_eq!(extended.axes()[1], shared.axes()[1]);
+        assert!(!extra_total_off_the_zero_line(48, 0));
+        assert!(extra_total_off_the_zero_line(48, 4));
+        assert!(!extra_total_off_the_zero_line(64, 4));
     }
 
     #[test]

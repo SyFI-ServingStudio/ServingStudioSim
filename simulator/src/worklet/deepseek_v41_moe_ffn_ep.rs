@@ -227,6 +227,8 @@ impl DeepseekV41MoeFfnEpWorklet {
                 routed_scaling_denominator: cfg.routed_scaling_denominator,
                 expert_demand: cfg.expert_demand.clone(),
                 folded_rank_position: cfg.folded_rank_position,
+                extra_token_points: Vec::new(),
+                gated_activation: None,
             },
             shared_gate_up: mxfp8((2 * shared_local).into(), cfg.hidden_size.clone()),
             // models/deepseek_v4/nvidia/model.py:187 `act_and_mul` (clamped

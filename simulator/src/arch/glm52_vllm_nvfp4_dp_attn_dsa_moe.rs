@@ -215,6 +215,7 @@ pub fn build_configs(
         activation_dtype: DType::Nvfp4E2m1,
         fabric: "nvlink".to_string(),
         max_total_tokens,
+        extra_total_tokens: Vec::new(),
     };
     let combine = MoeEpReduceScatterKernelConfig {
         backends: COLLECTIVE_BACKENDS.to_vec(),
@@ -224,6 +225,7 @@ pub fn build_configs(
         dtype: DType::Bf16,
         fabric: "nvlink".to_string(),
         max_total_tokens,
+        extra_total_tokens: Vec::new(),
     };
     Ok(Glm52VllmNvfp4DpAttnConfigs {
         parallel: parallel.clone(),

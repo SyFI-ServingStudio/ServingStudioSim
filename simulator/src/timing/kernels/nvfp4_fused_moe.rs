@@ -90,6 +90,21 @@ pub struct Nvfp4FusedMoeKernelConfig {
     /// representative local histogram without adding physical rank identity to
     /// the Python profiler key.
     pub folded_rank_position: u32,
+    /// Extra `num_tokens` grid points on top of the shared sweep, chosen by the
+    /// arch: the row counts the deployment actually executes between the shared
+    /// grid's points (e.g. the CUDA-graph capture sizes a step is padded to), so
+    /// they are measured rather than interpolated. Pricing is unchanged; only
+    /// the grid grows. Empty (the default, and absent from the serialized
+    /// config, so existing identities are unchanged) keeps the shared grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_token_points: Vec<u32>,
+    /// GEMM1's gated activation, as the profiler's `gated_activation` arg
+    /// spells it: `situ:beta=<b>,linear_beta=<lb>` for Kimi's SiTU-GLU, with
+    /// the model's `activation_situ_beta` / `activation_situ_linear_beta`.
+    /// Unset (the default, and absent from the serialized config and from the
+    /// profiler key, so existing identities and rows are unchanged) is SwiGLU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated_activation: Option<String>,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -106,10 +121,13 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
     const KIND: KernelKind = "nvfp4_fused_moe";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![config.expert_demand.token_axis(Axis::chain([
-            Axis::values([1, 4, 8, 16, 32, 48]),
-            Axis::token_axis(),
-        ]))])
+        SweepGrid::new(vec![Axis::chain([
+            config.expert_demand.token_axis(Axis::chain([
+                Axis::values([1, 4, 8, 16, 32, 48]),
+                Axis::token_axis(),
+            ])),
+            Axis::values(config.extra_token_points.iter().copied()),
+        ])])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -119,6 +137,15 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
     /// The corpus arm names a payload on disk, and `enumerate` has no way to
     /// report that it moved.
     fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if let Some(activation) = config.gated_activation.as_deref() {
+            // SwiGLU is the unset default: spelling it out would key the same
+            // call two ways.
+            anyhow::ensure!(
+                activation.starts_with("situ:beta="),
+                "gated_activation {activation:?}: leave it unset for SwiGLU; only \
+                 `situ:beta=<b>,linear_beta=<lb>` is set explicitly"
+            );
+        }
         if let Some(activation) = config.activation_format {
             anyhow::ensure!(
                 activation == config.input_dtype,
@@ -156,7 +183,7 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
         grid.expand_1d(|num_tokens| {
             let per_expert_batches = batches.next().expect("one histogram per grid point");
 
-            ArgsPayload::new()
+            let payload = ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_tokens", num_tokens as u32)
                 .with("hidden_size", config.hidden_size.get())
@@ -175,7 +202,11 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
                     "routed_scaling_denominator",
                     config.routed_scaling_denominator,
                 )
-                .with("per_expert_batches", per_expert_batches)
+                .with("per_expert_batches", per_expert_batches);
+            match config.gated_activation.as_deref() {
+                Some(activation) => payload.with("gated_activation", activation),
+                None => payload,
+            }
         })
     }
 }
@@ -216,7 +247,31 @@ mod tests {
                 ],
             },
             folded_rank_position: 0,
+            extra_token_points: Vec::new(),
+            gated_activation: None,
         }
+    }
+
+    #[test]
+    fn extra_token_points_extend_the_grid_and_empty_keeps_the_identity() {
+        let shared = Nvfp4FusedMoeSpec::sweep_grid(&config());
+        let mut extended_config = config();
+        extended_config.extra_token_points = vec![80, 96, 128, 4096];
+        let extended = Nvfp4FusedMoeSpec::sweep_grid(&extended_config);
+        let points = |grid: &SweepGrid| grid.axes()[0].clone();
+        let shared_points = points(&shared);
+        let extended_points = points(&extended);
+        // Shared points first and untouched; only the missing ones are appended.
+        assert_eq!(&extended_points[..shared_points.len()], &shared_points[..]);
+        assert_eq!(&extended_points[shared_points.len()..], &[80.0, 96.0]);
+        // Unset, the field leaves the serialized config (and so every existing
+        // identity) exactly as before.
+        let serialized = serde_json::to_value(config()).unwrap();
+        assert!(serialized.get("extra_token_points").is_none());
+        let with_points = serde_json::to_value(&extended_config).unwrap();
+        assert_eq!(with_points["extra_token_points"], serde_json::json!([80, 96, 128, 4096]));
+        let parsed: Nvfp4FusedMoeKernelConfig = serde_json::from_value(serialized).unwrap();
+        assert!(parsed.extra_token_points.is_empty());
     }
 
     #[test]
@@ -269,6 +324,8 @@ mod tests {
                 1,
             ),
             folded_rank_position: 0,
+            extra_token_points: Vec::new(),
+            gated_activation: None,
         }
     }
 
@@ -472,6 +529,8 @@ mod tests {
             routed_scaling_denominator: 1,
             expert_demand,
             folded_rank_position: 0,
+            extra_token_points: Vec::new(),
+            gated_activation: None,
         }
     }
 
@@ -581,6 +640,8 @@ mod tests {
                 1,
             ),
             folded_rank_position: 0,
+            extra_token_points: Vec::new(),
+            gated_activation: None,
         }
     }
 
@@ -637,5 +698,25 @@ mod tests {
         config.activation_format = Some(DType::Fp8E4m3);
         let error = Nvfp4FusedMoeSpec::validate_config(&config).expect_err("mismatch");
         assert!(format!("{error:#}").contains("must equal input_dtype"));
+    }
+
+    #[test]
+    fn gated_activation_keys_only_when_set() {
+        let grid = SweepGrid::new(vec![Axis::values([16])]);
+        let unset = Nvfp4FusedMoeSpec::enumerate(&config(), &grid, "flashinfer_trtllm_sm100");
+        assert!(!unset[0].fields().contains_key("gated_activation"));
+        assert!(serde_json::to_value(config()).unwrap().get("gated_activation").is_none());
+
+        let mut situ = config();
+        situ.gated_activation = Some("situ:beta=4,linear_beta=25".to_string());
+        assert!(Nvfp4FusedMoeSpec::validate_config(&situ).is_ok());
+        let set = Nvfp4FusedMoeSpec::enumerate(&situ, &grid, "flashinfer_trtllm_sm100");
+        assert_eq!(
+            set[0].fields()["gated_activation"],
+            Value::from("situ:beta=4,linear_beta=25")
+        );
+
+        situ.gated_activation = Some("swiglu".to_string());
+        assert!(Nvfp4FusedMoeSpec::validate_config(&situ).is_err());
     }
 }
