@@ -62,7 +62,7 @@ wave size of kernels that run one CTA per row. Changing either can change a run.
    parts. `fp4_tflops` is **Blackwell-only** and absent elsewhere.
 6. **China-export variants (H800, H20)** carry export-restricted specs (reduced
    NVLink BW and/or compute) — expected, not a typo.
-7. **GB200-Superchip compute/memory fields are COMBINED for its 2 B200 GPUs**
+7. **GB200-Superchip compute/memory fields are COMBINED for its 2 B200 GPUs** (the per-GPU row is `GB200-GPU-186GB`, which carries the `NVIDIA GB200` device name)
    (+1 Grace CPU). Divide by 2 for a per-GPU number. Its `dollar_per_hour`,
    however, is already **per-GPU**.
 

@@ -130,6 +130,7 @@ pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod rms_norm_mxfp8;
 pub mod row_all_gather;
+pub mod sparse_mla_shard_q;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
@@ -576,6 +577,10 @@ pub use rms_norm_mxfp8::{
     RmsNormMxfp8Kernel, RmsNormMxfp8KernelConfig, RmsNormMxfp8KernelInput, RmsNormMxfp8Spec,
 };
 pub use row_all_gather::{RowAllGatherKernel, RowAllGatherKernelConfig, RowAllGatherSpec};
+pub use sparse_mla_shard_q::{
+    SparseMlaShardQKernel, SparseMlaShardQKernelConfig, SparseMlaShardQKernelInput,
+    SparseMlaShardQSpec,
+};
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,

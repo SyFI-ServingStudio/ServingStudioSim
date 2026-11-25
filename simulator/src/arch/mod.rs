@@ -28,6 +28,7 @@ pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
 pub mod glm53_flash_vllm_nvfp4_dflash2;
 pub mod inkling_model_cfg;
+pub mod kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark;
 pub mod inkling_vllm_nvfp4_rel_attn_moe;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod kv_layout;

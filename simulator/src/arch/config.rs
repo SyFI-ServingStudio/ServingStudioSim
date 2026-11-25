@@ -1955,6 +1955,55 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// Kimi-K3.1-Pro NVFP4 (`KimiK31ForConditionalGeneration`) under the
+    /// vLLM Kimi-K3 fork verifying the DSpark proposer's drafts
+    /// (`arch::kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark`): TP attention and
+    /// dense layers, EP `tp_size * dp_size` routed experts. `dp_size` 1 is
+    /// plain TP (all-reduce boundaries); above 1 the graph runs sequence
+    /// parallel with the all-gather / reduce-scatter expert exchange.
+    KimiK31VllmNvfp4TpAttnEpMoeDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// The DSpark checkpoint config (default
+        /// `model/config/kimi_k31_pro_dspark.json`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_config: Option<String>,
+        #[serde(default = "default_kimi_k31_tp_size")]
+        #[param(default = 16, cache_key)]
+        tp_size: u16,
+        #[serde(default = "default_kimi_k31_dp_size")]
+        #[param(default = 1, cache_key)]
+        dp_size: u16,
+        /// Fabric of the sequence-parallel expert exchange (`nvlink` or
+        /// `infiniband`); unused at `dp_size` 1. Default `nvlink`.
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fabric: Option<String>,
+        #[serde(default = "default_kimi_k31_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        #[serde(default = "default_kimi_k31_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token routes (`routing = corpus`), 92 MoE layers.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// Graph token sizes (piecewise prefill and FULL verify): rows pad up
+        /// to the next one. Empty: eager.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
     /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
     /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
@@ -2049,7 +2098,8 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
             | Self::Qwen35VllmNvfp4GdnDense { model, .. }
-            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. }
+            | Self::KimiK31VllmNvfp4TpAttnEpMoeDspark { model, .. } => model,
         }
     }
 
@@ -2076,7 +2126,8 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
             | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
-            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. }
+            | Self::KimiK31VllmNvfp4TpAttnEpMoeDspark { max_model_len, .. } => {
                 Ok(*max_model_len)
             }
             Self::DeepseekV41Vllm {
@@ -2747,4 +2798,20 @@ mod layerwise_tests {
         assert!(serde_json::from_str::<AttnArchSel>(llama).is_err());
         assert!(serde_json::from_str::<FfnArchSel>(deepseek).is_err());
     }
+}
+
+fn default_kimi_k31_tp_size() -> u16 {
+    16
+}
+
+fn default_kimi_k31_dp_size() -> u16 {
+    1
+}
+
+fn default_kimi_k31_max_model_len() -> u32 {
+    131072
+}
+
+const fn default_kimi_k31_draft_tokens() -> u32 {
+    7
 }

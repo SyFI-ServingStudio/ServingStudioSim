@@ -50,6 +50,7 @@ pub mod glm53_kda_attn_local;
 pub mod glm53_mlp_local;
 pub mod glm53_moe_local;
 pub mod hc_mix_local;
+pub mod kimi_k31_local;
 pub mod inkling_attn_local;
 pub mod inkling_router_local;
 pub mod mimo_v2_attn_local;
@@ -227,6 +228,10 @@ pub use glm53_moe_local::{
     Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
     Glm53RoutedMoeLocalWorkletResolved,
+};
+pub use kimi_k31_local::{
+    KimiAttnInput, KimiK31Backends, KimiKdaAttnLocal, KimiKdaAttnLocalConfig, KimiMlaAttnLocal,
+    KimiMlaAttnLocalConfig, KimiMlpLocal, KimiMlpLocalConfig,
 };
 pub use hc_mix_local::{
     HcMixLocalWorklet, HcMixLocalWorkletConfig, HcMixLocalWorkletInput, HcMixLocalWorkletResolved,

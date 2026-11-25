@@ -14,7 +14,7 @@
 //! extrapolates linearly from the last two-shot segment and is flagged
 //! `EXTRAPOLATED` rather than silently pinned to the cap time.
 
-use crate::common::gpu::compute_capability;
+use crate::common::gpu::{compute_capability, nvl_domain_size};
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -53,8 +53,7 @@ pub struct AllReduceFusionSpec;
 /// the exact capability, so SM103 (B300) is not SM100 (B200, GB200). `None`
 /// where vLLM does not fuse: a TP or GPU with no row, or a GPU with no compute
 /// capability in gpu/spec.json. Both fused all-reduce kinds read it. The TP16
-/// rows are vLLM's multi-node MNNVL, which no runner measures
-/// ([`runner_tp_sizes`]).
+/// rows are vLLM's multi-node MNNVL ([`runner_tp_sizes`]).
 fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Option<u64> {
     let kib: u64 = match (compute_capability(gpu_name)?, num_gpus) {
         ((9, 0), 2) => 64 * 1024,
@@ -73,15 +72,30 @@ fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Option<u64> {
     Some(kib * 1024)
 }
 
-/// The TPs a FlashInfer fused all-reduce backend's runner measures, one node's
-/// NVLink domain: `SUPPORTED_TP_SIZES` in
+/// The TPs a FlashInfer fused all-reduce backend's runner measures:
+/// `SUPPORTED_TP_SIZES` in
 /// `profiling/runners/comm/flashinfer_trtllm.py` (both fused kinds) and the
 /// keys of `SM100_MAX_SIZE_MB` in `flashinfer_mnnvl.py`. A test reads both.
 fn runner_tp_sizes(backend: &str) -> &'static [u32] {
     match backend {
-        "flashinfer_trtllm" | "flashinfer_mnnvl" => &[2, 4, 8],
+        "flashinfer_trtllm" => &[2, 4, 8],
+        // TP16 spans GB200 trays over MNNVL in a multi-node job.
+        "flashinfer_mnnvl" => &[2, 4, 8, 16],
         other => panic!("{other} is not a FlashInfer fused all-reduce backend"),
     }
+}
+
+/// [`runner_tp_sizes`] on `gpu_name`: a TP past one node's eight GPUs is
+/// multi-node MNNVL, which needs an NVLink domain that holds the whole group
+/// (GB200 NVL72); a B200 NVL8 node pair is two NVLink domains joined by
+/// InfiniBand, so its TP16 is refused as on one node.
+fn gpu_tp_sizes(backend: &str, gpu_name: &str) -> Vec<u32> {
+    let domain = nvl_domain_size(gpu_name).unwrap_or(0);
+    runner_tp_sizes(backend)
+        .iter()
+        .copied()
+        .filter(|&tp| tp <= 8 || tp <= domain)
+        .collect()
 }
 
 /// Why a FlashInfer fused all-reduce with `backends` over `num_gpus` GPUs of
@@ -94,13 +108,13 @@ pub fn fused_all_reduce_refusal(
     gpu_name: &str,
     num_gpus: u32,
 ) -> Option<String> {
-    if let Some(backend) = backends
+    if let Some((backend, sizes)) = backends
         .iter()
-        .find(|backend| !runner_tp_sizes(backend).contains(&num_gpus))
+        .map(|backend| (backend, gpu_tp_sizes(backend, gpu_name)))
+        .find(|(_, sizes)| !sizes.contains(&num_gpus))
     {
         return Some(format!(
-            "the {backend} fused all-reduce is measured at TP {:?}, not {num_gpus}",
-            runner_tp_sizes(backend)
+            "the {backend} fused all-reduce is measured at TP {sizes:?}, not {num_gpus}"
         ));
     }
     flashinfer_fusion_workspace(gpu_name, num_gpus)
@@ -346,7 +360,12 @@ mod tests {
     fn a_tp_no_runner_measures_is_refused_with_its_reason() {
         let trtllm = ["flashinfer_trtllm"];
         assert_eq!(fused_all_reduce_refusal(&trtllm, "NVIDIA B200", 8), None);
-        // vLLM budgets SM100 TP16 (multi-node MNNVL); no runner launches it.
+        // vLLM budgets SM100 TP16 (multi-node MNNVL); only the MNNVL runner spans nodes.
+        assert_eq!(fused_all_reduce_refusal(&["flashinfer_mnnvl"], "NVIDIA GB200", 16), None);
+        // B200 NVL8 nodes have no NVLink domain spanning TP16.
+        assert!(fused_all_reduce_refusal(&["flashinfer_mnnvl"], "NVIDIA B200", 16)
+            .unwrap()
+            .contains("measured at TP [2, 4, 8], not 16"));
         assert!(fused_all_reduce_refusal(&trtllm, "NVIDIA B200", 16)
             .unwrap()
             .contains("measured at TP [2, 4, 8]"));
