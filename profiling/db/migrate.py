@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from profiling.db import storage
+from profiling.db import layout, storage
 from profiling.db.storage import NON_ARG_COLUMNS, RUN_COLUMNS, quote
 
 SCHEMA_VERSION = 3
@@ -27,7 +27,22 @@ RETIRED_TABLES = (
 
 
 def migrate(db_path: Path | str, target_version: int = SCHEMA_VERSION) -> bool:
-    """Migrate the DB at ``db_path``; VACUUM it when rows were rewritten.
+    """Migrate every kind file of the profile DB directory ``db_path``.
+
+    A legacy single-file DB (``profiling.db.layout``) is migrated in place, so
+    it can then be split. Returns whether anything was upgraded.
+    """
+    path = Path(db_path)
+    if layout.is_legacy_file(path):
+        return migrate_file(path, target_version)
+    upgraded = False
+    for kind_file in layout.kind_files(path):
+        upgraded = migrate_file(kind_file, target_version) or upgraded
+    return upgraded
+
+
+def migrate_file(db_path: Path | str, target_version: int = SCHEMA_VERSION) -> bool:
+    """Migrate the SQLite file at ``db_path``; VACUUM it when rows were rewritten.
 
     Returns whether anything was upgraded. Writers migrate implicitly, but only
     this entry point reclaims the pages the upgraded v2 tables leave free.

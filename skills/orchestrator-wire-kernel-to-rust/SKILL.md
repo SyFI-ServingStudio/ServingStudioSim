@@ -68,7 +68,7 @@ Things to verify:
   `uv run python -c "from profiling import perf_api; assert hasattr(perf_api, 'get_<kind>_times')"`;
 - the Python profiling smoke succeeds through the public CLI with a temporary
   DB, e.g.
-  `uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_handoff.db --spec '<json spec>' --json`;
+  `uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_handoff_db --spec '<json spec>' --json`;
 - `KIND` matches the Python table/facade stem exactly;
 - every Python `KernelArgs` field has a Rust source: either a Config field or an
   Input field emitted by `enumerate`;

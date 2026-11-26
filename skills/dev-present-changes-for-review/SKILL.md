@@ -54,8 +54,9 @@ defines *how many rounds and when*.
    sources, and nested repositories/submodules. A working tree that passes tests
    can still produce an incomplete commit when a required file is untracked or
    lives behind another Git boundary. Check tracked binary handoffs such as
-   `profiling/profile.db` for `skip-worktree`; status silence is not proof that
-   their working copy equals the committed copy.
+   the `profiling/profile_db/` kind files for `skip-worktree`, and for untracked
+   new `<kind>.db` files; status silence is not proof that their working copy
+   equals the committed copy.
    When the same feature crosses `ServingStudioSim/` and a topic worktree, verify the
    producer → persisted/service state → route/registry → consumer → behavior
    test closure before treating either diff as self-contained. Record which

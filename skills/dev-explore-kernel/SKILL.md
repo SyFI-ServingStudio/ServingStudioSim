@@ -78,7 +78,7 @@ plan must be concrete enough for `impl-register-kernel`:
 - unsupported cases and how the runner should fail them;
 - suggested timing method by mirroring the closest current runner family;
 - a representative smoke spec for
-  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`.
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke_db" --spec '<json spec>' --json`.
 
 If reuse versus a new kind remains ambiguous after source review, specify a
 matched-shape A/B that holds logical inputs, outputs, layout, and timing boundary

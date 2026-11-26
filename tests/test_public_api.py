@@ -1,7 +1,7 @@
 """The public API serves the kernel library read-only.
 
 The simulator's introspection, the kind docs and the model catalog are
-fixtures; the profiling registry and a small profile.db are real.
+fixtures; the profiling registry and a small profile DB directory are real.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from profiling.db import storage
+from profiling.db import layout, storage
 from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
 from profiling.db.registry import BackendSupport, iter_kernel_profiler_specs
@@ -53,7 +53,7 @@ GEMM_DOC = KernelDoc(
 
 
 class FixtureSources(Sources):
-    """Real profile.db access, canned simulator introspection."""
+    """Real profile DB access, canned simulator introspection."""
 
     def kernel_list(self) -> list[dict]:
         return [{"kind": "single_gemm", "compute_dtype": "dtype", "kv_dtype": None}]
@@ -61,8 +61,10 @@ class FixtureSources(Sources):
 
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
-    path = tmp_path / "profile.db"
-    conn = sqlite3.connect(path)
+    """A profile DB directory holding ``single_gemm``'s file."""
+    root = tmp_path / "profile_db"
+    root.mkdir()
+    conn = sqlite3.connect(layout.kind_file(root, "single_gemm"))
     conn.execute(storage.RUN_SCHEMA)
     conn.execute(
         storage.kind_table_schema(
@@ -90,7 +92,7 @@ def db(tmp_path: Path) -> Path:
         )
     conn.commit()
     conn.close()
-    return path
+    return root
 
 
 @pytest.fixture(autouse=True)
@@ -289,7 +291,7 @@ class Nvfp4Sources(FixtureSources):
 
 
 def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path) -> None:
-    path = tmp_path / "nvfp4.db"
+    path = tmp_path / "nvfp4"
     for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
         Table(spec, path).insert([_nvfp4_row(spec.backend)])
     client = TestClient(create_app(KernelLibrary(Nvfp4Sources(db_path=path), _index())))
@@ -316,7 +318,7 @@ def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path
 
 @pytest.mark.needs_binary
 def test_the_binary_tags_nvfp4_weight_format_as_the_compute_dtype(tmp_path: Path) -> None:
-    entries = Sources(db_path=tmp_path / "unused.db").kernel_list()
+    entries = Sources(db_path=tmp_path / "unused").kernel_list()
     (entry,) = [e for e in entries if e["kind"] == "nvfp4_fused_moe"]
     assert entry["compute_dtype"] == "weight_format"
 
@@ -357,8 +359,16 @@ def test_bad_requests(client: TestClient, path: str, params: dict, status: int) 
     assert client.get(f"{PREFIX}{path}", params=params).status_code == status
 
 
+def _snapshot(root: Path) -> dict[str, tuple[str, int]]:
+    """Every file under the directory ``root``: its sha256 and mtime."""
+    return {
+        path.name: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in sorted(root.iterdir())
+    }
+
+
 def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
-    before = (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns)
+    before = _snapshot(db)
     for path in (
         "/kernels",
         "/kernels/single_gemm",
@@ -366,9 +376,16 @@ def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
         "/kernels/single_gemm/rows?format=csv",
     ):
         assert client.get(f"{PREFIX}{path}").status_code == 200
-    assert (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns) == before
-    with FixtureSources(db_path=db).connect() as conn, pytest.raises(sqlite3.OperationalError):
+    assert _snapshot(db) == before
+    with (
+        FixtureSources(db_path=db).connect("single_gemm") as conn,
+        pytest.raises(sqlite3.OperationalError),
+    ):
         conn.execute("delete from single_gemm")
+    # A kind with no file is not created by reading it.
+    with FixtureSources(db_path=db).connect("rms_norm") as conn:
+        assert conn.execute("select count(*) from sqlite_master").fetchone() == (0,)
+    assert _snapshot(db) == before
 
 
 def test_a_kind_doc_declares_its_view(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:

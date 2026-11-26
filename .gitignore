@@ -12,6 +12,7 @@ __pycache__/
 *.parquet
 *.pftrace
 profile.db-journal
+profiling/profile_db/*.db-journal
 logs/
 # Large workload trace: provisioned per-worktree, not tracked (see create-worktree)
 trace/aime_long.csv

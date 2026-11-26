@@ -48,9 +48,10 @@ Third-party material included or adapted here (project, URL, version, license �
       change did not intend to touch. Rust was formatted per file
       (`rustfmt --edition 2021 --config skip_children=true <file.rs>`), not with
       `cargo fmt --all`; non-Rust formatters got an explicit file list, not the repo root.
-- [ ] **`profiling/profile.db`:** if it changed, rows were merged **row-wise** — never by
-      copying the file over another checkout's. State which tables, how many rows, and on
-      which GPU they were measured.
+- [ ] **`profiling/profile_db/`:** if a kind file changed, rows were merged **row-wise**
+      (`kernel-profile merge-db`) — never by copying a file over another checkout's. New
+      kinds' files are added. State which kinds, how many rows, and on which GPU they were
+      measured.
 - [ ] **Unmeasured shapes still fail.** A shape, backend, or parallelism degree with no
       measured rows produces a missing/unsupported cache identity; it does not borrow a
       neighbor's timing.

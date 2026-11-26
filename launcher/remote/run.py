@@ -44,7 +44,7 @@ from ..cli import GlobalOptions
 from . import image_send, launch
 from .config import AUTO_GPUS, Remote, RemoteConfigError, load_remote
 from .layout import Layout
-from .node import SHIPPED_MARKER
+from .node import PROFILE_DB_DIR, SHIPPED_MARKER
 from .source import (
     REPO_ROOT,
     Source,
@@ -305,7 +305,7 @@ class Session:
     def run_job(
         self, argv: list[str], *, env: dict[str, str] | None = None, keep_db: bool = False
     ) -> JobOutcome:
-        """Run ``python -m launcher ARGV`` there; ``keep_db`` keeps its profile.db copy."""
+        """Run ``python -m launcher ARGV`` there; ``keep_db`` keeps its profile DB copy."""
 
         source, bin_dir = self.source, self.bin_dir
         assert source is not None and (bin_dir is not None or self.image_python is not None)
@@ -531,6 +531,13 @@ class Session:
 
     def fetch_job_file(self, job_id: str, name: str, local: Path) -> None:
         self.data.rsync(self.data.remote_spec(self.layout.job(job_id) / name), str(local))
+
+    def fetch_job_directory(self, job_id: str, name: str, local: Path) -> None:
+        """Copy the job directory's subdirectory ``name`` to ``local``."""
+        local.mkdir(parents=True, exist_ok=True)
+        self.data.rsync(
+            self.data.remote_spec(self.layout.job(job_id) / name, directory=True), f"{local}/"
+        )
 
     def record(
         self,
@@ -762,16 +769,18 @@ def _timing_predict(session: Session, argv: list[str]) -> int:
 
 
 def _merge_profile_db(job_db: Path, report: Path) -> str:
-    """Fold a remote job's profile.db into this checkout's, under its write lease."""
+    """Fold a remote job's profile DB into this checkout's, under its write lease."""
 
+    from profiling.db.layout import replace_directory
     from profiling.db.merge import merge_profile_databases
 
     from ..process.leases import LauncherLeases
 
     target = Path(
-        os.environ.get("VIBESIM_PROFILE_DB", REPO_ROOT / "profiling" / "profile.db")
+        os.environ.get("VIBESIM_PROFILE_DB", REPO_ROOT / "profiling" / PROFILE_DB_DIR)
     ).resolve()
     with LauncherLeases(REPO_ROOT).profile_database(write=True):
+        target.mkdir(parents=True, exist_ok=True)
         merged = target.with_name(f".{target.name}.remote-{uuid.uuid4().hex[:8]}")
         result = merge_profile_databases(target, job_db, merged, report_path=report)
         if not result.published:
@@ -779,23 +788,21 @@ def _merge_profile_db(job_db: Path, report: Path) -> str:
                 f"the remote rows conflict with {target}; nothing was merged. "
                 f"Review {report} (the job's DB is kept at {job_db})"
             )
-        # The merge writes a private temporary file; keep the database's own mode.
-        os.chmod(merged, target.stat().st_mode & 0o7777)
-        os.replace(merged, target)
+        replace_directory(merged, target)
     inserted = sum(table.inserted_rows for table in result.tables)
     return f"{inserted} new row(s) merged into {target.relative_to(REPO_ROOT)}"
 
 
 def _fold_job_db(session: Session, job_id: str, output_dir: Path) -> tuple[str, bool]:
-    """Copy the job's profile.db back and merge it; returns (what happened, merged)."""
+    """Copy the job's profile DB back and merge it; returns (what happened, merged)."""
 
     held = Path(tempfile.mkdtemp(prefix="vibesim-remote-db-"))
-    job_db, keep = held / "profile.db", False
+    job_db, keep = held / PROFILE_DB_DIR, False
     try:
-        session.fetch_job_file(job_id, "profile.db", job_db)
+        session.fetch_job_directory(job_id, PROFILE_DB_DIR, job_db)
         return _merge_profile_db(job_db, output_dir / "remote-profile-db.merge-report.json"), True
     except TransportError as exc:
-        return f"not merged: the job's profile.db was not copied back ({exc})", False
+        return f"not merged: the job's profile DB was not copied back ({exc})", False
     except RemoteRunError as exc:
         keep = True  # a conflict: the message points at the kept DB
         return f"not merged: {exc}", False
@@ -817,7 +824,7 @@ def _kernel_fill(session: Session, args) -> int:
     from profiling.plan import UNITS_SCHEMA_VERSION
 
     if args.db is not None:
-        raise RemoteRunError("--db cannot be used with --remote: rows merge into this profile.db")
+        raise RemoteRunError("--db cannot be used with --remote: rows merge into this profile DB")
     if args.output_dir is None:
         raise RemoteRunError("kernel-profile fill --remote requires --output-dir under logs/")
     output_dir = _under_logs(args.output_dir, "--output-dir")

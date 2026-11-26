@@ -144,12 +144,10 @@ class LauncherLeases:
         return self._lease(f"build:{target}", "exclusive")
 
     def profile_database(self, *, write: bool) -> ResourceLease:
-        database = Path(os.environ.get(
-            "VIBESIM_PROFILE_DB", self.repository_root / "profiling" / "profile.db"
-        )).resolve()
-        return self._lease(
-            f"profile-db:{database}", "exclusive" if write else "shared"
-        )
+        database = Path(
+            os.environ.get("VIBESIM_PROFILE_DB", self.repository_root / "profiling" / "profile_db")
+        ).resolve()
+        return self._lease(f"profile-db:{database}", "exclusive" if write else "shared")
 
     def run_directory(self, log_dir: Path) -> ResourceLease:
         return self._lease(f"run-dir:{log_dir.resolve()}", "exclusive")

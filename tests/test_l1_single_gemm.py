@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import types
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,9 +29,11 @@ from profiling.db import (
     Table,
     find_kernel_profiler_spec,
     known_backends,
+    layout,
     run_profile_batch,
 )
 from profiling.db.metadata import get_db_metadata, get_profiler_versions
+from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
 from profiling.exec import (
     ENV_REGISTRY,
@@ -275,6 +278,8 @@ def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         sync_calls = 0
@@ -470,6 +475,8 @@ def test_energy_perf_uses_passed_timing_for_iteration_count(
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         sync_calls = 0
@@ -551,6 +558,8 @@ def test_energy_window_restarts_cleanly_when_planned_iters_are_short(
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     perf_counter_values = iter([0.0, 0.4, 10.0, 11.1])
     monkeypatch.setattr(energy_mod.time, "perf_counter", lambda: next(perf_counter_values))
@@ -634,6 +643,8 @@ def test_energy_perf_falls_back_to_power_polling(monkeypatch: pytest.MonkeyPatch
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         @staticmethod
@@ -839,7 +850,7 @@ def test_torch_linear_single_gemm_uses_model_weight_layout(
 
 
 def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile.db")
+    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile_db")
     spec = {"m": 16, "n": 32, "k": 64, "dtype": "fp16"}
 
     missing = perf_api.get_single_gemm_times([spec], backend="torch", gpu_name="TestGPU")[0]
@@ -887,7 +898,7 @@ def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_profile_db_read_paths_do_not_mutate_existing_database(tmp_path: Path):
-    db_path = tmp_path / "profile.db"
+    db_path = tmp_path / "profile_db"
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, db_path)
     args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
@@ -906,18 +917,29 @@ def test_profile_db_read_paths_do_not_mutate_existing_database(tmp_path: Path):
             )
         ]
     )
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(table.db_file)) as conn, conn:
         conn.execute(
             "UPDATE _db_metadata SET value = '2000-01-01 00:00:00' WHERE key = 'last_migrated_at'"
         )
 
-    checksum_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    def checksums() -> dict[str, tuple[str, int]]:
+        # Every file in the directory: reads neither change one nor create one.
+        return {
+            path.name: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+            for path in sorted(db_path.iterdir())
+        }
+
+    checksum_before = checksums()
     table.query([args], backend="torch", gpu_name="FakeGPU")
     table.exists([args], backend="torch", gpu_name="FakeGPU")
     table.metadata()
     get_db_metadata(db_path)
     get_profiler_versions(db_path, ["single_gemm"])
-    checksum_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    get_profiler_versions(db_path)
+    # A kind with no file reads as empty and is not created.
+    rms_norm = Table(next(iter_kernel_profiler_specs("rms_norm")), db_path)
+    rms_norm.metadata()
+    checksum_after = checksums()
 
     assert checksum_after == checksum_before
 
@@ -926,7 +948,7 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile.db")
+    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile_db")
     spec = {"m": 8, "n": 8, "k": 8, "dtype": "fp16"}
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, perf_api.DB_PATH)
@@ -966,7 +988,7 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
 
 
 def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
-    db_path = tmp_path / "profile.db"
+    db_path = tmp_path / "profile_db"
     run_profile_batch(
         "single_gemm",
         [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
@@ -987,7 +1009,7 @@ def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
 
 def test_table_schema_uses_metric_family_columns(tmp_path: Path):
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
-    table = Table(profiler_spec, tmp_path / "profile.db")
+    table = Table(profiler_spec, tmp_path / "profile_db")
     table.insert(
         [
             ProfileRow(
@@ -1004,7 +1026,7 @@ def test_table_schema_uses_metric_family_columns(tmp_path: Path):
         ]
     )
 
-    with sqlite3.connect(tmp_path / "profile.db") as conn:
+    with closing(sqlite3.connect(table.db_file)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")}
 
     assert {"time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"} <= columns
@@ -1014,8 +1036,9 @@ def test_table_schema_uses_metric_family_columns(tmp_path: Path):
 
 
 def test_table_schema_drops_metric_columns_from_other_family(tmp_path: Path):
-    db_path = tmp_path / "profile.db"
-    with sqlite3.connect(db_path) as conn:
+    db_path = tmp_path / "profile_db"
+    db_path.mkdir()
+    with closing(sqlite3.connect(layout.kind_file(db_path, "single_gemm"))) as conn, conn:
         conn.execute(
             """
             CREATE TABLE single_gemm (
@@ -1065,7 +1088,7 @@ def test_table_schema_drops_metric_columns_from_other_family(tmp_path: Path):
         ]
     )
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(table.db_file)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")}
 
     assert {"time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"} <= columns
@@ -1166,7 +1189,7 @@ def test_register_after_load_revalidates_and_rejects_duplicates(monkeypatch):
 
 def test_table_rejects_metrics_outside_registered_family(tmp_path: Path):
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
-    table = Table(profiler_spec, tmp_path / "profile.db")
+    table = Table(profiler_spec, tmp_path / "profile_db")
     args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
 
     with pytest.raises(ValueError, match="single_gemm is a compute metrics table"):
@@ -1189,7 +1212,7 @@ def test_table_rejects_metrics_outside_registered_family(tmp_path: Path):
 
 def test_table_replacement_policy_overwrites_same_profile_point(tmp_path: Path):
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
-    table = Table(profiler_spec, tmp_path / "profile.db")
+    table = Table(profiler_spec, tmp_path / "profile_db")
     args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
 
     table.insert(
@@ -1240,7 +1263,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
         "single_gemm",
         specs,
         pool=pool,
-        db_path=tmp_path / "profile.db",
+        db_path=tmp_path / "profile_db",
     )
 
     assert pool.acquire_calls == [(1, len(specs))]
@@ -1261,7 +1284,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
     ]
 
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
-    table = Table(profiler_spec, tmp_path / "profile.db")
+    table = Table(profiler_spec, tmp_path / "profile_db")
     assert table.metadata().row_count == len(specs)
 
 
@@ -1320,7 +1343,7 @@ def test_run_profile_batch_rejects_unknown_backend_before_gpu_work():
 
 
 def test_perf_api_rejects_spec_backend_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile.db")
+    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile_db")
     with pytest.raises(ValueError, match="spec backend 'missing' does not match"):
         perf_api.get_single_gemm_times(
             [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "missing"}],
@@ -1345,7 +1368,7 @@ def test_single_gemm_perf_api_example_profile_cuda(
         for m in [128, 256, 512, 1024, 2048, 4096, 8192]
     ]
 
-    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile.db")
+    monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile_db")
     # This is the public-path example for future agents: enter through perf_api,
     # and let the facade's JIT miss path schedule the batch internally.
     set_default_pool(LocalGpuPool(gpus=[_first_visible_gpu_index()]))
@@ -1628,7 +1651,7 @@ def test_single_gemm_exec_smoke_cuda(tmp_path: Path):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the torch GEMM smoke test")
 
-    db_path = tmp_path / "profile.db"
+    db_path = tmp_path / "profile_db"
     gpu_name = torch.cuda.get_device_name(0)
     run_profile_batch(
         "single_gemm",

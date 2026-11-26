@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 import profiling.db.provenance as provenance
-from profiling.db import storage
+from profiling.db import layout, storage
 from profiling.db.provenance import audit_profile_provenance
 
 
@@ -41,10 +42,12 @@ def _repo_with_kernel(
 
 
 def _db(tmp_path: Path, table: str, rows: list[tuple[str, str]]) -> Path:
-    """A v3 kind table: each row's stamp lives in the `_profile_run` it keys."""
-    path = tmp_path / "profile.db"
+    """A profile DB directory holding one v3 kind file: each row's stamp lives in
+    the `_profile_run` it keys."""
+    root = tmp_path / "profile_db"
+    root.mkdir()
     quoted = '"' + table.replace('"', '""') + '"'
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(layout.kind_file(root, table))) as conn, conn:
         conn.execute(storage.RUN_SCHEMA)
         conn.execute(
             f"""
@@ -65,12 +68,12 @@ def _db(tmp_path: Path, table: str, rows: list[tuple[str, str]]) -> Path:
                 for backend, stamp in rows
             ],
         )
-    return path
+    return root
 
 
-def _stamps(path: Path, table: str) -> list[str]:
+def _stamps(root: Path, table: str) -> list[str]:
     quoted = '"' + table.replace('"', '""') + '"'
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(layout.kind_file(root, table))) as conn:
         return [
             row[0]
             for row in conn.execute(
@@ -270,7 +273,7 @@ def test_missing_database_is_an_error(tmp_path: Path) -> None:
     repo, _ = _repo_with_kernel(tmp_path, "widget", ["torch"])
 
     with pytest.raises(FileNotFoundError, match="profile DB not found"):
-        audit_profile_provenance(tmp_path / "absent.db", repo)
+        audit_profile_provenance(tmp_path / "absent", repo)
 
 
 def test_cli_json_audit_is_read_only(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

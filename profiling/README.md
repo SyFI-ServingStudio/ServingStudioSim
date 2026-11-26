@@ -245,9 +245,9 @@ Everything flows through `perf_api`. There are exactly two internal paths.
 1. Resolve `gpu_name` (explicit arg, else auto-detect via torch).
 2. `find_kernel_profiler_spec(kind, backend)` → `Table(spec, DB_PATH).query(...)`.
 
-Set `VIBESIM_PROFILE_DB` to an absolute path to isolate a simulation or
-timing-predict run's profile database, including its demand-driven JIT writes.
-The default remains `profiling/profile.db`; an explicit kernel-profile `--db`
+Set `VIBESIM_PROFILE_DB` to an absolute directory path to isolate a simulation
+or timing-predict run's profile database, including its demand-driven JIT writes.
+The default remains `profiling/profile_db/`; an explicit kernel-profile `--db`
 overrides the environment selection. Preserve source databases when reproducing
 historical results and record the selected database with the experiment.
 3. Hits return `Metrics`; misses return `MissingEntry`.
@@ -337,7 +337,16 @@ Metric columns are a table-level contract chosen by `metric_family`:
   (`message_size_bytes` is an **args/cache-key** column, not a measured result —
   the simulator derives moved bytes from `busbw × time`.)
 
-profile.db is tracked in git, so it stores each repeated value once (schema v3,
+The profile DB is the directory `profiling/profile_db/`, one SQLite file per kind
+(`<kind>.db`, `profiling/db/layout.py`): the kind's table, the `_profile_run` rows
+its rows reference, and its own `_db_metadata`. Every query reads one kind table
+(joined with `_profile_run`), so no query spans files, and a run's `run_key` is a
+hash of its contents, so the same run copied into several files is one row. One
+file per kind keeps every tracked file far under GitHub's 100 MB limit, and a
+commit stores new versions of only the kinds whose rows changed. A kind measured
+for the first time creates its file, which `git add` must pick up.
+
+The files are tracked in git, so each stores each repeated value once (schema v3,
 `profiling/db/storage.py`). A row's provenance — profiler git hash, CUDA, driver
 and backend versions — is a `run_key` into `_profile_run`; `profiler_run_at` and
 `created_at` are epoch seconds. Readers still get the v2 columns: `Table.rows_for`
@@ -386,10 +395,18 @@ python -m launcher kernel-profile query         <table> --backend <b> [--spec '{
 python -m launcher kernel-profile count-missing <table> --backend <b> ...
 python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
 python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph]
-python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
-python -m launcher kernel-profile migrate-db profile.db
-python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
+python -m launcher kernel-profile merge-db LEFT RIGHT --output MERGED [--report REPORT.json]
+python -m launcher kernel-profile migrate-db DIR
+python -m launcher kernel-profile split-db LEGACY.db --output DIR [--json]
+python -m launcher kernel-profile audit-provenance [--db DIR] [--json]
 ```
+
+`merge-db` merges two profile DB directories kind file by kind file and
+publishes the output only when no row conflicts. Either input may also be a
+legacy single-file `profile.db` (from before the per-kind split), which is split
+first; `split-db` converts one into a directory on its own, keeping every row
+(rows whose `run_key` has no run are kept and listed) and skipping empty tables.
+Every other command refuses a legacy single file.
 
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.

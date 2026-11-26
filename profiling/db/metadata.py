@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from profiling.db import layout
 from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION, require_current
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.storage import RUN_TABLE
@@ -26,18 +28,37 @@ class ProfilerVersion:
 
 
 def get_db_metadata(db_path: Path | str) -> DbMetadata:
-    conn = _connect_read_only(db_path)
-    if conn is None:
-        return DbMetadata(schema_version=SCHEMA_VERSION, schema_hash=SCHEMA_HASH)
-    with conn:
-        if not _table_exists(conn, "_db_metadata"):
-            return DbMetadata(schema_version=SCHEMA_VERSION, schema_hash=SCHEMA_HASH)
-        rows = dict(conn.execute("SELECT key, value FROM _db_metadata").fetchall())
+    """The profile DB directory's metadata, over its kind files.
+
+    Every file must carry the same schema; ``created_at`` is the earliest
+    file's and ``last_migrated_at`` the latest write's.
+    """
+    schemas: set[tuple[int, str]] = set()
+    created: list[str] = []
+    migrated: list[str] = []
+    for path in layout.kind_files(layout.require_directory(db_path)):
+        conn = _connect_read_only(path)
+        if conn is None:
+            continue
+        with closing(conn):
+            if not _table_exists(conn, "_db_metadata"):
+                continue
+            rows = dict(conn.execute("SELECT key, value FROM _db_metadata").fetchall())
+        schemas.add(
+            (int(rows.get("schema_version", SCHEMA_VERSION)), rows.get("schema_hash", SCHEMA_HASH))
+        )
+        if rows.get("created_at"):
+            created.append(rows["created_at"])
+        if rows.get("last_migrated_at"):
+            migrated.append(rows["last_migrated_at"])
+    if len(schemas) > 1:
+        raise RuntimeError(f"{db_path} mixes profile DB schemas {sorted(schemas)}")
+    schema_version, schema_hash = schemas.pop() if schemas else (SCHEMA_VERSION, SCHEMA_HASH)
     return DbMetadata(
-        schema_version=int(rows.get("schema_version", SCHEMA_VERSION)),
-        schema_hash=rows.get("schema_hash", SCHEMA_HASH),
-        created_at=rows.get("created_at"),
-        last_migrated_at=rows.get("last_migrated_at"),
+        schema_version=schema_version,
+        schema_hash=schema_hash,
+        created_at=min(created) if created else None,
+        last_migrated_at=max(migrated) if migrated else None,
     )
 
 
@@ -45,17 +66,19 @@ def get_profiler_versions(
     db_path: Path | str,
     used_op_families: list[str] | None = None,
 ) -> list[ProfilerVersion]:
-    conn = _connect_read_only(db_path)
-    if conn is None:
-        return []
+    root = layout.require_directory(db_path)
     selected = set(used_op_families or [])
     versions: set[tuple[str, str]] = set()
-    with conn:
-        require_current(conn, str(db_path))
-        for profiler_spec in iter_kernel_profiler_specs():
-            op_family = profiler_spec.kernel_kind
-            if selected and op_family not in selected and profiler_spec.table_name not in selected:
-                continue
+    for profiler_spec in iter_kernel_profiler_specs():
+        op_family = profiler_spec.kernel_kind
+        if selected and op_family not in selected and profiler_spec.table_name not in selected:
+            continue
+        path = layout.kind_file(root, profiler_spec.table_name)
+        conn = _connect_read_only(path)
+        if conn is None:
+            continue
+        with closing(conn):
+            require_current(conn, str(path))
             if not _table_exists(conn, profiler_spec.table_name):
                 continue
             if not _column_exists(conn, profiler_spec.table_name, "run_key"):

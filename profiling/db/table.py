@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import threading
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -17,7 +18,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, get_origin
 
-from profiling.db import storage
+from profiling.db import layout, storage
 from profiling.db.args import KernelArgs, canonical_args, field_types, optional_fields
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
@@ -39,8 +40,12 @@ STANDARD_COLUMNS = [
 _WRITE_LOCK_TIMEOUT_S = 120.0
 # Bound parameters per lookup statement; SQLite allows 32766. See `Table._match_rows`.
 _SQL_VARIABLES = 30000
-# Each thread's last read-only connection. See `Table._connect_read_only`.
+# Each thread's recently used read-only connections, one per kind file, least
+# recently used first. See `Table._connect_read_only`.
 _read_only = threading.local()
+# A build reads a few dozen kinds in turn; past this many files a thread closes
+# its least recently used connection.
+_READ_ONLY_CONNECTIONS = 128
 
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
 # message_size for comm kernels is an args/cache-key column, NOT a measured
@@ -127,10 +132,12 @@ class Table:
     The table owns SQL and schema reflection. Runners only return ``Metrics``.
     """
 
-    def __init__(self, profiler_spec: KernelProfilerSpec, db_path: Path | str):
+    def __init__(self, profiler_spec: KernelProfilerSpec, db_root: Path | str):
         self.profiler_spec = profiler_spec
         self.name = profiler_spec.table_name
-        self.db_path = Path(db_path)
+        # The profile DB directory, and the one file in it this table lives in.
+        self.db_root = layout.require_directory(db_root)
+        self.db_file = layout.kind_file(self.db_root, self.name)
         self.args_columns = [field.name for field in fields(profiler_spec.args_schema)]
         # Optional args (`optional_arg`): nullable columns appended to the table
         # only once a row sets one, and left out of `args_hash` while unset.
@@ -314,34 +321,46 @@ class Table:
         discards GPU time already spent. Waiting is always cheaper than
         remeasuring.
         """
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path, timeout=_WRITE_LOCK_TIMEOUT_S) as conn:
+        self.db_root.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_file, timeout=_WRITE_LOCK_TIMEOUT_S) as conn:
             conn.row_factory = sqlite3.Row
             migrate_connection(conn)
             self._ensure_schema(conn)
             yield conn
 
     def _connect_read_only(self) -> sqlite3.Connection | None:
-        """A physically read-only connection, without creating the DB.
+        """A physically read-only connection to this kind's file, without creating it.
 
-        A build queries once per kernel, and a new connection parses the whole
-        schema before its first statement. So each thread reuses its last
-        connection while the file is the same one, unchanged on disk; any write,
-        replacement or fork opens (and ``require_current`` checks) a new one.
+        A build queries once per kernel, cycling through a few dozen kinds, and
+        a new connection parses the schema before its first statement. So each
+        thread keeps one connection per kind file and reuses it while the file
+        is the same one, unchanged on disk; any write, replacement or fork opens
+        (and ``require_current`` checks) a new one.
         """
-        if not self.db_path.is_file():
+        if not self.db_file.is_file():
             return None
-        path = self.db_path.resolve()
+        path = self.db_file.resolve()
         stat = path.stat()
-        identity = (path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, os.getpid())
-        cached = getattr(_read_only, "connection", None)
-        if cached is not None and cached[0] == identity:
-            return cached[1]
+        identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, os.getpid())
+        cache: OrderedDict[Path, tuple[tuple[int, ...], sqlite3.Connection]] | None = getattr(
+            _read_only, "connections", None
+        )
+        if cache is None:
+            cache = _read_only.connections = OrderedDict()
+        cached = cache.get(path)
+        if cached is not None:
+            if cached[0] == identity:
+                cache.move_to_end(path)
+                return cached[1]
+            del cache[path]
         conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
-        require_current(conn, str(self.db_path))
-        _read_only.connection = (identity, conn)
+        require_current(conn, str(self.db_file))
+        cache[path] = (identity, conn)
+        if len(cache) > _READ_ONLY_CONNECTIONS:
+            # Dropped, not closed: a caller may still hold it; it closes when collected.
+            cache.popitem(last=False)
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:

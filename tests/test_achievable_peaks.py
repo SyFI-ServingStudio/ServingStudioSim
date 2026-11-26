@@ -1,21 +1,27 @@
-"""The optimality R4a ceilings read from profile.db: best GEMM per dtype, large copies only."""
+"""The optimality R4a ceilings read from the profile DB: best GEMM per dtype, large copies only."""
 
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 
+from profiling.db import layout
 from profiling.db.achievable import MIN_COPY_INPUT_BYTES, achievable_peaks
 
 
-def _db(path):
-    conn = sqlite3.connect(path)
+def _db(root):
+    """A profile DB directory holding ``single_gemm``'s and ``elementwise``'s files."""
+    root.mkdir()
+    with closing(sqlite3.connect(layout.kind_file(root, "single_gemm"))) as conn, conn:
+        _gemm(conn)
+    with closing(sqlite3.connect(layout.kind_file(root, "elementwise"))) as conn, conn:
+        _elementwise(conn)
+
+
+def _gemm(conn):
     conn.execute(
         "CREATE TABLE single_gemm (gpu_name TEXT, backend TEXT, m INT, n INT, k INT, "
         "dtype TEXT, tflops REAL, is_outlier INT)"
-    )
-    conn.execute(
-        "CREATE TABLE elementwise (gpu_name TEXT, backend TEXT, input_size_bytes INT, "
-        "output_size_bytes INT, memory_bandwidth_gbps REAL, is_outlier INT)"
     )
     conn.executemany(
         "INSERT INTO single_gemm VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -26,6 +32,13 @@ def _db(path):
             ("NVIDIA B200", "deepgemm", 8192, 4096, 4096, "fp8_e4m3", 3200.0, 0),
             ("NVIDIA H200", "torch", 8192, 4096, 4096, "bf16", 800.0, 0),
         ],
+    )
+
+
+def _elementwise(conn):
+    conn.execute(
+        "CREATE TABLE elementwise (gpu_name TEXT, backend TEXT, input_size_bytes INT, "
+        "output_size_bytes INT, memory_bandwidth_gbps REAL, is_outlier INT)"
     )
     big = MIN_COPY_INPUT_BYTES
     conn.executemany(
@@ -40,12 +53,10 @@ def _db(path):
             ("NVIDIA B200", "torch", 4 * big, 4 * big, 7800.0, 1),  # outlier
         ],
     )
-    conn.commit()
-    conn.close()
 
 
 def test_best_gemm_per_dtype_and_best_large_copy(tmp_path):
-    db = tmp_path / "profile.db"
+    db = tmp_path / "profile_db"
     _db(db)
     peaks = achievable_peaks(db, "NVIDIA B200")
 
@@ -63,7 +74,7 @@ def test_best_gemm_per_dtype_and_best_large_copy(tmp_path):
 
 
 def test_a_gpu_without_rows_reports_nothing(tmp_path):
-    db = tmp_path / "profile.db"
+    db = tmp_path / "profile_db"
     _db(db)
     peaks = achievable_peaks(db, "NVIDIA A100")
     assert peaks["gemm_by_dtype"] == {}

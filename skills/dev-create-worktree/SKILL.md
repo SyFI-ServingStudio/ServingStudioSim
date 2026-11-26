@@ -15,11 +15,13 @@ kernels or hunting for trace files.
 `git worktree add` only materializes **committed** files. Three things a run/test
 needs are therefore missing or unsafe in a fresh or adopted worktree:
 
-1. **`profiling/profile.db`** — tracked, but the primary tree's *working copy* is
-   almost always richer than the committed snapshot (every GPU run JIT-fills new
-   kernel rows into it without committing). The worktree would get the stale
-   committed `profile.db` and re-profile on the next GPU run — slow and needs a
-   GPU. Copy the working copy over.
+1. **`profiling/profile_db/`** — the profile DB, one SQLite file per kernel kind
+   (`<kind>.db`). Tracked, but the primary tree's *working copy* is almost
+   always richer than the committed snapshot (every GPU run JIT-fills new
+   kernel rows into it without committing, and a kind measured for the first
+   time adds an untracked file). The worktree would get the stale committed
+   files and re-profile on the next GPU run — slow and needs a GPU. Copy the
+   working copy over.
 2. **Untracked traces** — large workload CSVs are deliberately **not**
    committed, so they never reach a new worktree: `trace/aime_long.csv` (~5 MB)
    and the full-dataset TraceLab traces `trace/tracelab_reported.csv` /
@@ -49,7 +51,7 @@ Worktrees are **siblings of `ServingStudioSim/`**, named `wt-<topic>/` — never
 
 ```
 <workspace-root>/
-├── ServingStudioSim/       ← primary tree (source of the working profile.db + traces)
+├── ServingStudioSim/       ← primary tree (source of the working profile_db/ + traces)
 ├── wt-<topic>/    ← what this skill creates
 └── …
 ```
@@ -80,20 +82,28 @@ git -C "$MAIN_WORKTREE" worktree add -b "$BRANCH_NAME" "$NEW_WORKTREE" "$BASE_BR
 If `$BRANCH_NAME` already exists, drop `-b` and pass the branch as the last arg
 instead. Confirm with `git -C "$MAIN_WORKTREE" worktree list`.
 
-### 2. Provision the working-copy `profile.db` (rich, but git-invisible)
+### 2. Provision the working-copy `profile_db/` (rich, but git-invisible)
 
-Copy the primary tree's working `profile.db`, then mark it `skip-worktree` in
-the new worktree so it stays present for runs but never shows as modified and is
-never swept into a `git commit -am`:
+Copy the primary tree's working `profile_db/` over the committed one, then mark
+its tracked files `skip-worktree` in the new worktree so they stay present for
+runs but never show as modified and are never swept into a `git commit -am`:
 
 ```bash
-cp "$MAIN_WORKTREE/profiling/profile.db" "$NEW_WORKTREE/profiling/profile.db"
-git -C "$NEW_WORKTREE" update-index --skip-worktree profiling/profile.db
+rm -rf "$NEW_WORKTREE/profiling/profile_db"
+cp -a "$MAIN_WORKTREE/profiling/profile_db" "$NEW_WORKTREE/profiling/profile_db"
+git -C "$NEW_WORKTREE" ls-files -z profiling/profile_db \
+  | xargs -0 git -C "$NEW_WORKTREE" update-index --skip-worktree
 ```
 
-(`skip-worktree` is the key: `profile.db` is a tracked binary, so without this
-the copy would leave the worktree permanently dirty and risk an accidental
-commit of the primary tree's kernel cache.)
+(`skip-worktree` is the key: the kind files are tracked binaries, so without
+this the copy would leave the worktree permanently dirty and risk an accidental
+commit of the primary tree's kernel cache. A kind file the primary tree has but
+main does not stays untracked; `git status` lists it, and only an explicit
+`git add` commits it.)
+
+If the primary tree still holds a single-file `profiling/profile.db` (from
+before the per-kind split), convert it first with
+`uv run python -m launcher kernel-profile split-db <file> --output <dir>`.
 
 ### 3. Provision untracked traces
 

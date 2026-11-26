@@ -32,19 +32,18 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from profiling.db import layout
+
 # 1 GiB of input is at least 8x the L2 of every GPU in gpu/spec.json.
 MIN_COPY_INPUT_BYTES = 1 << 30
-
-_DEFAULT_DB = Path(__file__).resolve().parents[1] / "profile.db"
 
 
 def achievable_peaks(db_path: Path | str, gpu_name: str) -> dict[str, Any]:
     """Best measured GEMM TFLOP/s per dtype and large-copy GB/s for ``gpu_name``."""
-    uri = f"file:{Path(db_path).resolve()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        gemm_rows = conn.execute(
-            """
+    root = layout.require_directory(db_path)
+    gemm_rows = _query(
+        layout.kind_file(root, "single_gemm"),
+        """
             SELECT dtype, backend, m, n, k, tflops
             FROM single_gemm AS row
             WHERE gpu_name = ? AND is_outlier = 0
@@ -54,10 +53,11 @@ def achievable_peaks(db_path: Path | str, gpu_name: str) -> dict[str, Any]:
               )
             ORDER BY dtype, backend
             """,
-            (gpu_name,),
-        ).fetchall()
-        copy_row = conn.execute(
-            """
+        (gpu_name,),
+    )
+    copy_rows = _query(
+        layout.kind_file(root, "elementwise"),
+        """
             SELECT backend, input_size_bytes, memory_bandwidth_gbps
             FROM elementwise
             WHERE gpu_name = ? AND is_outlier = 0
@@ -66,8 +66,9 @@ def achievable_peaks(db_path: Path | str, gpu_name: str) -> dict[str, Any]:
             ORDER BY memory_bandwidth_gbps DESC
             LIMIT 1
             """,
-            (gpu_name, MIN_COPY_INPUT_BYTES),
-        ).fetchone()
+        (gpu_name, MIN_COPY_INPUT_BYTES),
+    )
+    copy_row = copy_rows[0] if copy_rows else None
 
     gemm: dict[str, dict[str, Any]] = {}
     for row in gemm_rows:
@@ -95,6 +96,15 @@ def achievable_peaks(db_path: Path | str, gpu_name: str) -> dict[str, Any]:
     }
 
 
+def _query(path: Path, sql: str, params: tuple[Any, ...]) -> list[sqlite3.Row]:
+    """``sql``'s rows from one kind file; none when the kind has no file."""
+    if not path.is_file():
+        return []
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(sql, params).fetchall()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m profiling.db.achievable",
@@ -103,12 +113,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--gpu-name", required=True, help='profile.db gpu_name, e.g. "NVIDIA B200".'
     )
-    parser.add_argument("--db", type=Path, default=_DEFAULT_DB, help="profile.db path.")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="Profile DB directory (default VIBESIM_PROFILE_DB or profiling/profile_db).",
+    )
     args = parser.parse_args(argv)
-    if not args.db.is_file():
-        print(f"profile.db not found: {args.db}", file=sys.stderr)
+    db = args.db if args.db is not None else layout.configured_root()
+    if not db.is_dir():
+        print(f"profile DB directory not found: {db}", file=sys.stderr)
         return 2
-    print(json.dumps(achievable_peaks(args.db, args.gpu_name), indent=2, sort_keys=True))
+    print(json.dumps(achievable_peaks(db, args.gpu_name), indent=2, sort_keys=True))
     return 0
 
 

@@ -33,7 +33,9 @@ def main(argv: list[str] | None = None) -> int:
         "--db",
         type=Path,
         default=DB_PATH,
-        help="profile.db to read, opened read-only. Defaults to the one the profiler uses.",
+        help=(
+            "Profile DB directory to read, opened read-only. Defaults to the one the profiler uses."
+        ),
     )
     serve.add_argument("--build-type", default="release", help="Simulator build to introspect.")
     serve.add_argument(
@@ -94,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     from public_api.sim_preset import SimIndex
     from public_api.sources import Sources
 
-    # Every simulator and launcher call it makes reads this profile.db and
+    # Every simulator and launcher call it makes reads this profile DB and
     # measures nothing: a row it lacks is an error, never a profile.
     disable_gpus()
     os.environ["VIBESIM_PROFILE_DB"] = str(args.db.resolve())
@@ -103,8 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             f"{sources.binary} is missing; run `uv run cargo build --release -p simulator`"
         )
-    if not args.db.exists():
-        parser.error(f"{args.db} does not exist")
+    if not args.db.is_dir():
+        parser.error(f"{args.db} is not a profile DB directory")
     if not TRACEGEN.exists():
         parser.error(
             f"{TRACEGEN} is missing; run `cargo build --release --manifest-path "

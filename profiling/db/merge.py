@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -18,7 +19,9 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from profiling.db import layout
 from profiling.db.migrate import RETIRED_TABLES, SCHEMA_HASH, SCHEMA_VERSION
+from profiling.db.split import split_profile_db
 from profiling.db.storage import LOOKUP_KEYS, RUN_COLUMNS, RUN_TABLE
 
 _METADATA_TABLE = "_db_metadata"
@@ -51,7 +54,8 @@ class ProfileDbMergeReport:
     output: dict[str, Any]
     tables: tuple[TableMergeStats, ...]
     conflicts: tuple[MergeConflict, ...]
-    report_schema_version: int = 1
+    # 2: inputs and output are per-kind directories (`files`: kind -> sha256).
+    report_schema_version: int = 2
 
     @property
     def published(self) -> bool:
@@ -104,63 +108,76 @@ def merge_profile_databases(
     *,
     report_path: Path | str | None = None,
 ) -> ProfileDbMergeReport:
-    """Merge two profile DBs without modifying either input.
+    """Merge two profile DB directories into a new one without modifying either input.
 
-    The output is published atomically only when database schemas agree and no
-    semantic key maps to differing measurement or provenance data.  Conflicts
-    are returned and written to the report sidecar for explicit resolution.
+    Each kind file is merged on its own (``_merge_files``); a kind only one side
+    has is copied. Either input may also be a legacy single-file DB
+    (``profiling.db.layout``), which is split into a scratch directory first.
+    The output directory is published atomically only when database schemas
+    agree and no semantic key maps to differing measurement or provenance data.
+    Conflicts are returned and written to the report sidecar for explicit
+    resolution.
     """
 
-    left = _existing_file(left_path, "left input")
-    right = _existing_file(right_path, "right input")
+    left_input = _existing_db(left_path, "left input")
+    right_input = _existing_db(right_path, "right input")
     output = Path(output_path).expanduser().resolve()
     report = (
         Path(report_path).expanduser().resolve()
         if report_path is not None
         else output.with_name(f"{output.name}.merge-report.json")
     )
-    _validate_distinct_paths(left, right, output, report)
+    _validate_distinct_paths(left_input, right_input, output, report)
     if output.exists():
         raise FileExistsError(f"output already exists: {output}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    temp_fd, temp_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
-    )
-    os.close(temp_fd)
-    temp_path = Path(temp_name)
-
+    scratch = Path(tempfile.mkdtemp(prefix=f".{output.name}.merge-", dir=output.parent))
     try:
-        with (
-            closing(_connect_read_only(left)) as left_conn,
-            closing(_connect_read_only(right)) as right_conn,
-        ):
-            _validate_database(left_conn, left)
-            _validate_database(right_conn, right)
-            left_metadata = _read_metadata(left_conn, left)
-            right_metadata = _read_metadata(right_conn, right)
-            _validate_compatible_metadata(left_metadata, right_metadata)
+        left = _as_directory(left_input, scratch / "left")
+        right = _as_directory(right_input, scratch / "right")
+        staging = scratch / "output"
+        staging.mkdir()
+        left_files = {layout.kind_of(path): path for path in layout.kind_files(left)}
+        right_files = {layout.kind_of(path): path for path in layout.kind_files(right)}
 
-            with closing(sqlite3.connect(temp_path)) as output_conn:
-                output_conn.row_factory = sqlite3.Row
-                left_conn.backup(output_conn)
-                table_stats, conflicts = _merge_tables(left_conn, right_conn, output_conn)
-                output_conn.commit()
-                _validate_quick_check(output_conn, temp_path)
+        table_stats: list[TableMergeStats] = []
+        conflicts: list[MergeConflict] = []
+        for kind in sorted(left_files.keys() | right_files.keys()):
+            target = layout.kind_file(staging, kind)
+            left_file = left_files.get(kind)
+            right_file = right_files.get(kind)
+            if left_file is not None and right_file is not None:
+                stats, kind_conflicts = _merge_files(left_file, right_file, target)
+                table_stats.extend(stat for stat in stats if stat.table == kind)
+                conflicts.extend(kind_conflicts)
+                continue
+            only = left_file if left_file is not None else right_file
+            assert only is not None
+            rows = _validated_row_count(only, kind)
+            shutil.copy2(only, target)
+            table_stats.append(
+                TableMergeStats(
+                    table=kind,
+                    left_rows=rows if left_file is not None else 0,
+                    right_rows=rows if right_file is not None else 0,
+                    inserted_rows=rows if right_file is not None else 0,
+                    duplicate_rows=0,
+                    conflict_rows=0,
+                )
+            )
 
         published = not conflicts
-        output_sha256 = None
         if published:
-            os.link(temp_path, output)
-            output_sha256 = _sha256(output)
+            staging.rename(output)
 
         merge_report = ProfileDbMergeReport(
-            left=_input_description(left, left_metadata),
-            right=_input_description(right, right_metadata),
+            left=_input_description(left_input, left),
+            right=_input_description(right_input, right),
             output={
                 "path": str(output),
                 "published": published,
-                "sha256": output_sha256,
+                "files": _file_hashes(output) if published else None,
             },
             tables=tuple(table_stats),
             conflicts=tuple(conflicts),
@@ -168,7 +185,48 @@ def merge_profile_databases(
         _write_json_atomically(report, merge_report.to_dict())
         return merge_report
     finally:
-        temp_path.unlink(missing_ok=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _merge_files(
+    left: Path, right: Path, output: Path
+) -> tuple[list[TableMergeStats], list[MergeConflict]]:
+    """Merge two SQLite profile files into the new file ``output``.
+
+    Every table of either side is merged by its semantic key; the caller
+    publishes ``output`` only when no conflict is returned.
+    """
+    with (
+        closing(_connect_read_only(left)) as left_conn,
+        closing(_connect_read_only(right)) as right_conn,
+    ):
+        _validate_database(left_conn, left)
+        _validate_database(right_conn, right)
+        _validate_compatible_metadata(
+            _read_metadata(left_conn, left), _read_metadata(right_conn, right)
+        )
+
+        with closing(sqlite3.connect(output)) as output_conn:
+            output_conn.row_factory = sqlite3.Row
+            left_conn.backup(output_conn)
+            table_stats, conflicts = _merge_tables(left_conn, right_conn, output_conn)
+            output_conn.commit()
+            _validate_quick_check(output_conn, output)
+    return table_stats, conflicts
+
+
+def _validated_row_count(path: Path, kind: str) -> int:
+    """The row count of the kind file ``path`` only one side has, after the
+    checks a merged file gets."""
+    with closing(_connect_read_only(path)) as conn:
+        _validate_database(conn, path)
+        _validate_schema_metadata(str(path), _read_metadata(conn, path))
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (kind,)
+        ).fetchone()
+        if exists is None:
+            return 0
+        return int(conn.execute(f"SELECT COUNT(*) FROM {_quote_identifier(kind)}").fetchone()[0])
 
 
 def _merge_tables(
@@ -502,17 +560,21 @@ def _read_metadata(conn: sqlite3.Connection, path: Path) -> dict[str, str]:
 def _validate_compatible_metadata(
     left_metadata: dict[str, str], right_metadata: dict[str, str]
 ) -> None:
+    for side, metadata in (("left", left_metadata), ("right", right_metadata)):
+        _validate_schema_metadata(side, metadata)
+
+
+def _validate_schema_metadata(side: str, metadata: dict[str, str]) -> None:
     expected = {
         "schema_version": str(SCHEMA_VERSION),
         "schema_hash": SCHEMA_HASH,
     }
-    for side, metadata in (("left", left_metadata), ("right", right_metadata)):
-        actual = {key: metadata.get(key) for key in expected}
-        if actual != expected:
-            raise ValueError(
-                f"{side} profile DB schema metadata is incompatible: "
-                f"expected {expected!r}, got {actual!r}"
-            )
+    actual = {key: metadata.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(
+            f"{side} profile DB schema metadata is incompatible: "
+            f"expected {expected!r}, got {actual!r}"
+        )
 
 
 def _validate_database(conn: sqlite3.Connection, path: Path) -> None:
@@ -539,11 +601,19 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _existing_file(path: Path | str, label: str) -> Path:
+def _existing_db(path: Path | str, label: str) -> Path:
     resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
+    if not resolved.exists():
         raise FileNotFoundError(f"{label} does not exist: {resolved}")
     return resolved
+
+
+def _as_directory(path: Path, scratch: Path) -> Path:
+    """``path`` as a profile DB directory: a legacy single file is split into ``scratch``."""
+    if layout.is_legacy_file(path):
+        split_profile_db(path, scratch)
+        return scratch
+    return path
 
 
 def _validate_distinct_paths(left: Path, right: Path, output: Path, report: Path) -> None:
@@ -552,12 +622,18 @@ def _validate_distinct_paths(left: Path, right: Path, output: Path, report: Path
         raise ValueError("left input, right input, output, and report paths must be distinct")
 
 
-def _input_description(path: Path, metadata: dict[str, str]) -> dict[str, Any]:
-    return {
-        "path": str(path),
-        "sha256": _sha256(path),
-        "metadata": dict(sorted(metadata.items())),
-    }
+def _input_description(path: Path, directory: Path) -> dict[str, Any]:
+    """An input as the report records it: its path, whether it was a legacy
+    single file (then also its sha256), and each kind file's sha256."""
+    description: dict[str, Any] = {"path": str(path), "legacy_file": path.is_file()}
+    if path.is_file():
+        description["sha256"] = _sha256(path)
+    description["files"] = _file_hashes(directory)
+    return description
+
+
+def _file_hashes(directory: Path) -> dict[str, str]:
+    return {layout.kind_of(path): _sha256(path) for path in layout.kind_files(directory)}
 
 
 def _sha256(path: Path) -> str:

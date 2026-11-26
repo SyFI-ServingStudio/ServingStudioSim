@@ -1,7 +1,7 @@
 # Runtime for the public API: its Python environment, locked by the repo's
 # uv.lock. The image holds no code and no data; run.sh mounts a checkout
 # read-only and the service runs its code, its target/release/simulator and
-# its profiling/profile.db. The base is Ubuntu 24.04 because the simulator is
+# its profiling/profile_db/. The base is Ubuntu 24.04 because the simulator is
 # built on such a host and links its libpython3.12. git reads the served commit.
 FROM ubuntu:24.04
 RUN apt-get update \
