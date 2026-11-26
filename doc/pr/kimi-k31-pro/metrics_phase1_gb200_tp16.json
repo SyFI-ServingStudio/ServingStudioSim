@@ -1,0 +1,620 @@
+{
+  "cases": {
+    "tp16_ep16_c4096_s32/01_tp16_diverse_100": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 19.487266732552765,
+        "e2e_mean_pct": -3.2627833693448127,
+        "gpu_time_multiplier": 1.02760445302215,
+        "iteration_cycle_mean_pct": 8.907158783821,
+        "iterations_pct": -16.652136006974715,
+        "kernel_abs_pct": 1.9811874577290074,
+        "kernel_signed_pct": -1.8403239003579646,
+        "map_coverage_pct": 98.1422882365165,
+        "output_tps_pct": 10.177469876538225,
+        "prefill_tokens_mean_pct": 19.97907949790796,
+        "scheduled_kv_mean_pct": 8.97533804977233,
+        "server_tpot_mean_pct": -6.504825959336413,
+        "server_ttft_mean_pct": -6.013483782273166
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/analysis_kernel",
+        "capture_calibration": {
+          "attn_gpu_memory_gb": {
+            "blocks": 5107,
+            "gib": 56.63,
+            "log_line": "Extended KV cache to 5107 blocks (56.63 GiB)",
+            "rule": "the workload pass's server log: the smallest rank's vLLM `Extended KV cache to N blocks (X GiB)`, else `Available KV cache memory: X GiB`; X * 2**30 / 1e9 GB",
+            "source": "profile_workload/vllm/kimi_k31_gb200_tp16_01_tp16_diverse_100_workload_server.log",
+            "value": 60.805999
+          },
+          "speculative_acceptance": {
+            "accepted_tokens_per_position": {
+              "0": 26619,
+              "1": 20809,
+              "2": 15923,
+              "3": 12743,
+              "4": 10671,
+              "5": 9322,
+              "6": 8357
+            },
+            "num_drafts": 30907,
+            "rule": "the workload pass's spec_decode_metrics.json: accepted_tokens_per_position[0] / num_drafts, then accepted[k] / accepted[k-1]",
+            "source": "profile_workload/spec_decode_metrics.json",
+            "value": [
+              0.861261,
+              0.781735,
+              0.765198,
+              0.800289,
+              0.837401,
+              0.873583,
+              0.896481
+            ]
+          },
+          "speculative_acceptance_by_output_position": {
+            "rule": "the workload pass's metrics_jsonl decode_request_progress: per bucket of output_tokens_before, the distribution of accepted drafts 0..K per verify round (calibration.buckets_from_metrics)",
+            "source": "profile_workload/vllm/kimi_k31_gb200_tp16_01_tp16_diverse_100_workload_metrics.jsonl",
+            "tokens_per_round": {
+              "1": 3.180693,
+              "1024": 4.389231,
+              "128": 3.298077,
+              "2048": 5.392092,
+              "32": 3.064499,
+              "4096": 5.718852,
+              "512": 3.542786
+            },
+            "value": [
+              {
+                "from": 1,
+                "p": [
+                  0.1707920792079208,
+                  0.2400990099009901,
+                  0.2202970297029703,
+                  0.1707920792079208,
+                  0.09653465346534654,
+                  0.04207920792079208,
+                  0.024752475247524754,
+                  0.034653465346534656
+                ]
+              },
+              {
+                "from": 32,
+                "p": [
+                  0.19349845201238391,
+                  0.25696594427244585,
+                  0.21981424148606812,
+                  0.14086687306501547,
+                  0.08875128998968008,
+                  0.043343653250773995,
+                  0.023735810113519093,
+                  0.033023735810113516
+                ]
+              },
+              {
+                "from": 128,
+                "p": [
+                  0.1907993966817496,
+                  0.24226998491704374,
+                  0.20588235294117646,
+                  0.12952488687782807,
+                  0.08088235294117647,
+                  0.049396681749622924,
+                  0.023755656108597284,
+                  0.07748868778280543
+                ]
+              },
+              {
+                "from": 512,
+                "p": [
+                  0.1782219446179471,
+                  0.2383926712471372,
+                  0.19217155944201542,
+                  0.12034145325838018,
+                  0.07890901519883406,
+                  0.03830938996460546,
+                  0.023735165521549032,
+                  0.12991880074953155
+                ]
+              },
+              {
+                "from": 1024,
+                "p": [
+                  0.13753846153846153,
+                  0.19184615384615383,
+                  0.15723076923076923,
+                  0.09938461538461539,
+                  0.06523076923076923,
+                  0.03876923076923077,
+                  0.04,
+                  0.27
+                ]
+              },
+              {
+                "from": 2048,
+                "p": [
+                  0.08741912293314162,
+                  0.13227893601725377,
+                  0.11588785046728972,
+                  0.08382458662832494,
+                  0.05334291876347951,
+                  0.043278217109992814,
+                  0.040977713874910136,
+                  0.44299065420560746
+                ]
+              },
+              {
+                "from": 4096,
+                "p": [
+                  0.08806262230919765,
+                  0.11328549684714068,
+                  0.09545553381169819,
+                  0.05979560774081322,
+                  0.047619047619047616,
+                  0.05044574907588606,
+                  0.024787997390737115,
+                  0.5205479452054794
+                ]
+              }
+            ]
+          }
+        },
+        "iteration_count": 876,
+        "predict_log_dir": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/timing_predict",
+        "profile_log_dir": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "arrival_time_scale_matches": true,
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "identities": [
+            {
+              "request_id": 0,
+              "source_id": "0"
+            },
+            {
+              "request_id": 1,
+              "source_id": "1"
+            },
+            {
+              "request_id": 2,
+              "source_id": "2"
+            },
+            {
+              "request_id": 3,
+              "source_id": "3"
+            },
+            {
+              "request_id": 4,
+              "source_id": "4"
+            },
+            {
+              "request_id": 5,
+              "source_id": "5"
+            },
+            {
+              "request_id": 6,
+              "source_id": "6"
+            },
+            {
+              "request_id": 7,
+              "source_id": "7"
+            },
+            {
+              "request_id": 8,
+              "source_id": "8"
+            },
+            {
+              "request_id": 9,
+              "source_id": "9"
+            },
+            {
+              "request_id": 10,
+              "source_id": "10"
+            },
+            {
+              "request_id": 11,
+              "source_id": "11"
+            },
+            {
+              "request_id": 12,
+              "source_id": "12"
+            },
+            {
+              "request_id": 13,
+              "source_id": "13"
+            },
+            {
+              "request_id": 14,
+              "source_id": "14"
+            },
+            {
+              "request_id": 15,
+              "source_id": "15"
+            },
+            {
+              "request_id": 16,
+              "source_id": "16"
+            },
+            {
+              "request_id": 17,
+              "source_id": "17"
+            },
+            {
+              "request_id": 18,
+              "source_id": "18"
+            },
+            {
+              "request_id": 19,
+              "source_id": "19"
+            },
+            {
+              "request_id": 20,
+              "source_id": "20"
+            },
+            {
+              "request_id": 21,
+              "source_id": "21"
+            },
+            {
+              "request_id": 22,
+              "source_id": "22"
+            },
+            {
+              "request_id": 23,
+              "source_id": "23"
+            },
+            {
+              "request_id": 24,
+              "source_id": "24"
+            },
+            {
+              "request_id": 25,
+              "source_id": "25"
+            },
+            {
+              "request_id": 26,
+              "source_id": "26"
+            },
+            {
+              "request_id": 27,
+              "source_id": "27"
+            },
+            {
+              "request_id": 28,
+              "source_id": "28"
+            },
+            {
+              "request_id": 29,
+              "source_id": "29"
+            },
+            {
+              "request_id": 30,
+              "source_id": "30"
+            },
+            {
+              "request_id": 31,
+              "source_id": "31"
+            },
+            {
+              "request_id": 32,
+              "source_id": "32"
+            },
+            {
+              "request_id": 33,
+              "source_id": "33"
+            },
+            {
+              "request_id": 34,
+              "source_id": "34"
+            },
+            {
+              "request_id": 35,
+              "source_id": "35"
+            },
+            {
+              "request_id": 36,
+              "source_id": "36"
+            },
+            {
+              "request_id": 37,
+              "source_id": "37"
+            },
+            {
+              "request_id": 38,
+              "source_id": "38"
+            },
+            {
+              "request_id": 39,
+              "source_id": "39"
+            },
+            {
+              "request_id": 40,
+              "source_id": "40"
+            },
+            {
+              "request_id": 41,
+              "source_id": "41"
+            },
+            {
+              "request_id": 42,
+              "source_id": "42"
+            },
+            {
+              "request_id": 43,
+              "source_id": "43"
+            },
+            {
+              "request_id": 44,
+              "source_id": "44"
+            },
+            {
+              "request_id": 45,
+              "source_id": "45"
+            },
+            {
+              "request_id": 46,
+              "source_id": "46"
+            },
+            {
+              "request_id": 47,
+              "source_id": "47"
+            },
+            {
+              "request_id": 48,
+              "source_id": "48"
+            },
+            {
+              "request_id": 49,
+              "source_id": "49"
+            },
+            {
+              "request_id": 50,
+              "source_id": "50"
+            },
+            {
+              "request_id": 51,
+              "source_id": "51"
+            },
+            {
+              "request_id": 52,
+              "source_id": "52"
+            },
+            {
+              "request_id": 53,
+              "source_id": "53"
+            },
+            {
+              "request_id": 54,
+              "source_id": "54"
+            },
+            {
+              "request_id": 55,
+              "source_id": "55"
+            },
+            {
+              "request_id": 56,
+              "source_id": "56"
+            },
+            {
+              "request_id": 57,
+              "source_id": "57"
+            },
+            {
+              "request_id": 58,
+              "source_id": "58"
+            },
+            {
+              "request_id": 59,
+              "source_id": "59"
+            },
+            {
+              "request_id": 60,
+              "source_id": "60"
+            },
+            {
+              "request_id": 61,
+              "source_id": "61"
+            },
+            {
+              "request_id": 62,
+              "source_id": "62"
+            },
+            {
+              "request_id": 63,
+              "source_id": "63"
+            },
+            {
+              "request_id": 64,
+              "source_id": "64"
+            },
+            {
+              "request_id": 65,
+              "source_id": "65"
+            },
+            {
+              "request_id": 66,
+              "source_id": "66"
+            },
+            {
+              "request_id": 67,
+              "source_id": "67"
+            },
+            {
+              "request_id": 68,
+              "source_id": "68"
+            },
+            {
+              "request_id": 69,
+              "source_id": "69"
+            },
+            {
+              "request_id": 70,
+              "source_id": "70"
+            },
+            {
+              "request_id": 71,
+              "source_id": "71"
+            },
+            {
+              "request_id": 72,
+              "source_id": "72"
+            },
+            {
+              "request_id": 73,
+              "source_id": "73"
+            },
+            {
+              "request_id": 74,
+              "source_id": "74"
+            },
+            {
+              "request_id": 75,
+              "source_id": "75"
+            },
+            {
+              "request_id": 76,
+              "source_id": "76"
+            },
+            {
+              "request_id": 77,
+              "source_id": "77"
+            },
+            {
+              "request_id": 78,
+              "source_id": "78"
+            },
+            {
+              "request_id": 79,
+              "source_id": "79"
+            },
+            {
+              "request_id": 80,
+              "source_id": "80"
+            },
+            {
+              "request_id": 81,
+              "source_id": "81"
+            },
+            {
+              "request_id": 82,
+              "source_id": "82"
+            },
+            {
+              "request_id": 83,
+              "source_id": "83"
+            },
+            {
+              "request_id": 84,
+              "source_id": "84"
+            },
+            {
+              "request_id": 85,
+              "source_id": "85"
+            },
+            {
+              "request_id": 86,
+              "source_id": "86"
+            },
+            {
+              "request_id": 87,
+              "source_id": "87"
+            },
+            {
+              "request_id": 88,
+              "source_id": "88"
+            },
+            {
+              "request_id": 89,
+              "source_id": "89"
+            },
+            {
+              "request_id": 90,
+              "source_id": "90"
+            },
+            {
+              "request_id": 91,
+              "source_id": "91"
+            },
+            {
+              "request_id": 92,
+              "source_id": "92"
+            },
+            {
+              "request_id": 93,
+              "source_id": "93"
+            },
+            {
+              "request_id": 94,
+              "source_id": "94"
+            },
+            {
+              "request_id": 95,
+              "source_id": "95"
+            },
+            {
+              "request_id": 96,
+              "source_id": "96"
+            },
+            {
+              "request_id": 97,
+              "source_id": "97"
+            },
+            {
+              "request_id": 98,
+              "source_id": "98"
+            },
+            {
+              "request_id": 99,
+              "source_id": "99"
+            }
+          ],
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 100,
+          "simulated_arrival_time_scale": 1.0
+        },
+        "simulation_log_dir": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/simulation",
+        "workload_profile_log_dir": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261124_kimi_k31_pr_gb200_tp16_phase1/01_tp16_diverse_100/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    }
+  },
+  "formulas": {
+    "decode_batch_mean_pct": "ratio(workload.metrics.decode_batch_size.{simulated,measured}.mean)",
+    "e2e_mean_pct": "ratio(e2e.latency.e2e.{simulated,measured}_ms.mean)",
+    "gpu_time_multiplier": "iteration.meta.recommended_gpu_time_multiplier",
+    "iteration_cycle_mean_pct": "ratio(workload.metrics.iteration_cycle_ms.{simulated,measured}.mean)",
+    "iterations_pct": "ratio(workload.meta.{simulated,measured}_iterations)",
+    "kernel_abs_pct": "iteration.comparison.all.absolute_error_pct",
+    "kernel_signed_pct": "iteration.comparison.all.signed_error_pct",
+    "map_coverage_pct": "iteration.mapping.coverage.measured_duration_fraction * 100",
+    "output_tps_pct": "ratio(e2e.throughput.simulated_completion_tps, e2e.throughput.measured_client_completion_tps)",
+    "prefill_tokens_mean_pct": "ratio(workload.metrics.prefill_tokens.{simulated,measured}.mean)",
+    "scheduled_kv_mean_pct": "ratio(workload.metrics.scheduled_kv_tokens.{simulated,measured}.mean)",
+    "server_tpot_mean_pct": "ratio(e2e.latency.server_tpot.{simulated,measured}_ms.mean)",
+    "server_ttft_mean_pct": "ratio(e2e.latency.server_ttft.{simulated,measured}_ms.mean)"
+  },
+  "generated_by": "python -m launcher alignment-campaign extract",
+  "pack": "kimi_k31_pro_nvfp4_gb200_tp16_ep16",
+  "roots": [
+    "logs/20261124_kimi_k31_pr_gb200_tp16_phase1"
+  ],
+  "schema_version": 1
+}
