@@ -9,7 +9,7 @@ logs
 .launcher
 .codex
 .claude
-profiling/profile.db
+profiling/profile_db
 *.db-journal
 *.parquet
 *.pftrace

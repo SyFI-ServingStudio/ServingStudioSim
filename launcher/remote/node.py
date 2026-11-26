@@ -15,7 +15,7 @@ then names it as ``python``), so it runs the same code as the job it serves:
 
 ``run-job JOBDIR``
     Run the launcher command recorded in ``JOBDIR/job.json`` and record its
-    output and exit code there. The job gets a private copy of profile.db on
+    output and exit code there. The job gets a private copy of the profile DB on
     node-local disk (SQLite must not run on a network filesystem), a node-local
     TMPDIR (the launcher's leases are flocks there), the prebuilt binaries, and
     no managed-job context: the sending machine registered the job and reports
@@ -53,6 +53,9 @@ from .layout import Layout
 # The managed-job context variables (launcher/managed_client.py).
 MANAGED_CONTEXT_VARIABLES = ("VIBESIM_MANAGED_JOB_CONTEXT", "VIBESIM_MANAGED_RUN_CONTEXT")
 PROFILE_DB_ENV = "VIBESIM_PROFILE_DB"
+# The profile DB directory's name, under `profiling/` in the source and in each
+# job's scratch (its private copy) and job directory (kept to merge back).
+PROFILE_DB_DIR = "profile_db"
 _BUILD_EXCLUDES = ("/target", "/.venv", "/bin", "/logs")
 _BUILT_FILES = ("simulator", "analyze")
 # Overrides `.cargo/config.toml`'s `-fuse-ld=mold` (cargo reads config from env).
@@ -188,7 +191,7 @@ def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
         env["VIRTUAL_ENV"] = venv
         # The project `uv run` resolves to, which would otherwise be the version's `.venv`.
         env["UV_PROJECT_ENVIRONMENT"] = venv
-    env[PROFILE_DB_ENV] = str(scratch / "profile.db")
+    env[PROFILE_DB_ENV] = str(scratch / PROFILE_DB_DIR)
     return env
 
 
@@ -217,7 +220,11 @@ def run_job(jobdir: Path) -> int:
     scratch.mkdir(parents=True, exist_ok=True)
     exit_code = 1
     try:
-        shutil.copy2(src / "profiling" / "profile.db", scratch / "profile.db")
+        source_db = src / "profiling" / PROFILE_DB_DIR
+        if source_db.is_dir():
+            shutil.copytree(source_db, scratch / PROFILE_DB_DIR)
+        else:
+            (scratch / PROFILE_DB_DIR).mkdir()
         argv = [_job_python(job), "-m", "launcher", *job["argv"]]
         with (jobdir / "stdout.log").open("ab") as log:
             if stopped:
@@ -238,7 +245,7 @@ def run_job(jobdir: Path) -> int:
             if exit_code < 0:
                 exit_code = 128 - exit_code
         if job.get("keep_db"):
-            shutil.copy2(scratch / "profile.db", jobdir / "profile.db")
+            shutil.copytree(scratch / PROFILE_DB_DIR, jobdir / PROFILE_DB_DIR)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
         temporary = jobdir / "exit_code.tmp"

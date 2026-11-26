@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.exec import _build_subprocess_env, binary_path
+from profiling.db import layout
 from profiling.db.migrate import require_current
 
 
@@ -72,10 +73,11 @@ def introspect(binary: Path, args: list[str]) -> Any:
 
 
 class Sources:
-    """The simulator binary and profile.db behind every document the service builds."""
+    """The simulator binary and profile DB behind every document the service builds."""
 
     def __init__(self, *, db_path: Path, build_type: str = "release") -> None:
-        self.db_path = Path(db_path).resolve()
+        # The profile DB directory: one SQLite file per kind (`profiling.db.layout`).
+        self.db_path = layout.require_directory(Path(db_path).resolve())
         self.build_type = build_type
         self.binary = binary_path(build_type)
         self._lock = threading.Lock()
@@ -100,25 +102,33 @@ class Sources:
 
         return run_json(self.binary, ["cost-trees", "-", "--kernel-configs"], json.dumps(blocks))
 
-    # -- profile.db ----------------------------------------------------------------
+    # -- profile DB ----------------------------------------------------------------
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        """A read-only connection; the file is never opened for writing."""
+    def connect(self, kind: str) -> Iterator[sqlite3.Connection]:
+        """A read-only connection to ``kind``'s file; the file is never opened for
+        writing. A kind without a file gets an empty database, which holds no table."""
 
-        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        path = layout.kind_file(self.db_path, kind)
+        if path.is_file():
+            conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        else:
+            conn = sqlite3.connect(":memory:")
         try:
             conn.execute("pragma query_only = on")
-            require_current(conn, str(self.db_path))
+            require_current(conn, str(path))
             yield conn
         finally:
             conn.close()
 
     def cached_by_db(self, key: Any, compute: Callable[[], Any]) -> Any:
-        """``compute()``, reused until profile.db changes."""
+        """``compute()``, reused until any kind file of the profile DB changes."""
 
-        st = self.db_path.stat()
-        stamp = (st.st_mtime, st.st_size)
+        stamp = tuple(
+            (path.name, st.st_mtime_ns, st.st_size)
+            for path in layout.kind_files(self.db_path)
+            for st in (path.stat(),)
+        )
         with self._lock:
             if stamp != self._db_stamp:
                 self._db_cache.clear()

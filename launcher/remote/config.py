@@ -81,7 +81,7 @@ class Remote:
     # "rsync": ship inputs and fetch results over the transport. "shared": the
     # workdir is visible here at the same path, so files move by local copy.
     files: str
-    # Node-local scratch for each job's private profile.db copy and TMPDIR.
+    # Node-local scratch for each job's private profile DB copy and TMPDIR.
     node_local: PurePosixPath = PurePosixPath("/tmp")
     env: dict[str, str] = field(default_factory=dict)
     keep_versions: int = 10

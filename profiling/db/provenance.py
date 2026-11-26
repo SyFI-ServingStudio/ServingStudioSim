@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from profiling.db import layout
 from profiling.db.migrate import require_current
 from profiling.db.storage import RUN_TABLE
 
@@ -291,7 +292,7 @@ def audit_profile_provenance(
     repo_root: Path,
 ) -> ProvenanceReport:
     """Classify stamped rows without modifying the profile database."""
-    if not db_path.is_file():
+    if not layout.require_directory(db_path).is_dir():
         raise FileNotFoundError(f"profile DB not found: {db_path}")
 
     module_cache: dict[tuple[str, str], _HistoricalModule] = {}
@@ -301,51 +302,52 @@ def audit_profile_provenance(
     candidate_rows = 0
     unverifiable_rows = 0
 
-    with closing(_connect(db_path)) as conn:
-        require_current(conn, str(db_path))
-        for table in _tables_with_provenance(conn):
-            quoted_table = _quote_identifier(table)
-            groups = conn.execute(
-                f"""
-                SELECT t.backend, r.profiler_git_hash, COUNT(*)
-                FROM {quoted_table} t JOIN {RUN_TABLE} r ON r.run_key = t.run_key
-                WHERE r.profiler_git_hash != ''
-                GROUP BY t.backend, r.profiler_git_hash
-                """
-            ).fetchall()
-            for backend_value, stamp_value, row_count_value in groups:
-                backend = str(backend_value)
-                stamp = str(stamp_value)
-                row_count = int(row_count_value)
-                total_rows += row_count
-                if stamp.endswith(_DIRTY_SUFFIX) or stamp == _UNKNOWN_HASH:
-                    continue
+    for kind_file in layout.kind_files(db_path):
+        with closing(_connect(kind_file)) as conn:
+            require_current(conn, str(kind_file))
+            for table in _tables_with_provenance(conn):
+                quoted_table = _quote_identifier(table)
+                groups = conn.execute(
+                    f"""
+                    SELECT t.backend, r.profiler_git_hash, COUNT(*)
+                    FROM {quoted_table} t JOIN {RUN_TABLE} r ON r.run_key = t.run_key
+                    WHERE r.profiler_git_hash != ''
+                    GROUP BY t.backend, r.profiler_git_hash
+                    """
+                ).fetchall()
+                for backend_value, stamp_value, row_count_value in groups:
+                    backend = str(backend_value)
+                    stamp = str(stamp_value)
+                    row_count = int(row_count_value)
+                    total_rows += row_count
+                    if stamp.endswith(_DIRTY_SUFFIX) or stamp == _UNKNOWN_HASH:
+                        continue
 
-                verdict = _classify(
-                    repo_root,
-                    table,
-                    backend,
-                    stamp,
-                    module_cache,
-                    commit_cache,
-                )
-                if verdict == "consistent":
-                    continue
-                findings.append(
-                    ProvenanceFinding(
-                        table=table,
-                        backend=backend,
-                        profiler_git_hash=stamp,
-                        rows=row_count,
-                        verdict=verdict,
+                    verdict = _classify(
+                        repo_root,
+                        table,
+                        backend,
+                        stamp,
+                        module_cache,
+                        commit_cache,
                     )
-                )
-                if verdict in _CANDIDATE_VERDICTS:
-                    candidate_rows += row_count
-                elif verdict in _UNVERIFIABLE_VERDICTS:
-                    unverifiable_rows += row_count
-                else:  # Guard report semantics when a classifier verdict is added.
-                    raise AssertionError(f"unhandled provenance verdict: {verdict}")
+                    if verdict == "consistent":
+                        continue
+                    findings.append(
+                        ProvenanceFinding(
+                            table=table,
+                            backend=backend,
+                            profiler_git_hash=stamp,
+                            rows=row_count,
+                            verdict=verdict,
+                        )
+                    )
+                    if verdict in _CANDIDATE_VERDICTS:
+                        candidate_rows += row_count
+                    elif verdict in _UNVERIFIABLE_VERDICTS:
+                        unverifiable_rows += row_count
+                    else:  # Guard report semantics when a classifier verdict is added.
+                        raise AssertionError(f"unhandled provenance verdict: {verdict}")
     findings.sort(
         key=lambda finding: (
             -finding.rows,

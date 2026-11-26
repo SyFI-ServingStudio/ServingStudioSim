@@ -152,9 +152,13 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         "--work", type=Path, required=True, help="work list JSON (profiling/plan.py write_units)"
     )
     fill_parser.add_argument(
-        "--output-dir", type=Path, help="Where to write fill_report.json (under logs/ for --remote)."
+        "--output-dir",
+        type=Path,
+        help="Where to write fill_report.json (under logs/ for --remote).",
     )
-    fill_parser.add_argument("--db", type=Path, help="profile.db to fill (default VIBESIM_PROFILE_DB).")
+    fill_parser.add_argument(
+        "--db", type=Path, help="Profile DB directory to fill (default VIBESIM_PROFILE_DB)."
+    )
     fill_parser.set_defaults(command_fn=_cmd_fill)
 
     measure_parser = subparsers.add_parser(
@@ -202,17 +206,21 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         action="store_false",
         help="Skip the NVML energy window; the reported energy_j is then 0.0 (not measured).",
     )
-    measure_parser.set_defaults(
-        command_fn=_cmd_measure, clear_l2=True, telemetry=True, energy=None
-    )
+    measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True, telemetry=True, energy=None)
 
     merge_parser = subparsers.add_parser(
         "merge-db",
         help="Merge profile databases by semantic row identity.",
     )
-    merge_parser.add_argument("left", type=Path, help="First input profile.db.")
-    merge_parser.add_argument("right", type=Path, help="Second input profile.db.")
-    merge_parser.add_argument("--output", type=Path, required=True, help="New merged profile.db.")
+    merge_parser.add_argument(
+        "left", type=Path, help="First input profile DB directory (or legacy single file)."
+    )
+    merge_parser.add_argument(
+        "right", type=Path, help="Second input profile DB directory (or legacy single file)."
+    )
+    merge_parser.add_argument(
+        "--output", type=Path, required=True, help="New merged profile DB directory."
+    )
     merge_parser.add_argument(
         "--report",
         type=Path,
@@ -223,10 +231,23 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
 
     migrate_parser = subparsers.add_parser(
         "migrate-db",
-        help="Upgrade a profile.db to this checkout's schema in place, then VACUUM it.",
+        help="Upgrade a profile DB to this checkout's schema in place, then VACUUM it.",
     )
-    migrate_parser.add_argument("db", type=Path, help="profile.db to upgrade.")
+    migrate_parser.add_argument(
+        "db", type=Path, help="Profile DB directory (or legacy single file) to upgrade."
+    )
     migrate_parser.set_defaults(command_fn=_cmd_migrate_db)
+
+    split_parser = subparsers.add_parser(
+        "split-db",
+        help="Split a legacy single-file profile.db into a per-kind profile DB directory.",
+    )
+    split_parser.add_argument("db", type=Path, help="Legacy single-file profile.db.")
+    split_parser.add_argument(
+        "--output", type=Path, required=True, help="New profile DB directory."
+    )
+    split_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    split_parser.set_defaults(command_fn=_cmd_split_db)
 
     provenance_parser = subparsers.add_parser(
         "audit-provenance",
@@ -235,7 +256,7 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
     provenance_parser.add_argument(
         "--db",
         type=Path,
-        help="profile.db path. Defaults to profiling.perf_api.DB_PATH.",
+        help="Profile DB directory. Defaults to profiling.perf_api.DB_PATH.",
     )
     provenance_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
     provenance_parser.set_defaults(command_fn=_cmd_audit_provenance)
@@ -259,7 +280,7 @@ def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db",
         type=Path,
-        help="profile.db path. Defaults to profiling.perf_api.DB_PATH.",
+        help="Profile DB directory. Defaults to profiling.perf_api.DB_PATH.",
     )
     parser.add_argument("--gpu-name", help="DB gpu_name key. Defaults to CUDA device 0 name.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
@@ -268,11 +289,45 @@ def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
 def _cmd_migrate_db(args: argparse.Namespace) -> int:
     from profiling.db.migrate import SCHEMA_VERSION, migrate
 
-    before = args.db.stat().st_size
+    before = _db_bytes(args.db)
     upgraded = migrate(args.db)
-    after = args.db.stat().st_size
+    after = _db_bytes(args.db)
     state = "upgraded" if upgraded else "already current"
     print(f"{args.db}: {state} (schema v{SCHEMA_VERSION}), {before:,} -> {after:,} bytes")
+    return 0
+
+
+def _db_bytes(db: Path) -> int:
+    """Bytes of a profile DB directory's kind files, or of a legacy single file."""
+    from profiling.db import layout
+
+    if layout.is_legacy_file(db):
+        return db.stat().st_size
+    return sum(path.stat().st_size for path in layout.kind_files(db))
+
+
+def _cmd_split_db(args: argparse.Namespace) -> int:
+    from profiling.db.split import split_profile_db
+
+    report = split_profile_db(args.db, args.output)
+    if args.json:
+        print(json.dumps({"ok": True, **report.as_dict()}, indent=2, sort_keys=True))
+        return 0
+    summary = report.summary
+    print(f"Split {report.source} -> {report.output}")
+    print(
+        f"Files: {summary['files']} ({summary['rows']:,} rows); "
+        f"empty tables skipped: {summary['empty_tables']}; "
+        f"runs no row references, not copied: {summary['unreferenced_runs']}"
+    )
+    if summary["orphan_rows"]:
+        print(
+            f"Kept as they were: {summary['orphan_rows']:,} rows whose run_key has no "
+            f"_profile_run row ({summary['orphan_run_keys']} keys):"
+        )
+        for table in report.tables:
+            if table.orphan_rows:
+                print(f"  {table.table}: {table.orphan_rows} rows")
     return 0
 
 

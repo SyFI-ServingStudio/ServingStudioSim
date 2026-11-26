@@ -5,7 +5,7 @@
 #
 # The image carries only the Python environment (uv.lock's `public-api` and
 # `launcher` groups). The container mounts this checkout read-only at the same
-# path and serves its profiling/profile.db with its target/release/simulator
+# path and serves its profiling/profile_db with its target/release/simulator
 # and analyze, so build those first. Predictions are kept for Read more in
 # logs/public_api/predictions, simulations run in logs/public_api/simulations and
 # uploaded workloads are kept in logs/public_api/workloads and every request is
@@ -41,7 +41,7 @@ access=$repo/logs/public_api/access
 mkdir -p "$runs" "$sims" "$uploads" "$access"
 
 tracegen=$repo/alignment/load_generator/req-frontend/target/release/tracegen
-for path in "$repo/target/release/simulator" "$repo/target/release/analyze" "$tracegen" "$repo/profiling/profile.db"; do
+for path in "$repo/target/release/simulator" "$repo/target/release/analyze" "$tracegen" "$repo/profiling/profile_db"; do
   [[ -e $path ]] || { echo "$path is missing" >&2; exit 1; }
 done
 
@@ -67,7 +67,7 @@ docker run -d --name "$name" --restart unless-stopped \
   -w "$repo" -p "$bind:$port:$port" \
   "$image" \
   python -m public_api serve --bind 0.0.0.0 --port "$port" \
-  --db "$repo/profiling/profile.db" --build-type release \
+  --db "$repo/profiling/profile_db" --build-type release \
   --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --access-log-dir "$access" \
   --analyzer-port "$((port + 1))" \
   --forwarded-allow-ips "$forwarded_allow_ips" >/dev/null

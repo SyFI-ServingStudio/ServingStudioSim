@@ -1,31 +1,37 @@
+"""Merging two profile DB directories (``profiling.db.layout``) kind file by kind file."""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from launcher.__main__ import main as launcher_main
+from profiling.db import layout
 from profiling.db.merge import merge_profile_databases
 from profiling.db.migrate import migrate_connection
 
 
 def _create_profile_db(
-    path: Path,
+    root: Path,
     *,
     table_rows: dict[str, list[dict[str, object]]],
     schema_hash: str | None = None,
 ) -> None:
-    with sqlite3.connect(path) as conn:
-        migrate_connection(conn)
-        if schema_hash is not None:
-            conn.execute(
-                "UPDATE _db_metadata SET value = ? WHERE key = 'schema_hash'",
-                (schema_hash,),
-            )
-        for table_name, rows in table_rows.items():
+    """A profile DB directory with one kind file per ``table_rows`` entry."""
+    root.mkdir(parents=True, exist_ok=True)
+    for table_name, rows in table_rows.items():
+        with closing(sqlite3.connect(layout.kind_file(root, table_name))) as conn, conn:
+            migrate_connection(conn)
+            if schema_hash is not None:
+                conn.execute(
+                    "UPDATE _db_metadata SET value = ? WHERE key = 'schema_hash'",
+                    (schema_hash,),
+                )
             conn.execute(
                 f"""
                 CREATE TABLE {table_name} (
@@ -89,22 +95,25 @@ def _profile_row(
     }
 
 
-def _rows(path: Path, table_name: str) -> list[sqlite3.Row]:
-    with sqlite3.connect(path) as conn:
+def _rows(root: Path, table_name: str) -> list[sqlite3.Row]:
+    with closing(sqlite3.connect(layout.kind_file(root, table_name))) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(f"SELECT * FROM {table_name} ORDER BY m").fetchall()
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256(root: Path) -> dict[str, str]:
+    """Every file under the directory ``root`` by name, with its sha256."""
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.iterdir())
+    }
 
 
 def test_launcher_merge_db_preserves_one_sided_rows_and_tables(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    left = tmp_path / "left.db"
-    right = tmp_path / "right.db"
-    output = tmp_path / "merged.db"
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    output = tmp_path / "merged"
     _create_profile_db(
         left,
         table_rows={"single_gemm": [{"m": 1, "time_ms": 1.0, "profiler_git_hash": "left-commit"}]},
@@ -151,9 +160,9 @@ def test_launcher_merge_db_preserves_one_sided_rows_and_tables(
 
 
 def test_merge_db_deduplicates_identical_semantic_rows(tmp_path: Path) -> None:
-    left = tmp_path / "left.db"
-    right = tmp_path / "right.db"
-    output = tmp_path / "merged.db"
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    output = tmp_path / "merged"
     shared = {"m": 1, "time_ms": 1.0, "profiler_git_hash": "same-commit"}
     _create_profile_db(left, table_rows={"single_gemm": [shared]})
     _create_profile_db(
@@ -170,9 +179,9 @@ def test_merge_db_deduplicates_identical_semantic_rows(tmp_path: Path) -> None:
 
 
 def test_merge_db_reports_conflict_and_does_not_publish(tmp_path: Path) -> None:
-    left = tmp_path / "left.db"
-    right = tmp_path / "right.db"
-    output = tmp_path / "merged.db"
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    output = tmp_path / "merged"
     _create_profile_db(
         left,
         table_rows={"single_gemm": [{"m": 1, "time_ms": 1.0, "profiler_git_hash": "left-commit"}]},
@@ -199,11 +208,11 @@ def test_merge_db_reports_conflict_and_does_not_publish(tmp_path: Path) -> None:
 
 
 def test_merge_db_rejects_schema_metadata_mismatch(tmp_path: Path) -> None:
-    left = tmp_path / "left.db"
-    right = tmp_path / "right.db"
-    output = tmp_path / "merged.db"
-    _create_profile_db(left, table_rows={})
-    _create_profile_db(right, table_rows={}, schema_hash="incompatible-schema")
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    output = tmp_path / "merged"
+    _create_profile_db(left, table_rows={"single_gemm": []})
+    _create_profile_db(right, table_rows={"single_gemm": []}, schema_hash="incompatible-schema")
 
     with pytest.raises(ValueError, match="right profile DB schema metadata is incompatible"):
         merge_profile_databases(left, right, output)
@@ -212,11 +221,11 @@ def test_merge_db_rejects_schema_metadata_mismatch(tmp_path: Path) -> None:
 
 
 def test_merge_db_does_not_overwrite_existing_output(tmp_path: Path) -> None:
-    left = tmp_path / "left.db"
-    right = tmp_path / "right.db"
-    output = tmp_path / "merged.db"
-    _create_profile_db(left, table_rows={})
-    _create_profile_db(right, table_rows={})
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    output = tmp_path / "merged"
+    _create_profile_db(left, table_rows={"single_gemm": []})
+    _create_profile_db(right, table_rows={"single_gemm": []})
     output.write_bytes(b"keep this output")
 
     with pytest.raises(FileExistsError, match="output already exists"):

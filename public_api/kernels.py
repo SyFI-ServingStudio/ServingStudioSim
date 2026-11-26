@@ -166,7 +166,7 @@ class KernelLibrary:
         """``{column: declared type}`` of the kind's table; empty when it has none."""
 
         def compute() -> dict[str, str]:
-            with self.sources.connect() as conn:
+            with self.sources.connect(kind) as conn:
                 info = conn.execute(f'pragma table_info("{kind}")').fetchall()
             return {row[1]: (row[2] or "").upper() for row in info}
 
@@ -185,7 +185,7 @@ class KernelLibrary:
                 f"select gpu_name, backend, {precision_sql}, count(*), {last} "
                 f'from "{kind}" group by 1, 2, 3 order by 1, 2, 3'
             )
-            with self.sources.connect() as conn:
+            with self.sources.connect(kind) as conn:
                 records = conn.execute(query).fetchall()
             return [
                 {"gpu": g, "backend": b, "precision": p, "rows": n, "last_measured_at": t}
@@ -354,7 +354,7 @@ class KernelLibrary:
                 + (f" where {' and '.join(where)}" if where else "")
                 + f" order by {', '.join(select[: len(keyed)])}"
             )
-            with self.sources.connect() as conn:
+            with self.sources.connect(kind) as conn:
                 records = conn.execute(query, params).fetchall()
             width = 2 + len(args) + len(metrics)
             for record in records:
@@ -379,7 +379,7 @@ class KernelLibrary:
             metrics = self._metrics(kind)
             select = ", ".join(f'"{m}"' for m in metrics)
             out: dict[bytes, dict[str, dict]] = {}
-            with self.sources.connect() as conn:
+            with self.sources.connect(profile_kind) as conn:
                 if not conn.execute(
                     "select 1 from sqlite_master where type = 'table' and name = ?", [profile_kind]
                 ).fetchone():

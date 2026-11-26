@@ -225,8 +225,8 @@ def test_a_direct_job_runs_detached_and_is_polled_to_its_exit(tmp_path, monkeypa
 
 def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, monkeypatch):
     src = tmp_path / "src"
-    (src / "profiling").mkdir(parents=True)
-    (src / "profiling" / "profile.db").write_bytes(b"db")
+    (src / "profiling" / "profile_db").mkdir(parents=True)
+    (src / "profiling" / "profile_db" / "single_gemm.db").write_bytes(b"db")
     (src / ".venv" / "bin").mkdir(parents=True)
     # A fake interpreter that records the environment the job sees.
     (src / ".venv" / "bin" / "python").write_text(
@@ -235,7 +235,8 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
         "keys = ('TMPDIR', 'VIBESIM_BIN_DIR', 'VIBESIM_PROFILE_DB', "
         "'VIBESIM_MANAGED_JOB_CONTEXT', 'HF_HOME', 'UV_NO_SYNC')\n"
         "print(json.dumps({'argv': sys.argv[1:], **{k: os.environ.get(k) for k in keys}}))\n"
-        "print(open(os.environ['VIBESIM_PROFILE_DB'], 'rb').read().decode())\n"
+        "db = os.path.join(os.environ['VIBESIM_PROFILE_DB'], 'single_gemm.db')\n"
+        "print(open(db, 'rb').read().decode())\n"
         "sys.exit(5)\n"
     )
     (src / ".venv" / "bin" / "python").chmod(0o755)
@@ -258,7 +259,7 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
     seen = json.loads(first)
     scratch = tmp_path / "local" / "vibesim-job-j"
     assert seen["argv"] == ["-m", "launcher", "p.yaml", "--no-gpu"]
-    assert seen["VIBESIM_PROFILE_DB"] == str(scratch / "profile.db") and second == "db"
+    assert seen["VIBESIM_PROFILE_DB"] == str(scratch / "profile_db") and second == "db"
     assert seen["TMPDIR"] == str(scratch / "tmp") and seen["VIBESIM_BIN_DIR"] == "/w/bin/h"
     assert seen["VIBESIM_MANAGED_JOB_CONTEXT"] is None and seen["HF_HOME"] == "/hf"
     assert seen["UV_NO_SYNC"] == "1"
@@ -268,8 +269,8 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
 
 def test_a_job_with_its_own_venv_runs_and_keeps_its_database(tmp_path):
     src = tmp_path / "src"
-    (src / "profiling").mkdir(parents=True)
-    (src / "profiling" / "profile.db").write_bytes(b"db")
+    (src / "profiling" / "profile_db").mkdir(parents=True)
+    (src / "profiling" / "profile_db" / "single_gemm.db").write_bytes(b"db")
     venv = tmp_path / "venvs" / "gpu"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin" / "python").write_text(
@@ -277,7 +278,8 @@ def test_a_job_with_its_own_venv_runs_and_keeps_its_database(tmp_path):
         "import json, os\n"
         "keys = ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT')\n"
         "print(json.dumps({k: os.environ.get(k) for k in keys}))\n"
-        "open(os.environ['VIBESIM_PROFILE_DB'], 'ab').write(b'+row')\n"
+        "db = os.path.join(os.environ['VIBESIM_PROFILE_DB'], 'single_gemm.db')\n"
+        "open(db, 'ab').write(b'+row')\n"
     )
     (venv / "bin" / "python").chmod(0o755)
     jobdir = tmp_path / "jobs" / "j"
@@ -297,7 +299,7 @@ def test_a_job_with_its_own_venv_runs_and_keeps_its_database(tmp_path):
 
     seen = json.loads((jobdir / "stdout.log").read_text())
     assert seen == {"VIRTUAL_ENV": str(venv), "UV_PROJECT_ENVIRONMENT": str(venv)}
-    assert (jobdir / "profile.db").read_bytes() == b"db+row"
+    assert (jobdir / "profile_db" / "single_gemm.db").read_bytes() == b"db+row"
 
 
 def test_prune_keeps_recent_and_busy_versions_and_their_binaries(tmp_path):
@@ -331,11 +333,15 @@ def test_prune_keeps_recent_and_busy_versions_and_their_binaries(tmp_path):
 
 
 def _copy_db_with_new_gemm_row(source_db: Path, target: Path, *, time_ms: float) -> None:
+    """A copy of the profile DB directory ``source_db`` with one more single_gemm row."""
     import shutil
     import sqlite3
+    from contextlib import closing
 
-    shutil.copy2(source_db, target)
-    with sqlite3.connect(target) as conn:
+    from profiling.db import layout
+
+    shutil.copytree(source_db, target)
+    with closing(sqlite3.connect(layout.kind_file(target, "single_gemm"))) as conn, conn:
         columns = [row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")]
         row = dict(
             zip(columns, conn.execute("SELECT * FROM single_gemm LIMIT 1").fetchone(), strict=True)
@@ -348,16 +354,21 @@ def _copy_db_with_new_gemm_row(source_db: Path, target: Path, *, time_ms: float)
         )
 
 
+def _snapshot(root: Path) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in sorted(root.iterdir())}
+
+
 def test_a_remote_jobs_rows_merge_into_the_local_database(tmp_path, monkeypatch):
     from launcher.remote import run
+    from profiling.db import layout
 
-    repo_db = source.REPO_ROOT / "profiling" / "profile.db"
-    local = tmp_path / "profile.db"
+    repo_db = source.REPO_ROOT / "profiling" / "profile_db"
+    local = tmp_path / "profile_db"
     import shutil
 
-    shutil.copy2(repo_db, local)
-    local.chmod(0o664)
-    job_db = tmp_path / "job.db"
+    shutil.copytree(repo_db, local)
+    local.chmod(0o775)
+    job_db = tmp_path / "job_db"
     _copy_db_with_new_gemm_row(repo_db, job_db, time_ms=1.0)
     monkeypatch.setenv("VIBESIM_PROFILE_DB", str(local))
     monkeypatch.setattr(run, "REPO_ROOT", tmp_path)
@@ -366,20 +377,23 @@ def test_a_remote_jobs_rows_merge_into_the_local_database(tmp_path, monkeypatch)
 
     assert message.startswith("1 new row(s) merged")
     import sqlite3
+    from contextlib import closing
 
-    with sqlite3.connect(local) as conn:
+    with closing(sqlite3.connect(layout.kind_file(local, "single_gemm"))) as conn:
         assert conn.execute("SELECT time_ms FROM single_gemm WHERE m = 999983").fetchall() == [
             (1.0,)
         ]
-    assert local.stat().st_mode & 0o777 == 0o664
+    # Every kind the checkout had is still there, and the directory keeps its mode.
+    assert sorted(p.name for p in local.iterdir()) == sorted(p.name for p in repo_db.iterdir())
+    assert local.stat().st_mode & 0o777 == 0o775
 
     # The same key with another value is a conflict: nothing changes here.
-    before = local.read_bytes()
-    conflicting = tmp_path / "conflict.db"
+    before = _snapshot(local)
+    conflicting = tmp_path / "conflict_db"
     _copy_db_with_new_gemm_row(repo_db, conflicting, time_ms=2.0)
     with pytest.raises(run.RemoteRunError, match="conflict"):
         run._merge_profile_db(conflicting, tmp_path / "report2.json")
-    assert local.read_bytes() == before
+    assert _snapshot(local) == before
 
 
 def test_an_in_image_remote_runs_on_the_images_interpreter_only_if_it_is_the_image(
@@ -502,7 +516,7 @@ def test_a_job_database_that_does_not_come_back_is_reported_and_cleaned_up(tmp_p
     def missing(_job_id, _name, _local):
         raise TransportError("rsync: No such file or directory")
 
-    monkeypatch.setattr(session, "fetch_job_file", missing)
+    monkeypatch.setattr(session, "fetch_job_directory", missing)
     message, merged = remote_run._fold_job_db(session, "j", tmp_path)
     assert not merged and "not copied back" in message
     assert not held.exists()
@@ -511,7 +525,7 @@ def test_a_job_database_that_does_not_come_back_is_reported_and_cleaned_up(tmp_p
     def conflict(_job_db, _report):
         raise remote_run.RemoteRunError(f"conflict; the job's DB is kept at {held}")
 
-    monkeypatch.setattr(session, "fetch_job_file", lambda *_a: None)
+    monkeypatch.setattr(session, "fetch_job_directory", lambda *_a: None)
     monkeypatch.setattr(remote_run, "_merge_profile_db", conflict)
     message, merged = remote_run._fold_job_db(session, "j", tmp_path)
     assert not merged and "conflict" in message
@@ -532,20 +546,20 @@ def test_a_stop_before_the_job_starts_still_records_an_exit_code(tmp_path, monke
     import signal
 
     src = tmp_path / "src"
-    (src / "profiling").mkdir(parents=True)
-    (src / "profiling" / "profile.db").write_bytes(b"db")
+    (src / "profiling" / "profile_db").mkdir(parents=True)
+    (src / "profiling" / "profile_db" / "single_gemm.db").write_bytes(b"db")
     jobdir = tmp_path / "job"
     jobdir.mkdir()
     job = {"job_id": "j", "src": str(src), "argv": [], "env": {}, "venv": sys.prefix}
     job.update(node_local=str(tmp_path / "node"), bin_dir="")
     (jobdir / "job.json").write_text(json.dumps(job))
-    copy = node.shutil.copy2
+    copy = node.shutil.copytree
 
-    def copy_then_stopped(source, destination):
-        copy(source, destination)
+    def copy_then_stopped(source, destination, **kwargs):
+        copy(source, destination, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)  # `scancel` while the DB is copied
 
-    monkeypatch.setattr(node.shutil, "copy2", copy_then_stopped)
+    monkeypatch.setattr(node.shutil, "copytree", copy_then_stopped)
     previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
     try:
         assert node.run_job(jobdir) == 128 + signal.SIGTERM

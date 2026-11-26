@@ -1,5 +1,9 @@
-"""profile.db's compact v3 storage: args keys, provenance runs, the lossless
-upgrade from v2, and the tables an older checkout wrote that migration drops."""
+"""The profile DB's compact v3 storage: args keys, provenance runs, the lossless
+upgrade from v2, and the tables an older checkout wrote that migration drops.
+
+The profile DB is a directory of per-kind files (``profiling.db.layout``); a v2
+DB is a legacy single file, which ``migrate`` upgrades in place and
+``split_profile_db`` then turns into a directory."""
 
 from __future__ import annotations
 
@@ -12,11 +16,12 @@ from typing import get_type_hints
 
 import pytest
 
-from profiling.db import storage
+from profiling.db import layout, storage
 from profiling.db.args import DType
 from profiling.db.merge import merge_profile_databases
 from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION, migrate
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
+from profiling.db.split import split_profile_db
 from profiling.db.table import ProfileRow, Table, _sqlite_type, _to_db_value
 from profiling.runners.metrics import ComputeMetrics
 
@@ -101,18 +106,21 @@ def _v2_insert(conn: sqlite3.Connection, spec: KernelProfilerSpec, args, prov, n
     )
 
 
-def _v2_db(path: Path) -> None:
+def _v2_db(path: Path, *, moe_table: bool = True) -> None:
+    """A v2 file: the legacy single file, or (``moe_table=False``) one kind file."""
     finalize, moe = _spec("moe_finalize_fuse_shared"), _spec("bf16_fused_moe")
     prov_a = ("abc", "2026-09-01T00:00:00+00:00", "12.9", "580.1", None)
     prov_b = ("def-dirty", "2026-09-02T00:00:07+00:00", None, "580.1", "0.5.1")
+    path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE _db_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("INSERT INTO _db_metadata VALUES ('schema_version', '2')")
         _v2_kind_table(conn, finalize)
-        _v2_kind_table(conn, moe)
         _v2_insert(conn, finalize, _finalize_args(1, True), prov_a, 1)
         _v2_insert(conn, finalize, _finalize_args(1, False), prov_b, 2)
-        _v2_insert(conn, moe, _moe_args(2), prov_a, 3)
+        if moe_table:
+            _v2_kind_table(conn, moe)
+            _v2_insert(conn, moe, _moe_args(2), prov_a, 3)
         _retired_registry(conn)
 
 
@@ -163,9 +171,11 @@ def test_upgrade_keeps_every_row_as_v2_stored_it(tmp_path: Path) -> None:
 
 
 def test_upgraded_rows_are_found_by_their_args(tmp_path: Path) -> None:
-    db = tmp_path / "profile.db"
-    _v2_db(db)
-    migrate(db)
+    legacy = tmp_path / "profile.db"
+    _v2_db(legacy)
+    migrate(legacy)
+    db = tmp_path / "profile_db"
+    split_profile_db(legacy, db)
 
     finalize = Table(_spec("moe_finalize_fuse_shared"), db)
     moe = Table(_spec("bf16_fused_moe"), db)
@@ -182,11 +192,20 @@ def test_upgraded_rows_are_found_by_their_args(tmp_path: Path) -> None:
 
 
 def test_readers_refuse_a_db_an_older_checkout_wrote(tmp_path: Path) -> None:
-    db = tmp_path / "profile.db"
-    _v2_db(db)
+    db = tmp_path / "profile_db"
+    _v2_db(layout.kind_file(db, "moe_finalize_fuse_shared"), moe_table=False)
 
     with pytest.raises(RuntimeError, match="migrate-db"):
         Table(_spec("moe_finalize_fuse_shared"), db).query([_finalize_args(1, True)], gpu_name=GPU)
+
+
+def test_readers_refuse_a_legacy_single_file(tmp_path: Path) -> None:
+    legacy = tmp_path / "profile.db"
+    _v2_db(legacy)
+    migrate(legacy)
+
+    with pytest.raises(layout.LegacyProfileDbError, match="split-db"):
+        Table(_spec("moe_finalize_fuse_shared"), legacy)
 
 
 @pytest.mark.parametrize(
@@ -222,33 +241,33 @@ def _measure(db: Path, m: int) -> None:
 
 
 def test_two_dbs_with_one_run_merge_without_conflict(tmp_path: Path) -> None:
-    left, right = tmp_path / "left.db", tmp_path / "right.db"
+    left, right = tmp_path / "left", tmp_path / "right"
     _measure(left, 1)
     _measure(right, 2)
 
-    report = merge_profile_databases(left, right, tmp_path / "out.db")
+    report = merge_profile_databases(left, right, tmp_path / "out")
 
     assert report.published and not report.conflicts
-    with closing(sqlite3.connect(tmp_path / "out.db")) as conn:
+    with closing(sqlite3.connect(layout.kind_file(tmp_path / "out", "single_gemm"))) as conn:
         count = lambda t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: E731
         assert (count("single_gemm"), count(storage.RUN_TABLE)) == (2, 1)
 
 
 def test_migration_drops_the_registry_an_older_v3_checkout_wrote(tmp_path: Path) -> None:
-    left, right = tmp_path / "left.db", tmp_path / "right.db"
+    left, right = tmp_path / "left", tmp_path / "right"
     _measure(left, 1)
     _measure(right, 2)
-    with closing(sqlite3.connect(right)) as conn, conn:
+    with closing(sqlite3.connect(layout.kind_file(right, "single_gemm"))) as conn, conn:
         _retired_registry(conn)
 
     with pytest.raises(ValueError, match="migrate-db"):
-        merge_profile_databases(left, right, tmp_path / "out.db")
-    assert not (tmp_path / "out.db").exists()
+        merge_profile_databases(left, right, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
 
     assert migrate(right) is True
     assert migrate(right) is False
 
-    with closing(sqlite3.connect(right)) as conn:
+    with closing(sqlite3.connect(layout.kind_file(right, "single_gemm"))) as conn:
         assert not any(name.startswith("_kernel_config") for name in _tables(conn))
     [row] = Table(_spec("single_gemm"), right).rows_for(
         [_spec("single_gemm").args_schema(m=2, n=6144, k=4096, dtype=DType.BF16)],
@@ -256,11 +275,11 @@ def test_migration_drops_the_registry_an_older_v3_checkout_wrote(tmp_path: Path)
         gpu_name=GPU,
     )
     assert row["time_ms"] == 0.02
-    assert merge_profile_databases(left, right, tmp_path / "out.db").published
+    assert merge_profile_databases(left, right, tmp_path / "out").published
 
 
 def test_a_conflict_report_names_the_runs_by_their_provenance(tmp_path: Path) -> None:
-    left, right = tmp_path / "left.db", tmp_path / "right.db"
+    left, right = tmp_path / "left", tmp_path / "right"
     _measure(left, 1)
     table = Table(_spec("single_gemm"), right)
     table.insert(
@@ -278,7 +297,7 @@ def test_a_conflict_report_names_the_runs_by_their_provenance(tmp_path: Path) ->
         ]
     )
 
-    report = merge_profile_databases(left, right, tmp_path / "out.db")
+    report = merge_profile_databases(left, right, tmp_path / "out")
 
     [conflict] = report.conflicts
     assert "time_ms" in conflict.differing_columns and "run_key" in conflict.differing_columns
@@ -333,9 +352,11 @@ def _kv_append_row(args, time_ms: float) -> ProfileRow:
     )
 
 
-def _main_layout_kv_append(path: Path) -> None:
-    """``kv_cache_append`` as a checkout without ``head_dim_v`` writes it."""
+def _main_layout_kv_append(root: Path) -> None:
+    """``kv_cache_append``'s file under ``root`` as a checkout without ``head_dim_v`` writes it."""
     values = {k: v for k, v in _kv_append_spec().items()}
+    path = layout.kind_file(root, "kv_cache_append")
+    path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE _db_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute(f"INSERT INTO _db_metadata VALUES ('schema_version', '{SCHEMA_VERSION}')")
@@ -375,7 +396,7 @@ def _main_layout_kv_append(path: Path) -> None:
 def test_an_unset_optional_arg_keeps_the_key_rows_had_before_it_existed() -> None:
     """Symmetric K/V, spelled out or not, must hash exactly as before
     head_dim_v existed, or every existing row would turn into a miss."""
-    table = Table(_spec("kv_cache_append"), Path("unused.db"))
+    table = Table(_spec("kv_cache_append"), Path("unused"))
     before = storage.args_hash(_kv_append_spec(), _KV_APPEND_MAIN_TYPES)
     for args in (_kv_append_args(), _kv_append_args(head_dim_v=128)):
         assert args.head_dim_v is None
@@ -386,7 +407,7 @@ def test_an_unset_optional_arg_keeps_the_key_rows_had_before_it_existed() -> Non
 def test_a_table_without_the_optional_column_is_read_and_extended_in_place(
     tmp_path: Path,
 ) -> None:
-    db = tmp_path / "profile.db"
+    db = tmp_path / "profile_db"
     _main_layout_kv_append(db)
     table = Table(_spec("kv_cache_append"), db)
     assert table.query([_kv_append_args()], backend="vllm_cuda", gpu_name=GPU)[0].time_ms == 0.0042
@@ -395,13 +416,13 @@ def test_a_table_without_the_optional_column_is_read_and_extended_in_place(
     ]
 
     table.insert([_kv_append_row(_kv_append_args(16), 0.005)])
-    with closing(sqlite3.connect(db)) as conn:
+    with closing(sqlite3.connect(table.db_file)) as conn:
         assert "head_dim_v" not in {
             row[1] for row in conn.execute("PRAGMA table_info(kv_cache_append)")
         }
 
     table.insert([_kv_append_row(_kv_append_args(head_dim_v=96), 0.006)])
-    with closing(sqlite3.connect(db)) as conn:
+    with closing(sqlite3.connect(table.db_file)) as conn:
         info = conn.execute("PRAGMA table_info(kv_cache_append)").fetchall()
     assert info[-1][1:6] == ("head_dim_v", "INTEGER", 0, None, 0)
     old, new, asym, missing = table.query(
@@ -420,14 +441,14 @@ def test_a_table_without_the_optional_column_is_read_and_extended_in_place(
 
 @pytest.mark.parametrize("wide_side", ["left", "right"])
 def test_dbs_with_and_without_an_optional_column_merge(tmp_path: Path, wide_side: str) -> None:
-    narrow, wide = tmp_path / "narrow.db", tmp_path / "wide.db"
+    narrow, wide = tmp_path / "narrow", tmp_path / "wide"
     _main_layout_kv_append(narrow)
     _main_layout_kv_append(wide)
     Table(_spec("kv_cache_append"), wide).insert(
         [_kv_append_row(_kv_append_args(head_dim_v=96), 0.006)]
     )
     left, right = (wide, narrow) if wide_side == "left" else (narrow, wide)
-    merged = tmp_path / "merged.db"
+    merged = tmp_path / "merged"
     report = merge_profile_databases(left, right, merged)
 
     assert report.published

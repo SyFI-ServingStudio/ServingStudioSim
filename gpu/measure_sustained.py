@@ -37,9 +37,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from profiling.db.achievable import achievable_peaks  # noqa: E402
+from profiling.db.layout import configured_root  # noqa: E402
 
 SPEC_PATH = ROOT / "gpu" / "spec.json"
-DB_PATH = ROOT / "profiling" / "profile.db"
 
 
 def _measure_last_second_ms(
@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     if observed != args.gpu_name:
         raise SystemExit(f"visible GPU is {observed!r}, not {args.gpu_name!r}")
 
-    peaks = achievable_peaks(DB_PATH, args.gpu_name)
+    peaks = achievable_peaks(configured_root(), args.gpu_name)
     tflops = {}
     for dtype, row in sorted(peaks["gemm_by_dtype"].items()):
         try:

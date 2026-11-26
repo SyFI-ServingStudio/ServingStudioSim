@@ -18,6 +18,7 @@ import logging
 import os
 from pathlib import Path
 
+from profiling.db import layout
 from profiling.db.metadata import (
     DbMetadata,
     ProfilerVersion,
@@ -32,7 +33,8 @@ from profiling.facade import build_kind_facades
 from profiling.facade import get_current_gpu_name as _get_current_gpu_name
 from profiling.plan import WorkCollector
 
-DB_PATH = Path(os.environ.get("VIBESIM_PROFILE_DB", Path(__file__).resolve().parent / "profile.db"))
+# The profile DB directory (`profiling.db.layout`): VIBESIM_PROFILE_DB or profiling/profile_db.
+DB_PATH = layout.configured_root()
 
 _jit_enabled = False
 
