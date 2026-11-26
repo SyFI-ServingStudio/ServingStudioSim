@@ -275,6 +275,8 @@ def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         sync_calls = 0
@@ -470,6 +472,8 @@ def test_energy_perf_uses_passed_timing_for_iteration_count(
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         sync_calls = 0
@@ -551,6 +555,8 @@ def test_energy_window_restarts_cleanly_when_planned_iters_are_short(
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     perf_counter_values = iter([0.0, 0.4, 10.0, 11.1])
     monkeypatch.setattr(energy_mod.time, "perf_counter", lambda: next(perf_counter_values))
@@ -634,6 +640,8 @@ def test_energy_perf_falls_back_to_power_polling(monkeypatch: pytest.MonkeyPatch
     # The window is opt-in; this test is about what it does once opened.
     monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    # Unmasked: the fake torch has no device UUID, so NVML resolves by index.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     class FakeCuda:
         @staticmethod
