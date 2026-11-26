@@ -6,8 +6,10 @@
 //! of the runtime input. Comm / compute / distribution-sensitive kernels are
 //! all the same shape here — variations live in each per-kernel `KernelSpec`.
 
-use std::collections::BTreeMap;
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::timing::bridge::{ArgsPayload, ConfigGrid, KernelKind, KernelMetrics, PerfApiBridge};
 use crate::timing::cache::interp::{CoverageFlags, LeafMetrics};
@@ -22,7 +24,7 @@ use crate::timing::{BuildError, Coords, DType, Probe};
 /// reading `&self.backends` directly; structs without a `backends` field fail
 /// to derive at the generated access site.
 pub trait KernelConfig:
-    std::hash::Hash + Eq + Clone + std::fmt::Debug + serde::Serialize + 'static
+    std::hash::Hash + Eq + Clone + std::fmt::Debug + serde::Serialize + Send + Sync + 'static
 {
     fn backends(&self) -> &[&'static str];
     /// Replace the candidate backend set. The `#[derive(KernelConfig)]` macro
@@ -280,13 +282,14 @@ impl<S: KernelSpec> Kernel<S> {
             });
         }
 
-        let sweep_grid = S::sweep_grid(&config);
+        let plan = GridPlan::of::<S>(&config);
+        let sweep_grid = &plan.grid;
         let backends = config.backends();
 
         // Physically-infeasible grid cells (row-major). We never send these to
         // the profiler — `drop_infeasible` strips them from a spec list before
         // profiling, so the profiler is only ever asked about shapes that exist.
-        let infeasible = S::infeasible_mask(&config, &sweep_grid);
+        let infeasible = &plan.infeasible;
         let drop_infeasible = |specs: Vec<ArgsPayload>| -> Vec<ArgsPayload> {
             if infeasible.is_empty() {
                 return specs;
@@ -298,7 +301,7 @@ impl<S: KernelSpec> Kernel<S> {
             );
             specs
                 .into_iter()
-                .zip(&infeasible)
+                .zip(infeasible)
                 .filter_map(|(spec, &drop)| (!drop).then_some(spec))
                 .collect()
         };
@@ -311,7 +314,7 @@ impl<S: KernelSpec> Kernel<S> {
             let mut missing = 0;
             let mut total = 0;
             for &backend in backends {
-                let specs = drop_infeasible(S::enumerate(&config, &sweep_grid, backend));
+                let specs = drop_infeasible(plan.specs::<S>(&config, backend).to_vec());
                 let specs =
                     bridge.unique_dry_run_specs(S::profile_kind(), config.gpu_name(), specs);
                 total += specs.len();
@@ -331,7 +334,7 @@ impl<S: KernelSpec> Kernel<S> {
         let mut backend_caches = Vec::with_capacity(backends.len());
         let mut outlier_warnings = Vec::new();
         for &backend in backends {
-            let specs = S::enumerate(&config, &sweep_grid, backend);
+            let specs = plan.specs::<S>(&config, backend).to_vec();
             let profiled = bridge
                 .get_times(drop_infeasible(specs), S::profile_kind(), config.gpu_name())
                 .map_err(|err| BuildError::from_perf_api(S::KIND, backend, err))?;
@@ -359,7 +362,7 @@ impl<S: KernelSpec> Kernel<S> {
                 S::KIND,
                 backend,
                 S::cache_kind(backend),
-                &sweep_grid,
+                sweep_grid,
                 &samples,
             )?;
             backend_caches.push(cache);
@@ -868,15 +871,94 @@ pub(crate) use register_kernel;
 
 // ─── internal helpers ───────────────────────────────────────────────────────
 
+/// What a spec's `sweep_grid`, `infeasible_mask` and `enumerate` return for one
+/// config, computed once per process.
+///
+/// All three are functions of the config (and, for `enumerate`, the backend)
+/// alone, yet one process builds the same config many times: every layer is its
+/// own kernel, and `timing-predict` walks the whole model twice (the collect
+/// pass, then the real build). Some specs search per cell for the batch a grid
+/// point stands for; `compressed_sparse_mla_rope_cast` alone was most of a
+/// DeepSeek V4.1 predict. Kept per spec type, since two specs may share a config
+/// type and still enumerate differently.
+struct GridPlan {
+    grid: SweepGrid,
+    infeasible: Vec<bool>,
+    specs: Mutex<HashMap<&'static str, Arc<Vec<ArgsPayload>>>>,
+}
+
+/// Per spec type: a `HashMap<S::Config, Arc<GridPlan>>`.
+type GridPlans = Mutex<HashMap<TypeId, Box<dyn Any + Send>>>;
+static GRID_PLANS: OnceLock<GridPlans> = OnceLock::new();
+
+impl GridPlan {
+    /// `config`'s plan, computed on first use. The lock is not held while a
+    /// plan is computed; two threads that race on one config compute the same
+    /// plan and the first insert wins.
+    fn of<S: KernelSpec>(config: &S::Config) -> Arc<Self> {
+        let plans = GRID_PLANS.get_or_init(Default::default);
+        if let Some(plan) = Self::lookup::<S>(&mut plans.lock().expect("grid plans"), config) {
+            return plan;
+        }
+        let grid = S::sweep_grid(config);
+        let infeasible = S::infeasible_mask(config, &grid);
+        let plan = Arc::new(Self {
+            grid,
+            infeasible,
+            specs: Mutex::default(),
+        });
+        let mut plans = plans.lock().expect("grid plans");
+        Self::per_spec::<S>(&mut plans)
+            .entry(config.clone())
+            .or_insert(plan)
+            .clone()
+    }
+
+    fn lookup<S: KernelSpec>(
+        plans: &mut HashMap<TypeId, Box<dyn Any + Send>>,
+        config: &S::Config,
+    ) -> Option<Arc<Self>> {
+        Self::per_spec::<S>(plans).get(config).cloned()
+    }
+
+    fn per_spec<S: KernelSpec>(
+        plans: &mut HashMap<TypeId, Box<dyn Any + Send>>,
+    ) -> &mut HashMap<S::Config, Arc<Self>> {
+        plans
+            .entry(TypeId::of::<S>())
+            .or_insert_with(|| Box::new(HashMap::<S::Config, Arc<Self>>::new()))
+            .downcast_mut()
+            .expect("grid plans are keyed by spec type")
+    }
+
+    /// `S::enumerate` of this plan's grid for `backend`, computed on first use.
+    fn specs<S: KernelSpec>(
+        &self,
+        config: &S::Config,
+        backend: &'static str,
+    ) -> Arc<Vec<ArgsPayload>> {
+        if let Some(specs) = self.specs.lock().expect("grid plan specs").get(backend) {
+            return specs.clone();
+        }
+        let specs = Arc::new(S::enumerate(config, &self.grid, backend));
+        self.specs
+            .lock()
+            .expect("grid plan specs")
+            .entry(backend)
+            .or_insert(specs)
+            .clone()
+    }
+}
+
 /// The grid `config` asks profile.db for: cache axes, the args of each cell
 /// (without `backend`) and the infeasible cells. Enumerates every backend so a
 /// kernel whose args depend on the backend fails here instead of recording
 /// rows that only one backend reads.
 fn config_grid<S: KernelSpec>(config: &S::Config) -> Result<ConfigGrid, BuildError> {
-    let grid = S::sweep_grid(config);
+    let plan = GridPlan::of::<S>(config);
     let cells_for = |backend: &'static str| -> Vec<BTreeMap<String, serde_json::Value>> {
-        S::enumerate(config, &grid, backend)
-            .into_iter()
+        plan.specs::<S>(config, backend)
+            .iter()
             .map(|payload| {
                 let mut args = payload.fields().clone();
                 args.remove("backend");
@@ -898,14 +980,15 @@ fn config_grid<S: KernelSpec>(config: &S::Config) -> Result<ConfigGrid, BuildErr
             });
         }
     }
-    let infeasible = S::infeasible_mask(config, &grid)
+    let infeasible = plan
+        .infeasible
         .iter()
         .enumerate()
         .filter_map(|(i, &drop)| drop.then_some(i))
         .collect();
     Ok(ConfigGrid {
         cache_coords: <S::Input as SweepCoords>::coord_field_names(),
-        axes: grid.axes().to_vec(),
+        axes: plan.grid.axes().to_vec(),
         cells,
         infeasible,
     })
