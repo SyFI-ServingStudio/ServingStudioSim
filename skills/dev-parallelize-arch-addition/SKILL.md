@@ -89,7 +89,7 @@ Merge each lane into the feature branch as it finishes, in any order:
 
 1. `git merge --no-ff <lane branch>`. Resolve the module-list conflict by
    keeping both sides' lines.
-2. Fold the lane's `profile.db` into the feature tree's with
+2. Fold the lane's `profiling/profile_db/` into the feature tree's with
    `launcher kernel-profile merge-db` (never pick one side), and commit the
    database as its own commit. `dev-finalize-model-addition` step 5 has the
    commands. Check the report shows 0 conflicts.

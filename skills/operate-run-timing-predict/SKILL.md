@@ -83,7 +83,7 @@ GPUs are not yours to use. A missing row then fails with `GpuDisabledError`
 profiled; the `cache build plan` lines printed just before it name the kernels. Report that error; do not drop
 `--no-gpu` to get past it without asking.
 
-Do not pin GPUs by default. A warm `profiling/profile.db` needs no GPU. On a cold
+Do not pin GPUs by default. A warm `profiling/profile_db/` needs no GPU. On a cold
 cache, timing-predict first walks the model to collect every row it uses that
 is missing, then has the profiling layer measure them all in one batch across
 the idle GPUs it selects, and only then costs the cases. Do not precompute a guessed row list or

@@ -29,7 +29,7 @@ Analyzer reads both. Uploaded workloads are kept in `--workloads-dir` (default
 `status`, `ms`, `ua`, and for `POST /predict`, `/simulate` and `/workloads` a
 `note` with the preset, member params, case count or workload source, and the
 id the request left. Request bodies are not kept. `--db` defaults to the profiler's database
-(`VIBESIM_PROFILE_DB` or `profiling/profile.db`). Behind a proxy, pass its
+(`VIBESIM_PROFILE_DB` or `profiling/profile_db/`). Behind a proxy, pass its
 address as `--forwarded-allow-ips` so the rate limits count the client that
 `X-Forwarded-For` names. Interactive API docs are at `/api/public/v1/docs`.
 
@@ -51,7 +51,7 @@ The image holds only the Python environment, installed from `uv.lock`'s
 `public-api` and `launcher` groups, so it is rebuilt only when the lock changes.
 The container runs as the calling user and mounts the checkout read-only at the
 same path, with its git directory (a worktree's lies outside it). It serves
-that checkout's code, `profiling/profile.db`, `target/release/simulator` and
+that checkout's code, `profiling/profile_db/`, `target/release/simulator` and
 req-frontend's `tracegen`, and writes only `logs/public_api/{predictions,simulations,workloads,access}`.
 Bind the host address the CSE web host's proxy reaches; that address is kept out
 of this public repository, in the Intro deploy's `CSE_PUBLIC_API_TARGET`. The
@@ -251,7 +251,8 @@ finished runs and marks unfinished ones failed.
 - checkpoint names and the config each one uses: `model/catalog.yaml`, read
   at start;
 - GPU peaks: `gpu/spec.json`;
-- measurements: `profile.db`, aggregates cached until the file changes.
+- measurements: `profiling/profile_db/`, aggregates cached until any kind file
+  changes.
 
 ## Agent skills
 

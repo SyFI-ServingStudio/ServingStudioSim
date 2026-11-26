@@ -104,7 +104,8 @@ together, or the [documentation index](doc/README.md) for detailed references.
 - A compatible NVIDIA GPU and CUDA environment when profiling missing kernel
   measurements. The simulation itself runs on the CPU using cached costs.
 
-The repository includes `profiling/profile.db`. Cache coverage depends on the
+The repository includes the kernel profile DB `profiling/profile_db/` (one
+SQLite file per kernel kind). Cache coverage depends on the
 selected GPU, kernel backend, and input shapes; filling missing measurements
 requires the corresponding hardware. Model configuration files are included;
 the simulation does not load model weights.

@@ -62,7 +62,7 @@ multi-GB rebuilds:
 1. Review each worktree's diff and its report.
 2. Merge: new files are disjoint; the shared barrels get a one-line addition per
    agent → take the **union** of those lines (a trivial conflict to resolve).
-   Fold each agent's `profiling/profile.db` rows in with
+   Fold each agent's `profiling/profile_db/` rows in with
    `launcher kernel-profile merge-db`, never by choosing one side, and commit
    the database separately (`dev-finalize-model-addition` step 5).
 3. Run **one** consolidated validation on the merged tree: whole-repo build +

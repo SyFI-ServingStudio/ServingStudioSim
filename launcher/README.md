@@ -214,7 +214,7 @@ Two concurrency mechanisms have different ownership:
 | Resource | Lease | Meaning |
 |---|---|---|
 | Cargo target | exclusive | all build profiles share one target/build lease |
-| `profiling/profile.db` | exclusive for cache/predict, shared for simulation | no JIT/SQLite writer races; warm simulations may overlap |
+| `profiling/profile_db/` | exclusive for cache/predict, shared for simulation | no JIT/SQLite writer races; warm simulations may overlap |
 | concrete `log_dir` | exclusive | two launcher instances never write one run concurrently |
 | simulation slot | in-process semaphore | bounds active simulator roots |
 | analysis slot | independent in-process semaphore | renderer/trace load does not consume simulation capacity |
@@ -908,8 +908,9 @@ architecture as `image_cache_key` keys it locally.
 - `kernel-profile run|measure --remote NAME`: the controller and its workers
   run in one container (`VIBESIM_PROFILE_RUNTIME=in-image`). `--output-dir` is
   required and must be under `logs/`; `--db` is refused. The job measures into
-  its own profile.db copy, which is fetched and merged into this checkout's
-  (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB write
+  its own copy of the profile DB directory, which is fetched and merged into
+  this checkout's (`VIBESIM_PROFILE_DB` or `profiling/profile_db/`) under the
+  profile-DB write
   lease. A conflicting row merges nothing: the report is left in the output
   directory. `--fresh` writes no rows and merges nothing. The whole output
   directory comes back; `remote-run.json` adds the image and its id, and the

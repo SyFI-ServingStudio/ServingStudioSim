@@ -140,11 +140,11 @@ Things to verify:
   `uv run python -c "from profiling import perf_api; assert hasattr(perf_api, 'get_<kind>_times')"`;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke_db" --spec '<json spec>' --json`;
 - the production callable is what the runner measures, while the Task A.2
   reference checks it outside timing;
 - the implementer produced tests and smoke evidence, without writing shared
-  `profiling/profile.db` unless the user explicitly authorized it.
+  `profiling/profile_db/` unless the user explicitly authorized it.
 
 Once the production backend is in place, ask whether additional implementations
 are needed. Use Path B for each added backend; do not repeat Path A or change the
@@ -209,7 +209,7 @@ Things to verify:
 - the existing generated perf API symbol still resolves for that kind;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec for that backend, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke_db" --spec '<json spec>' --json`;
 - focused tests and smoke evidence cover the new backend. If no compatible
   GPU/environment is available, treat the task as not fully verified and return
   the exact blocker instead of accepting it as done.

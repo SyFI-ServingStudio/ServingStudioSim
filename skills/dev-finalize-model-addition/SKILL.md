@@ -80,7 +80,7 @@ when a MoE member states no routing.
 
 ## 4. Finish kernel profiling
 
-`just test-presets` builds every public preset member against the shipped `profiling/profile.db`.
+`just test-presets` builds every public preset member against the shipped `profiling/profile_db/`.
 `test_every_member_is_measured` lists each member with missing rows. Fill those rows on GPU through
 `operate-profile-existing-kernel` (Slurm, per `run-gpu-job`) and repeat until the test passes.
 
@@ -89,15 +89,19 @@ Check: `just test-presets` passes with no missing rows.
 ## 5. Merge main and review
 
 1. Run `git fetch origin && git merge origin/main` on the feature branch. Resolve every conflict.
-2. Fold the local `profiling/profile.db` into main's copy. The file is `skip-worktree`, so the rows step 4
-   filled are not committed and `git status` does not show them. Never resolve it by choosing one side.
-   - Write main's copy out with `git show origin/main:profiling/profile.db > $TMPDIR/main.db`.
-   - Upgrade both copies in place with `uv run python -m launcher kernel-profile migrate-db <db>`.
-   - Merge them with `uv run python -m launcher kernel-profile merge-db $TMPDIR/main.db profiling/profile.db
-     --output $TMPDIR/merged.db --report $TMPDIR/merge.json`. Read the report, then copy the merged file over
-     `profiling/profile.db`.
-   - Commit the database as its own commit: `git update-index --no-skip-worktree profiling/profile.db`, then
-     `git add` and `git commit`, then `git update-index --skip-worktree profiling/profile.db`.
+2. Fold the local `profiling/profile_db/` (one SQLite file per kind) into main's copy. Its tracked files
+   are `skip-worktree`, so the rows step 4 filled are not committed and `git status` does not show them.
+   Never resolve a kind file by choosing one side.
+   - Write main's copy out with `mkdir $TMPDIR/main && git archive origin/main profiling/profile_db |
+     tar -x -C $TMPDIR/main`.
+   - Upgrade both copies in place with `uv run python -m launcher kernel-profile migrate-db <dir>`.
+   - Merge them with `uv run python -m launcher kernel-profile merge-db $TMPDIR/main/profiling/profile_db
+     profiling/profile_db --output $TMPDIR/merged --report $TMPDIR/merge.json`. Read the report, then
+     replace the directory: `rm -rf profiling/profile_db && mv $TMPDIR/merged profiling/profile_db`.
+   - Commit the database as its own commit: `git ls-files -z profiling/profile_db | xargs -0 git
+     update-index --no-skip-worktree`, then `git add profiling/profile_db` (it also adds the kinds main
+     lacked) and `git commit`, then `git ls-files -z profiling/profile_db | xargs -0 git update-index
+     --skip-worktree`. Only the kind files whose rows changed appear in the commit.
 3. Read every resolved hunk against both sides with `git show --remerge-diff <merge commit>`. A file-level
    check misses a wrong hunk.
 4. Run `just test-cpu` and `just test-presets`. Run `just test-gpu` through Slurm.

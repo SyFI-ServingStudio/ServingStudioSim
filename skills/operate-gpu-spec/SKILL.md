@@ -14,7 +14,7 @@ Intel). It is a **reference / analysis** table — roofline sanity checks, cost
 
 Editing a peak, bandwidth, or price here does **not** change any simulated run.
 The simulator's kernel timings come from **measured rows in
-`profiling/profile.db`**, keyed by the GPU **name string** a preset carries
+`profiling/profile_db/`**, keyed by the GPU **name string** a preset carries
 (`gpu: "NVIDIA H200"`), not from these peak-TFLOPS figures. The exception is
 `compute_capability`: the simulator compiles it in (`simulator/src/common/gpu.rs`)
 and uses it for capability-keyed rules, such as vLLM's FlashInfer all-reduce

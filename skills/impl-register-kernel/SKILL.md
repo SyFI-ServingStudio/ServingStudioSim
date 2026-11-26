@@ -162,14 +162,14 @@ Then run a real public-entry smoke through the profiling CLI on a representative
 spec:
 
 ```bash
-uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json
+uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke_db" --spec '<json spec>' --json
 ```
 
 This must invoke the registered runner through `profiling.perf_api`, the table
 layer, and the execution backend. Do not call the runner directly as the only
 smoke.
 
-Do not write the shared `profiling/profile.db` unless the orchestrator or user
+Do not write the shared `profiling/profile_db/` unless the orchestrator or user
 explicitly authorized it. Use a temporary DB path for smoke runs and include the
 exact command/output in the report. If no compatible GPU or backend environment
 is available, report that as a verification blocker; do not claim the backend is

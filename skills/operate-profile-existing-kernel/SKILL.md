@@ -27,9 +27,9 @@ The supported CLI is:
 
 ```bash
 uv run python -m launcher kernel-profile list [--json]
-uv run python -m launcher kernel-profile count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m launcher kernel-profile query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force | --fresh] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db DIR] [--json]
+uv run python -m launcher kernel-profile query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db DIR] [--json]
+uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force | --fresh] [--output-dir DIR] [--gpu-name NAME] [--db DIR] [--json]
 ```
 
 `python -m profiling ...` remains a compatibility/developer entry and calls the
@@ -103,14 +103,16 @@ bless a pathological input or a relaxed tolerance.
 
 ### Preserve rows written in a worktree
 
-`profiling/profile.db` is tracked, but a worktree may hide its local changes with
-`skip-worktree`. Check before writing the shared database:
+`profiling/profile_db/` (one SQLite file per kind) is tracked, but a worktree may
+hide its local changes with `skip-worktree`. Check before writing the shared
+database:
 
 ```bash
-git ls-files -v profiling/profile.db
+git ls-files -v profiling/profile_db | grep '^S' | head
 ```
 
-An `S` prefix means new profile rows may not appear in `git status`. Record the
+An `S` prefix means new profile rows may not appear in `git status`; a kind
+measured for the first time adds an untracked `<kind>.db` instead. Record the
 worktree and database path that receive the rows. If the rows must be preserved,
 explicitly transfer that database to the checkout responsible for keeping it.
 Stage or commit it only when the user requests that action. A clean `git status`
@@ -183,7 +185,7 @@ there. Run from the checkout root. The output directory must be under `logs/`
 (`run` requires `--output-dir`); `--db` is refused. The remote needs only docker with the NVIDIA runtime:
 the image is sent from here when it lacks it, so it must be built here first.
 The first send of an image is 30–40 GB and takes minutes; later calls reuse it.
-The job measures into a private profile.db copy, which is merged into this
+The job measures into a private copy of the profile DB, which is merged into this
 checkout's DB when the job finishes (`--fresh` merges nothing). A conflicting
 row merges nothing and leaves the merge report in the output directory: report
 that and do not force it. `remote-run.json` in the output directory records the
@@ -203,7 +205,7 @@ util / temp / throttle drift for one kernel spec, **not** to fill or refresh
 ```bash
 uv run python -m launcher kernel-profile measure <table> --backend <backend> --spec JSON \
   [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph] \
-  [--gpu-name NAME] [--db PATH] [--json]
+  [--gpu-name NAME] [--db DIR] [--json]
 ```
 
 How it differs from the cache verbs:
@@ -370,7 +372,7 @@ Single-spec run:
 
 ```bash
 uv run python -m launcher kernel-profile run single_gemm --backend torch --force \
-  --db "$TMPDIR/single-gemm/profile.db" \
+  --db "$TMPDIR/single-gemm/profile_db" \
   --output-dir logs/20260731_0_single_gemm_profile --json \
   --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}'
 ```
@@ -378,9 +380,9 @@ uv run python -m launcher kernel-profile run single_gemm --backend torch --force
 Complete JSON/JSONL spec set:
 
 ```bash
-uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --output-dir logs/20260731_0_single_gemm_profile --json
-uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --json
-uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db "$TMPDIR/single-gemm/profile.db" --json
+uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile_db" --output-dir logs/20260731_0_single_gemm_profile --json
+uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile_db" --json
+uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db "$TMPDIR/single-gemm/profile_db" --json
 ```
 
 ## Do not re-tune what an earlier run already tuned
