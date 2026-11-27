@@ -26,12 +26,15 @@ If `/health` does not return `{"status": "ok", ...}`, ask the user for the base
 URL; do not guess another host. `$API/openapi.json` lists every route.
 
 Calling the API needs a tool that makes HTTP requests. A coding agent with a
-shell, such as Claude Code or Codex, runs the `curl` lines here as written. A
-chat assistant's web browsing often cannot: it may open only links that
-already appear on a page or in the conversation, and it cannot send `POST`.
-If you cannot reach `/health` at all, do not report the service as down: tell
-the user that this chat cannot call the API and to ask again in an agent or
-work mode that can fetch URLs or run commands, or in a coding agent.
+shell and network access, such as Claude Code or Codex, runs the `curl` lines
+here as written; if its sandbox has no network (`curl` cannot resolve the
+host), ask the user to allow network access for the command. A web search or
+browsing tool often cannot: it may open only links that already appear on a
+page or in the conversation, refuse an API URL outright, and it cannot send
+`POST`. If you cannot reach `/health` at all, do not report the service as
+down: tell the user that this environment cannot call the API and to ask
+again in an agent or work mode that can fetch URLs or run commands, or in a
+coding agent with network access.
 
 Every route this skill reads is a `GET`, so a URL fetcher can follow it once
 the links appear; each kernel kind's Markdown page,
