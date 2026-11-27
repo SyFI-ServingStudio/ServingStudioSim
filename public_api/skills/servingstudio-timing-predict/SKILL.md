@@ -31,6 +31,20 @@ curl -s "$API/health"
 If `/health` does not return `{"status": "ok", ...}`, ask the user for the base
 URL; do not guess another host. `$API/openapi.json` lists every route.
 
+Calling the API needs a tool that makes HTTP requests. A coding agent with a
+shell, such as Claude Code or Codex, runs the `curl` lines here as written. A
+chat assistant's web browsing often cannot: it may open only links that
+already appear on a page or in the conversation, and it cannot send `POST`.
+If you cannot reach `/health` at all, do not report the service as down: tell
+the user that this chat cannot call the API and to ask again in an agent or
+work mode that can fetch URLs or run commands, or in a coding agent.
+
+With only a URL fetcher, use the `GET` routes: `GET /predict` (one case in
+the query string, section 4) and `GET /attention` (KV cache at a context
+length). Each deployment's Markdown page,
+`https://servingstudio.cs.washington.edu/models/{preset id}.md`, has a ready
+link to each.
+
 ## 1. Find a deployment
 
 `/models` lists every checkpoint with its presets, one per arch type. A preset
