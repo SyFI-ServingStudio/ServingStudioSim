@@ -68,6 +68,41 @@ SIMULATE_PER_MINUTE = 6
 UPLOAD_PER_MINUTE = 6
 
 
+PRESET_DOC = (
+    "A public preset's id, `{checkpoint directory}/{arch}`, from `/models`; name its "
+    "member by each of the preset's axes as further query parameters."
+)
+# How `GET /predict` reads each case field type from a query string.
+_SPELLINGS = {
+    "int": "an integer, e.g. 64",
+    "int_list": "comma-separated integers, e.g. 1024,2048",
+    "int_pair_list": "comma-separated a:b pairs, e.g. 0:2048,128:64",
+}
+
+
+def case_parameters(case_fields: dict) -> list[dict]:
+    """``GET /predict``'s case fields as OpenAPI query parameters, from the
+    simulator's ``case_fields``: each name once, with its type, how a query
+    spells it and the case forms that take it."""
+    fields: dict[str, dict] = {}
+    for selector, scopes in case_fields.items():
+        for specs in scopes.values() if isinstance(scopes, dict) else []:
+            for spec in specs:
+                field = fields.setdefault(spec["name"], {**spec, "selectors": []})
+                field["selectors"].append(selector)
+    return [
+        {
+            "name": name,
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": f"Case field, {_SPELLINGS.get(field['type'], field['type'])}; "
+            f"case forms {', '.join(field['selectors'])}. {field.get('description', '')}".strip(),
+        }
+        for name, field in fields.items()
+    ]
+
+
 def create_app(
     kernels: KernelLibrary,
     runs_dir: Path | None = None,
@@ -209,11 +244,23 @@ def create_app(
     # rows or code it was computed on.
     served = uuid.uuid4().hex
 
-    @app.get(f"{PREFIX}/predict")
-    async def predict_query(request: Request, response: Response, preset: str) -> Any:
+    @app.get(
+        f"{PREFIX}/predict",
+        summary="Time one batch given in the query string",
+        openapi_extra={"parameters": case_parameters(index.case_fields)},
+    )
+    async def predict_query(
+        request: Request, response: Response, preset: str = Query(description=PRESET_DOC)
+    ) -> Any:
         """``POST /predict`` with one case, spelled in the query string, and no
-        ``analyze``: a link an agent can fetch. The answer also gives the
-        ``POST`` body it equals as ``request``."""
+        ``analyze``: a link an agent can fetch. Besides ``preset``, the query
+        names the member by each of its preset's axes (``/models`` lists them,
+        e.g. ``tp_size=2``) and gives the case by its ``case_fields``: an
+        ``int`` as ``64``, an ``int_list`` as ``1024,2048``, an
+        ``int_pair_list`` as ``0:2048,128:64``; a group field describes every
+        group alike. The answer is ``POST /predict``'s for that one case, plus
+        ``request``, the ``POST`` body it equals. Example:
+        ``/predict?preset=Llama-3.1-8B/llama3_dense_tp&tp_size=2&decode_count=32&average_decode_length=4096``."""
         query = dict(request.query_params)
         query.pop("preset")
         etag = (
@@ -260,14 +307,29 @@ def create_app(
         response.headers["Cache-Control"] = "public, max-age=3600"
         return document
 
-    @app.get(f"{PREFIX}/attention")
-    async def attention_at(request: Request, response: Response, preset: str) -> dict:
-        """One member's attention at ``tokens`` context: ``kv_cache``, what one
-        request's KV cache holds, part by part, stored once, on one GPU and over
-        the KV partition. Arithmetic on the arch's layout; no run."""
+    @app.get(f"{PREFIX}/attention", summary="One request's KV cache at a context length")
+    async def attention_at(
+        request: Request,
+        response: Response,
+        preset: str = Query(description=PRESET_DOC),
+        tokens: int = Query(
+            description="Context length of the request, in tokens: 1 to the member's "
+            "max_model_len (/models)."
+        ),
+    ) -> dict:
+        """One member's attention at ``tokens`` context. Besides ``preset`` and
+        ``tokens``, the query names the member by each of its preset's axes
+        (``/models`` lists them, e.g. ``tp_size=2``). ``kv_cache`` is what one
+        request's KV cache holds, part by part, each size three ways:
+        ``one_copy`` (stored once), ``per_gpu`` (one GPU of the KV partition)
+        and ``partition`` (over it, copies included), with the total split by
+        growth (``per_token``, ``window``, ``per_request``). The model's own
+        bytes, from the arch's layout; no run. A pipeline-parallel member with
+        unequal stages gives the average stage's ``per_gpu``. Example:
+        ``/attention?preset=Llama-3.1-8B/llama3_dense_tp&tp_size=2&tokens=8192``."""
         query = dict(request.query_params)
         query.pop("preset")
-        tokens = query.pop("tokens", None)
+        tokens = query.pop("tokens")
         document = await answer(attention.document, index, preset, query, tokens)
         response.headers["Cache-Control"] = "public, max-age=3600"
         return document

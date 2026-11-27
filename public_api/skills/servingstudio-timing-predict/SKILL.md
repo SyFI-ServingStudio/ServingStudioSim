@@ -3,8 +3,10 @@ name: servingstudio-timing-predict
 description: >-
   Predict how long one LLM serving iteration takes for given batch shapes on a
   published deployment (model, GPU, parallelism, MoE routing) through the
-  ServingStudio public API, with a per-kernel breakdown. Not for request
-  queueing or end-to-end latency.
+  ServingStudio public API, with a per-kernel breakdown, and size one
+  request's KV cache (attention state) at a context length, part by part, per
+  GPU, over the partition and stored once. Both also work as plain GET links.
+  Not for request queueing or end-to-end latency.
 ---
 
 # ServingStudio Timing Prediction
