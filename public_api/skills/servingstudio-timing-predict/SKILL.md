@@ -118,6 +118,25 @@ cell's metrics (`points`):
 curl -s "$API/kernels/single_gemm/configs/5604a34006bb60d2" | jq '{kind, gpu, identity, swept, measured}'
 ```
 
+### Attention at a context length
+
+`GET $API/attention` gives one member's attention at `tokens` context. Its
+`kv_cache` sizes one request's KV cache part by part, from the same layout as
+the tree's `kv_cache`:
+
+```bash
+curl -s "$API/attention?preset=GLM-5.3-NVFP4/glm53_vllm_nvfp4_dsa_moe_dflash2&max_model_len=8192&workload=diverse_100&tokens=8192" \
+  | jq -c '.kv_cache.parts[] | [.name, .growth.kind, .entries, .bytes.per_gpu, .share]'
+```
+
+Each size comes three ways: `one_copy` (stored once, the least the model
+needs), `per_gpu` (on one GPU of the KV partition, `attention_shards` GPUs)
+and `partition` (over it, copies included). `per_token`, `window` and
+`per_request` split the total by how parts grow. These are the model's own
+bytes; what vLLM adds and how many requests fit a memory budget are a
+simulation member's (`/simulations/presets`). For a pipeline-parallel member
+with unequal stages, `per_gpu` is the average stage's.
+
 ## 3. Build the cases
 
 `cases` is a list of 1 to 64 cases. Each case's form depends on the member's

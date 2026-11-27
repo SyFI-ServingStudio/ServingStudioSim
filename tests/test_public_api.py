@@ -25,8 +25,8 @@ from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
+from public_api import attention, predict
 from public_api import kernels as library
-from public_api import predict
 from public_api.access_log import AccessLog
 from public_api.app import PREFIX, create_app
 from public_api.deployments import Config, DeploymentIndex, Member, Preset, config_id
@@ -648,3 +648,93 @@ def test_get_predict_costs_one_case_and_names_the_post_it_equals(
     post = {"preset": PRESET, "params": {"tp_size": 1}, "cases": [case]}
     assert client.post(f"{PREFIX}/predict", json=post).status_code == 200
     assert client.get(f"{PREFIX}/predict", params={**query, "decode_count": "9"}).status_code == 429
+
+
+# One part of each growth: a compressed per-token part split over 4 GPUs, a
+# sliding window kept whole on each, and one state per request.
+KV = {
+    "attention_shards": 4,
+    "layout": {
+        "parts": [
+            {
+                "name": "c4_kv",
+                "growth": {"kind": "per_token", "tokens_per_entry": 4},
+                "bytes_per_entry": 400,
+                "one_copy_bytes_per_entry": 400,
+                "per_gpu_bytes_per_entry": 100.0,
+                "placement": {"shards": 4, "replicas": 1},
+                "prefix_reusable": True,
+            },
+            {
+                "name": "swa",
+                "growth": {"kind": "sliding_window", "window_tokens": 128},
+                "bytes_per_entry": 40,
+                "one_copy_bytes_per_entry": 10,
+                "per_gpu_bytes_per_entry": 10.0,
+                "placement": {"shards": 1, "replicas": 4},
+                "prefix_reusable": True,
+            },
+            {
+                "name": "state",
+                "growth": {"kind": "per_request"},
+                "bytes_per_entry": 4000,
+                "one_copy_bytes_per_entry": 1000,
+                "per_gpu_bytes_per_entry": 1000.0,
+                "placement": {"shards": 1, "replicas": 4},
+                "prefix_reusable": False,
+            },
+        ],
+        "engine": {"block_tokens": None, "fixed_device_bytes": 0},
+    },
+}
+
+
+def test_a_requests_kv_cache_is_each_parts_entries_times_its_entry() -> None:
+    sizes = attention.sizes(KV, 1001)
+    c4, swa, state = sizes["parts"]
+    # A compressed part rounds its entries up; a window holds at most its tokens.
+    assert (c4["tokens_held"], c4["entries"]) == (1001, 251)
+    assert c4["bytes"] == {"one_copy": 100400, "per_gpu": 25100.0, "partition": 100400}
+    assert (swa["tokens_held"], swa["entries"]) == (128, 128)
+    assert swa["bytes"] == {"one_copy": 1280, "per_gpu": 1280.0, "partition": 5120}
+    assert (state["tokens_held"], state["entries"]) == (None, 1)
+    assert sizes["total"] == {"one_copy": 102680, "per_gpu": 27380.0, "partition": 109520}
+    assert sizes["per_token"] == {"one_copy": 100, "per_gpu": 25.0, "partition": 100}
+    assert sizes["window"] == {"one_copy": 1280, "per_gpu": 1280.0, "partition": 5120}
+    assert sizes["per_request"] == {"one_copy": 1000, "per_gpu": 1000.0, "partition": 4000}
+    assert sum(p["share"] for p in sizes["parts"]) == pytest.approx(1.0)
+    # Below the window it holds every token.
+    assert attention.sizes(KV, 100)["parts"][1]["entries"] == 100
+
+
+def test_get_attention_sizes_one_members_kv_cache_at_a_length(db: Path, tmp_path: Path) -> None:
+    index = _index()
+    for member in index.presets[PRESET].members:
+        member.predict = {"selector": "iter", "groups": 1, "max_model_len": 4096}
+    index.presets[PRESET].members[0].kv_cache = KV
+    client = TestClient(create_app(KernelLibrary(FixtureSources(db_path=db), index), tmp_path))
+
+    def get(**query) -> object:
+        return client.get(f"{PREFIX}/attention", params={"preset": PRESET, **query})
+
+    answer = get(tp_size=1, tokens=1001)
+    assert answer.status_code == 200
+    document = answer.json()
+    assert (document["params"], document["tokens"], document["max_model_len"]) == (
+        {"tp_size": 1},
+        1001,
+        4096,
+    )
+    assert document["kv_cache"]["attention_shards"] == 4
+    assert document["kv_cache"]["total"] == {
+        "one_copy": 102680,
+        "per_gpu": 27380.0,
+        "partition": 109520,
+    }
+    assert answer.headers["cache-control"] == "public, max-age=3600"
+    assert get(tp_size=1, tokens=4097).status_code == 400
+    assert get(tp_size=1, tokens=0).status_code == 400
+    assert get(tp_size=1).status_code == 400
+    assert get(tp_size=4, tokens=10).status_code == 400
+    # A member without a KV cache (an FFN side) answers why.
+    assert get(tp_size=2, tokens=10).status_code == 409

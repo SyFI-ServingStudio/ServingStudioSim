@@ -1,6 +1,7 @@
 """The FastAPI app: routes under ``/api/public/v1``. Everything is a GET but
 ``POST /predict``, which costs the reader's cases (``GET /predict`` costs one
-case spelled in the query string), ``POST /simulate``, which
+case spelled in the query string; ``GET /attention`` sizes one request's KV
+cache at a context length), ``POST /simulate``, which
 queues a simulation, ``POST /workloads``, which keeps an uploaded trace, and
 ``DELETE /simulations/{id}``. The prediction or simulation they leave is read
 through the Analyzer's own routes, forwarded read-only under ``/analyzer``.
@@ -26,8 +27,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from public_api import attention, simulate, workloads
 from public_api import predict as timing
-from public_api import simulate, workloads
 from public_api.access_log import AccessLog
 from public_api.deployments import BadMember, UnknownDeployment
 from public_api.kernels import REPO_ROOT, BadQuery, KernelLibrary, UnknownConfig, UnknownKind
@@ -151,13 +152,13 @@ def create_app(
             raise HTTPException(404, f"no public preset {error.args[0]!r}") from None
         except BadMember as error:
             raise HTTPException(400, {"message": str(error), "choices": error.choices}) from None
-        except (BadQuery, timing.BadCases, workloads.BadWorkload) as error:
+        except (BadQuery, timing.BadCases, workloads.BadWorkload, attention.BadTokens) as error:
             # A request too long for its pool or arch also gives the limit.
             too_long = getattr(error, "too_long", None)
             message = hide(str(error))
             detail = {"message": message, "too_long": too_long} if too_long else message
             raise HTTPException(400, detail) from None
-        except (timing.NotPredictable, simulate.NotRunnable) as error:
+        except (timing.NotPredictable, simulate.NotRunnable, attention.NoKvCache) as error:
             raise HTTPException(409, hide(str(error))) from None
         except simulate.UnknownSimulation as error:
             raise HTTPException(404, f"no simulation {error.args[0]!r}") from None
@@ -256,6 +257,18 @@ def create_app(
         with limited(predict_limit, request):
             document = await answer(run)
         response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return document
+
+    @app.get(f"{PREFIX}/attention")
+    async def attention_at(request: Request, response: Response, preset: str) -> dict:
+        """One member's attention at ``tokens`` context: ``kv_cache``, what one
+        request's KV cache holds, part by part, stored once, on one GPU and over
+        the KV partition. Arithmetic on the arch's layout; no run."""
+        query = dict(request.query_params)
+        query.pop("preset")
+        tokens = query.pop("tokens", None)
+        document = await answer(attention.document, index, preset, query, tokens)
         response.headers["Cache-Control"] = "public, max-age=3600"
         return document
 
