@@ -125,6 +125,42 @@ def missing_specs(member: Member, build_type: str = "release") -> dict[str, int]
     return missing_by_role(report)
 
 
+def query_case(shape: dict, fields: dict, query: dict[str, str]) -> dict:
+    """The one case ``GET /predict``'s ``query`` spells for a member of
+    prediction ``shape``, by ``fields``, its selector's ``case_fields`` entry.
+
+    Each value is spelled by its field's type: ``int`` as ``512``, ``int_list``
+    as ``1,2,3``, ``int_pair_list`` as ``0:512,128:64``. A ``groups`` field
+    describes every group alike; a ``case`` field the case itself."""
+    (scope, specs), *rest = fields.items()
+    if rest or scope not in ("groups", "case"):
+        raise RuntimeError(f"unknown case shape {sorted(fields)}")
+    values = {}
+    for spec in specs:
+        name = spec["name"]
+        if name not in query:
+            continue
+        text = query[name]
+        try:
+            if spec["type"] == "int":
+                values[name] = int(text)
+            elif spec["type"] == "int_list":
+                values[name] = [int(x) for x in text.split(",")]
+            elif spec["type"] == "int_pair_list":
+                values[name] = [
+                    [int(a), int(b)] for a, b in (p.split(":") for p in text.split(","))
+                ]
+            else:
+                raise BadCases(f"{name} ({spec['type']}) can be given only by POST /predict")
+        except ValueError:
+            raise BadCases(f"{name}={text!r} is not a {spec['type']}") from None
+    if not values:
+        raise BadCases(f"give at least one of {[s['name'] for s in specs]}")
+    if scope == "case":
+        return values
+    return {"groups": [values] * shape["groups"]}
+
+
 def prune(runs_dir: Path, keep_seconds: float) -> None:
     """Remove the predictions older than ``keep_seconds``."""
     cutoff = time.time() - keep_seconds

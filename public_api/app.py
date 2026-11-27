@@ -1,14 +1,19 @@
 """The FastAPI app: routes under ``/api/public/v1``. Everything is a GET but
-``POST /predict``, which costs the reader's cases, ``POST /simulate``, which
+``POST /predict``, which costs the reader's cases (``GET /predict`` costs one
+case spelled in the query string), ``POST /simulate``, which
 queues a simulation, ``POST /workloads``, which keeps an uploaded trace, and
 ``DELETE /simulations/{id}``. The prediction or simulation they leave is read
 through the Analyzer's own routes, forwarded read-only under ``/analyzer``.
 The three ``POST`` routes are rate limited per client address, counting only
-the requests they accept."""
+the requests they accept; ``GET /predict`` counts against ``POST /predict``'s
+limit."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -198,6 +203,61 @@ def create_app(
 
         with limited(predict_limit, request):
             return await answer(run)
+
+    # Changes when the service restarts, so a cached answer never outlives the
+    # rows or code it was computed on.
+    served = uuid.uuid4().hex
+
+    @app.get(f"{PREFIX}/predict")
+    async def predict_query(request: Request, response: Response, preset: str) -> Any:
+        """``POST /predict`` with one case, spelled in the query string, and no
+        ``analyze``: a link an agent can fetch. The answer also gives the
+        ``POST`` body it equals as ``request``."""
+        query = dict(request.query_params)
+        query.pop("preset")
+        etag = (
+            '"'
+            + hashlib.sha256(
+                json.dumps([served, preset, sorted(query.items())]).encode()
+            ).hexdigest()[:32]
+            + '"'
+        )
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        # Case field names; the rest of the query names the member.
+        case_names = {
+            spec["name"]
+            for fields in index.case_fields.values()
+            for specs in fields.values()
+            for spec in specs
+        }
+        params = {k: v for k, v in query.items() if k not in case_names}
+        request.state.note = {"preset": preset, "params": params, "cases": 1, "analyze": False}
+        if runs_dir is None:
+            raise HTTPException(503, "this service keeps no runs directory")
+
+        def run() -> dict:
+            clash = case_names & {axis["name"] for axis in index.preset(preset).axes}
+            if clash:
+                raise BadQuery(
+                    f"{preset}'s axes {sorted(clash)} are case fields: use POST /predict"
+                )
+            _, member = index.member(preset, params)
+            if member.error or member.predict is None:
+                raise timing.NotPredictable(
+                    f"{preset} {member.params} does not build: {member.error}"
+                )
+            fields = index.case_fields[member.predict["selector"]]
+            case = timing.query_case(member.predict, fields, query)
+            result = timing.predict(runs_dir, member, [case], sources.build_type)
+            body = {"preset": preset, "params": member.params, "cases": [case]}
+            return {"sim_commit": index.sim_commit, **result, "request": body}
+
+        with limited(predict_limit, request):
+            document = await answer(run)
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return document
 
     @app.get(f"{PREFIX}/kernels")
     async def catalog() -> dict:

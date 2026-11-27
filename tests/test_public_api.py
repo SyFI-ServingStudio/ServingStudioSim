@@ -31,6 +31,7 @@ from public_api.access_log import AccessLog
 from public_api.app import PREFIX, create_app
 from public_api.deployments import Config, DeploymentIndex, Member, Preset, config_id
 from public_api.kernels import PROVENANCE, REPO_ROOT, KernelLibrary
+from public_api.limits import RateLimiter
 from public_api.sources import Sources
 
 GEMM_ARGS = {"m": "INTEGER", "n": "INTEGER", "k": "INTEGER", "dtype": "TEXT"}
@@ -567,3 +568,83 @@ def test_a_failed_run_names_no_host_path(tmp_path: Path) -> None:
     )
     # A panic writes no error; the end of the log stands in.
     assert predict._cause(None, f"panicked at {log_dir}/x\n", scratch, log_dir) == "panicked at x"
+
+
+ITER_FIELDS = {
+    "groups": [
+        {"name": "prefill_chunk_pairs", "type": "int_pair_list"},
+        {"name": "decode_kv_lens", "type": "int_list"},
+        {"name": "decode_count", "type": "int"},
+        {"name": "average_decode_length", "type": "int"},
+    ]
+}
+FFN_FIELDS = {"case": [{"name": "tokens_per_group", "type": "int_list"}]}
+
+
+def test_a_query_spells_one_case_by_its_fields_types() -> None:
+    shape = {"selector": "iter", "groups": 2}
+    case = predict.query_case(
+        shape,
+        ITER_FIELDS,
+        {"prefill_chunk_pairs": "0:512,128:64", "decode_kv_lens": "100,200", "tp_size": "2"},
+    )
+    group = {"prefill_chunk_pairs": [[0, 512], [128, 64]], "decode_kv_lens": [100, 200]}
+    # Every group alike; a name that is no field is the member's, not the case's.
+    assert case == {"groups": [group, group]}
+    assert predict.query_case(
+        shape, ITER_FIELDS, {"decode_count": "64", "average_decode_length": "4096"}
+    ) == {"groups": [{"decode_count": 64, "average_decode_length": 4096}] * 2}
+    ffn = predict.query_case(
+        {"selector": "ffn", "groups": 2}, FFN_FIELDS, {"tokens_per_group": "8,8"}
+    )
+    assert ffn == {"tokens_per_group": [8, 8]}
+    with pytest.raises(predict.BadCases, match="is not a int_pair_list"):
+        predict.query_case(shape, ITER_FIELDS, {"prefill_chunk_pairs": "512"})
+    with pytest.raises(predict.BadCases, match="give at least one of"):
+        predict.query_case(shape, ITER_FIELDS, {})
+
+
+def _iter_index() -> DeploymentIndex:
+    index = _index()
+    index.case_fields = {"iter": ITER_FIELDS, "ffn": FFN_FIELDS}
+    for member in index.presets[PRESET].members:
+        member.predict = {"selector": "iter", "groups": 2}
+    return index
+
+
+def test_get_predict_costs_one_case_and_names_the_post_it_equals(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran = []
+
+    def fake(runs_dir, member, cases, build_type="release", *, analyze=False):
+        ran.append((member.params, cases, analyze))
+        return {"cases": [{"sections": []}], "kernel_time_share": {}}
+
+    monkeypatch.setattr(predict, "predict", fake)
+    limit = RateLimiter(2, 60.0)
+    client = TestClient(
+        create_app(
+            KernelLibrary(FixtureSources(db_path=db), _iter_index()), tmp_path, predict_limit=limit
+        )
+    )
+    query = {"preset": PRESET, "tp_size": "1", "decode_count": "8", "average_decode_length": "1024"}
+    answer = client.get(f"{PREFIX}/predict", params=query)
+    assert answer.status_code == 200
+    case = {"groups": [{"decode_count": 8, "average_decode_length": 1024}] * 2}
+    assert ran == [({"tp_size": 1}, [case], False)]
+    assert answer.json()["request"] == {"preset": PRESET, "params": {"tp_size": 1}, "cases": [case]}
+    assert answer.headers["cache-control"] == "public, max-age=3600"
+    # A fetch that names the answer it holds runs nothing and counts nothing.
+    again = client.get(
+        f"{PREFIX}/predict", params=query, headers={"if-none-match": answer.headers["etag"]}
+    )
+    assert again.status_code == 304 and len(ran) == 1
+    # Refused input counts nothing either.
+    assert client.get(f"{PREFIX}/predict", params={**query, "tp_size": "4"}).status_code == 400
+    assert client.get(f"{PREFIX}/predict", params={**query, "decode_count": "x"}).status_code == 400
+    assert client.get(f"{PREFIX}/predict", params={"tp_size": "1"}).status_code == 422
+    # GET and POST share one limit.
+    post = {"preset": PRESET, "params": {"tp_size": 1}, "cases": [case]}
+    assert client.post(f"{PREFIX}/predict", json=post).status_code == 200
+    assert client.get(f"{PREFIX}/predict", params={**query, "decode_count": "9"}).status_code == 429
