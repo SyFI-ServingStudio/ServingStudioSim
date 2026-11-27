@@ -734,7 +734,26 @@ def test_get_attention_sizes_one_members_kv_cache_at_a_length(db: Path, tmp_path
     assert answer.headers["cache-control"] == "public, max-age=3600"
     assert get(tp_size=1, tokens=4097).status_code == 400
     assert get(tp_size=1, tokens=0).status_code == 400
-    assert get(tp_size=1).status_code == 400
+    assert get(tp_size=1).status_code == 422
     assert get(tp_size=4, tokens=10).status_code == 400
     # A member without a KV cache (an FFN side) answers why.
     assert get(tp_size=2, tokens=10).status_code == 409
+
+
+def test_the_get_routes_document_their_query_in_openapi(db: Path, tmp_path: Path) -> None:
+    """An agent that reads only openapi.json learns every parameter: the case
+    fields of GET /predict, spelled per type, and GET /attention's tokens."""
+    client = TestClient(
+        create_app(KernelLibrary(FixtureSources(db_path=db), _iter_index()), tmp_path)
+    )
+    paths = client.get(f"{PREFIX}/openapi.json").json()["paths"]
+    predict_get = paths[f"{PREFIX}/predict"]["get"]
+    params = {p["name"]: p for p in predict_get["parameters"]}
+    assert {"preset", "prefill_chunk_pairs", "decode_kv_lens", "tokens_per_group"} <= set(params)
+    assert "0:2048,128:64" in params["prefill_chunk_pairs"]["description"]
+    assert "tp_size=2" in predict_get["description"]
+    attention_get = paths[f"{PREFIX}/attention"]["get"]
+    assert {p["name"] for p in attention_get["parameters"]} == {"preset", "tokens"}
+    assert attention_get["summary"] == "One request's KV cache at a context length"
+    # POST /predict keeps its body.
+    assert "requestBody" in paths[f"{PREFIX}/predict"]["post"]
