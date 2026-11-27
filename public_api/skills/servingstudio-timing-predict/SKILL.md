@@ -250,6 +250,25 @@ curl -s -X POST "$API/predict" -H 'content-type: application/json' \
 # {"detail":{"message":"Llama-3.1-8B/llama3_dense_tp has no member {'tp_size': '3'}","choices":[{"tp_size":1},{"tp_size":2},{"tp_size":4},{"tp_size":8}]}}
 ```
 
+### One case as a link
+
+When your tool can only fetch a URL, `GET $API/predict` costs one case spelled
+in the query string: `preset`, each axis of the member by name, and the case's
+fields from `case_fields`. An `int` is spelled `64`, an `int_list` `1024,2048`,
+an `int_pair_list` `0:2048,128:64` (`prefix_len:append_len`). For a selector
+with groups, the fields describe every group alike, so a group count above one
+repeats the same batch in each group; an `ffn` member's `tokens_per_group`
+still lists one count per group.
+
+```bash
+curl -s "$API/predict?preset=Llama-3.1-8B/llama3_dense_tp&tp_size=2&prefill_chunk_pairs=0:2048&decode_count=32&average_decode_length=4096"
+```
+
+The answer is the `POST` answer for that one case, plus `request`, the `POST`
+body it equals. Use `POST` for several cases, groups that differ, or
+`analyze`; `GET` counts against the same rate limit, and a repeat of the same
+link may be served from a cache for up to an hour.
+
 ### Analyze and keep a prediction
 
 Add `"analyze": true` to the request. The answer gains a `prediction_id`, and

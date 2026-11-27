@@ -67,7 +67,7 @@ that host's address) lists the proxies trusted to name it.
 
 ## Routes
 
-Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate`,
+Under `/api/public/v1`; all `GET` (including a one-case `GET /predict`) but `POST /predict`, `POST /simulate`,
 `POST /workloads` and `DELETE /simulations/{id}`.
 
 | Route | Returns |
@@ -81,6 +81,7 @@ Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate`,
 | `/models` | Every checkpoint of `model/catalog.yaml` with its public presets (`presets/public/<checkpoint>/<arch type>.yaml`): the arch's reader-facing name (`arch_name`, from `model/arch_catalog.yaml`), axes, and per member its params, GPUs per replica, prediction shape and the profile.db rows it lacks (`missing`, `{kind: count}`); plus `case_fields`, the fields of a prediction case per shape |
 | `/models/{checkpoint}/{arch}/tree` | One member's kernels: each section's leaf slots; the query gives every axis of the preset. Each slot names its config by `id`, the key of `/kernels/{kind}/configs/{id}`; `configs` gives each config's identity and the profile.db rows this member asks of it and lacks (`missing`); `kv_cache` is the arch's own KV layout (`cost-trees`: `attention_shards` and `layout`, bytes over one partition), null for an FFN side |
 | `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per node of its cost tree (as `analyze gen-iter-breakdown` reads it), from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. A prediction builds the arch with unchunked steps, as `launcher timing-predict` does: kernels sized by the step budget (DeepSeek V4's `max_num_batched_tokens`) are sized for `max_model_len`, where a simulation's chunked-prefill worker sizes them for its chunk (`max_batch_tokens`, 8192 in the DeepSeek V4 sim presets), so the two read different profile.db rows for one shape. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
+| `GET /predict` | `POST /predict` for one case, without `analyze`, as a link: `preset`, each axis, and the case's `case_fields` in the query (`int` `64`, `int_list` `1,2`, `int_pair_list` `0:2048,128:64`; a group field describes every group alike). The answer adds `request`, the `POST` body it equals. It counts against `POST /predict`'s limit, carries `ETag` and `Cache-Control: public, max-age=3600`, and answers a matching `If-None-Match` with 304 without running; the tag changes when the service restarts |
 | `/analyzer/predictions/{prediction_id}/...` | The Analyzer's routes for one kept prediction (`/api/analyzer/v1/predictions/{id}/...`: descriptor, reports, payloads), forwarded read-only to the `analyze serve` the service runs on 127.0.0.1 over its runs directory |
 | `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools (each with its `kv_cache`: the first partition's entry of the build's `raw/kv_cache.json`, with `partitions`, the partitions one replica holds) and why it cannot run a capture (`unavailable`: `{error}`, `{missing: {role: rows}}`, or `{misfit}` when the capture's requests do not fit its pools); plus the limits and the workload's JSON schema |
 | `/workloads` | Where a simulation's requests can come from: a capture; a generated trace, with each offered tracegen generator's arguments (`tracegen describe`); an upload, with the formats and tags it may declare (`simulator trace-formats`) and its size limit |
@@ -235,7 +236,7 @@ Limits (`public_api/simulate.py`, `public_api/app.py`): two simulations run
 at once and up to 32 wait (429 past that); a run is stopped after 10 minutes
 of wall clock and marked `timed_out`; a run and its directory are removed 24
 hours after it was submitted, and an upload 24 hours after it arrived.
-`POST /predict` takes 30, and `POST /simulate` and `POST /workloads` 6,
+`POST /predict` and `GET /predict` together take 30, and `POST /simulate` and `POST /workloads` 6,
 requests per minute per client address (429 with `Retry-After`), counted in
 the process; a request the route refuses (4xx) is not counted. A restart keeps
 finished runs and marks unfinished ones failed.
