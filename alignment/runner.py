@@ -38,6 +38,7 @@ from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, writ
 from .nsys.parsed_io import kernel_rows_path, write_parsed
 from .profiler import (
     capture_facts,
+    multinode,
     nsys_capture,
     record_extraction,
     runtime_artifacts,
@@ -511,6 +512,46 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             nsys_executable=None,
         )
 
+    topo = multinode.topology()
+    peers: multinode.Peers | None = None
+    peer_launch: dict[int, dict] = {}
+    if cfg.server.nnodes > 1:
+        if topo is None or topo.nodes != cfg.server.nnodes or not topo.is_head:
+            raise RuntimeError(
+                f"server.nnodes={cfg.server.nnodes} needs a {cfg.server.nnodes}-node job "
+                f"with this runner on node 0 ({multinode.NODE_COUNT_ENV}="
+                f"{os.environ.get(multinode.NODE_COUNT_ENV)!r})"
+            )
+        # DP ranks per node; 0 when one replica's TP group spans the nodes.
+        if cfg.server.dp_size % cfg.server.nnodes == 0:
+            local_dp = cfg.server.dp_size // cfg.server.nnodes
+        elif cfg.server.dp_size == 1:
+            local_dp = 0
+        else:
+            raise ValueError(
+                f"dp_size={cfg.server.dp_size} over nnodes={cfg.server.nnodes}: either every "
+                "node holds whole DP ranks or one replica spans all nodes"
+            )
+        server_argv = multinode.head_argv(server_argv, topo, local_dp)
+        overlay, unset = multinode.env_overlay(env)
+        for k in range(1, topo.nodes):
+            argv = multinode.peer_argv(server_argv, k, local_dp)
+            if nsys_executable is not None:
+                argv = (
+                    nsys_capture.build_nsys_prefix(
+                        nsys_executable, cfg.nsys, nsys_dir / f"{cfg.name}_node{k}"
+                    )
+                    + argv
+                )
+            peer_launch[k] = {
+                "argv": argv,
+                "env": overlay,
+                "unset": unset,
+                "cwd": str(REPO_ROOT),
+                "log": str(engine_dir / f"{cfg.name}_server.node{k}.log"),
+                "wrapped": nsys_executable is not None,
+            }
+        peers = multinode.Peers(topo, f"{log_dir.name}-{cfg.name}-{os.getpid()}")
     full_argv = (
         nsys_capture.build_nsys_prefix(nsys_executable, cfg.nsys, out_rep) + server_argv
         if nsys_executable is not None
@@ -547,12 +588,16 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             cwd=str(REPO_ROOT),
             start_new_session=True,
         )
+        if peers is not None:
+            peers.launch(peer_launch)
         drive_summary: dict = {}
         cuda_profile_active = False
         capture_timer_cancelled = threading.Event()
         capture_timer: threading.Thread | None = None
         capture_timer_errors: list[BaseException] = []
         try:
+            if peers is not None:
+                peers.wait_started(600.0)
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
             driver.verify_server_started(server_log, cfg.server)
             if warm_only:
@@ -573,6 +618,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             counters_before = None
             replay_start_monotonic_ns = None
             measurement_log_offset = None
+            peer_marks: dict[int, int] = {}
 
             def measurement_ready() -> None:
                 nonlocal cuda_profile_active, capture_timer, counters_before
@@ -580,6 +626,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
                 if not driver.wait_for_idle(base_url, cfg.idle, cfg.server):
                     raise RuntimeError("server did not drain before measurement")
                 measurement_log_offset = server_log.stat().st_size
+                if peers is not None:
+                    peer_marks.update(peers.mark())
                 if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
                     driver.set_cuda_profile(base_url, active=True)
                     cuda_profile_active = True
@@ -611,7 +659,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             drive_summary = load_generator.run_replay(
                 cfg.workload, prepared_replay, base_url=base_url, model=model,
                 measurement_ready=measurement_ready,
-                server_failure=_server_failure(proc, server_log),
+                server_failure=_server_failure(proc, server_log, peers),
                 # Only the corpus pass needs per-token routes, and it pays for
                 # them with the replay's streaming timeline. An expert_popularity
                 # pass reads the server's own counters and keeps its timeline.
@@ -626,6 +674,10 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             drive_summary["replay_start_monotonic_ns"] = replay_start_monotonic_ns
             drive_summary["replay_end_monotonic_ns"] = replay_end_monotonic_ns
             drive_summary["measurement_log_offset"] = measurement_log_offset
+            if peers is not None:
+                drive_summary["peer_measurement_log_offsets"] = {
+                    str(k): v for k, v in peer_marks.items()
+                }
             capture_timer_cancelled.set()
             if capture_timer is not None:
                 capture_timer.join()
@@ -668,7 +720,26 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
                     driver.set_cuda_profile(base_url, active=False)
                 except RuntimeError:
                     pass
+            if peers is not None:
+                peers.request_stop()
             _shutdown(proc, wrapped=nsys_executable is not None)
+            if peers is not None:
+                exits = peers.wait_stopped()
+                print(f"[profile] peer node exits: {exits}", flush=True)
+
+    if peers is not None and not warm_only:
+        drive_summary = _fold_peers(
+            cfg,
+            peers,
+            engine_dir=engine_dir,
+            server_log=server_log,
+            out_rep=out_rep,
+            nsys_dir=nsys_dir,
+            drive_summary=drive_summary,
+            drive_summary_path=drive_summary_path,
+            nsys_executable=nsys_executable,
+        )
+        nsys_executable = None  # the merged export stands in for the head's
 
     return _finalize_profile(
         cfg,
@@ -687,7 +758,70 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
 _SGLANG_SUBPROCESS_CRASH = re.compile(r"Subprocess \S+ \(pid=\d+\) crashed with exit code")
 
 
-def _server_failure(proc: subprocess.Popen, server_log: Path):
+def _fold_peers(
+    cfg: ProfileConfig,
+    peers: multinode.Peers,
+    *,
+    engine_dir: Path,
+    server_log: Path,
+    out_rep: Path,
+    nsys_dir: Path,
+    drive_summary: dict,
+    drive_summary_path: Path,
+    nsys_executable,
+) -> dict:
+    """Fold a multi-node capture into the single-node shape `_finalize_profile` reads.
+
+    The head's log becomes ``*_server.node0.log`` and ``*_server.log`` the
+    merged one (peers' monotonic stamps on the head's clock); each node's
+    Nsight report is exported and merged into the ``.sqlite`` beside the head's
+    report, its devices renumbered ``node * L + local``.
+    """
+
+    k_range = list(peers.ranks())
+    offsets = peers.offsets()
+    head_log = engine_dir / f"{cfg.name}_server.node0.log"
+    os.replace(server_log, head_log)
+    peer_logs = {k: engine_dir / f"{cfg.name}_server.node{k}.log" for k in k_range}
+    recorded = drive_summary.get("peer_measurement_log_offsets") or {}
+    marks = {int(k): v for k, v in recorded.items()}
+    merged_offset = multinode.merge_server_logs(
+        head_log,
+        peer_logs,
+        offsets,
+        server_log,
+        head_mark=drive_summary.get("measurement_log_offset"),
+        peer_marks=marks,
+    )
+    folded = {
+        "nodes": cfg.server.nnodes,
+        "monotonic_offsets_ns": {str(k): v for k, v in offsets.items()},
+        "node_logs": {"0": str(head_log), **{str(k): str(p) for k, p in peer_logs.items()}},
+        "head_measurement_log_offset": drive_summary.get("measurement_log_offset"),
+    }
+    drive_summary = {**drive_summary, "measurement_log_offset": merged_offset, "multinode": folded}
+    if nsys_executable is not None:
+        local = cfg.local_gpu_count
+        head_rep = out_rep.with_suffix(".nsys-rep")
+        head_sqlite = nsys_capture.export_sqlite(nsys_executable, head_rep)
+        node0_sqlite = nsys_dir / f"{cfg.name}_node0.sqlite"
+        os.replace(head_sqlite, node0_sqlite)
+        peer_sqlite = {
+            k: nsys_capture.export_sqlite(
+                nsys_executable, nsys_dir / f"{cfg.name}_node{k}.nsys-rep"
+            )
+            for k in k_range
+        }
+        folded["nsys_merge"] = multinode.merge_nsys_sqlite(
+            node0_sqlite, peer_sqlite, local, head_rep.with_suffix(".sqlite")
+        )
+    drive_summary_path.write_text(json.dumps(drive_summary, indent=2))
+    return drive_summary
+
+
+def _server_failure(
+    proc: subprocess.Popen, server_log: Path, peers: multinode.Peers | None = None
+):
     """A poll for `run_replay`: why the server can no longer answer, or None.
 
     Reads only the log written since the previous poll.
@@ -700,6 +834,10 @@ def _server_failure(proc: subprocess.Popen, server_log: Path):
         code = proc.poll()
         if code is not None:
             return f"server process exited with code {code}"
+        if peers is not None:
+            failure = peers.failure()
+            if failure:
+                return failure
         with server_log.open("rb") as log:
             log.seek(offset)
             chunk = log.read()

@@ -111,7 +111,7 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
             int(variant.server.get("tp_size", 1)),
             int(variant.server.get("dp_size", 1)),
             list(variant.server.get("extra_args", [])),
-        )
+        ) // int(variant.server.get("nnodes", 1))  # a multi-node role names one node's devices
         for case in pack.cases:
             if case.variant != variant.name:
                 continue
@@ -746,11 +746,12 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
             int(variant.server.get("dp_size", 1)),
             flags,
         )
-        if len(devices) != world:
+        if len(devices) * int(variant.server.get("nnodes", 1)) != world:
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}",
                         f"device role {case.device_role!r} yields {len(devices)} devices "
-                        f"but dp*tp*pp*pcp is {world}")
+                        f"but dp*tp*pp*pcp / nnodes is {world}/"
+                        f"{variant.server.get('nnodes', 1)}")
             )
     return findings
 

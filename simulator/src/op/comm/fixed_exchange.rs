@@ -73,6 +73,7 @@ impl FixedExpertExchangeConfig {
                 activation_dtype: DType::Nvfp4E2m1,
                 fabric: FABRIC.into(),
                 max_total_tokens,
+                extra_total_tokens: Vec::new(),
             },
             combine: MoeEpReduceScatterKernelConfig {
                 backends: PUSH_BACKENDS.to_vec(),
@@ -82,6 +83,7 @@ impl FixedExpertExchangeConfig {
                 dtype: DType::Bf16,
                 fabric: FABRIC.into(),
                 max_total_tokens,
+                extra_total_tokens: Vec::new(),
             },
         })
     }
@@ -172,6 +174,7 @@ impl GroupGatherScatterConfig {
                 dtype: DType::Bf16,
                 fabric: FABRIC.into(),
                 max_total_tokens,
+                extra_total_tokens: Vec::new(),
             },
         }
     }

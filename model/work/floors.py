@@ -127,6 +127,7 @@ _FP8_INDEX_CACHE_ARCHS = frozenset({"qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculativ
 #: ModelOpt's ``hf_quant_config``; :func:`_check_precision`).
 _FP4_ARCHS = frozenset(
     {
+        "kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark",
         "glm52_vllm_nvfp4_dsa_moe",
         "glm52_vllm_nvfp4_dsa_moe_speculative",
         "glm52_sglang_nvfp4_tp_dsa_moe",
@@ -159,6 +160,7 @@ _SPECULATIVE_ARCHS = frozenset(
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
         "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2",
+        "kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark",
         "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
     }
 )
@@ -173,6 +175,7 @@ _DEFAULT_DRAFT_TOKENS = {
     "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
     "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2": 7,
     "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2": 7,
+    "kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark": 7,
     "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,
 }
 

@@ -895,6 +895,24 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::KimiK31VllmNvfp4TpAttnEpMoeDspark { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark(
+                    &g.arch,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
                 max_model_len,
                 draft_tokens,

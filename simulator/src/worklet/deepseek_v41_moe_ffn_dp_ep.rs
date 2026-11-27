@@ -121,6 +121,7 @@ impl DeepseekV41MoeFfnDpEpWorklet {
                 activation_dtype: DType::Mxfp8E4m3,
                 fabric: "nvlink".into(),
                 max_total_tokens,
+                extra_total_tokens: Vec::new(),
             },
             // bf16 `finalize` output back to each rank's own rows.
             combine: MoeEpReduceScatterKernelConfig {
@@ -131,6 +132,7 @@ impl DeepseekV41MoeFfnDpEpWorklet {
                 dtype: DType::Bf16,
                 fabric: "nvlink".into(),
                 max_total_tokens,
+                extra_total_tokens: Vec::new(),
             },
             raw_cfg: cfg.clone(),
         }

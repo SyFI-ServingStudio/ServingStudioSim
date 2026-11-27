@@ -300,10 +300,24 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             f"server.dp_size={config.server.dp_size} attention DP, not replicas; write "
             f"server.dp_size: 1 and --attn-dp-size {config.server.dp_size} instead"
         )
-    if len(visible_devices) != gpu_count:
+    nnodes = config.server.nnodes
+    if type(nnodes) is not int or nnodes < 1:
+        raise ValueError(f"invalid profile config: server.nnodes must be >= 1, got {nnodes!r}")
+    if nnodes > 1:
+        if config.engine != "vllm":
+            raise ValueError("invalid profile config: server.nnodes > 1 is vLLM-only")
+        # Either every node holds whole DP ranks, or one replica (dp_size 1)
+        # spans all nodes with its TP group (`multinode.head_argv`).
+        if config.server.dp_size % nnodes and config.server.dp_size != 1:
+            raise ValueError(
+                f"invalid profile config: server.dp_size={config.server.dp_size} does not "
+                f"divide over server.nnodes={nnodes}"
+            )
+    if len(visible_devices) * nnodes != gpu_count:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
-            f"dp_size * tp_size * pp * pcp={gpu_count} devices; found {visible_devices}"
+            f"dp_size * tp_size * pp * pcp / nnodes={gpu_count // nnodes} devices; "
+            f"found {visible_devices}"
         )
     if len(set(visible_devices)) != len(visible_devices):
         raise ValueError("invalid profile config: cuda_visible_devices contains duplicates")

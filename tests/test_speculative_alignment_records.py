@@ -42,6 +42,9 @@ def scheduled_batch():
         ),
         num_scheduled_tokens={"new": 8, "decode-a": 6, "chunk": 4, "decode-b": 6},
         scheduled_spec_decode_tokens={"decode-a": [1] * 5, "decode-b": [2] * 5},
+        # Upstream's SchedulerOutput field; None (iteration-detail logging off)
+        # leaves the decode set to `is_context_phase`.
+        iteration_details=None,
     )
 
 
@@ -71,7 +74,7 @@ def extract(tmp_path, row):
 @pytest.mark.needs_vllm_fork
 def test_spec5_progress_round_trips_with_reordered_output(request_details, tmp_path):
     output = SimpleNamespace(
-        req_id_to_index={"decode-b": 0, "decode-a": 1},
+        req_ids=["decode-b", "decode-a"],
         sampled_token_ids=[[8], [1, 2, 3, 4]],
     )
     result = extract(tmp_path, iteration_row(request_details(scheduled_batch(), output)))
@@ -85,9 +88,23 @@ def test_spec5_progress_round_trips_with_reordered_output(request_details, tmp_p
 
 
 @pytest.mark.needs_vllm_fork
+def test_scheduler_decode_set_overrides_context_phase(request_details, tmp_path):
+    # With iteration details on, the scheduler's own decode set decides; it
+    # agrees with `is_context_phase` here, so the records are unchanged.
+    batch = scheduled_batch()
+    batch.iteration_details = SimpleNamespace(alignment_decode_req_ids=["decode-a", "decode-b"])
+    output = SimpleNamespace(req_ids=["decode-b", "decode-a"], sampled_token_ids=[[8], [1, 2, 3, 4]])
+    result = extract(tmp_path, iteration_row(request_details(batch, output)))
+    assert result["prefill_chunk_pairs"] == [[0, 8], [20, 4]]
+    assert [request["request_id"] for request in result["decode_request_progress"]] == [
+        "decode-a", "decode-b",
+    ]
+
+
+@pytest.mark.needs_vllm_fork
 def test_zero_sampled_output_does_not_invent_a_bonus_token(request_details, tmp_path):
     output = SimpleNamespace(
-        req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[], []]
+        req_ids=["decode-a", "decode-b"], sampled_token_ids=[[], []]
     )
     result = extract(tmp_path, iteration_row(request_details(scheduled_batch(), output)))
     assert [request["emitted_tokens"] for request in result["decode_request_progress"]] == [0, 0]
@@ -98,7 +115,7 @@ def test_async_placeholders_do_not_advance_confirmed_progress(request_details, t
     batch = scheduled_batch()
     batch.scheduled_cached_reqs.num_output_tokens = [68, 0, 3, 15]
     output = SimpleNamespace(
-        req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[1], [2]]
+        req_ids=["decode-a", "decode-b"], sampled_token_ids=[[1], [2]]
     )
     requests = {
         "decode-a": SimpleNamespace(num_output_tokens=60, is_finished=lambda: False),
@@ -128,7 +145,7 @@ def test_internal_id_normalization_preserves_a_client_hex_suffix(
     )
     batch.num_scheduled_tokens = {internal: 6}
     batch.scheduled_spec_decode_tokens = {internal: [1] * 5}
-    output = SimpleNamespace(req_id_to_index={internal: 0}, sampled_token_ids=[[1]])
+    output = SimpleNamespace(req_ids=[internal], sampled_token_ids=[[1]])
     details = request_details(batch, output, request_ids_randomized=randomized, requests={
         internal: SimpleNamespace(num_output_tokens=1, is_finished=lambda: False),
     })
@@ -152,7 +169,7 @@ def test_internal_id_normalization_preserves_a_client_hex_suffix(
 )
 def test_invalid_progress_is_rejected(request_details, tmp_path, field, value):
     output = SimpleNamespace(
-        req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[1], [2]]
+        req_ids=["decode-a", "decode-b"], sampled_token_ids=[[1], [2]]
     )
     row = iteration_row(request_details(scheduled_batch(), output))
     row["decode_request_progress"][0][field] = value
@@ -188,7 +205,7 @@ def test_producer_rejects_missing_or_impossible_output(request_details):
     with pytest.raises(ValueError, match="requires model output"):
         request_details(scheduled_batch(), None)
     output = SimpleNamespace(
-        req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[1] * 7, [2]]
+        req_ids=["decode-a", "decode-b"], sampled_token_ids=[[1] * 7, [2]]
     )
     with pytest.raises(ValueError, match="invalid alignment decode output"):
         request_details(scheduled_batch(), output)
@@ -200,7 +217,7 @@ def test_producer_rejects_missing_or_impossible_output(request_details):
 )
 def test_request_records_reach_speculative_predict_cases(request_details, tmp_path, arch_type):
     output = SimpleNamespace(
-        req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[1], [2]]
+        req_ids=["decode-a", "decode-b"], sampled_token_ids=[[1], [2]]
     )
     row = extract(tmp_path, iteration_row(request_details(scheduled_batch(), output)))
     aggregate = fold_rank_metrics([row], 0)

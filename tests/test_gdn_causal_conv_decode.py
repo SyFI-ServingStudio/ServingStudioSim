@@ -246,7 +246,7 @@ def test_vllm_runner_rejects_unsupported_width_before_cuda(kernel_size: int) -> 
 
 @pytest.mark.parametrize(
     ("dtype", "state_dtype"),
-    [("fp16", "bf16"), ("fp32", "bf16"), ("bf16", "fp16"), ("bf16", "fp32")],
+    [("fp16", "bf16"), ("fp32", "bf16"), ("bf16", "fp16")],
 )
 def test_vllm_runner_rejects_unsupported_dtypes_before_cuda(
     dtype: str,

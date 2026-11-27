@@ -230,21 +230,41 @@ def _build_operands(
 
 def _prepare_deepgemm_call(deep_gemm: Any, operands: _DsaMqaLogitsPrefillOperands) -> Any:
     """Adapt legacy/unified query forms and return the exact timed callable."""
+    import inspect
+
+    import torch
+
     entry_point = _mqa_logits_entry_point(deep_gemm)
     unified = getattr(entry_point, "__name__", "") == "fp8_fp4_mqa_logits"
-    query = (operands.q, None) if unified else operands.q
+    params = inspect.signature(entry_point).parameters
+    weights, k_scale, q_scale = operands.weights, operands.k_scale, None
+    use_mx = getattr(deep_gemm, "mqa_logits_use_mx_scales", None)
+    if unified and callable(use_mx) and use_mx():
+        # SM100 forks take MX-scaled inputs only: the FP8 query keeps its scale
+        # folded into the weights with unit UE8M0 scales, and each key's
+        # power-of-two scale is four equal UE8M0 bytes (`mqa_logits_mx_inputs`).
+        q_scale, weights = deep_gemm.mqa_logits_mx_inputs(
+            operands.q, None, operands.weights, torch.float32
+        )
+        k_scale = ue8m0_x4(torch, operands.k_scale)
+    query = (operands.q, q_scale) if unified else operands.q
+    args: list[Any] = [query, (operands.k, k_scale), weights, operands.k_start, operands.k_end]
+    if "max_seqlen_k" in params:
+        args.append(int((operands.k_end - operands.k_start).max()))
+    takes_kwargs = any(param.kind is param.VAR_KEYWORD for param in params.values())
+    kwargs = {"clean_logits": False} if "clean_logits" in params or takes_kwargs else {}
 
     def kernel() -> Any:
-        return entry_point(
-            query,
-            (operands.k, operands.k_scale),
-            operands.weights,
-            operands.k_start,
-            operands.k_end,
-            clean_logits=False,
-        )
+        return entry_point(*args, **kwargs)
 
     return kernel
+
+
+def ue8m0_x4(torch: Any, scale: Any) -> Any:
+    """Power-of-two fp32 scales as int32 words of four equal UE8M0 bytes."""
+    exponent = (scale.float().contiguous().view(torch.int32) >> 23) & 0xFF
+    packed = exponent.to(torch.int64) * 0x01010101
+    return torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
 
 
 def _torch_composite(

@@ -9,12 +9,16 @@ implementation; Kimi-K3's KDA layer is the same op GLM-5.3-Flash uses
 (per-key-channel gate with ``lower_bound``, sigmoid beta, q/k l2norm).
 
 Cache pages. vLLM stores one KDA layer's states in one page per block, in
-``get_state_shape`` order: conv ``[state_len, conv_dim]`` (SD layout, bf16),
-the checkpoint ``[H, V, K]`` (``state_dtype``: fp32 by default, bf16 with
-``--mamba-ssm-cache-dtype bfloat16``), the fp32 correction record ``[H, S, V]``
-and the key/gate record ``[H, S, 2K]`` (activation dtype). Each is a strided
-view of the layer's raw page buffer whose block stride is the whole page.
-``_layer_page`` reproduces that layout; ``state_len = conv_size - 1 + S - 1``
+``get_state_shape`` order: conv ``[state_len, conv_dim]`` (SD layout, bf16)
+and the checkpoint ``[H, V, K]`` (``state_dtype``: fp32 by default, bf16 with
+``--mamba-ssm-cache-dtype bfloat16``). Each is a strided view of the layer's
+raw page buffer whose block stride is the whole page. The verify records, the
+fp32 correction ``[H, S, V]`` and the key/gate ``[H, S, 2K]`` (activation
+dtype), live outside the KV cache in ``KDARecoverSSMRecords``, one row per
+request of the step: verify writes row ``b`` for request ``b`` and the commit
+reads the same row. ``_layer_page`` reproduces the page layout and keeps one
+slot-indexed copy of the records beside it, which the commit runners gather to
+request rows. ``state_len = conv_size - 1 + S - 1``
 with GLM-5.3-Flash's ``short_conv_kernel_size = 4``. Slot 0 is the NULL block
 and the B requests own a fixed scattered permutation of slots ``1..B``.
 
@@ -240,8 +244,8 @@ class LayerPage:
     raw: Any
     conv: Any  # [blocks, state_len, conv_dim] bf16 (SD layout)
     checkpoint: Any  # [blocks, H, V, K] state_dtype
-    correction: Any  # [blocks, H, S, V] fp32
-    kg: Any  # [blocks, H, S, 2K] bf16
+    correction: Any  # [blocks, H, S, V] fp32, outside the page
+    kg: Any  # [blocks, H, S, 2K] bf16, outside the page
     a_log: Any  # [H] fp32
     dt_bias: Any  # [H*K] fp32
 
@@ -252,8 +256,6 @@ def _layer_page(torch: Any, shape: KdaRecoverSSMShape, *, device: Any, generator
     parts = (
         ((shape.conv_state_len, shape.conv_dim), torch.bfloat16),
         ((heads, dim, dim), state_torch_dtype(torch, shape.state_dtype)),
-        ((heads, spec, dim), torch.float32),
-        ((heads, spec, 2 * dim), torch.bfloat16),
     )
     sizes = [_numel(dims) * _itemsize(torch, dtype) for dims, dtype in parts]
     page_bytes = sum(sizes)
@@ -275,8 +277,10 @@ def _layer_page(torch: Any, shape: KdaRecoverSSMShape, *, device: Any, generator
             )
         )
         offset += size
-    conv, checkpoint, correction, kg = views
-    for view in views:
+    conv, checkpoint = views
+    correction = torch.empty((blocks, heads, spec, dim), dtype=torch.float32, device=device)
+    kg = torch.empty((blocks, heads, spec, 2 * dim), dtype=torch.bfloat16, device=device)
+    for view in (conv, checkpoint, correction, kg):
         view.copy_(torch.randn(view.shape, generator=generator, device=device, dtype=torch.float32))
     a_log = (
         torch.empty(heads, dtype=torch.float32, device=device)
@@ -317,6 +321,10 @@ class VerifyOperands:
     query_start_loc: Any
     state_indices: Any
     out: Any
+    # The fork's verify records, outside the KV cache and one row per request
+    # of the step (``KDARecoverSSMRecords``: fp32 correction [B, H, S, V] and
+    # activation-dtype key/gate [B, H, S, 2K]).
+    records: Any = None
 
 
 def build_verify_operands(torch: Any, shape: KdaRecoverSSMShape, *, device: Any) -> VerifyOperands:
@@ -339,6 +347,11 @@ def build_verify_operands(torch: Any, shape: KdaRecoverSSMShape, *, device: Any)
     )
     state_indices = torch.tensor(state_slots(shape.batch_size), dtype=torch.int32, device=device)
     out = torch.empty(1, tokens, heads, dim, dtype=torch.bfloat16, device=device)
+    rows = (shape.batch_size, heads, shape.spec_query_len)
+    records = SimpleNamespace(
+        correction=torch.empty((*rows, dim), dtype=torch.float32, device=device),
+        key_gate=torch.empty((*rows, 2 * dim), dtype=torch.bfloat16, device=device),
+    )
     return VerifyOperands(
         conv_out=conv_out,
         projected=projected,
@@ -351,6 +364,7 @@ def build_verify_operands(torch: Any, shape: KdaRecoverSSMShape, *, device: Any)
         query_start_loc=query_start_loc,
         state_indices=state_indices,
         out=out,
+        records=records,
     )
 
 
@@ -367,8 +381,7 @@ def invoke_verify(callable_: Any, operands: VerifyOperands, spec_query_len: int)
         dt_bias=page.dt_bias,
         lower_bound=LOWER_BOUND,
         checkpoint_state=page.checkpoint,
-        correction_cache=page.correction,
-        kg_cache=page.kg,
+        records=operands.records,
         query_start_loc=operands.query_start_loc,
         state_indices=operands.state_indices,
         spec_query_len=spec_query_len,
@@ -387,11 +400,21 @@ class CommitOperands:
     context: Any = None
 
 
-def commit_layers(pages: tuple[LayerPage, ...], shape: KdaRecoverSSMShape) -> list[Any]:
-    """The per-layer attributes ``KDARecoverSSMCommitContext.create`` reads."""
+def commit_layers(
+    pages: tuple[LayerPage, ...], shape: KdaRecoverSSMShape, slots: Any
+) -> list[Any]:
+    """The per-layer attributes ``KDARecoverSSMCommitContext.create`` reads.
+
+    The fork keeps the verify records outside the KV cache, one row per request,
+    so each layer's page records are gathered to request rows; the oracle reads
+    the same values from the page slots."""
     return [
         SimpleNamespace(
-            kv_cache=(page.conv, page.checkpoint, page.correction, page.kg),
+            kv_cache=(page.conv, page.checkpoint),
+            recoverssm_records=SimpleNamespace(
+                correction=page.correction[slots].contiguous(),
+                key_gate=page.kg[slots].contiguous(),
+            ),
             A_log=page.a_log,
             dt_bias=page.dt_bias,
             local_num_heads=shape.num_heads,
@@ -407,7 +430,7 @@ def build_commit_operands(
 ) -> CommitOperands:
     operands = build_commit_pages(torch, shape, device=device)
     context = context_cls.create(
-        commit_layers(operands.pages, shape),
+        commit_layers(operands.pages, shape, operands.state_indices.long()),
         spec_query_len=shape.spec_query_len,
         max_num_reqs=shape.batch_size,
     )
@@ -503,8 +526,8 @@ def check_verify(
     if not torch.isfinite(output).all():
         raise AssertionError("non-finite verify output")
     o_err = rmse_ratio(expected_o, output[0, tokens])
-    corr_err = rmse_ratio(expected_corr, page.correction[slots])
-    if not torch.equal(page.kg[slots], expected_kg):
+    corr_err = rmse_ratio(expected_corr, operands.records.correction[:n])
+    if not torch.equal(operands.records.key_gate[:n], expected_kg):
         raise AssertionError("key/gate record mismatch")
     if not (o_err < output_tol and corr_err < correction_tol):
         raise AssertionError(

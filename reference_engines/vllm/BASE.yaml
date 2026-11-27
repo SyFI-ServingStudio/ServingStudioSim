@@ -1,13 +1,11 @@
 # vLLM reference engine: the upstream commit patches/ apply to and its official image.
 # Read by reference_engines (README.md); change it with `just ref bump-base vllm`.
 upstream_repo: https://github.com/vllm-project/vllm.git
-upstream_commit: 5629b26146a39705c814ddae6a0f98321e14d2a6
-image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26146a39705c814ddae6a0f98321e14d2a6
+upstream_commit: c5db9bd35fb0b0ca75a670d037b7a1d9aa8cfcc8
+image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c5db9bd35fb0b0ca75a670d037b7a1d9aa8cfcc8
 platforms:
   linux/amd64:
-    digest: sha256:a3a232b8e67f29b928ca5418a962f7b03d6a29045cf2b27c39d574ab2c1d4e5c
+    digest: sha256:02a5d7cbd05dff6b81acf9205b4beb9aa0b8300a707e31eb117bf4799226b528
   linux/arm64:
-    note: vLLM's CI publishes no -arm64 image of 5629b26. b4dffa50 is 3 commits earlier and differs from it only in recipes/ and tests/ (no vllm/ or csrc/ change), so the same patches apply to its installed vllm/.
-    image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:b4dffa5095ffa673ed1530524a503b168f5b611c-arm64
-    upstream_commit: b4dffa5095ffa673ed1530524a503b168f5b611c
-    digest: sha256:f64971090ca3f36d6e3a2b8f20426eefd117c3889b56e73f892409aa9e6f3ca5
+    image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c5db9bd35fb0b0ca75a670d037b7a1d9aa8cfcc8-arm64
+    digest: sha256:dabf005e86d789bb42b773b4f3e6e131279ac73d638c8b4bc89bd616f3f2c412

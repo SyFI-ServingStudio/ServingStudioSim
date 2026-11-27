@@ -149,6 +149,7 @@ from profiling.kernels import (
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
     sparse_mla_norm_rope_cast_prefill,  # noqa: F401
+    sparse_mla_shard_q,  # noqa: F401
     sparse_mqa_logits_decode,  # noqa: F401
     sparse_mqa_logits_decode_metadata,  # noqa: F401
     sparse_mqa_logits_metadata,  # noqa: F401

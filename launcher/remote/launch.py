@@ -40,6 +40,9 @@ class Submitted:
     slurm: bool
     # A container job: its `pid` file is in the container's pid namespace.
     container: bool = False
+    # Queued into a held allocation: the queue entry (`<queue>/<job id>`,
+    # without its .job/.running/.done suffix); ``handle`` is the allocation.
+    queued: PurePosixPath | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ class Container:
     gpu_count: int = 1
     # The image's `ai.vibesim.cache-key` label; empty for an image without one.
     cache_label: str = ""
+    # `docker`, or `pyxis`: `srun --container-image` of ``squashfs`` on ``nodes``.
+    runtime: str = "docker"
+    squashfs: str = ""
+    nodes: int = 1
 
 
 # Quoted twice: docker reads the value as CSV, so a GPU list needs its own quotes.
@@ -178,6 +185,8 @@ def container_script(
     started records the ``docker run`` status instead.
     """
 
+    if container.runtime == "pyxis":
+        return pyxis_script(container, job_id=job_id, jobdir=jobdir, cwd=cwd)
     name = container_name(job_id)
     log = q(jobdir / "stdout.log")
     volumes = []
@@ -283,6 +292,96 @@ def container_script(
     )
 
 
+def pyxis_script(
+    container: Container, *, job_id: str, jobdir: PurePosixPath, cwd: PurePosixPath
+) -> str:
+    """The host side of one pyxis job: one container task per allocated node.
+
+    Node 0 runs ``node.py run-job``; every other node runs the capture's peer
+    agent (`alignment/profiler/multinode.py`), told where the head is and where
+    the job's peer files live. When node 0's task ends it writes ``done`` there,
+    so the peers leave too and `srun` returns. The container sees the workdir,
+    node-local scratch and each mount at the same path and ``/cache`` as the
+    image's persistent cache for these cards, as a docker job does, kept on
+    each node's local disk. Slurm
+    already confines the task to its GPUs.
+    """
+
+    log = q(jobdir / "stdout.log")
+    peer_dir = jobdir / "peers"
+    # Node-local, not the shared workdir: every node of a multi-node capture
+    # JIT-compiles into it at once (Triton writes a temp dir and renames it),
+    # and on NFS that races into EBUSY and stale file handles. A pinned node
+    # list keeps each node's warm cache across jobs.
+    cache_root = container.node_local / "vibesim-cache"
+    mounts = ",".join(
+        f"{path}:{path}"
+        for path in dict.fromkeys((container.workdir, container.node_local, *container.mounts))
+    )
+    fallback_key = container.image.replace("/", "_").replace(":", "_")
+    inner = (
+        "export VIBESIM_NODE_RANK=$SLURM_NODEID; "
+        'if [ "$SLURM_NODEID" = 0 ]; then '
+        f"{q(container.python)} -m launcher.remote.node run-job {q(jobdir)}; rc=$?; "
+        f"touch {q(peer_dir / 'done')}; exit $rc; "
+        f"else exec {q(container.python)} -m alignment.profiler.multinode peer; fi"
+    )
+    srun = [
+        "srun",
+        "--kill-on-bad-exit=0",
+        f"--nodes={container.nodes}",
+        "--ntasks-per-node=1",
+        f"--container-image={container.squashfs}",
+        f'--container-mounts={mounts},"$cache":/cache',
+        "--no-container-mount-home",
+        # vLLM, Triton and FlashInfer write under /tmp and the root filesystem;
+        # the smoke runs on these squashfs images needed a writable one.
+        "--container-writable",
+        f"--container-workdir={cwd}",
+        "bash",
+        "-c",
+        shlex.quote(inner),
+    ]
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            "set -uo pipefail",
+            *(
+                [
+                    "caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sort -u)",
+                    'if [ "$(echo "$caps" | wc -l)" -ne 1 ]; then echo "[remote] GPUs mix '
+                    f'compute capabilities: $caps" >> {log}; '
+                    f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
+                    f"cache={q(cache_root)}/{shlex.quote(container.cache_label)}"
+                    '-sm$(echo "$caps" | tr -d .)',
+                ]
+                if container.cache_label
+                else [f"cache={q(cache_root / fallback_key)}"]
+            ),
+            # The cache is node-local: make it on every node, or pyxis cannot
+            # mount it into the peers' containers.
+            f'srun --nodes={container.nodes} --ntasks-per-node=1 mkdir -p "$cache/home"',
+            f"mkdir -p {q(peer_dir)}",
+            'head=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)',
+            "head_addr=$(getent ahostsv4 \"$head\" | awk 'NR==1 {print $1}')",
+            f"export VIBESIM_NODE_COUNT={container.nodes} VIBESIM_HEAD_ADDR=$head_addr "
+            f"VIBESIM_PEER_DIR={q(peer_dir)} HOME=/cache/home HF_HUB_OFFLINE=1 "
+            "USER=vibesim LOGNAME=vibesim",
+            f'echo "[remote] pyxis job {job_id} on $SLURM_JOB_NODELIST (head $head_addr), '
+            f'{container.squashfs}, cache $cache" >> {log}',
+            "child=",
+            'stop() { [ -n "$child" ] && kill -TERM "$child" 2>/dev/null; }',
+            "trap stop TERM INT HUP",
+            " ".join(srun) + " &",
+            "child=$!",
+            'while :; do wait "$child"; status=$?; kill -0 "$child" 2>/dev/null || break; done',
+            f"[ -f {q(jobdir / 'exit_code')} ] || echo $status > {q(jobdir / 'exit_code')}",
+            "exit $status",
+            "",
+        ]
+    )
+
+
 def sbatch_script(
     slurm: Slurm, *, name: str, jobdir: PurePosixPath, cwd: PurePosixPath, command: str
 ) -> str:
@@ -301,6 +400,8 @@ def sbatch_script(
         lines.append(f"#SBATCH --mem={slurm.mem}")
     if slurm.account:
         lines.append(f"#SBATCH --account={slurm.account}")
+    if slurm.nodes > 1:
+        lines.append(f"#SBATCH --nodes={slurm.nodes}")
     if slurm.gpus:
         lines.append(f"#SBATCH --gres=gpu:{slurm.gpus}")
     lines += [f"#SBATCH {extra}" for extra in slurm.extra]
@@ -343,6 +444,8 @@ def submit(
         pid = transport.run(script).stdout.strip()
         transport.write_text(jobdir / "launch.pid", pid + "\n")
         return Submitted(jobdir, pid, slurm=False, container=container is not None)
+    if remote.slurm.allocation is not None:
+        return _enqueue(transport, remote, job_id=job_id, jobdir=jobdir, cwd=cwd, command=command)
     batch = jobdir / "job.sbatch"
     transport.write_text(
         batch,
@@ -359,9 +462,56 @@ def submit(
     return Submitted(jobdir, slurm_id, slurm=True, container=container is not None)
 
 
+def allocation_queue(remote: Remote) -> PurePosixPath:
+    """Where the held allocation's runner looks for jobs (its QUEUE_DIR)."""
+    assert remote.slurm is not None and remote.slurm.allocation is not None
+    return remote.workdir / "allocations" / remote.slurm.allocation
+
+
+def _enqueue(
+    transport: Transport,
+    remote: Remote,
+    *,
+    job_id: str,
+    jobdir: PurePosixPath,
+    cwd: PurePosixPath,
+    command: str,
+) -> Submitted:
+    """Queue a job into the held allocation instead of submitting it."""
+    assert remote.slurm is not None and remote.slurm.allocation is not None
+    allocation = remote.slurm.allocation
+    queue = allocation_queue(remote)
+    state = transport.run(f"squeue -h -j {shlex.quote(allocation)} -o %T", check=False)
+    if state.stdout.strip() != "RUNNING":
+        raise RuntimeError(
+            f"allocation {allocation} is not running ({state.stdout.strip() or 'gone'}); "
+            "hold one with launcher/remote/allocation_runner.sh"
+        )
+    entry = queue / job_id
+    line = (
+        "unset VIBESIM_MANAGED_JOB_CONTEXT VIBESIM_MANAGED_RUN_CONTEXT; "
+        f"cd {q(cwd)} && exec {command} > {q(jobdir / 'slurm.out')} 2>&1"
+    )
+    # Written whole, then renamed: the runner must never read half a line.
+    transport.write_text(PurePosixPath(f"{entry}.tmp"), line + "\n")
+    transport.run(f"mv {q(PurePosixPath(f'{entry}.tmp'))} {q(PurePosixPath(f'{entry}.job'))}")
+    transport.write_text(jobdir / "slurm_id", allocation + "\n")
+    return Submitted(jobdir, allocation, slurm=True, container=True, queued=entry)
+
+
 def status_script(submitted: Submitted, offset: int) -> str:
     jobdir = q(submitted.jobdir)
-    if submitted.slurm:
+    if submitted.queued is not None:
+        entry = q(submitted.queued)
+        alive = (
+            f"state=$(squeue -h -j {shlex.quote(submitted.handle)} -o %T 2>/dev/null); "
+            f'if [ -z "$state" ]; then echo alive=0; echo "detail=allocation gone"; '
+            f"elif [ -f {entry}.done ]; then echo alive=0; "
+            f'echo "detail=exited $(cat {entry}.done) without an exit code"; '
+            f"elif [ -f {entry}.running ]; then echo alive=1; echo detail=RUNNING; "
+            "else echo alive=1; echo detail=PENDING; fi"
+        )
+    elif submitted.slurm:
         alive = (
             f"state=$(squeue -h -j {shlex.quote(submitted.handle)} -o %T 2>/dev/null); "
             'if [ -n "$state" ]; then echo alive=1; echo "detail=$state"; else '
@@ -409,6 +559,11 @@ def poll(transport: Transport, submitted: Submitted, offset: int) -> Status:
 
 
 def cancel(transport: Transport, submitted: Submitted) -> None:
+    if submitted.queued is not None:
+        # The allocation stays: the runner stops this job and takes the next.
+        entry = q(submitted.queued)
+        transport.run(f"rm -f {entry}.job; touch {entry}.cancel", check=False)
+        return
     if submitted.slurm:
         transport.run(f"scancel {shlex.quote(submitted.handle)}", check=False)
         return

@@ -12,6 +12,7 @@
 //! lays the same rows on a time axis instead of summing them.
 
 mod barrier;
+mod clock;
 pub(crate) mod host;
 mod kernel_rows;
 pub(crate) mod timeline;
@@ -315,6 +316,15 @@ struct MeasuredIteration {
     /// measured cost. Absent in v4, where it reads as zero.
     #[serde(default)]
     jit_stall_ns: u64,
+    /// DP ranks that ran this forward as a dummy (no NVTX window of their own,
+    /// but they still join the step's EP collectives). Absent before DP-aware
+    /// parses, where it reads as empty.
+    #[serde(default)]
+    dummy_dp_ranks: Vec<i64>,
+    /// Capture devices with no window in this step. Absent before DP-aware
+    /// parses, where it reads as empty.
+    #[serde(default)]
+    devices_absent: Vec<i64>,
     ranges: Vec<MeasuredRange>,
 }
 
@@ -607,6 +617,38 @@ struct IterationMeasurement {
     /// of one track ran while another was busy is the difference between the
     /// per-track unions and the union across them.
     track_intervals: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    /// `node -> ns` subtracted from that node's timestamps to put it on the
+    /// head's clock ([`clock`]). Empty on one clock; a node that neither this
+    /// iteration nor the run could align is absent.
+    clock_offsets_ns: BTreeMap<i64, i64>,
+    /// `node -> which estimate` for every peer node of a multi-node capture.
+    clock_offset_sources: BTreeMap<i64, clock::OffsetSource>,
+    /// The iteration's own clock evidence, before any run-wide fallback.
+    clock_estimate: clock::IterationEstimate,
+}
+
+/// Calibrate the run-wide clock fallback ([`clock::ClockDomains::with_run_offsets`])
+/// from every measured iteration's own estimate. A one-clock capture returns
+/// `clocks` unchanged without measuring anything. Iterations that fail to
+/// measure here are skipped; the main pass reports their errors.
+fn calibrate_clocks(
+    clocks: clock::ClockDomains,
+    iterations: &[MeasuredIteration],
+    inventory: &CompiledInventory,
+    kernel_names: &BTreeMap<u64, &str>,
+) -> clock::ClockDomains {
+    if !clocks.is_multi_node() {
+        return clocks;
+    }
+    let estimates: Vec<clock::IterationEstimate> = iterations
+        .par_iter()
+        .filter_map(|iteration| {
+            measure_iteration(iteration, inventory, kernel_names, &clocks)
+                .ok()
+                .map(|measurement| measurement.clock_estimate)
+        })
+        .collect();
+    clocks.with_run_offsets(&estimates)
 }
 
 #[derive(Default)]
@@ -670,6 +712,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "case-map schema_version must be 1"
     );
     let inventory = load_inventory(&input.labeled_kernel_sequences)?;
+    let clocks = clock::ClockDomains::from_profile_dir(&input.profile_log_dir)?;
 
     let manifests = read_cost_manifests(&input.predict_log_dir)?;
     let (pool_tag, worker_id, manifest) = single_iter_manifest(&manifests)?;
@@ -686,6 +729,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let measured_gpu_cycles_ms = measured_gpu_cycles_ms(&measured.iteration_details)?;
     let kernel_names = kernel_name_index(&measured)?;
     inventory.validate_slots(manifest)?;
+    let clocks = calibrate_clocks(clocks, &measured.iteration_details, &inventory, &kernel_names);
 
     let mut iteration_rows = Vec::new();
     // Per-iteration kernel breakdowns are the bulk of this subject — 550 MB of
@@ -733,7 +777,26 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // Chunked rather than one `par_iter` over every case: an `IterationMeasurement`
     // holds every launch of its iteration, and this subject already peaks near
     // 68 GB. A chunk bounds the extra live set to `MEASURE_CHUNK` of them.
-    for chunk in case_map.cases.chunks(MEASURE_CHUNK) {
+    // Steps whose measured side is missing a participating rank's kernels are
+    // left out of every Check 1 statistic: see `incomplete_device_coverage`.
+    let mut coverage_excluded_iterations = Vec::new();
+    let included_cases: Vec<&CaseMap> = case_map
+        .cases
+        .iter()
+        .filter(|joined| {
+            let Some(measured_iter) = measured_by_id.get(&joined.measured_iteration) else {
+                return true; // reported as an error by the main pass
+            };
+            match incomplete_device_coverage(measured_iter, inventory.device_ids.as_ref()) {
+                Some(entry) => {
+                    coverage_excluded_iterations.push(entry);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect();
+    for chunk in included_cases.chunks(MEASURE_CHUNK) {
         let chunk_outputs = chunk
             .par_iter()
             .map(
@@ -752,7 +815,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                             joined.case_index
                         )
                     })?;
-                    let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+                    let measurement = measure_iteration(measured_iter, &inventory, &kernel_names, &clocks)?;
                     let output = build_breakdown(
                         joined,
                         measured_iter,
@@ -875,6 +938,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "stage": joined.stage,
                 "iteration_type": measured_iter.iteration_type,
                 "measured_busy_union_ms": output.measured_busy_union_ms,
+                "clock_offset_ns_by_node": measurement.clock_offsets_ns,
+                "clock_offset_source_by_node": measurement.clock_offset_sources,
                 "simulated_ms": simulated_ms,
                 "delta_ms": delta_ms,
                 "relative_diff_pct": relative_pct,
@@ -1066,6 +1131,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
             "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
+            "excluded_iterations": coverage_excluded_iterations,
             "pdl_wait_under_collective_ms": iteration_rows
                 .iter()
                 .filter_map(|row| row.get("pdl_wait_under_collective_ms").and_then(Value::as_f64))
@@ -1134,6 +1200,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
             "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
+            "excluded_iterations": coverage_excluded_iterations,
         },
         "iterations": report["iterations"],
         "sequences": sequences,
@@ -1595,6 +1662,7 @@ fn measure_iteration(
     measured_iter: &MeasuredIteration,
     inventory: &CompiledInventory,
     kernel_names: &BTreeMap<u64, &str>,
+    clocks: &clock::ClockDomains,
 ) -> Result<IterationMeasurement> {
     let ranges: Vec<_> = measured_iter
         .ranges
@@ -1848,6 +1916,51 @@ fn measure_iteration(
         }
     }
 
+    // Put every node on the head's clock before anything compares launches
+    // across ranks: the order of positions and the barrier windows both do.
+    let clock_estimate = clock::estimate_iteration(&kernels, clocks);
+    let resolved = clocks.resolve(&clock_estimate);
+    let clock_offset_sources: BTreeMap<i64, clock::OffsetSource> =
+        resolved.iter().map(|(node, (_, source))| (*node, *source)).collect();
+    let clock_offsets_ns: BTreeMap<i64, i64> = resolved
+        .into_iter()
+        .filter(|(_, (_, source))| *source != clock::OffsetSource::None)
+        .map(|(node, (offset, _))| (node, offset))
+        .collect();
+    let mut busy_union_ms = busy_union_ms;
+    if !clock_offsets_ns.is_empty() {
+        let offset_of =
+            |device: i64| clock_offsets_ns.get(&clocks.node_of(device)).copied().unwrap_or(0);
+        for item in kernels.values_mut() {
+            for launch in &mut item.launches {
+                let offset = offset_of(launch.device_id);
+                launch.start_ns = clock::shift(launch.start_ns, offset);
+                launch.end_ns = clock::shift(launch.end_ns, offset);
+            }
+            item.first_start_ns = item.launches.iter().map(|launch| launch.start_ns).min();
+        }
+        for (device, tracks) in &mut track_intervals {
+            let offset = offset_of(*device);
+            for intervals in tracks.values_mut() {
+                for interval in intervals.iter_mut() {
+                    *interval = (clock::shift(interval.0, offset), clock::shift(interval.1, offset));
+                }
+            }
+        }
+        for summary in &mut phase_summaries {
+            let offset = offset_of(summary.device_id);
+            summary.span_ns = (
+                clock::shift(summary.span_ns.0, offset),
+                clock::shift(summary.span_ns.1, offset),
+            );
+        }
+        let shifted: Vec<(u64, u64)> = track_intervals
+            .values()
+            .flat_map(|tracks| tracks.values().flatten().copied())
+            .collect();
+        busy_union_ms = interval_union_ns(&shifted) as f64 / 1e6;
+    }
+
     let mut inventory_kernels: Vec<_> = kernels.into_iter().collect();
     inventory_kernels.sort_by_key(|(_, item)| item.first_start_ns.unwrap_or(u64::MAX));
     let kernels = join_mapped_occurrences(&inventory_kernels)?;
@@ -1858,6 +1971,9 @@ fn measure_iteration(
         device_ids,
         busy_union_ms,
         track_intervals,
+        clock_offsets_ns,
+        clock_offset_sources,
+        clock_estimate,
     })
 }
 
@@ -3055,6 +3171,8 @@ fn definitions() -> Value {
         ("critical_busy_ms_by_device", "each rank's share of critical_busy_ms, from the segments it won"),
         ("measured_track_busy", "per device and concurrent track, that track own busy union and launch count"),
         ("measured_kernel_overlap", "per position, summed over its launches: duration, overlap with the union of every other launch on the same device, and the same with only same-stream or only other-stream launches. A pair of overlapping launches reports the shared stretch on both sides, so these do not sum to any hidden total. same_stream_ms may be griddepcontrol.wait residency"),
+        ("clock_offset_ns_by_node", "per peer node, nanoseconds subtracted from its timestamps to put it on the head node's clock; see clock_offset_source_by_node for which estimate was used; empty on one clock"),
+        ("clock_offset_source_by_node", "per peer node, where its offset came from: iteration (median exit difference over this iteration's node-spanning synchronizing collectives, at least three), run_median (the iteration had too few such collectives or an implausible estimate, so the median of the per-iteration estimates over the whole capture was used), or none (no estimate, left unshifted)"),
         ("measured_busy_union_ms", "audit-only physical union of CUDA kernel intervals across every NSYS phase and rank; it is independent of the measured_ms path and is not the multiplier denominator"),
         ("total_simulated_ms", "timing-predict cost-tree total_time_ms (Sum/Max/Scale semantics preserved)"),
         ("relative_diff_pct", "(simulated - measured) / measured * 100; positive means overprediction"),
@@ -3062,6 +3180,7 @@ fn definitions() -> Value {
         ("comparison.absolute_error_pct", "aggregate absolute error = sum(abs(simulated_ms - measured_ms)) / sum(measured_ms) * 100. This is duration-weighted and differs from the unweighted abs_relative_error_pct mean"),
         ("operation_impact_rank", "semantic operations ordered by descending aggregate absolute_error_ms, then operation name. Physical kernels and simulated slots are not forced into a false one-to-one join"),
         ("measured_gpu_cycle_ms", "CUPTI first-kernel start of the next valid measured iteration minus first-kernel start of this iteration; the final valid iteration has no cycle. Idle, collective skew, and the inter-iteration gap live here, not in measured_ms; the recommended_gpu_time_multiplier is the correction that spans them"),
+        ("excluded_iterations", "one entry per measured step left out of every Check 1 statistic (no iteration row, no aggregate), with the evidence. reason incomplete_device_coverage: a DP rank ran the forward as a dummy, but its devices have no captured kernels, so the step's EP collectives cover fewer devices than the world size"),
         ("multiplier_excluded_iterations", "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when measured_gpu_cycle_ms / measured_ms both exceeds 2.0 and is an Iglewicz-Hoaglin outlier within its own stage"),
         ("recommended_gpu_time_multiplier", "validated physical duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_ms after the per-stage outlier screen. measured_ms is the barrier critical path (busy + collective) that timing-predict models. Null when the raw ratio is non-finite or below one"),
         ("raw_gpu_time_multiplier", "the physical duty-cycle ratio before validation; retained when no recommendation can safely be injected into simulation"),
@@ -3087,6 +3206,57 @@ fn definitions() -> Value {
             .map(|(key, text)| ((*key).to_owned(), json!(text)))
             .collect(),
     )
+}
+
+/// Reason tag of [`incomplete_device_coverage`] exclusions.
+const INCOMPLETE_DEVICE_COVERAGE: &str = "incomplete_device_coverage";
+
+/// Whether a measured step lacks the kernels of a rank that took part in it.
+///
+/// Under data parallelism with expert parallelism every rank runs one forward
+/// per global step; a rank with no scheduled work runs a dummy forward that
+/// still joins the step's EP collectives, but opens no NVTX window, so the
+/// parse attributes none of its kernels to the step. The measured side then
+/// holds only part of the collective's participants: the barrier model sees
+/// fewer devices than the world size and the step's measured time is not the
+/// step the simulator predicts. Such a step is excluded (with the evidence)
+/// rather than compared. A step with every device present, or a capture
+/// without a labeled device population, is kept.
+fn incomplete_device_coverage(
+    measured_iter: &MeasuredIteration,
+    world: Option<&BTreeSet<i64>>,
+) -> Option<Value> {
+    let world = world?;
+    if measured_iter.dummy_dp_ranks.is_empty() {
+        return None;
+    }
+    let present: BTreeSet<i64> = measured_iter
+        .ranges
+        .iter()
+        .filter_map(|range| range.device_id)
+        .collect();
+    let absent: BTreeSet<i64> = world
+        .iter()
+        .copied()
+        .filter(|device| !present.contains(device))
+        .chain(measured_iter.devices_absent.iter().copied().filter(|d| world.contains(d)))
+        .collect();
+    if absent.is_empty() {
+        return None;
+    }
+    let covered = world.len() - absent.len();
+    Some(json!({
+        "iteration": measured_iter.iteration,
+        "reason": INCOMPLETE_DEVICE_COVERAGE,
+        "detail": format!(
+            "DP rank(s) {:?} ran this forward as a dummy but devices {:?} have no captured kernels, so its EP collectives cover {} of {} devices",
+            measured_iter.dummy_dp_ranks, absent, covered, world.len()
+        ),
+        "dummy_dp_ranks": measured_iter.dummy_dp_ranks,
+        "devices_absent": absent,
+        "covered_devices": covered,
+        "world_size": world.len(),
+    }))
 }
 
 #[cfg(test)]
@@ -3595,6 +3765,61 @@ mod tests {
         assert_eq!(pooled_gpu_time_multiplier(0.0, 0.0), 1.0);
     }
 
+    fn coverage_iteration(devices: &[i64], dummy: &[i64], absent: &[i64]) -> MeasuredIteration {
+        MeasuredIteration {
+            iteration: 16,
+            iteration_type: "prefill".into(),
+            jit_module_loads: 0,
+            jit_stall_ns: 0,
+            dummy_dp_ranks: dummy.to_vec(),
+            devices_absent: absent.to_vec(),
+            ranges: devices
+                .iter()
+                .map(|&device| MeasuredRange {
+                    device_id: Some(device),
+                    phase: "forward".into(),
+                    start_ns: 0,
+                    end_ns: 100,
+                    kernels: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dummy_rank_without_captured_kernels_is_excluded_with_evidence() {
+        let world: BTreeSet<i64> = (0..4).collect();
+        let iteration = coverage_iteration(&[2, 3], &[0], &[0, 1]);
+        let entry = incomplete_device_coverage(&iteration, Some(&world)).expect("excluded");
+        assert_eq!(entry["iteration"], 16);
+        assert_eq!(entry["reason"], INCOMPLETE_DEVICE_COVERAGE);
+        assert_eq!(entry["devices_absent"], json!([0, 1]));
+        assert_eq!(entry["covered_devices"], 2);
+        assert_eq!(entry["world_size"], 4);
+        assert_eq!(entry["dummy_dp_ranks"], json!([0]));
+    }
+
+    #[test]
+    fn absent_devices_are_found_even_without_the_parse_field() {
+        // An older parse without `devices_absent`: the missing devices still
+        // follow from the ranges against the labeled population.
+        let world: BTreeSet<i64> = (0..4).collect();
+        let iteration = coverage_iteration(&[0, 1], &[1], &[]);
+        let entry = incomplete_device_coverage(&iteration, Some(&world)).expect("excluded");
+        assert_eq!(entry["devices_absent"], json!([2, 3]));
+    }
+
+    #[test]
+    fn complete_or_non_dummy_steps_are_kept() {
+        let world: BTreeSet<i64> = (0..4).collect();
+        // Every device present, even with a dummy rank: its kernels were captured.
+        assert!(incomplete_device_coverage(&coverage_iteration(&[0, 1, 2, 3], &[1], &[]), Some(&world)).is_none());
+        // No dummy rank: a partial step is the union catalog's business, not this rule's.
+        assert!(incomplete_device_coverage(&coverage_iteration(&[0, 1], &[], &[2, 3]), Some(&world)).is_none());
+        // No labeled device population (single-device schema).
+        assert!(incomplete_device_coverage(&coverage_iteration(&[0], &[1], &[1]), None).is_none());
+    }
+
     #[test]
     fn gpu_cycles_use_chronological_first_kernel_boundaries() {
         let measured_iteration = |iteration, start_ns| MeasuredIteration {
@@ -3602,6 +3827,8 @@ mod tests {
             iteration_type: "decode".into(),
             jit_module_loads: 0,
             jit_stall_ns: 0,
+            dummy_dp_ranks: Vec::new(),
+            devices_absent: Vec::new(),
             ranges: vec![MeasuredRange {
                 device_id: Some(0),
                 phase: "forward".into(),

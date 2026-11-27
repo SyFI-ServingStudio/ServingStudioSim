@@ -132,4 +132,6 @@ def test_unbudgeted_backend_lifts_only_the_byte_budget():
     assert "budget" in spec_error(over_budget)
     assert unbudgeted_spec_error(over_budget) is None
     assert "NVLink" in unbudgeted_spec_error({**over_budget, "fabric": "pcie"})
-    assert "TP" in unbudgeted_spec_error({**over_budget, "num_gpus": 16})
+    # vLLM's SM100 table stops at TP16 (multi-node MNNVL over GB200 trays).
+    assert unbudgeted_spec_error({**over_budget, "num_gpus": 16}) is None
+    assert "TP" in unbudgeted_spec_error({**over_budget, "num_gpus": 32})

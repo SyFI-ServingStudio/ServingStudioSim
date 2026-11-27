@@ -67,6 +67,30 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACK_ROOT = REPO_ROOT / "presets" / "alignment"
 HOST_ROOT = PACK_ROOT / "hosts"
 
+#: Draft counters of a pack whose depth differs from the synthetic pass's five
+#: positions, copied unchanged from that pack's own captured workload pass
+#: (`spec_decode_metrics.json`, replay Prometheus delta over diverse_100).
+CAPTURED_SPEC_METRICS = {
+    "kimi_k31_pro_nvfp4_b200x2_tp8dp2_ep16": {
+        "schema_version": 1,
+        "num_drafts": 30990,
+        "draft_tokens": 216930,
+        "accepted_tokens": 104349,
+        "accepted_tokens_per_position": {
+            "0": 26818, "1": 21066, "2": 15994, "3": 12642, "4": 10598, "5": 9099, "6": 8132,
+        },
+    },
+    "kimi_k31_pro_nvfp4_gb200_tp16_ep16": {
+        "schema_version": 1,
+        "num_drafts": 30907,
+        "draft_tokens": 216349,
+        "accepted_tokens": 104444,
+        "accepted_tokens_per_position": {
+            "0": 26619, "1": 20809, "2": 15923, "3": 12743, "4": 10671, "5": 9322, "6": 8357,
+        },
+    },
+}
+
 
 def _pack_dirs() -> list[Path]:
     if not PACK_ROOT.is_dir():
@@ -104,7 +128,11 @@ def resolved_pack(request, tmp_path_factory):
     for case in loaded.cases:
         if case.capture_fields:
             directory = render_case(loaded, case, host, out_root, REPO_ROOT).directory
-            _write_workload_pass(directory)
+            captured = CAPTURED_SPEC_METRICS.get(request.param.name)
+            if captured is None:
+                _write_workload_pass(directory)
+            else:
+                _write_workload_pass(directory, spec_metrics=captured)
             case = materialize(loaded, case, directory, REPO_ROOT)
         cases.append(case)
     return dataclasses.replace(loaded, cases=tuple(cases))
@@ -1300,7 +1328,8 @@ def test_every_pack_case_device_role_is_recorded_with_the_right_width(pack):
         assert case.device_role in roles, f"{case.slug}: role not in recorded_on"
         devices = str(roles[case.device_role]).split(",")
         world = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
-        assert len(devices) == world, case.slug
+        # A multi-node role names one node's devices (check.py does the same).
+        assert len(devices) * int(variant.server.get("nnodes", 1)) == world, case.slug
         assert len(set(devices)) == len(devices), case.slug
 
 

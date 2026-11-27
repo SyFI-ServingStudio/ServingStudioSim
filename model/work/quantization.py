@@ -53,7 +53,10 @@ _LAYER_PREFIX = re.compile(r"^model\.(?:language_model\.)?layers\.\d+\.")
 _MODEL_PREFIX = re.compile(r"^model\.")
 _LAYER_INDEX = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)\.(.+)$")
 
-_SUPPORTED_QUANT_METHODS = ("fp8", "modelopt")
+_SUPPORTED_QUANT_METHODS = ("fp8", "modelopt", "modelopt_mixed")
+# A ModelOpt MIXED_PRECISION export that vLLM loads as ``modelopt_mixed``
+# (Kimi-K3.1-Pro NVFP4) names a layer three ways; all are one checkpoint path.
+_MIXED_KEY_ALIASES = re.compile(r"^(?:language_model\.model\.|model\.)?layers\.(?=\d+\.)")
 
 
 def _layer_relative(module: str) -> str:
@@ -215,14 +218,27 @@ _FP8_PER_TENSOR = QuantScheme(
     not_converted=frozenset(),
 )
 
+#: ModelOpt MXFP8: E4M3 weights with one UE8M0 scale per 32 weights along K.
+_MXFP8 = QuantScheme(
+    bytes_per_weight=1.0,
+    compute_dtype="fp8",
+    block_shape=(1, 32),
+    scale_dtype_bytes=1.0,
+    not_converted=frozenset(),
+)
+
 
 def _mixed_algo_scheme(module: str, entry: dict) -> QuantScheme:
     algo = str(entry.get("quant_algo", "")).upper()
     if algo == "FP8":
         return _FP8_PER_TENSOR
+    if algo == "MXFP8":
+        return _MXFP8
     if algo == "NVFP4":
         return _nvfp4_scheme(int(entry.get("group_size", 16)))
-    raise ValueError(f"MIXED_PRECISION {module!r}: model.work knows FP8 and NVFP4, not {algo!r}")
+    raise ValueError(
+        f"MIXED_PRECISION {module!r}: model.work knows FP8, MXFP8 and NVFP4, not {algo!r}"
+    )
 
 
 def _layer_type_algos(entries: dict[str, dict], layer_types: list[str]) -> dict[str, dict]:
@@ -288,7 +304,24 @@ def config_layer_types(raw_config: dict) -> list[str] | None:
     ``text_config`` for a VL wrapper), or None when it leaves the schedule implicit."""
     text = raw_config.get("text_config", raw_config)
     layer_types = text.get("layer_types") or raw_config.get("layer_types")
-    return list(layer_types) if layer_types else None
+    if layer_types:
+        return list(layer_types)
+    return _kimi_linear_layer_types(text)
+
+
+def _kimi_linear_layer_types(text: dict) -> list[str] | None:
+    """Kimi-Linear's schedule: ``linear_attn_config`` numbers its KDA and full
+    attention layers from 1, and the first ``first_k_dense_replace`` layers keep
+    a dense MLP instead of the MoE."""
+    linear = text.get("linear_attn_config") if text.get("model_type") == "kimi_linear" else None
+    if not linear:
+        return None
+    full = {int(number) - 1 for number in linear.get("full_attn_layers", ())}
+    dense = int(text.get("first_k_dense_replace", 0))
+    return [
+        ("full_attention" if layer in full else "kda") + ("_dense" if layer < dense else "_moe")
+        for layer in range(int(text["num_hidden_layers"]))
+    ]
 
 
 def _mixed_precision_scheme(
@@ -304,15 +337,29 @@ def _mixed_precision_scheme(
             "layer_types, so the model builder must pass its layer schedule"
         )
     # An excluded module is left unquantized even if listed (vLLM checks it first).
+    # Against this allow-list a `*name*` entry is a substring match on the path
+    # (Kimi-K3.1-Pro's `*block_sparse_moe.gate*`); any other entry keeps the
+    # one-trailing-`*` rule.
+    ignore = quant.get("ignore", quant.get("exclude_modules"))
+    anywhere = [
+        entry[1:-1]
+        for entry in ignore or ()
+        if len(entry) > 2 and entry.startswith("*") and entry.endswith("*") and entry.count("*") == 2
+    ]
+    rest = None if ignore is None else [entry for entry in ignore if entry[1:-1] not in anywhere or not entry.startswith("*")]
     excluded = [
         entry[:-1] if entry.endswith("*") else f"{entry}."
-        for entry in modelopt_excluded(quant) or ()
+        for entry in modelopt_excluded({"ignore": rest} if rest is not None else {}) or ()
     ]
-    entries = {
-        path: entry
-        for path, entry in quant["quantized_layers"].items()
-        if not any(f"{path}.".startswith(prefix) for prefix in excluded)
-    }
+    entries: dict[str, dict] = {}
+    for path, entry in quant["quantized_layers"].items():
+        if any(f"{path}.".startswith(prefix) for prefix in excluded) or any(
+            name in path for name in anywhere
+        ):
+            continue
+        key = _MIXED_KEY_ALIASES.sub("model.layers.", path)
+        if entries.setdefault(key, entry) != entry:
+            raise ValueError(f"MIXED_PRECISION lists {key!r} twice with different algorithms")
     algos = _pack_shards(_layer_type_algos(entries, layer_types), packed_modules)
     schemes = {module: _mixed_algo_scheme(module, entry) for module, entry in algos.items()}
     if not schemes:
@@ -364,7 +411,9 @@ def parse_quantization_config(
             f"unsupported quant_method {method!r}; model.work knows "
             f"{_SUPPORTED_QUANT_METHODS} — extend quantization.py before using this config"
         )
-    if method == "modelopt":
+    if method == "modelopt_mixed" and quant.get("quant_algo") != "MIXED_PRECISION":
+        raise ValueError("quant_method 'modelopt_mixed' requires quant_algo='MIXED_PRECISION'")
+    if method in ("modelopt", "modelopt_mixed"):
         if quant.get("quant_algo") == "MIXED_PRECISION":
             if layer_types is None:
                 layer_types = config_layer_types(raw_config)

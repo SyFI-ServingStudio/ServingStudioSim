@@ -3262,7 +3262,8 @@ pub fn build_iter_model(
         | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
         | IterArchSel::DeepseekV41VllmDspark { .. }
         | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
-        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+        | IterArchSel::KimiK31VllmNvfp4TpAttnEpMoeDspark { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -3462,6 +3463,10 @@ pub fn build_speculative_iter_model(
                 name,
                 bridge,
             )?),
+            *draft_tokens,
+        )),
+        IterArchSel::KimiK31VllmNvfp4TpAttnEpMoeDspark { draft_tokens, .. } => Ok((
+            Box::new(kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark(selector, gpu, name, bridge)?),
             *draft_tokens,
         )),
         _ => bail!("timing-predict speculative_iter requires a speculative architecture"),
@@ -3743,7 +3748,8 @@ fn build_arch(
                     | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
                     | IterArchSel::DeepseekV41VllmDspark { .. }
                     | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
-                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+                    | IterArchSel::KimiK31VllmNvfp4TpAttnEpMoeDspark { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
@@ -5064,4 +5070,74 @@ mod tests {
         assert_ne!(json(&built[0]), json(&built[2]));
         assert!(built[1].error.as_deref().unwrap().contains("no_such_arch"));
     }
+}
+
+/// Kimi-K3.1-Pro NVFP4 with TP attention, EP routed experts and the DSpark
+/// proposer (`arch::kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark`).
+pub fn kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<crate::arch::kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark::KimiK31Model> {
+    use crate::arch::kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark as kimi;
+    let IterArchSel::KimiK31VllmNvfp4TpAttnEpMoeDspark {
+        model: model_spec,
+        draft_config,
+        tp_size,
+        dp_size,
+        ep_fabric,
+        max_model_len,
+        draft_tokens,
+        routing,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+    } = sel
+    else {
+        bail!("{sel:?} is not kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark");
+    };
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!("Kimi-K3.1 rejects num_layers/sim_num_layers overrides: the hybrid schedule is fixed");
+    }
+    let model = kimi::KimiK31ModelCfg::from_json(Path::new(&model_spec.model_config))?;
+    let draft = kimi::KimiDsparkCfg::from_json(Path::new(
+        draft_config.as_deref().unwrap_or("model/config/kimi_k31_pro_dspark.json"),
+    ))?;
+    anyhow::ensure!(
+        *draft_tokens == draft.block_size,
+        "DSpark drafts its whole block: draft_tokens must be {}, got {draft_tokens}",
+        draft.block_size
+    );
+    let ep_fabric: Fabric = match ep_fabric.as_deref().unwrap_or("nvlink") {
+        "nvlink" => Fabric::Nvlink,
+        "infiniband" => Fabric::Infiniband,
+        other => bail!("ep_fabric must be nvlink or infiniband, got {other:?}"),
+    };
+    let ep_size = tp_size * dp_size;
+    let routed_layers = model.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: *routing,
+        seed: *routing_seed,
+        num_experts: model.num_experts,
+        experts_per_token: model.experts_per_token,
+        ep_size,
+        expert_popularity_file: expert_popularity_file.as_deref(),
+        token_corpus_file: token_corpus_file.as_deref(),
+        num_routed_layers: routed_layers,
+    };
+    let demand = source.demand(0..routed_layers as usize, draft_tokens + 1)?;
+    let parallel = kimi::KimiK31Parallel {
+        tp_size: *tp_size,
+        dp_size: *dp_size,
+        gpu_name: gpu.to_string(),
+        ep_fabric,
+        max_model_len: *max_model_len,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.clone(),
+        draft_tokens: *draft_tokens,
+        backends: Default::default(),
+    };
+    kimi::build(name.to_string(), &model, &draft, parallel, &demand, bridge)
+        .context("building Kimi-K3.1 TP-attention/EP + DSpark (often a missing profile.db row)")
 }

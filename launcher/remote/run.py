@@ -108,6 +108,12 @@ class Session:
 
     def __init__(self, remote: Remote):
         self.remote = remote
+        if remote.platform is not None:
+            from reference_engines import PLATFORM_ENV
+
+            # Every image tag this run names (the capture's, a kernel job's)
+            # is the compute nodes' image, not this machine's.
+            os.environ[PLATFORM_ENV] = remote.platform
         self.transport = Transport(remote)
         # `files: shared` moves files with a local copy; commands still run on
         # the access host.
@@ -443,9 +449,26 @@ class Session:
 
         assert self.source is not None
         pod = self.remote.profile_runtime == "in-image"
+        pyxis = self.remote.profile_runtime == "pyxis"
+        squashfs = None
+        if pyxis:
+            self.check_container_host()
         if pod:
             found = self.transport.run(f"cat {q(IMAGE_MANIFEST)}", check=False)
             image_id = ""
+        elif pyxis:
+            assert self.remote.images is not None
+            squashfs = self.remote.images / (tag.replace(":", "+") + ".sqsh")
+            found = self.transport.run(
+                f"unsquashfs -cat {q(squashfs)} {q(str(IMAGE_MANIFEST).lstrip('/'))}",
+                check=False,
+            )
+            if found.returncode != 0:
+                raise RemoteRunError(
+                    f"{self.remote.name} has no squashfs of {tag} at {squashfs}; build it there "
+                    "(python -m profiling.container.enroot_build plan/build)"
+                )
+            image_id = squashfs.name
         else:
             self.check_container_host()
             image_id = self.ensure_image(tag)
@@ -481,6 +504,29 @@ class Session:
         self.image_python = PurePosixPath(python)
         if pod:
             return inputs
+        if pyxis:
+            assert squashfs is not None
+            labels = self.transport.run(
+                f"unsquashfs -cat {q(squashfs)} etc/vibesim-image-labels.json", check=False
+            ).stdout
+            try:
+                label = str(json.loads(labels).get("ai.vibesim.cache-key", ""))
+            except ValueError:
+                label = ""
+            slurm = self.remote.slurm
+            self.container = launch.Container(
+                image=tag,
+                python=self.image_python,
+                workdir=self.layout.workdir,
+                node_local=self.remote.node_local,
+                mounts=self.remote.mounts,
+                gpu_count=gpu_count,
+                cache_label="" if label in ("", "unknown") else label,
+                runtime="pyxis",
+                squashfs=str(squashfs),
+                nodes=1 if slurm is None else slurm.nodes,
+            )
+            return image_id
         label = self.transport.run(
             "docker image inspect --format "
             + q('{{index .Config.Labels "ai.vibesim.cache-key"}}')
@@ -502,6 +548,17 @@ class Session:
 
     def check_container_host(self) -> None:
         """Fail early, by name, on a remote that cannot run a GPU container."""
+
+        if self.remote.profile_runtime == "pyxis":
+            report = self.transport.run(
+                "srun --help 2>/dev/null | grep -q -- --container-image || echo missing=pyxis; "
+                "command -v unsquashfs >/dev/null || echo missing=unsquashfs",
+                check=False,
+            ).stdout
+            missing = [line.split("=", 1)[1] for line in report.splitlines() if "=" in line]
+            if missing:
+                raise RemoteRunError(f"{self.remote.name} cannot run pyxis jobs: {missing}")
+            return
 
         report = self.transport.run(
             "command -v docker >/dev/null || { echo 'missing=docker'; exit 0; }; "
@@ -1027,6 +1084,13 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     return outcome.exit_code or (0 if ok else 1)
 
 
+def _nodes(config: Path) -> int:
+    import yaml
+
+    server = (yaml.safe_load(config.read_text("utf-8")) or {}).get("server") or {}
+    return int(server.get("nnodes") or 1)
+
+
 def _world_size(config: Path) -> int:
     import yaml
 
@@ -1088,11 +1152,22 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
     env_name = f"{engines.pop()}_env"
     image = container_image(env_name)
     gpus = max(_world_size(config) for config in configs)
+    nodes = {_nodes(config) for config in configs}
+    if len(nodes) != 1:
+        raise RemoteRunError(f"one remote job has one node count; these use {sorted(nodes)}")
+    node_count = nodes.pop()
+    if node_count > 1 and session.remote.profile_runtime != "pyxis":
+        raise RemoteRunError(
+            f"a {node_count}-node server needs profile_runtime: pyxis on {session.remote.name}"
+        )
     if session.remote.slurm is not None:
         session.remote = dataclasses.replace(
             session.remote,
             slurm=dataclasses.replace(
-                session.remote.slurm, gpus=max(session.remote.slurm.gpus, gpus)
+                session.remote.slurm,
+                # Per node: Slurm's --gres counts one node's GPUs.
+                gpus=max(session.remote.slurm.gpus, gpus // node_count),
+                nodes=node_count,
             ),
         )
     elif (

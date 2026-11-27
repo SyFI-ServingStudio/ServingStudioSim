@@ -812,6 +812,9 @@ mod tests {
             device_ids,
             busy_union_ms: 0.0,
             track_intervals: BTreeMap::new(),
+            clock_offsets_ns: BTreeMap::new(),
+            clock_offset_sources: BTreeMap::new(),
+            clock_estimate: Default::default(),
         }
     }
 

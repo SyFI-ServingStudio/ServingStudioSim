@@ -576,6 +576,7 @@ fn layer_config(
             dtype: DType::Bf16,
             fabric: "nvlink".into(),
             max_total_tokens: 8192,
+            extra_total_tokens: Vec::new(),
         },
         finalize: ElementwiseKernelConfig {
             backends: vec!["torch"],

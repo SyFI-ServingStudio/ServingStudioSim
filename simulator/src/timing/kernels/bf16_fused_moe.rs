@@ -227,6 +227,8 @@ mod tests {
                 routed_scaling_denominator: 1,
                 expert_demand: popularity(),
                 folded_rank_position: 0,
+                extra_token_points: Vec::new(),
+                gated_activation: None,
             },
         );
 

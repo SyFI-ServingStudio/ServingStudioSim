@@ -466,6 +466,7 @@ pub fn build_configs(
                     activation_dtype: DType::Nvfp4E2m1,
                     fabric: "nvlink".into(),
                     max_total_tokens,
+                    extra_total_tokens: Vec::new(),
                 }),
                 Some(ElementwiseKernelConfig {
                     backends: ROUTER_SELECT_BACKENDS.to_vec(),
@@ -487,6 +488,7 @@ pub fn build_configs(
             dtype: ACTIVATION_DTYPE,
             fabric: "nvlink".into(),
             max_total_tokens,
+            extra_total_tokens: Vec::new(),
         },
         routed,
         local,

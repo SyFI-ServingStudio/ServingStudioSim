@@ -7,6 +7,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.runners.comm._batch import all_error, run_comm_batch
 from profiling.runners.comm._launcher import VllmLauncher
+from profiling.runners.comm._multinode import MultiNodeVllmLauncher, spans_nodes
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
 
@@ -36,6 +37,12 @@ def profile_moe_ep_reduce_scatter_batch(kwargs_list: list[dict]) -> list[RunnerR
     return _profile_batch(kwargs_list, _reduce_scatter_per_rank_batch, _validate_reduce_scatter)
 
 
+def profile_row_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    """`row_all_gather` over PyNCCL: vLLM's TP all-gather of bf16 rows (the
+    sequence-parallel gather before attention), one NCCL AllGather launch."""
+    return _profile_batch(kwargs_list, _row_all_gather_per_rank_batch, _validate_row_all_gather)
+
+
 def _profile_batch(kwargs_list: list[dict], per_rank_fn, validator) -> list[RunnerResult]:
     if not kwargs_list:
         return []
@@ -46,11 +53,17 @@ def _profile_batch(kwargs_list: list[dict], per_rank_fn, validator) -> list[Runn
             raise ProfilerNotImplemented("all batch specs must use the same num_gpus")
     except Exception as exc:  # noqa: BLE001 - validation maps one bad group to one batch error
         return all_error(len(kwargs_list), str(exc))
-    return run_comm_batch(
-        VllmLauncher(num_gpus),
-        per_rank_fn,
-        kwargs_list,
+    fabrics = {spec["fabric"] for spec in kwargs_list}
+    if len(fabrics) != 1:
+        return all_error(len(kwargs_list), "all batch specs must use the same fabric")
+    # One node's GPUs on NVLink; over InfiniBand (or a group larger than a node)
+    # the group spans the job's nodes.
+    launcher = (
+        MultiNodeVllmLauncher(num_gpus)
+        if fabrics == {"infiniband"} or spans_nodes(num_gpus, next(iter(fabrics)))
+        else VllmLauncher(num_gpus)
     )
+    return run_comm_batch(launcher, per_rank_fn, kwargs_list)
 
 
 def _validate_topology(
@@ -77,8 +90,10 @@ def _validate_topology(
         raise ValueError("per_rank_tokens must move at least one token")
     if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
         raise ValueError("hidden_size must be a positive integer")
-    if fabric != "nvlink":
-        raise ProfilerNotImplemented(f"vllm_pynccl supports fabric='nvlink', got {fabric!r}")
+    if fabric not in ("nvlink", "infiniband"):
+        raise ProfilerNotImplemented(
+            f"vllm_pynccl supports fabric 'nvlink' or 'infiniband', got {fabric!r}"
+        )
     return num_gpus, token_counts, hidden_size
 
 
@@ -173,6 +188,19 @@ def _validate_reduce_scatter(
     values = _validate_topology(num_gpus, per_rank_tokens, hidden_size, fabric)
     if DType.from_value(dtype) is not DType.BF16:
         raise ProfilerNotImplemented("MoE reduce-scatter requires dtype=bf16")
+    return values
+
+
+def _validate_row_all_gather(
+    num_gpus: int,
+    per_rank_tokens: tuple[int, ...] | list[int],
+    hidden_size: int,
+    dtype: DType | str,
+    fabric: str,
+) -> tuple[int, tuple[int, ...], int]:
+    values = _validate_topology(num_gpus, per_rank_tokens, hidden_size, fabric)
+    if DType.from_value(dtype) is not DType.BF16:
+        raise ProfilerNotImplemented("row all-gather requires dtype=bf16")
     return values
 
 
@@ -337,6 +365,55 @@ def _quantized_all_gather_per_rank_batch(
         if rank == 0:
             token_bytes = quantized_all_gather_token_bytes(hidden_size, top_k, dtype)
             local_payloads = [count * token_bytes for count in token_counts]
+            results.append(
+                _metric_payload(
+                    rank_times,
+                    sum(local_payloads) / world_size,
+                    sum(local_payloads) - min(local_payloads),
+                )
+            )
+    return results if rank == 0 else None
+
+
+def _row_all_gather_per_rank_batch(
+    *,
+    rank: int,
+    world_size: int,
+    communicator: Any,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+) -> list[dict] | None:
+    import torch
+    import torch.distributed as dist
+
+    results = []
+    for spec in specs:
+        _, token_counts, hidden_size = _validate_row_all_gather(**spec)
+        tensor = _rank_tensor(torch, token_counts[rank], hidden_size, rank, torch.bfloat16)
+        output = torch.empty((sum(token_counts), hidden_size), dtype=torch.bfloat16, device="cuda")
+
+        def launch() -> None:
+            if len(set(token_counts)) == 1:
+                communicator.all_gather(output, tensor)
+            else:
+                communicator.all_gatherv(output, tensor, sizes=list(token_counts))
+
+        launch()
+        torch.cuda.synchronize()
+        expected = torch.cat(
+            [
+                _rank_tensor(torch, count, hidden_size, source, torch.bfloat16)
+                for source, count in enumerate(token_counts)
+            ]
+        )
+        if not torch.equal(output, expected):
+            raise KernelLaunchFailed("PyNCCL row all-gather failed the Torch reference")
+
+        rank_time_ms = _time_launch(torch, dist, launch, warmup, rep)
+        rank_times = _gather_rank_times(dist, rank, world_size, rank_time_ms)
+        if rank == 0:
+            local_payloads = [count * hidden_size * 2 for count in token_counts]
             results.append(
                 _metric_payload(
                     rank_times,

@@ -16,6 +16,7 @@ from __future__ import annotations
 from profiling.db.args import DType
 from profiling.runners.comm._batch import all_error, run_comm_batch
 from profiling.runners.comm._launcher import TorchMpLauncher
+from profiling.runners.comm._multinode import MultiNodeTorchLauncher, spans_nodes
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
 
@@ -29,7 +30,12 @@ def profile_all_reduce_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     num_gpus = int(kwargs_list[0]["num_gpus"])
     if num_gpus < 2:
         return all_error(len(kwargs_list), "all-reduce needs at least 2 GPUs")
-    launcher = TorchMpLauncher(num_gpus, backend="nccl")
+    fabric = str(kwargs_list[0].get("fabric", "nvlink"))
+    launcher = (
+        MultiNodeTorchLauncher(num_gpus, backend="nccl")
+        if spans_nodes(num_gpus, fabric)
+        else TorchMpLauncher(num_gpus, backend="nccl")
+    )
     return run_comm_batch(launcher, _all_reduce_per_rank_batch, kwargs_list)
 
 
@@ -82,9 +88,7 @@ def _all_reduce_per_rank_batch(
             algbw_gbps = (actual_bytes / latency_s) / 1e9 if latency_s > 0 else 0.0
             # Ring all-reduce moves 2(N-1)/N of the payload across the bus.
             busbw_gbps = algbw_gbps * 2 * (world_size - 1) / world_size
-            results.append(
-                {"time_ms": time_ms, "algbw_gbps": algbw_gbps, "busbw_gbps": busbw_gbps}
-            )
+            results.append({"time_ms": time_ms, "algbw_gbps": algbw_gbps, "busbw_gbps": busbw_gbps})
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
 

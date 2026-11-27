@@ -195,6 +195,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "case-map schema_version must be 1"
     );
     let inventory = load_inventory(&input.labeled_kernel_sequences)?;
+    let clocks = super::clock::ClockDomains::from_profile_dir(&input.profile_log_dir)?;
 
     let manifests = read_cost_manifests(&input.predict_log_dir)?;
     let (pool_tag, worker_id, manifest) = single_iter_manifest(&manifests)?;
@@ -209,6 +210,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .map(|item| (item.iteration, item))
         .collect();
     let kernel_names = kernel_name_index(&measured)?;
+    let clocks = super::calibrate_clocks(clocks, &measured.iteration_details, &inventory, &kernel_names);
     let gpu_cycles_ms = measured_gpu_cycles_ms(&measured.iteration_details)?;
 
     // Every timestamp in the payload is an offset from here. Not cosmetic:
@@ -254,7 +256,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                     joined.case_index
                 )
             })?;
-            let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+            let measurement = measure_iteration(measured_iter, &inventory, &kernel_names, &clocks)?;
             let path = barrier::barrier_path(&measurement)
                 .with_context(|| format!("measured iteration {}", measured_iter.iteration))?;
             let measured_ms = path.critical_path_ns() as f64 / 1e6;
@@ -384,7 +386,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 let summary = &summaries[*index];
                 let measured_iter = measured_by_id[&summary.iteration_id];
                 let sim = &sim_cases[&summary.case_index];
-                let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+                let measurement = measure_iteration(measured_iter, &inventory, &kernel_names, &clocks)?;
                 let reference = reference_device_id
                     .or_else(|| measurement.device_ids.first().copied())
                     .context("measured iteration has no device ids")?;
@@ -1481,6 +1483,9 @@ mod tests {
             device_ids: BTreeSet::from([0, 1]),
             busy_union_ms: 0.0,
             track_intervals: BTreeMap::new(),
+            clock_offsets_ns: BTreeMap::new(),
+            clock_offset_sources: BTreeMap::new(),
+            clock_estimate: Default::default(),
         };
         let reference = ReferenceRank::of(&measurement, 0);
         reference.report(&reference.occupancy(), 0, &measurement, 0)

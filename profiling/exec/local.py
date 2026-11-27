@@ -34,6 +34,7 @@ from profiling.gpu_policy import require_gpu
 from profiling.instrument import TIMELINE_ENV, span
 from profiling.profilers.energy import energy_enabled
 from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_COMPARE_ENV
+from profiling.runners import vllm_tactic_policy
 from profiling.runners.autotune_cache import (
     tactic_cache_dir,
     tactic_file_stem,
@@ -621,7 +622,13 @@ def _container_worker_command(
     # read identically -- that is the shape the rest of these should move to.
     policy_args = [
         argument
-        for name in (CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMELINE_ENV, TIMER_COMPARE_ENV)
+        for name in (
+            CUPTI_BUDGET_ENV,
+            CUPTI_TRACE_ENV,
+            TIMELINE_ENV,
+            TIMER_COMPARE_ENV,
+            *vllm_tactic_policy.ENV_NAMES,
+        )
         if name in os.environ
         for argument in ("--env", f"{name}={os.environ[name]}")
     ]

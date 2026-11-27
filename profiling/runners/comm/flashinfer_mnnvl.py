@@ -38,6 +38,7 @@ from functools import partial
 from profiling.db.args import DType
 from profiling.runners.comm._batch import run_comm_batch
 from profiling.runners.comm._launcher import TorchMpLauncher
+from profiling.runners.comm._multinode import MultiNodeTorchLauncher, spans_nodes
 from profiling.runners.comm.flashinfer_trtllm import _comm_payload, _time_cuda_graph
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
@@ -49,11 +50,11 @@ from profiling.runners.metrics import RunnerResult
 # workspace and bounds the tensors vLLM dispatches to FlashInfer; larger
 # tensors fall through to another all-reduce backend. The one statement of the
 # budget on the Python side: the kernel DOC and the backend's ``sm_100a`` gate
-# refer to it rather than repeat it. vLLM's TP16 row is multi-node MNNVL, which
-# this one-node launcher cannot run, so the keys are the TPs the runner measures.
-# A Rust test (simulator/src/timing/kernels/all_reduce_fusion.rs) checks these
-# rows against the simulator's copy of vLLM's table.
-SM100_MAX_SIZE_MB: dict[int, float] = {2: 64, 4: 32, 8: 1}
+# refer to it rather than repeat it. vLLM's TP16 row is multi-node MNNVL (four
+# GB200 trays), which the runner spreads over a multi-node job. A Rust test
+# (simulator/src/timing/kernels/all_reduce_fusion.rs) checks these rows against
+# the simulator's copy of vLLM's table.
+SM100_MAX_SIZE_MB: dict[int, float] = {2: 64, 4: 32, 8: 1, 16: 64}
 MIB = 1024 * 1024
 # vLLM ``PDL_ADVANCE_LAUNCH_TOKENS``; FlashInfer ignores it on MNNVL but the
 # call keeps production's arguments.
@@ -86,7 +87,7 @@ def spec_error(spec: dict) -> str | None:
     if num_gpus not in SM100_MAX_SIZE_MB:
         sizes = "/".join(str(size) for size in sorted(SM100_MAX_SIZE_MB))
         return (
-            f"the FlashInfer MNNVL all-reduce runner measures TP {sizes} (one node), got {num_gpus}"
+            f"the FlashInfer MNNVL all-reduce runner measures TP {sizes}, got {num_gpus}"
         )
     if spec["fabric"] != "nvlink":
         return f"FlashInfer MNNVL all-reduce needs NVLink multicast, got fabric={spec['fabric']!r}"
@@ -156,8 +157,15 @@ def _profile_batch(kwargs_list: list[dict], error_fn, per_rank_fn) -> list[Runne
             results[index] = RunnerResult(error=error)
     if runnable:
         num_gpus = int(kwargs_list[runnable[0]]["num_gpus"])
+        fabric = str(kwargs_list[runnable[0]].get("fabric", "nvlink"))
+        # A TP group larger than one NVL72 tray spans the job's trays over MNNVL.
+        launcher = (
+            MultiNodeTorchLauncher(num_gpus, backend="cpu:gloo,cuda:nccl")
+            if spans_nodes(num_gpus, fabric)
+            else TorchMpLauncher(num_gpus, backend="cpu:gloo,cuda:nccl")
+        )
         measured = run_comm_batch(
-            TorchMpLauncher(num_gpus, backend="cpu:gloo,cuda:nccl"),
+            launcher,
             per_rank_fn,
             [kwargs_list[index] for index in runnable],
         )

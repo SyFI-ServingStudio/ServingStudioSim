@@ -1,0 +1,122 @@
+schema_version: 1
+pack: kimi_k31_pro_nvfp4_b200x2_tp8dp2_ep16
+description: Kimi-K3.1-Pro NVFP4 (routed experts NVFP4, KDA and shared experts MXFP8, MLA BF16) on
+  two HGX B200 nodes (NVL8 each, 8x400G NDR InfiniBand between them). Attention TP8 within
+  a node, DP2 across the nodes, routed experts EP16 over NCCL allgather/reduce-scatter, vLLM main
+  c5db9bd, DSpark proposer with 7 drafted tokens (verify width 8). Prefill and mixed steps run in
+  piecewise CUDA graphs, decode in full graphs. Alignment phase 1 only, the tracked diverse_100
+  trace at its recorded arrival times.
+recorded_on:
+  host: b200x2_nvl8_ib
+  gpu: NVIDIA B200
+  checkpoint_snapshots:
+    kimi_k31_pro_nvfp4: models--nvidia--Kimi-K3.1-Pro-NVFP4/snapshots/3af0462972c9cc07e5ba6e0867b44f961ce95e9b
+    kimi_k31_pro_dspark: models--Inferact--Kimi-K3.1-Pro-DSpark/snapshots/46ea9cb020652016de0d6e60ee6e4510fd6ec986
+  nsys_version: 2025.5.2
+  device_roles:
+    primary: 0,1,2,3,4,5,6,7
+variants:
+  tp8dp2_ep16_c4096_s32:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: kimi_k31_pro_nvfp4
+    draft_checkpoint: kimi_k31_pro_dspark
+    tokenizer: kimi_k31_pro_tokenizer
+    engine: vllm
+    backend: openai
+    run_name_prefix: kimi_k31_b200x2_tp8dp2
+    python_runtime:
+      packages:
+      - name: nvtx
+        version: 0.2.15
+        index_url: https://pypi.org/simple
+      environment:
+        HF_HUB_OFFLINE: '1'
+        OMP_NUM_THREADS: '8'
+        VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+        VLLM_RPC_TIMEOUT: '600000'
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # NCCL_IB_HCA (the compute HCAs) and NCCL_SOCKET_IFNAME (the bootstrap
+        # interface) depend on the machine, so the pack does not set them: give
+        # them in the remote's `env` (remote.yaml) or the job environment.
+        NCCL_CUMEM_ENABLE: '1'
+    server:
+      tp_size: 8
+      dp_size: 2
+      nnodes: 2
+      expert_parallel_size: 16
+      expert_count_reduction_group_size: 16
+      # TP8 shards the 68 GiB of non-expert weights, so a rank holds about
+      # 98 GiB (89 GiB of routed experts) of a B200's 179 GiB. That leaves room
+      # for 4096-token chunks and piecewise CUDA graphs up to that size.
+      chunk_size: 4096
+      max_cudagraph_capture_size: 4096
+      enable_server_load_tracking: true
+      api_server_count: 2
+      served_model_name: kimi-k31-pro
+      # KimiLinearForCausalLM declares MixtureOfExperts but sets none of its
+      # EPLB fields, so the routing pass records routes alone.
+      extra_args: [--no-enable-eplb, --enable-expert-parallel, --all2all-backend, allgather_reducescatter, --trust-remote-code, --language-model-only, --kv-cache-dtype,
+        fp8, --mamba-cache-dtype, float32, --mamba-ssm-cache-dtype, float32, --use-replayssm, --max-num-seqs,
+        '32', --attention-config, '{"indexer_kv_dtype":"mxfp4"}', --seed, '0', --generation-config, vllm,
+        --compilation-config, '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[8,16,24,32,48,64,96,128,192,256,384,512,1024,2048,4096]}',
+        --speculative-config, '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block"}']
+    arch:
+      type: kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark
+      model_config: model/config/kimi_k31_pro_nvfp4.json
+      draft_tokens: 7
+      tp_size: 8
+      dp_size: 2
+      # The EP exchange spans the two nodes.
+      ep_fabric: infiniband
+      # The capture's own routes (profile_corpus pass), published to the
+      # workload dataset.
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@6ad8e60bf522a04db0fde4efffd8de2b33c87a1a/kimi_k31_pro_nvfp4/vllm_dspark_k7/diverse_100/capture/20261125/manifest.json
+      cudagraph_capture_sizes: [8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 2048, 4096]
+    worker:
+      type: speculative
+      max_batch_tokens: 4096
+      batch_policy: mix
+      draft_tokens: 7
+      acceptance_seed: 73
+      dp_placement: vllm-least-loaded
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+    - kind: nsys
+      name: profile_nsys
+      trace: workload
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 7
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: tp8dp2_diverse_100
+  variant: tp8dp2_ep16_c4096_s32
+  phase: 1
+  purpose: 'alignment Phase 1: the tracked diverse_100 trace at its recorded arrival times.'
+  coverage: [diverse_100]
+  max_model_len: 131072
+  max_concurrency: 256
+  chunk_size: 4096
+  speculative_acceptance: &from_capture
+    status: from_capture
+  speculative_acceptance_by_output_position: *from_capture
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.92
+  capture_seconds: 60.0
+  device_role: primary
+  workload_trace:
+    path: trace/diverse_100.csv
+  attn_gpu_memory_gb: *from_capture

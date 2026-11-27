@@ -281,7 +281,9 @@ def _image_exists(tag: str) -> bool:
     )
 
 
-def build(name: str, root: Path = REPO_ROOT) -> str:
+def build_plan(name: str, root: Path = REPO_ROOT) -> tuple[str, dict[str, str]]:
+    """The tag and build arguments of image ``name``, checked as `build` checks them."""
+
     image = IMAGES[name]
     _require_pinned_checkouts(image, root)
     if image.base_image is not None:
@@ -305,6 +307,12 @@ def build(name: str, root: Path = REPO_ROOT) -> str:
         "VIBESIM_REVISION": _git(root, "rev-parse", "HEAD"),
         "VIBESIM_IMAGE_INPUTS": tag.rpartition(":")[2],
     }
+    return tag, args
+
+
+def build(name: str, root: Path = REPO_ROOT) -> str:
+    image = IMAGES[name]
+    tag, args = build_plan(name, root)
     command = ["docker", "build", "--file", str(root / image.dockerfile), "--tag", tag]
     for key, value in args.items():
         command += ["--build-arg", f"{key}={value}"]

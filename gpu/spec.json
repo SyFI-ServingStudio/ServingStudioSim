@@ -271,8 +271,6 @@
     {
       "name": "GB200-Superchip",
       "aliases": [
-        "NVIDIA GB200",
-        "GB200",
         "GB200-NVL72"
       ],
       "vendor": "NVIDIA",
@@ -294,6 +292,33 @@
       "nvl_domain_size": 72,
       "dollar_per_hour": 17.85,
       "notes": "Grace-Blackwell Superchip (1 Grace CPU + 2 B200 GPUs); compute/memory fields are COMBINED for the 2 GPUs (divide by 2 for per-GPU). dollar_per_hour, in contrast, is PER-GPU. nvl_domain_size 72 assumes the GB200 NVL72 rack."
+    },
+    {
+      "name": "GB200-GPU-186GB",
+      "aliases": [
+        "NVIDIA GB200",
+        "GB200",
+        "GB200-GPU"
+      ],
+      "vendor": "NVIDIA",
+      "architecture": "Blackwell",
+      "compute_capability": "10.0",
+      "year": 2024,
+      "mem_size_gb": 186,
+      "mem_type": "HBM3e",
+      "mem_bandwidth_gbps": 8000,
+      "fp16_tflops": 2500,
+      "fp8_tflops": 5000,
+      "bf16_tflops": 2500,
+      "fp32_tflops": 90,
+      "fp4_tflops": 10000,
+      "int8_tops": 5000,
+      "tdp_watts": 1200,
+      "interconnect": "NVLink 5.0",
+      "interconnect_bandwidth_gbps": 1800,
+      "nvl_domain_size": 72,
+      "dollar_per_hour": 17.85,
+      "notes": "One Blackwell GPU of a GB200 superchip (what nvidia-smi and torch call 'NVIDIA GB200'), per GPU: half of the GB200-Superchip datasheet row (NVIDIA GB200 NVL72 page: superchip 20 PF FP8 sparse, 10 PF FP16/BF16 sparse, NVFP4 20 PF dense, 372 GB HBM3E at 16 TB/s, NVLink 3.6 TB/s). Dense tensor peaks. fp32 halves the superchip row. dollar_per_hour is the superchip row's per-GPU rate. tdp_watts is the per-GPU board-level share, an estimate."
     },
     {
       "name": "H800-SXM5-80GB",

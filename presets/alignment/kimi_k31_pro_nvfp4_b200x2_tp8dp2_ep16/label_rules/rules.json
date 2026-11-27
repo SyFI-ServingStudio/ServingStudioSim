@@ -1,0 +1,2354 @@
+{
+ "schema_version": 2,
+ "note": "Generate the Kimi K3.1 Pro NVFP4 + DSpark label rules for one topology.\n\nUsage: make_rules.py <cost_manifest.json> > rules.json\n\nThe cost manifest is any timing-predict worker manifest of the topology\n(timing_predict/raw/cost_manifest/worker_predict_0.json). Its slots decide the\nboundary family:\n\n* TP16 attention (gb200_tp16_ep16): per-layer TP all-reduces\n  (`all_reduce_fusion`), with the prefill o_proj fused into GemmRsAr;\n* TP8 attention x DP2 (b200x2_tp8dp2_ep16): sequence-parallel row all-gather /\n  reduce-scatter around attention and an EP16 quantized dispatch all-gather /\n  combine reduce-scatter around the routed experts.\n\nThe compute rules are shared: both packs run the same vLLM model code\n(vllm/models/kimi_k3/nvidia/{model,kda,mla,dsa,latent_moe_runner}.py) and\nthe same kernels, so a kernel's owner is read from its call site there and from\nits neighbours in the capture. The rules are an order-independent set: every\nname that serves several operations (the nvjet GEMM tiles, the MXFP8 quant, the\nblockscaled GEMM, rms_norm, elementwise launches) is split by its immediate\nneighbours, so no position is claimed by two operations.",
+ "rules": [
+  {
+   "name": "vocab_parallel_embedding_kernel",
+   "operation": "embedding",
+   "type": "model",
+   "role": "vocab-parallel embedding lookup",
+   "slot_suffixes": [
+    "embedding"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "attn_res_fwd_online_v2_kernel",
+   "operation": "attn_res",
+   "type": "model",
+   "role": "attention-residual mixing (AttnRes) before every attention, FFN and the final norm",
+   "slot_suffixes": [
+    "attn_res",
+    "ffn_res",
+    "final_attn_res"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "kda.in_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): fused q/k/v/g/beta in_proj, MXFP8 quant + blockscaled GEMM",
+   "slot_suffixes": [
+    "kda.in_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "attn_res_fwd_online_v2_kernel"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "kda.in_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): fused q/k/v/g/beta in_proj, MXFP8 quant + blockscaled GEMM",
+   "slot_suffixes": [
+    "kda.in_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "<none>"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "kda.in_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): fused q/k/v/g/beta in_proj, MXFP8 quant + blockscaled GEMM",
+   "slot_suffixes": [
+    "kda.in_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "mnnvl_lamport_all_gather"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "kda.in_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): fused q/k/v/g/beta in_proj, MXFP8 quant + blockscaled GEMM",
+   "slot_suffixes": [
+    "kda.in_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "ncclDevKernel_AllGather"
+  },
+  {
+   "name": "kernel_cutlass_kernel_flashinfergemmkernelsdense_",
+   "operation": "kda.in_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): fused q/k/v/g/beta in_proj, MXFP8 quant + blockscaled GEMM",
+   "slot_suffixes": [
+    "kda.in_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.in_proj"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "kda.f_b",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): bf16 f_b (forget-gate low-rank up) projection",
+   "slot_suffixes": [
+    "kda.f_b"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.in_proj"
+  },
+  {
+   "name": "cutlass_80_wmma_tensorop_bf16",
+   "operation": "kda.f_b",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): bf16 f_b (forget-gate low-rank up) projection",
+   "slot_suffixes": [
+    "kda.f_b"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.in_proj"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "kda.f_b",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): bf16 f_b (forget-gate low-rank up) projection",
+   "slot_suffixes": [
+    "kda.f_b"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.f_b"
+  },
+  {
+   "name": "at::native::elementwise_kernel<",
+   "operation": "kda.glue_copy",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): q/k/v contiguous copy ahead of the conv",
+   "slot_suffixes": [
+    "kda.glue_copy"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.f_b"
+  },
+  {
+   "name": "at::native::elementwise_kernel<",
+   "operation": "kda.glue_copy",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): q/k/v contiguous copy ahead of the conv",
+   "slot_suffixes": [
+    "kda.glue_copy"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "_causal_conv1d_update_kernel"
+  },
+  {
+   "name": "at::native::elementwise_kernel<",
+   "operation": "kda.glue_copy",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): q/k/v contiguous copy ahead of the conv",
+   "slot_suffixes": [
+    "kda.glue_copy"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "_gather_initial_states_kernel"
+  },
+  {
+   "name": "_causal_conv1d_update_kernel",
+   "operation": "kda.conv_decode",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): decode causal conv1d update",
+   "slot_suffixes": [
+    "kda.conv_decode"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_kda_recoverssm_verify_kernel",
+   "operation": "kda.recoverssm_verify",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): RecoverSSM verify recurrence over the draft block",
+   "slot_suffixes": [
+    "kda.recoverssm_verify"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_packed_causal_conv1d_fwd_kernel",
+   "operation": "kda.conv_prefill",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): prefill packed causal conv1d",
+   "slot_suffixes": [
+    "kda.conv_prefill"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_gather_initial_states_kernel",
+   "operation": "kda.state_io",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): prefill recurrent-state gather / checkpoint store",
+   "slot_suffixes": [
+    "kda.state_io"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "store_cache_checkpoints_kernel",
+   "operation": "kda.state_io",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): prefill recurrent-state gather / checkpoint store",
+   "slot_suffixes": [
+    "kda.state_io"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_flash_kda_fwd_prepare",
+   "operation": "kda.chunk_prefill",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): chunked prefill (prepare + recurrence)",
+   "slot_suffixes": [
+    "kda.chunk_prefill"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_flash_kda_fwd_recurrence",
+   "operation": "kda.chunk_prefill",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): chunked prefill (prepare + recurrence)",
+   "slot_suffixes": [
+    "kda.chunk_prefill"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "unrolled_elementwise_kernel<at::native::direct_copy",
+   "operation": "kda.prefill_glue",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): prefill output scatter back to token order",
+   "slot_suffixes": [
+    "kda.prefill_glue"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "store_cache_checkpoints_kernel"
+  },
+  {
+   "name": "at::native::index_elementwise_kernel<",
+   "operation": "kda.prefill_glue",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): prefill output scatter back to token order",
+   "slot_suffixes": [
+    "kda.prefill_glue"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.prefill_glue"
+  },
+  {
+   "name": "layer_norm_gated_fwd_kernel",
+   "operation": "kda.gated_norm",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): sigmoid-gated RMSNorm",
+   "slot_suffixes": [
+    "kda.gated_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o153615361",
+   "operation": "kda.o_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): o_proj, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "kda.o_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "kernel_cutlass_kernel_flashinfergemmkernelsdense_"
+  },
+  {
+   "name": "kernel_cutlass_kernel_flashinfergemmkernelsdense_",
+   "operation": "kda.o_proj",
+   "type": "model",
+   "role": "KDA linear attention (kda.py KimiDeltaAttention): o_proj, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "kda.o_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "kda.o_proj"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "dense_ffn.gate_up",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): gate_up",
+   "slot_suffixes": [
+    "dense_ffn.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "attn_res_fwd_online_v2_kernel",
+   "before_name": "situ_and_mul_kernel"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "dense_ffn.gate_up",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): gate_up",
+   "slot_suffixes": [
+    "dense_ffn.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "situ_and_mul_kernel"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "dense_ffn.gate_up",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): gate_up",
+   "slot_suffixes": [
+    "dense_ffn.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "attn_res_fwd_online_v2_kernel",
+   "before": "dense_ffn.gate_up"
+  },
+  {
+   "name": "situ_and_mul_kernel",
+   "operation": "dense_ffn.situ_and_mul",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): SiTU and mul",
+   "slot_suffixes": [
+    "dense_ffn.situ_and_mul"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "dense_ffn.gate_up"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "dense_ffn.down",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): down",
+   "slot_suffixes": [
+    "dense_ffn.down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "dense_ffn.situ_and_mul"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "dense_ffn.down",
+   "type": "model",
+   "role": "layer-0 dense SiTU MLP (bf16): down",
+   "slot_suffixes": [
+    "dense_ffn.down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "dense_ffn.down"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.fused_qkv_a",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): fused q_a/kv_a down-projection",
+   "slot_suffixes": [
+    "mla.fused_qkv_a"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "rms_norm_kernel"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "mla.fused_qkv_a",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): fused q_a/kv_a down-projection",
+   "slot_suffixes": [
+    "mla.fused_qkv_a"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "rms_norm_kernel"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.fused_qkv_a",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): fused q_a/kv_a down-projection",
+   "slot_suffixes": [
+    "mla.fused_qkv_a"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before": "mla.fused_qkv_a"
+  },
+  {
+   "name": "fused_a_gemm_kernel",
+   "operation": "mla.fused_qkv_a",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): fused q_a/kv_a down-projection",
+   "slot_suffixes": [
+    "mla.fused_qkv_a"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "rms_norm_kernel"
+  },
+  {
+   "name": "rms_norm_kernel",
+   "operation": "mla.q_a_norm",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): q_a RMSNorm",
+   "slot_suffixes": [
+    "mla.q_a_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.fused_qkv_a"
+  },
+  {
+   "name": "rms_norm_kernel",
+   "operation": "mla.kv_a_norm",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): kv_a RMSNorm",
+   "slot_suffixes": [
+    "mla.kv_a_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.q_a_norm"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.q_b",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): q_b up-projection",
+   "slot_suffixes": [
+    "mla.q_b"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.kv_a_norm"
+  },
+  {
+   "name": "fused_a_gemm_kernel",
+   "operation": "mla.q_b",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): q_b up-projection",
+   "slot_suffixes": [
+    "mla.q_b"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.kv_a_norm"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.index_wq",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): indexer wq projection",
+   "slot_suffixes": [
+    "mla.index_wq"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.q_b"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.index_wk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): indexer wk projection",
+   "slot_suffixes": [
+    "mla.index_wk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.index_wq"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "mla.index_wk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): indexer wk projection",
+   "slot_suffixes": [
+    "mla.index_wk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.index_wk"
+  },
+  {
+   "name": "_mxfp4_k_norm_quant_insert_kernel",
+   "operation": "mla.index_cache_append",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): indexer k norm + MXFP4 quant + cache insert",
+   "slot_suffixes": [
+    "mla.index_cache_append"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_mxfp4_q_quant_kernel",
+   "operation": "mla.index_q_quant",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): indexer q MXFP4 quant",
+   "slot_suffixes": [
+    "mla.index_q_quant"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "cp_gather_indexer_k_quant_cache_kernel",
+   "operation": "mla.index_prefill_logits",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): prefill indexer (gather cached k, MQA logits)",
+   "slot_suffixes": [
+    "mla.index_prefill_logits"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "deep_gemm::sm100_mqa_logits<",
+   "operation": "mla.index_prefill_logits",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): prefill indexer (gather cached k, MQA logits)",
+   "slot_suffixes": [
+    "mla.index_prefill_logits"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "topKPerRowPrefill",
+   "operation": "mla.index_prefill_topk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): prefill indexer top-k",
+   "slot_suffixes": [
+    "mla.index_prefill_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "deep_gemm::sm100_paged_mqa_logits<",
+   "operation": "mla.index_decode_logits",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): decode indexer paged MQA logits",
+   "slot_suffixes": [
+    "mla.index_decode_logits"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "sampled_topk_kernel",
+   "operation": "mla.index_decode_topk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): decode indexer top-k",
+   "slot_suffixes": [
+    "mla.index_decode_topk",
+    "mla.index_decode_topk_persistent",
+    "mla.index_decode_topk_graph"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "cooperative_topk",
+   "operation": "mla.index_decode_topk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): decode indexer top-k",
+   "slot_suffixes": [
+    "mla.index_decode_topk",
+    "mla.index_decode_topk_persistent",
+    "mla.index_decode_topk_graph"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "persistent_topk_kernel",
+   "operation": "mla.index_decode_topk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): decode indexer top-k",
+   "slot_suffixes": [
+    "mla.index_decode_topk",
+    "mla.index_decode_topk_persistent",
+    "mla.index_decode_topk_graph"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "filtered_topk::FilteredTopKUnifiedKernel",
+   "operation": "mla.index_decode_topk",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): decode indexer top-k",
+   "slot_suffixes": [
+    "mla.index_decode_topk",
+    "mla.index_decode_topk_persistent",
+    "mla.index_decode_topk_graph"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "concat_and_cache_mla_kernel",
+   "operation": "mla.mla_cache_append",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): latent KV cache append",
+   "slot_suffixes": [
+    "mla.mla_cache_append"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_bz_NNT",
+   "operation": "mla.q_absorb",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): q absorb (W_UK) batched GEMM",
+   "slot_suffixes": [
+    "mla.q_absorb"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "scaled_fp8_quant_kernel_strided_group_shape",
+   "operation": "mla.q_quant",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): static FP8 q quant",
+   "slot_suffixes": [
+    "mla.q_quant"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "HQk576HV512HVPerCta256",
+   "operation": "mla.sparse_prefill",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): sparse MLA prefill attention (TRT-LLM gen fmha), plain or on the ShardQ token shards",
+   "slot_suffixes": [
+    "mla.sparse_prefill",
+    "mla.sparse_prefill_shard_q"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "HQk576HV512PagedKv",
+   "operation": "mla.sparse_decode",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): sparse MLA decode attention",
+   "slot_suffixes": [
+    "mla.sparse_decode"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_shard_q_kernel",
+   "operation": "mla.shard_q",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ shard_q exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.shard_q"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "symmetric_memory::barrier_kernel",
+   "operation": "mla.shard_q",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ shard_q exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.shard_q"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "_shard_q_kernel"
+  },
+  {
+   "name": "symmetric_memory::barrier_kernel",
+   "operation": "mla.shard_q",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ shard_q exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.shard_q"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "_shard_q_kernel"
+  },
+  {
+   "name": "_unshard_out_kernel",
+   "operation": "mla.unshard_out",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ unshard_out exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.unshard_out"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "symmetric_memory::barrier_kernel",
+   "operation": "mla.unshard_out",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ unshard_out exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.unshard_out"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "_unshard_out_kernel"
+  },
+  {
+   "name": "symmetric_memory::barrier_kernel",
+   "operation": "mla.unshard_out",
+   "type": "collective",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ unshard_out exchange (symmetric-memory push between two group barriers)",
+   "slot_suffixes": [
+    "mla.unshard_out"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "_unshard_out_kernel"
+  },
+  {
+   "name": "sparse_mla_index_remap_kernel",
+   "operation": "mla.index_remap",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): top-k index remap to cache slots",
+   "slot_suffixes": [
+    "mla.index_remap"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "_pad_query_heads_kernel",
+   "operation": "mla.shard_q_pad_heads",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): ShardQ query head padding",
+   "slot_suffixes": [
+    "mla.shard_q_pad_heads"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.v_up",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): v up-projection (W_UV)",
+   "slot_suffixes": [
+    "mla.v_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.sparse_decode"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.v_up",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): v up-projection (W_UV)",
+   "slot_suffixes": [
+    "mla.v_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.unshard_out"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.v_up",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): v up-projection (W_UV)",
+   "slot_suffixes": [
+    "mla.v_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.index_remap",
+   "stream_role": "primary"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.g_proj",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): output gate projection",
+   "slot_suffixes": [
+    "mla.g_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.v_up"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "mla.g_proj",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): output gate projection",
+   "slot_suffixes": [
+    "mla.g_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.g_proj"
+  },
+  {
+   "name": "at::native::vectorized_elementwise_kernel<",
+   "operation": "mla.gate_mul",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): sigmoid gate multiply",
+   "slot_suffixes": [
+    "mla.gate_mul"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.g_proj"
+  },
+  {
+   "name": "at::native::vectorized_elementwise_kernel<",
+   "operation": "mla.gate_mul",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): sigmoid gate multiply",
+   "slot_suffixes": [
+    "mla.gate_mul"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.v_up"
+  },
+  {
+   "name": "at::native::vectorized_elementwise_kernel<",
+   "operation": "mla.gate_mul",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): sigmoid gate multiply",
+   "slot_suffixes": [
+    "mla.gate_mul"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.gate_mul"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "mla.o_proj",
+   "type": "model",
+   "role": "MLA attention with the DSA sparse indexer (mla.py / dsa.py): o_proj",
+   "slot_suffixes": [
+    "mla.o_proj"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "mla.gate_mul"
+  },
+  {
+   "name": "nvjet_sm100_tss_",
+   "operation": "moe.router.gate",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: router gate (fp32 logits)",
+   "slot_suffixes": [
+    "moe.router.gate"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "moe.router.gate",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: router gate (fp32 logits)",
+   "slot_suffixes": [
+    "moe.router.gate"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.router.gate"
+  },
+  {
+   "name": "LLBf16Dotprod",
+   "operation": "moe.router.gate",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: router gate (fp32 logits)",
+   "slot_suffixes": [
+    "moe.router.gate"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "LLBf16SplitK",
+   "operation": "moe.router.gate",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: router gate (fp32 logits)",
+   "slot_suffixes": [
+    "moe.router.gate"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "single_group_topk_block_kernel",
+   "operation": "moe.single_group_topk",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: router top-k",
+   "slot_suffixes": [
+    "moe.single_group_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.router.gate"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "cvt_fp16_to_fp4_sf_major"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "cvt_fp16_to_fp4_sf_major"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before": "moe.latent_down"
+  },
+  {
+   "name": "CuteSkinnyGemm",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "single_group_topk_block_kernel"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "moe.latent_down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent down-projection",
+   "slot_suffixes": [
+    "moe.latent_down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "single_group_topk_block_kernel"
+  },
+  {
+   "name": "cvt_fp16_to_fp4_sf_major",
+   "operation": "moe.latent_quant",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent NVFP4 quant",
+   "slot_suffixes": [
+    "moe.latent_quant"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "routingIndices",
+   "operation": "moe.routed",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: routed experts (TRT-LLM NVFP4 fused MoE: routing, FC1, FC2, finalize)",
+   "slot_suffixes": [
+    "moe.routed_rank0",
+    "moe.routed_rank1",
+    "moe.routed_rank2",
+    "moe.routed_rank3",
+    "moe.routed_rank4",
+    "moe.routed_rank5",
+    "moe.routed_rank6",
+    "moe.routed_rank7",
+    "moe.routed_rank8",
+    "moe.routed_rank9",
+    "moe.routed_rank10",
+    "moe.routed_rank11",
+    "moe.routed_rank12",
+    "moe.routed_rank13",
+    "moe.routed_rank14",
+    "moe.routed_rank15"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "bmm_E2m1",
+   "operation": "moe.routed",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: routed experts (TRT-LLM NVFP4 fused MoE: routing, FC1, FC2, finalize)",
+   "slot_suffixes": [
+    "moe.routed_rank0",
+    "moe.routed_rank1",
+    "moe.routed_rank2",
+    "moe.routed_rank3",
+    "moe.routed_rank4",
+    "moe.routed_rank5",
+    "moe.routed_rank6",
+    "moe.routed_rank7",
+    "moe.routed_rank8",
+    "moe.routed_rank9",
+    "moe.routed_rank10",
+    "moe.routed_rank11",
+    "moe.routed_rank12",
+    "moe.routed_rank13",
+    "moe.routed_rank14",
+    "moe.routed_rank15"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "bmm_Bfloat16_E2m1",
+   "operation": "moe.routed",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: routed experts (TRT-LLM NVFP4 fused MoE: routing, FC1, FC2, finalize)",
+   "slot_suffixes": [
+    "moe.routed_rank0",
+    "moe.routed_rank1",
+    "moe.routed_rank2",
+    "moe.routed_rank3",
+    "moe.routed_rank4",
+    "moe.routed_rank5",
+    "moe.routed_rank6",
+    "moe.routed_rank7",
+    "moe.routed_rank8",
+    "moe.routed_rank9",
+    "moe.routed_rank10",
+    "moe.routed_rank11",
+    "moe.routed_rank12",
+    "moe.routed_rank13",
+    "moe.routed_rank14",
+    "moe.routed_rank15"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "finalizeKernel",
+   "operation": "moe.routed",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: routed experts (TRT-LLM NVFP4 fused MoE: routing, FC1, FC2, finalize)",
+   "slot_suffixes": [
+    "moe.routed_rank0",
+    "moe.routed_rank1",
+    "moe.routed_rank2",
+    "moe.routed_rank3",
+    "moe.routed_rank4",
+    "moe.routed_rank5",
+    "moe.routed_rank6",
+    "moe.routed_rank7",
+    "moe.routed_rank8",
+    "moe.routed_rank9",
+    "moe.routed_rank10",
+    "moe.routed_rank11",
+    "moe.routed_rank12",
+    "moe.routed_rank13",
+    "moe.routed_rank14",
+    "moe.routed_rank15"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "rms_norm_kernel",
+   "operation": "moe.latent_norm",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent RMSNorm",
+   "slot_suffixes": [
+    "moe.latent_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "ncclDevKernel_ReduceScatter"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "moe.latent_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent up-projection",
+   "slot_suffixes": [
+    "moe.latent_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.latent_norm"
+  },
+  {
+   "name": "CuteSkinnyGemm",
+   "operation": "moe.latent_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: latent up-projection",
+   "slot_suffixes": [
+    "moe.latent_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.latent_norm"
+  },
+  {
+   "name": "at::native::vectorized_elementwise_kernel<",
+   "operation": "moe.combine_add",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared + routed combine add",
+   "slot_suffixes": [
+    "moe.combine_add"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.latent_up"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "splitKreduce_kernel"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "nvjet_sm100_tst_"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "nvjet_sm100_tss_"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "LLBf16Dotprod"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "LLBf16SplitK"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o716871681",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "CuteSkinnyGemm"
+  },
+  {
+   "name": "kernel_cutlass_kernel_flashinfergemmkernelsdense_",
+   "operation": "moe.shared_experts.gate_up",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts gate_up, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.gate_up"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.shared_experts.gate_up"
+  },
+  {
+   "name": "situ_and_mul_kernel",
+   "operation": "moe.shared_experts.situ_and_mul",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts SiTU and mul",
+   "slot_suffixes": [
+    "moe.shared_experts.situ_and_mul"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.shared_experts.gate_up"
+  },
+  {
+   "name": "mxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o614461441",
+   "operation": "moe.shared_experts.down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts down, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "kernel_cutlass_kernel_flashinfergemmkernelsdense_",
+   "operation": "moe.shared_experts.down",
+   "type": "model",
+   "role": "latent MoE (latent_moe_runner.py): shared experts, router, latent down/up around NVFP4 routed experts: shared experts down, MXFP8 quant + GEMM",
+   "slot_suffixes": [
+    "moe.shared_experts.down"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.shared_experts.down"
+  },
+  {
+   "name": "mnnvl_lamport_all_gather",
+   "operation": "sp_all_gather",
+   "type": "collective",
+   "role": "sequence-parallel row all-gather ahead of attention (TP8 attention over the DP group's rows)",
+   "slot_suffixes": [
+    "sp_all_gather"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "ncclDevKernel_AllGather",
+   "operation": "sp_all_gather",
+   "type": "collective",
+   "role": "sequence-parallel row all-gather ahead of attention (TP8 attention over the DP group's rows)",
+   "slot_suffixes": [
+    "sp_all_gather"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "attn_res"
+  },
+  {
+   "name": "mnnvl_lamport_reduce_scatter",
+   "operation": "sp_reduce_scatter",
+   "type": "collective",
+   "role": "sequence-parallel reduce-scatter after the attention o_proj / embedding",
+   "slot_suffixes": [
+    "kda_dense.sp_reduce_scatter",
+    "kda_moe.sp_reduce_scatter",
+    "mla_moe.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "mnnvl_multimem_reduce_scatter",
+   "operation": "sp_reduce_scatter",
+   "type": "collective",
+   "role": "sequence-parallel reduce-scatter after the attention o_proj / embedding",
+   "slot_suffixes": [
+    "kda_dense.sp_reduce_scatter",
+    "kda_moe.sp_reduce_scatter",
+    "mla_moe.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "mnnvl_multimem_barrier_kernel",
+   "operation": "sp_reduce_scatter",
+   "type": "collective",
+   "role": "sequence-parallel reduce-scatter after the attention o_proj / embedding",
+   "slot_suffixes": [
+    "kda_dense.sp_reduce_scatter",
+    "kda_moe.sp_reduce_scatter",
+    "mla_moe.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "mnnvl_multimem_reduce_scatter"
+  },
+  {
+   "name": "mnnvl_multimem_barrier_kernel",
+   "operation": "sp_reduce_scatter",
+   "type": "collective",
+   "role": "sequence-parallel reduce-scatter after the attention o_proj / embedding",
+   "slot_suffixes": [
+    "kda_dense.sp_reduce_scatter",
+    "kda_moe.sp_reduce_scatter",
+    "mla_moe.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after_name": "mnnvl_multimem_reduce_scatter"
+  },
+  {
+   "name": "oneshotAllreduceFusionKernel",
+   "operation": "embedding.sp_reduce_scatter",
+   "type": "collective",
+   "role": "embedding reduction: vLLM all-reduces the vocab-parallel embedding (one-shot or two-shot kernel by size); the simulator prices it as the sequence-parallel reduce-scatter",
+   "slot_suffixes": [
+    "embedding.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "embedding"
+  },
+  {
+   "name": "twoshotAllreduceKernel",
+   "operation": "embedding.sp_reduce_scatter",
+   "type": "collective",
+   "role": "embedding reduction: vLLM all-reduces the vocab-parallel embedding (one-shot or two-shot kernel by size); the simulator prices it as the sequence-parallel reduce-scatter",
+   "slot_suffixes": [
+    "embedding.sp_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "embedding"
+  },
+  {
+   "name": "ncclDevKernel_AllGather",
+   "operation": "moe.ep_all_gather",
+   "type": "collective",
+   "role": "EP16 dispatch all-gather of the NVFP4 latent rows",
+   "slot_suffixes": [
+    "moe.ep_all_gather"
+   ],
+   "phase": "forward",
+   "cross_rank": "synchronizing",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.latent_quant"
+  },
+  {
+   "name": "ncclDevKernel_AllGather",
+   "operation": "moe.ep_all_gather",
+   "type": "collective",
+   "role": "EP16 dispatch all-gather of the NVFP4 latent rows",
+   "slot_suffixes": [
+    "moe.ep_all_gather"
+   ],
+   "phase": "forward",
+   "cross_rank": "synchronizing",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "routingIndices"
+  },
+  {
+   "name": "ncclDevKernel_ReduceScatter",
+   "operation": "moe.ep_reduce_scatter",
+   "type": "collective",
+   "role": "EP16 combine reduce-scatter of the routed-expert output",
+   "slot_suffixes": [
+    "moe.ep_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "synchronizing",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "after": "moe.routed"
+  },
+  {
+   "name": "ncclDevKernel_ReduceScatter",
+   "operation": "moe.ep_reduce_scatter",
+   "type": "collective",
+   "role": "EP16 combine reduce-scatter of the routed-expert output",
+   "slot_suffixes": [
+    "moe.ep_reduce_scatter"
+   ],
+   "phase": "forward",
+   "cross_rank": "synchronizing",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ],
+   "before_name": "rms_norm_kernel"
+  },
+  {
+   "name": "rms_norm_kernel",
+   "operation": "final_norm",
+   "type": "model",
+   "role": "final RMSNorm",
+   "slot_suffixes": [
+    "final_norm"
+   ],
+   "phase": "sample",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "lm_head",
+   "type": "model",
+   "role": "target lm_head (vocab-parallel)",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "lm_head",
+   "type": "model",
+   "role": "target lm_head (vocab-parallel)",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16",
+   "excluded_slot_prefixes": [
+    "unified.draft."
+   ]
+  },
+  {
+   "name": "vocab_parallel_embedding_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "nvjet_sm100_tst_",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "splitKreduce_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "rms_norm_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "rotary_embedding_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "reshape_and_cache_flash_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "FlashPrepareScheduler",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "FlashAttentionForwardSm100",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "FlashAttentionForwardCombine",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "act_and_mul_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "indexSelectSmallIndex",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "_gumbel_sample_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "_gumbel_combine_kernel",
+   "operation": "draft.compute",
+   "type": "model",
+   "role": "DSpark draft: fc + context K/V, five SWA layers, head and seven Markov steps",
+   "slot_suffixes": [
+    "draft.fc",
+    "draft.final_norm",
+    "draft.layer.attention",
+    "draft.layer.context_kv",
+    "draft.layer.context_kv_store",
+    "draft.layer.down",
+    "draft.layer.gate_up",
+    "draft.layer.input_norm",
+    "draft.layer.o_proj",
+    "draft.layer.post_norm",
+    "draft.layer.qk_norm_rope",
+    "draft.layer.qkv_proj",
+    "draft.layer.silu_and_mul",
+    "draft.lm_head",
+    "draft.markov.bias_add",
+    "draft.markov.greedy_argmax",
+    "draft.markov.markov_w1_gather",
+    "draft.markov.markov_w2",
+    "draft.mask_embedding"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  },
+  {
+   "name": "Allreduce",
+   "operation": "draft.all_reduces",
+   "type": "collective",
+   "role": "DSpark draft TP all-reduces (embedding, attention, MLP)",
+   "slot_suffixes": [
+    "draft.embedding_all_reduce",
+    "draft.embedding_all_reduce_large",
+    "draft.layer.attn_all_reduce",
+    "draft.layer.attn_all_reduce_large",
+    "draft.layer.mlp_all_reduce",
+    "draft.layer.mlp_all_reduce_large"
+   ],
+   "phase": "draft",
+   "cross_rank": "independent",
+   "source_experiment": "phase-1 diverse_100 nsys capture, TP8xDP2/EP16"
+  }
+ ]
+}

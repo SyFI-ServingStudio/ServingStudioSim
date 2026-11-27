@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners.comm._multinode import local_rank_count
 
 KIND = "moe_ep_quantized_all_gather"
 
@@ -29,14 +30,15 @@ class MoeEpQuantizedAllGatherArgs(KernelArgs):
     activation_dtype: DType = arg(
         doc="Element type of the gathered activations: nvfp4_e2m1 or mxfp8_e4m3."
     )
-    fabric: str = arg(doc="Interconnect label; this backend requires nvlink.")
+    fabric: str = arg(
+        doc="Interconnect: nvlink (one node), or infiniband (vllm_pynccl over the job's nodes)."
+    )
 
 
 DOC = KernelDoc(
     title="MoE all-gather of quantized activations and top-k routing",
     summary=(
-        "Gather NVFP4 or MXFP8 activations, scales and top-k routing from every "
-        "data-parallel GPU."
+        "Gather NVFP4 or MXFP8 activations, scales and top-k routing from every data-parallel GPU."
     ),
     description=(
         "With data and expert parallelism, vLLM's allgather_reducescatter backend "
@@ -97,7 +99,12 @@ register(
         # error". With NVLS off NCCL runs its NVLink ring/tree algorithms.
         # all_gatherv is grouped broadcasts, which never use NVLS anyway.
         worker_env=(("NCCL_NVLS_ENABLE", "0"),),
-        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        # Over InfiniBand the group spans the job's nodes: L1b reserves this
+        # node's share and the other nodes' peer agents run the rest
+        # (`profiling.runners.comm._multinode`).
+        gpu_count_fn=lambda spec: local_rank_count(
+            int(spec["num_gpus"]), str(spec.get("fabric", "nvlink"))
+        ),
         list_native=True,
         doc=BackendDoc(
             summary=(

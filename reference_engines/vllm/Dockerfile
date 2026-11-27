@@ -9,7 +9,8 @@
 # system tools, the capture interpreter, the req-frontend binary, then the
 # patches and the Sim code. A patch-only or Sim-only change reuses everything
 # above them. The official image already carries vLLM's wheel at that commit
-# (system Python, /usr/local/lib/python3.12/dist-packages), FlashInfer with
+# (system Python: /usr/bin/python3, 3.14 since mid-November 2026, its
+# dist-packages), FlashInfer with
 # every cubin and its AOT JIT cache, and nvtx.
 
 ARG BASE_IMAGE
@@ -87,7 +88,7 @@ COPY --from=req-frontend /src/req-frontend/target/release/session_runner \
 # patches that change anything else, e.g. csrc/); a patch that
 # does not apply means the image is not BASE.yaml's commit.
 COPY reference_engines/vllm/patches /opt/vibesim/reference_engines/vllm/patches
-RUN cd /usr/local/lib/python3.12/dist-packages \
+RUN cd "$(python3 -c "import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec('vllm').origin)))")" \
     && git apply --include='vllm/*' /opt/vibesim/reference_engines/vllm/patches/*.patch \
     && python3 -c "import vllm.v1.worker.alignment_trace"
 
@@ -100,7 +101,9 @@ COPY reference_engines/autotune_guard.py /opt/vibesim/reference_engines/autotune
 
 # The envs images.py assigns this image (`selfcheck` loads their runners).
 ARG VIBESIM_PROFILE_ENVS
-RUN python3 -c "import torch; assert torch.version.cuda == '13.0'" \
+# torch 2.14+cu132 since c5db9bd; a 580 driver (CUDA 13.0) runs it under CUDA's
+# minor-version compatibility.
+RUN python3 -c "import torch; assert torch.version.cuda == '13.2', torch.version.cuda" \
     && python3 -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}
 
 # Last, so a new commit only rewrites the manifest and labels.

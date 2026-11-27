@@ -24,6 +24,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners.comm._multinode import local_rank_count
 
 KIND: str = "all_reduce_fusion"
 
@@ -146,7 +147,9 @@ register(
         subprocess_env="vllm_env",
         # The MNNVL workspace is fabric-handle memory.
         imex_channel=True,
-        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        gpu_count_fn=lambda spec: local_rank_count(
+            int(spec["num_gpus"]), str(spec.get("fabric", "nvlink"))
+        ),
         list_native=True,
         doc=BackendDoc(
             summary=(
@@ -179,7 +182,9 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
         imex_channel=True,
-        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        gpu_count_fn=lambda spec: local_rank_count(
+            int(spec["num_gpus"]), str(spec.get("fabric", "nvlink"))
+        ),
         list_native=True,
         doc=BackendDoc(
             summary=(

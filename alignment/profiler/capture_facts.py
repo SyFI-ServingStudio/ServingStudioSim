@@ -213,11 +213,11 @@ def collect(cfg: ProfileConfig, env: dict[str, str]) -> dict:
 def check(cfg: ProfileConfig, facts: dict) -> list[str]:
     """What the config states and the machine contradicts. Empty means go."""
     problems = []
-    expected = cfg.gpu_count
+    expected = cfg.local_gpu_count
     gpus = facts["gpus"]
     if len(gpus) != expected:
         problems.append(
-            f"server needs {expected} GPU(s) (dp_size * tp_size * pp * pcp), but "
+            f"server needs {expected} GPU(s) per node (dp_size * tp_size * pp * pcp / nnodes), but "
             f"CUDA_VISIBLE_DEVICES={facts['cuda_visible_devices']!r} names "
             f"{len(gpus)} visible one(s)"
         )

@@ -102,7 +102,7 @@ _live_kernel: str | None = None
 
 
 @contextlib.contextmanager
-def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
+def autotune_cached(autotune: Any, kernel: str, **overrides: Any) -> Iterator[None]:
     """``autotune()`` that starts from, and writes back to, the shared cache.
 
     ``autotune`` is passed in rather than imported here so the import stays
@@ -120,6 +120,9 @@ def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
     Concurrent workers can still race -- one that loaded before another saved
     will overwrite it -- but the loser is a cache miss on the next run, not a
     wrong tactic, and the file converges as runs accumulate.
+
+    ``overrides`` go to ``autotune()`` unchanged (e.g. ``tuning_buckets`` and
+    ``round_up`` for :func:`vllm_tactic_scope`).
     """
 
     global _live_kernel
@@ -127,7 +130,35 @@ def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
     if path is not None and kernel != _live_kernel:
         _forget_live_tactics(autotune)
     _live_kernel = kernel
-    with autotune() if path is None else autotune(cache=str(path)):
+    with autotune(**overrides) if path is None else autotune(cache=str(path), **overrides):
+        yield
+
+
+@contextlib.contextmanager
+def vllm_served_tactic(
+    autotune: Any, kernel: str, decision: Any, custom_op: str, tune: Any
+) -> Iterator[None]:
+    """Run the body under the tactic a vLLM server would serve (``decision``,
+    a ``vllm_tactic_policy.VllmTactic``).
+
+    A tuned bucket is tuned the way vLLM's warm-up tunes it -- ``tune()``
+    inside ``autotune(tuning_buckets=hybrid(budget), round_up=True)`` -- and
+    the body then runs outside any context, so FlashInfer finds it with the
+    op's own mapper, as in serving. A bucket the warm-up never tuned is a miss
+    in serving, which FlashInfer answers with ``runners[0]`` and tactic -1; the
+    body runs under ``skip_ops`` for the op, FlashInfer's own way to that
+    fallback, so a tactic this process tuned or loaded for another budget,
+    policy or label cannot leak in.
+    """
+
+    if decision.tuned:
+        with autotune_cached(
+            autotune, kernel, tuning_buckets=decision.tuning_buckets, round_up=True
+        ):
+            tune()
+        yield
+        return
+    with autotune(False, skip_ops={custom_op}):
         yield
 
 

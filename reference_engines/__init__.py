@@ -19,6 +19,7 @@ README.md.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 from dataclasses import dataclass, field
@@ -93,7 +94,20 @@ def _repository(image: str) -> str:
     return name if name and "/" not in tag else image
 
 
+#: Set by a launcher planning images for another machine (`platform:` in a
+#: pyxis remote.yaml, whose compute nodes are aarch64 behind an x86 login): the
+#: platform whose BASE digest, and so whose image tag, this process resolves.
+PLATFORM_ENV = "VIBESIM_IMAGE_PLATFORM"
+
+
 def host_platform() -> str:
+    override = os.environ.get(PLATFORM_ENV, "").strip()
+    if override:
+        if override not in _PLATFORMS.values():
+            raise BaseError(
+                f"{PLATFORM_ENV}={override!r} is not one of {sorted(set(_PLATFORMS.values()))}"
+            )
+        return override
     machine = platform.machine()
     try:
         return _PLATFORMS[machine]

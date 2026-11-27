@@ -1,0 +1,27 @@
+# vLLM Kimi-K3.1-Pro NVFP4 verifying the DSpark draft (7 draft tokens) on four
+# GB200 NVL72 trays: one TP16 replica with the routed experts EP16 over NVLink
+# (presets/alignment/kimi_k31_pro_nvfp4_gb200_tp16_ep16). The MoE rows are
+# measured for this capture's routes on this deployment. max_model_len 131072
+# is the capture's --max-model-len; cudagraph_capture_sizes are its log's.
+# The B200x2 TP8/DP2 deployment is only an alignment pack
+# (presets/alignment/kimi_k31_pro_nvfp4_b200x2_tp8dp2_ep16): a checkpoint has
+# one public preset per arch type, on one GPU.
+checkpoint: nvidia/Kimi-K3.1-Pro-NVFP4
+gpu: NVIDIA GB200
+arch:
+  type: kimi_k31_vllm_nvfp4_tp_attn_ep_moe_dspark
+  draft_tokens: 7
+  tp_size: 16
+  dp_size: 1
+  ep_fabric: nvlink
+  max_model_len: ${max_model_len}
+  cudagraph_capture_sizes: [8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512, 1024, 2048, 4096]
+  routing: ${routing}
+  token_corpus_file: ${token_corpus_file}
+sweep:
+  max_model_len: [131072]
+compound:
+  workload:
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@6ad8e60bf522a04db0fde4efffd8de2b33c87a1a/kimi_k31_pro_nvfp4/vllm_dspark_k7/diverse_100/capture/20261120/manifest.json

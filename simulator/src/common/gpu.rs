@@ -34,6 +34,27 @@ pub fn sm_count(gpu_name: &str) -> Option<u32> {
         .copied()
 }
 
+/// GPUs in one NVLink domain (`nvl_domain_size`: 8 for a B200 NVL8 node, 72
+/// for a GB200 NVL72 rack), by catalog name or alias as [`compute_capability`].
+/// `None` when the catalog does not record it.
+pub fn nvl_domain_size(gpu_name: &str) -> Option<u32> {
+    static BY_NAME: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    BY_NAME
+        .get_or_init(|| {
+            let mut by_name = HashMap::new();
+            for gpu in catalog() {
+                if let Some(size) = gpu.nvl_domain_size {
+                    for name in std::iter::once(gpu.name).chain(gpu.aliases) {
+                        by_name.entry(key(&name)).or_insert(size);
+                    }
+                }
+            }
+            by_name
+        })
+        .get(&key(gpu_name))
+        .copied()
+}
+
 /// The form a GPU name is matched in.
 fn key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
@@ -46,6 +67,8 @@ struct Gpu {
     aliases: Vec<String>,
     compute_capability: Option<String>,
     sm_count: Option<u32>,
+    #[serde(default)]
+    nvl_domain_size: Option<u32>,
 }
 
 fn catalog() -> Vec<Gpu> {
